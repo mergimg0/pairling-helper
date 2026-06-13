@@ -21,6 +21,7 @@ ALLOW_DIRTY="0"
 RELEASE_MODE="0"
 PREBUILT_ARM64=""
 PREBUILT_X64=""
+VENDOR_PYTHON="0"
 
 usage() {
   cat <<'EOF'
@@ -30,9 +31,13 @@ Options:
   --version X.Y.Z         npm semver for all three packages.
                           Defaults to mac/VERSION, which must be semver.
   --release               Enforce release invariants: clean source tree,
-                          Developer ID signing, semver version.
-  --notarize              Notarize each connectd binary (zip submission via
-                          xcrun notarytool, keychain profile pairling-notary).
+                          Developer ID signing, semver version. Implies
+                          --vendor-python.
+  --vendor-python         Vendor a signed CPython (dev.pairling.python) into
+                          each runtime package (P3 Python custody).
+  --notarize              Notarize each connectd binary and (with
+                          --vendor-python) each CPython, via xcrun notarytool
+                          keychain profile pairling-notary.
   --prebuilt-arm64 PATH   Use an already-built/signed arm64 pairling-connectd
                           instead of building (CI assembly mode).
   --prebuilt-x64 PATH     Same for x64.
@@ -53,6 +58,7 @@ while [[ $# -gt 0 ]]; do
     --notarize) NOTARIZE="1"; shift ;;
     --prebuilt-arm64) PREBUILT_ARM64="${2:-}"; shift 2 ;;
     --prebuilt-x64) PREBUILT_X64="${2:-}"; shift 2 ;;
+    --vendor-python) VENDOR_PYTHON="1"; shift ;;
     --allow-dirty) ALLOW_DIRTY="1"; shift ;;
     --help|-h) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
@@ -92,6 +98,8 @@ fi
 if [[ "$RELEASE_MODE" == "1" ]]; then
   [[ "$SOURCE_DIRTY" == "false" || "$ALLOW_DIRTY" == "1" ]] || fail "source tree is dirty; commit first (or --allow-dirty for non-release builds)."
   [[ -n "$SIGN_IDENTITY" && "$SIGN_IDENTITY" != "-" ]] || [[ -n "$PREBUILT_ARM64" ]] || fail "--release requires PAIRLING_SIGN_IDENTITY (Developer ID) or prebuilt signed binaries."
+  # A release ships the vendored CPython (P3 custody) in the runtime packages.
+  VENDOR_PYTHON="1"
 fi
 
 WORK="$(mktemp -d)"
@@ -230,15 +238,37 @@ stage_runtime() {
   cp "$REPO_ROOT/npm/runtime-darwin-$arch/README.md" "$dir/README.md"
   cp "$binary" "$dir/bin/pairling-connectd"
   chmod 755 "$dir/bin/pairling-connectd"
-  python3 - "$dir/manifest.json" "$dir/bin/pairling-connectd" "$VERSION" "$REVISION" "$(team_of "$dir/bin/pairling-connectd")" <<'PY'
+
+  # P3: vendor the signed CPython into the runtime package.
+  local python_bin="" python_team="" python_id=""
+  if [[ "$VENDOR_PYTHON" == "1" ]]; then
+    local notarize_arg=""
+    [[ "$NOTARIZE" == "1" ]] && notarize_arg="--notarize"
+    "$REPO_ROOT/mac/packaging/vendor-cpython.sh" --arch "$arch" --out "$dir" $notarize_arg
+    python_bin="$dir/python/bin/python3"
+    [[ -x "$python_bin" ]] || fail "vendor-cpython.sh did not produce $python_bin"
+    python_team="$(team_of "$python_bin")"
+    python_id="$(/usr/bin/codesign -dvv "$python_bin" 2>&1 | sed -n 's/^Identifier=//p')"
+  fi
+
+  python3 - "$dir/manifest.json" "$dir/bin/pairling-connectd" "$VERSION" "$REVISION" "$(team_of "$dir/bin/pairling-connectd")" "${python_bin:-}" "${python_team:-}" "${python_id:-}" <<'PY'
 import hashlib, json, sys
-out, binary, version, revision, team = sys.argv[1:]
-digest = hashlib.sha256(open(binary, "rb").read()).hexdigest()
+out, binary, version, revision, team, python_bin, python_team, python_id = sys.argv[1:]
+def sha(p):
+    return hashlib.sha256(open(p, "rb").read()).hexdigest()
+files = [{"path": "bin/pairling-connectd", "sha256": sha(binary), "team_id": team or None}]
+if python_bin:
+    files.append({
+        "path": "python/bin/python3",
+        "sha256": sha(python_bin),
+        "team_id": python_team or None,
+        "identifier": python_id or None,
+    })
 json.dump({
     "schema_version": 1,
     "package_version": version,
     "source_revision": revision,
-    "files": [{"path": "bin/pairling-connectd", "sha256": digest, "team_id": team or None}],
+    "files": files,
 }, open(out, "w"), indent=2, sort_keys=True)
 open(out, "a").write("\n")
 PY

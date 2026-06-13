@@ -239,18 +239,18 @@ def next_action_for_stage(stage: str, *, remote_status: str, pair_window_open: b
         return {
             "id": "open_pairing_invitation",
             "label": "Open pairing invitation",
-            "message": "Open a pairing invitation from Pairling Helper, then pair from the iPhone.",
+            "message": "Run pairling pair to open a pairing invitation, then pair from the iPhone.",
         }
     if stage == "runtime_not_ready":
         return {
-            "id": "start_helper",
-            "label": "Start Pairling Helper",
-            "message": "Run Pairling Helper setup and review the failing runtime checks.",
+            "id": "start_runtime",
+            "label": "Start the Pairling runtime",
+            "message": "Run pairling setup and review the failing runtime checks.",
         }
     return {
-        "id": "install_helper",
-        "label": "Install Pairling Helper",
-        "message": "Install Pairling Helper on this Mac before pairing.",
+        "id": "install_cli",
+        "label": "Install the Pairling CLI",
+        "message": "Run npm install -g pairling then pairling setup on this Mac before pairing.",
     }
 
 
@@ -501,39 +501,73 @@ add(
     (out or err)[:2000],
 )
 
-helper_artifact = Path(os.environ.get("PAIRLING_HELPER_ARTIFACT", str(repo_root / "dist" / "PairlingHelper.dmg")))
-helper_bundle = APP_SUPPORT / "Pairling Helper.app"
-if helper_artifact.exists():
-    code, out, err = run([
-        "/usr/sbin/spctl",
-        "-a",
-        "-vv",
-        "--type",
-        "open",
-        "--context",
-        "context:primary-signature",
-        str(helper_artifact),
-    ], timeout=8)
-    if code != 0:
-        release_blockers.append("Developer ID signed/notarized helper DMG is not Gatekeeper-accepted yet.")
+# npm distribution: the staged pairling-connectd binary must be a valid
+# Developer ID build from the pinned team. This replaces the retired dmg
+# Gatekeeper check; the npm install path never sets com.apple.quarantine, so
+# Gatekeeper assessment is not in the launch path, but signature + Team ID
+# verification is the integrity equivalent and matches the fail-closed staging
+# gate in install-runtime.sh.
+expected_team = os.environ.get("PAIRLING_CONNECTD_TEAM_ID", "965AVD34A3")
+staged_connectd = CURRENT / "connectd" / "pairling-connectd"
+if staged_connectd.exists():
+    vcode, vout, verr = run(["/usr/bin/codesign", "--verify", "--strict", str(staged_connectd)], timeout=8)
+    icode, iout, ierr = run(["/usr/bin/codesign", "-dvv", str(staged_connectd)], timeout=8)
+    team_line = next((l for l in ((iout or "") + (ierr or "")).splitlines() if l.startswith("TeamIdentifier=")), "")
+    team_id = team_line.split("=", 1)[1] if "=" in team_line else ""
+    signed_ok = vcode == 0 and (expected_team == "-" or team_id == expected_team)
+    if not signed_ok:
+        release_blockers.append("Staged pairling-connectd is not a valid Developer ID build from the expected team.")
     add(
-        "helper_signing_notarization",
-        code == 0,
+        "connectd_signature",
+        signed_ok,
         "warning",
-        "Helper DMG Gatekeeper assessment.",
-        {"artifact": str(helper_artifact), "assessment": (out or err)[:2000]},
+        "Staged pairling-connectd passes codesign --verify --strict with the expected Team ID.",
+        {"binary": str(staged_connectd), "team_id": team_id or None, "expected_team": expected_team, "verify": (vout or verr)[:1000]},
     )
-elif helper_bundle.exists():
-    code, out, err = run(["/usr/sbin/spctl", "-a", "-vv", str(helper_bundle)], timeout=8)
-    add("helper_signing_notarization", code == 0, "warning", "Helper bundle Gatekeeper assessment.", (out or err)[:2000])
 else:
-    release_blockers.append("Developer ID signed/notarized helper artifact is not present yet.")
+    release_blockers.append("Staged pairling-connectd is not present; run pairling setup.")
     add(
-        "helper_signing_notarization",
+        "connectd_signature",
         False,
         "warning",
-        "Helper artifact not present; signing/notarization remains a release blocker.",
-        {"artifact": str(helper_artifact), "bundle": str(helper_bundle)},
+        "Staged pairling-connectd not present; signature verification unavailable until pairling setup runs.",
+        {"binary": str(staged_connectd)},
+    )
+
+# P3 Python custody: when a vendored interpreter is staged, it must be a valid
+# Developer ID build from the expected team with the dev.pairling.python
+# identity — that scoping is the whole point (TCC grants attach to Pairling, not
+# a generic python3). When no vendored python is staged (the daemon runs under a
+# system python3), this check is informational, not a blocker.
+expected_python_identifier = os.environ.get("PAIRLING_PYTHON_IDENTIFIER", "dev.pairling.python")
+staged_python = CURRENT / "python" / "bin" / "python3"
+if staged_python.exists():
+    pvcode, pvout, pverr = run(["/usr/bin/codesign", "--verify", "--strict", str(staged_python)], timeout=10)
+    picode, piout, pierr = run(["/usr/bin/codesign", "-dvv", str(staged_python)], timeout=10)
+    pinfo = (piout or "") + (pierr or "")
+    p_team = next((l.split("=", 1)[1] for l in pinfo.splitlines() if l.startswith("TeamIdentifier=")), "")
+    p_id = next((l.split("=", 1)[1] for l in pinfo.splitlines() if l.startswith("Identifier=")), "")
+    python_signed_ok = (
+        pvcode == 0
+        and (expected_team == "-" or p_team == expected_team)
+        and p_id == expected_python_identifier
+    )
+    if not python_signed_ok:
+        release_blockers.append("Staged vendored python is not a valid dev.pairling.python Developer ID build.")
+    add(
+        "python_runtime",
+        python_signed_ok,
+        "warning",
+        "Staged vendored CPython is signed dev.pairling.python by the expected Team ID.",
+        {"python": str(staged_python), "team_id": p_team or None, "identifier": p_id or None, "expected_identifier": expected_python_identifier},
+    )
+else:
+    add(
+        "python_runtime",
+        True,
+        "warning",
+        "No vendored CPython staged; daemon runs under a system python3 (acceptable pre-P3-rollout).",
+        {"python": str(staged_python), "vendored": False},
     )
 
 errors = [c for c in checks if c["status"] != "ok" and c["severity"] == "error"]

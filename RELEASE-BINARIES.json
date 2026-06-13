@@ -1,0 +1,14 @@
+{
+  "binaries": {
+    "arm64": {
+      "sha256": "cd1b4973ff48a3e21ca26538f95e676e17e8195ce387e9ab5bcdcd37971104a5",
+      "team_id": "965AVD34A3"
+    },
+    "x64": {
+      "sha256": "b7d631ffc601cc60768130856b63b6f8092d9b7efdd0422a25010ded8e7b1610",
+      "team_id": "965AVD34A3"
+    }
+  },
+  "schema_version": 1,
+  "version": "0.2.0"
+}

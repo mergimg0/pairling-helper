@@ -34,7 +34,6 @@ PACKAGED_SOURCE_PATHS=(
   "mac/connectd/go.mod"
   "mac/connectd/go.sum"
   "mac/guardian"
-  "mac/helper-assistant/PairlingHelperAssistant.swift"
   "mac/install"
   "mac/mcp"
 )
@@ -76,6 +75,13 @@ MCP_SERVER_DIR="$HOME/.claude/mcp-servers"
 MCP_SERVER_SHIM="$MCP_SERVER_DIR/phone-tools.py"
 PYTHON3_BIN="${PAIRLING_DAEMON_PYTHON:-${COMPANION_DAEMON_PYTHON:-$(command -v python3)}}"
 GUARDIAN_PYTHON_BIN="${PAIRLING_GUARDIAN_PYTHON:-${COMPANION_GUARDIAN_PYTHON:-/usr/bin/python3}}"
+# P3 Python custody: the npm shim points PAIRLING_DAEMON_PYTHON at the vendored
+# CPython inside the platform runtime package (…/python/bin/python3). When that
+# is in play we stage the whole interpreter into the release tree and run the
+# daemon under it, so a Pairling-signed python (identity dev.pairling.python),
+# not a generic system python3, owns the daemon's TCC grants — and npm churn
+# can't remove the running interpreter.
+PYTHON_CODESIGN_IDENTIFIER="dev.pairling.python"
 DRY_RUN="${PAIRLING_DRY_RUN:-0}"
 
 log() {
@@ -263,6 +269,7 @@ copy_release() {
   cp "$REPO_ROOT/mac/guardian/companion-power-guardian.py" "$tmp/guardian/"
   cp "$REPO_ROOT/mac/guardian/guardian_contract.py" "$tmp/guardian/"
   build_connectd_binary "$tmp/connectd/pairling-connectd"
+  stage_vendored_python "$tmp/python"
   copy_runtime_source_tree "$tmp/mac" "$tmp/connectd/pairling-connectd"
   write_installed_pairling_launcher "$tmp/bin/pairling"
   chmod 755 "$tmp/bin/pairling" "$tmp/companiond/pairlingd.py" "$tmp/mcp/phone_tools.py" "$tmp/guardian/companion-power-guardian.py"
@@ -320,6 +327,59 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 exec "$ROOT/mac/packaging/bin/pairling" "$@"
 SH
+}
+
+# Stage the vendored CPython (P3 custody) into the release tree when the npm
+# shim provided one via PAIRLING_DAEMON_PYTHON pointing at …/python/bin/python3.
+# Fail-closed: the interpreter must carry a valid signature, the pinned Team ID,
+# and the dev.pairling.python identifier. On success, repoint PYTHON3_BIN at the
+# STAGED interpreter so the daemon plist never references the npm package path.
+stage_vendored_python() {
+  local dest="$1"
+  local provided="${PAIRLING_DAEMON_PYTHON:-}"
+  # Only act on a vendored interpreter living under a runtime package's python/
+  # tree. A bare system python3 (no sibling python/ tree) is left as-is.
+  case "$provided" in
+    */python/bin/python3) : ;;
+    *) return 0 ;;
+  esac
+  local src_tree
+  src_tree="$(cd "$(dirname "$provided")/.." && pwd)"
+  if [[ ! -x "$src_tree/bin/python3" ]]; then
+    return 0
+  fi
+  local required_team="${PAIRLING_CONNECTD_TEAM_ID:-965AVD34A3}"
+  # Always enforce signature integrity and the dev.pairling.python identity
+  # (cert-independent defense in depth). Pin the Apple Team ID unless the dev
+  # switch (-) disables that one check for local ad-hoc builds.
+  if ! /usr/bin/codesign --verify --strict "$src_tree/bin/python3" >/dev/null 2>&1; then
+    log "ERROR: vendored python failed codesign verification; refusing to stage: $src_tree/bin/python3" >&2
+    exit 1
+  fi
+  local team identifier
+  identifier="$(/usr/bin/codesign -dvv "$src_tree/bin/python3" 2>&1 | sed -n 's/^Identifier=//p')"
+  if [[ "$identifier" != "$PYTHON_CODESIGN_IDENTIFIER" ]]; then
+    log "ERROR: vendored python identifier '${identifier:-none}' is not '$PYTHON_CODESIGN_IDENTIFIER'; refusing to stage." >&2
+    exit 1
+  fi
+  if [[ "$required_team" == "-" ]]; then
+    log "WARNING: vendored python Team ID pin disabled (PAIRLING_CONNECTD_TEAM_ID=-). Dev builds only."
+  else
+    team="$(/usr/bin/codesign -dvv "$src_tree/bin/python3" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+    if [[ "$team" != "$required_team" ]]; then
+      log "ERROR: vendored python TeamIdentifier '${team:-none}' does not match required '$required_team'; refusing to stage." >&2
+      exit 1
+    fi
+  fi
+  rm -rf "$dest"
+  mkdir -p "$(dirname "$dest")"
+  cp -R "$src_tree" "$dest"
+  chmod 755 "$dest/bin/python3" 2>/dev/null || true
+  # Point the daemon at the interpreter through the stable `current` symlink
+  # (not $dest, which is the pre-move temp path) so the plist resolves after the
+  # release is moved into place and after rollback — exactly like connectd.
+  PYTHON3_BIN="$CURRENT_LINK/python/bin/python3"
+  log "Staged vendored CPython (daemon will run under dev.pairling.python via $PYTHON3_BIN)"
 }
 
 build_connectd_binary() {
@@ -551,7 +611,7 @@ if [[ -x "$RUNTIME_PAIRLING" ]]; then
   exec "$RUNTIME_PAIRLING" "$@"
 fi
 
-printf 'Pairling runtime command is not installed. Open Pairling Helper and run Start setup, or use a repo-local mac/packaging/bin/pairling.\n' >&2
+printf 'Pairling runtime command is not installed. Run: npm install -g pairling && pairling setup (or use a repo-local mac/packaging/bin/pairling).\n' >&2
 exit 127
 SH
   chmod 755 "$tmp"
@@ -559,11 +619,17 @@ SH
 }
 
 render_plists() {
+  # Prefer the staged vendored interpreter whenever it exists, so start/
+  # rollback (which don't re-stage) also run the daemon under dev.pairling.python.
+  local daemon_python="$PYTHON3_BIN"
+  if [[ -x "$CURRENT_LINK/python/bin/python3" ]]; then
+    daemon_python="$CURRENT_LINK/python/bin/python3"
+  fi
   python3 "$REPO_ROOT/mac/install/render-launchd.py" \
     --current-root "$CURRENT_LINK" \
     --logs-root "$LOGS_ROOT" \
     --output-dir "$PLIST_BUILD_DIR" \
-    --daemon-python "$PYTHON3_BIN" \
+    --daemon-python "$daemon_python" \
     --guardian-python "$GUARDIAN_PYTHON_BIN"
 }
 
