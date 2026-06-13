@@ -13,6 +13,12 @@ name: release-npm
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (e.g. v0.1.0). Idempotent — skips versions already on the registry.
+        required: true
+        type: string
 
 permissions: {}
 
@@ -31,7 +37,7 @@ jobs:
       - name: Check out release tag
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
           persist-credentials: false
 
       - name: Set up Node
@@ -46,7 +52,7 @@ jobs:
       - name: Download signed binaries from release assets
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           mkdir -p dist/assets
           gh release download "$TAG" --pattern 'pairling-connectd-*' --dir dist/assets
@@ -75,7 +81,7 @@ jobs:
 
       - name: Assemble packages from mirrored sources
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           bash mac/packaging/build-npm-packages.sh \
             --release \
@@ -86,9 +92,21 @@ jobs:
 
       - name: Publish with provenance (runtime packages first, meta last)
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           VERSION="${TAG#v}"
-          npm publish "dist/npm/pairling-runtime-darwin-arm64-$VERSION.tgz" --provenance --access public
-          npm publish "dist/npm/pairling-runtime-darwin-x64-$VERSION.tgz" --provenance --access public
-          npm publish "dist/npm/pairling-$VERSION.tgz" --provenance --access public
+          # Idempotent: skip any version already on the registry so a re-run
+          # after fixing a per-package trusted-publisher gap only publishes the
+          # missing packages (re-publishing an existing version is a hard error).
+          publish_if_absent() {
+            local pkg="$1" tarball="$2"
+            if npm view "$pkg@$VERSION" version >/dev/null 2>&1; then
+              echo "skip: $pkg@$VERSION already published"
+              return 0
+            fi
+            echo "publishing $pkg@$VERSION"
+            npm publish "$tarball" --provenance --access public
+          }
+          publish_if_absent "@pairling/runtime-darwin-arm64" "dist/npm/pairling-runtime-darwin-arm64-$VERSION.tgz"
+          publish_if_absent "@pairling/runtime-darwin-x64" "dist/npm/pairling-runtime-darwin-x64-$VERSION.tgz"
+          publish_if_absent "pairling" "dist/npm/pairling-$VERSION.tgz"
