@@ -1,14 +1,26 @@
 {
   "binaries": {
     "arm64": {
-      "sha256": "cd1b4973ff48a3e21ca26538f95e676e17e8195ce387e9ab5bcdcd37971104a5",
+      "sha256": "369fc39855b2ddbd5e5470a2026908e7914dc5190a8762de5d39d36d00255347",
       "team_id": "965AVD34A3"
     },
     "x64": {
-      "sha256": "b7d631ffc601cc60768130856b63b6f8092d9b7efdd0422a25010ded8e7b1610",
+      "sha256": "6110a1487cd8f9bc8330b9310180bbf4fd5031307466a821bea8073dc847e013",
       "team_id": "965AVD34A3"
     }
   },
-  "schema_version": 1,
+  "python": {
+    "arm64": {
+      "identifier": "dev.pairling.python",
+      "sha256": "c82dd7b61b98d46795eefbff8d0d44ffaf32b5e541e3c9bd6a79fdaaaa765b2c",
+      "team_id": "965AVD34A3"
+    },
+    "x64": {
+      "identifier": "dev.pairling.python",
+      "sha256": "654dd431d8369285ec2082747567e4a7051c92f6123f2493c68b20f0f0691fb7",
+      "team_id": "965AVD34A3"
+    }
+  },
+  "schema_version": 2,
   "version": "0.2.0"
 }

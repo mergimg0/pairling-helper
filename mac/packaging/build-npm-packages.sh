@@ -21,6 +21,8 @@ ALLOW_DIRTY="0"
 RELEASE_MODE="0"
 PREBUILT_ARM64=""
 PREBUILT_X64=""
+PREBUILT_PYTHON_ARM64=""
+PREBUILT_PYTHON_X64=""
 VENDOR_PYTHON="0"
 
 usage() {
@@ -58,6 +60,8 @@ while [[ $# -gt 0 ]]; do
     --notarize) NOTARIZE="1"; shift ;;
     --prebuilt-arm64) PREBUILT_ARM64="${2:-}"; shift 2 ;;
     --prebuilt-x64) PREBUILT_X64="${2:-}"; shift 2 ;;
+    --prebuilt-python-arm64) PREBUILT_PYTHON_ARM64="${2:-}"; shift 2 ;;
+    --prebuilt-python-x64) PREBUILT_PYTHON_X64="${2:-}"; shift 2 ;;
     --vendor-python) VENDOR_PYTHON="1"; shift ;;
     --allow-dirty) ALLOW_DIRTY="1"; shift ;;
     --help|-h) usage; exit 0 ;;
@@ -100,6 +104,12 @@ if [[ "$RELEASE_MODE" == "1" ]]; then
   [[ -n "$SIGN_IDENTITY" && "$SIGN_IDENTITY" != "-" ]] || [[ -n "$PREBUILT_ARM64" ]] || fail "--release requires PAIRLING_SIGN_IDENTITY (Developer ID) or prebuilt signed binaries."
   # A release ships the vendored CPython (P3 custody) in the runtime packages.
   VENDOR_PYTHON="1"
+  # Custody guard: CI has no Developer ID cert, so it MUST supply pre-signed
+  # python tarballs (built+signed on the release Mac). Never ship unsigned.
+  if [[ -z "$SIGN_IDENTITY" || "$SIGN_IDENTITY" == "-" ]]; then
+    [[ -n "$PREBUILT_PYTHON_ARM64" && -n "$PREBUILT_PYTHON_X64" ]] \
+      || fail "--release without a Developer ID identity requires --prebuilt-python-arm64 and --prebuilt-python-x64 (CI must not re-vendor/sign python)."
+  fi
 fi
 
 WORK="$(mktemp -d)"
@@ -230,8 +240,21 @@ mkdir -p "$STAGE/pairling/bin"
 cp "$REPO_ROOT/npm/pairling/bin/pairling.mjs" "$STAGE/pairling/bin/pairling.mjs"
 chmod 755 "$STAGE/pairling/bin/pairling.mjs"
 
+verify_prebuilt_python() {
+  local py="$1"
+  [[ -x "$py" ]] || fail "prebuilt python missing: $py"
+  /usr/bin/codesign --verify --strict "$py" || fail "prebuilt python failed codesign verification: $py"
+  local id team
+  id="$(/usr/bin/codesign -dvv "$py" 2>&1 | sed -n 's/^Identifier=//p')"
+  [[ "$id" == "dev.pairling.python" ]] || fail "prebuilt python identifier '$id' != dev.pairling.python: $py"
+  if [[ "$EXPECTED_TEAM_ID" != "-" ]]; then
+    team="$(team_of "$py")"
+    [[ "$team" == "$EXPECTED_TEAM_ID" ]] || fail "prebuilt python TeamIdentifier '$team' != expected '$EXPECTED_TEAM_ID': $py"
+  fi
+}
+
 stage_runtime() {
-  local arch="$1" binary="$2"
+  local arch="$1" binary="$2" prebuilt_python="$3"
   local dir="$STAGE/runtime-darwin-$arch"
   mkdir -p "$dir/bin"
   cp "$REPO_ROOT/npm/runtime-darwin-$arch/package.json" "$dir/package.json"
@@ -239,14 +262,30 @@ stage_runtime() {
   cp "$binary" "$dir/bin/pairling-connectd"
   chmod 755 "$dir/bin/pairling-connectd"
 
-  # P3: vendor the signed CPython into the runtime package.
+  # P3 CPython. Custody rule (same as connectd): the Developer ID signing only
+  # happens on the release Mac. A prebuilt python tarball (already signed +
+  # notarized) is consumed verbatim and verified — never re-signed. CI MUST use
+  # a prebuilt; only the local release Mac vendors+signs from scratch.
   local python_bin="" python_team="" python_id=""
-  if [[ "$VENDOR_PYTHON" == "1" ]]; then
+  if [[ -n "$prebuilt_python" ]]; then
+    local ptmp; ptmp="$(mktemp -d)"
+    tar -xzf "$prebuilt_python" -C "$ptmp" || fail "could not extract prebuilt python: $prebuilt_python"
+    [[ -d "$ptmp/python" ]] || fail "prebuilt python tarball missing top-level python/ dir: $prebuilt_python"
+    verify_prebuilt_python "$ptmp/python/bin/python3"
+    rm -rf "$dir/python"; mv "$ptmp/python" "$dir/python"; rm -rf "$ptmp"
+    python_bin="$dir/python/bin/python3"
+  elif [[ "$VENDOR_PYTHON" == "1" ]]; then
     local notarize_arg=""
     [[ "$NOTARIZE" == "1" ]] && notarize_arg="--notarize"
     "$REPO_ROOT/mac/packaging/vendor-cpython.sh" --arch "$arch" --out "$dir" $notarize_arg
     python_bin="$dir/python/bin/python3"
     [[ -x "$python_bin" ]] || fail "vendor-cpython.sh did not produce $python_bin"
+    # Emit the signed python as a standalone release asset so CI can consume it
+    # as a prebuilt (CI cannot sign). Deterministic tarball.
+    ( cd "$dir" && find python -exec touch -h -t 202001010000 {} + && \
+      tar -czf "$DIST_DIR/pairling-python-$arch.tar.gz" python )
+  fi
+  if [[ -n "$python_bin" ]]; then
     python_team="$(team_of "$python_bin")"
     python_id="$(/usr/bin/codesign -dvv "$python_bin" 2>&1 | sed -n 's/^Identifier=//p')"
   fi
@@ -273,8 +312,8 @@ json.dump({
 open(out, "a").write("\n")
 PY
 }
-stage_runtime arm64 "$CONNECTD_ARM64"
-stage_runtime x64 "$CONNECTD_X64"
+stage_runtime arm64 "$CONNECTD_ARM64" "$PREBUILT_PYTHON_ARM64"
+stage_runtime x64 "$CONNECTD_X64" "$PREBUILT_PYTHON_X64"
 
 # Set versions + pin optionalDependencies exactly (never mutates npm/ sources).
 python3 - "$STAGE" "$VERSION" <<'PY'

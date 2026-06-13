@@ -56,38 +56,68 @@ jobs:
         run: |
           mkdir -p dist/assets
           gh release download "$TAG" --pattern 'pairling-connectd-*' --dir dist/assets
+          gh release download "$TAG" --pattern 'pairling-python-*.tar.gz' --dir dist/assets
           chmod 755 dist/assets/pairling-connectd-arm64 dist/assets/pairling-connectd-x64
 
       - name: Verify assets against committed digests and Team ID
         run: |
           python3 - <<'PY'
-          import hashlib, json, subprocess, sys
+          import hashlib, json, subprocess, sys, tarfile, tempfile
           expected = json.load(open("RELEASE-BINARIES.json"))
           team = "${{ env.PAIRLING_TEAM_ID }}"
+          def sha(path):
+              return hashlib.sha256(open(path, "rb").read()).hexdigest()
+          def codesign_fields(path):
+              info = subprocess.run(["/usr/bin/codesign", "-dvv", path], capture_output=True, text=True)
+              blob = (info.stdout or "") + (info.stderr or "")
+              out = {}
+              for line in blob.splitlines():
+                  if "=" in line:
+                      k, _, v = line.partition("=")
+                      out[k] = v
+              return out
+          # connectd binaries: digest + Developer ID signature + Team ID.
           for arch in ("arm64", "x64"):
               path = f"dist/assets/pairling-connectd-{arch}"
-              digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
-              want = expected["binaries"][arch]["sha256"]
-              if digest != want:
-                  sys.exit(f"{path}: sha256 {digest} != committed {want}")
+              if sha(path) != expected["binaries"][arch]["sha256"]:
+                  sys.exit(f"{path}: sha256 mismatch")
               subprocess.run(["/usr/bin/codesign", "--verify", "--strict", path], check=True)
-              info = subprocess.run(["/usr/bin/codesign", "-dvv", path], capture_output=True, text=True)
-              fields = (info.stdout or "") + (info.stderr or "")
-              line = next((l for l in fields.splitlines() if l.startswith("TeamIdentifier=")), "")
-              if line != f"TeamIdentifier={team}":
-                  sys.exit(f"{path}: unexpected {line!r}")
+              f = codesign_fields(path)
+              if f.get("TeamIdentifier") != team:
+                  sys.exit(f"{path}: TeamIdentifier {f.get('TeamIdentifier')!r} != {team}")
               print(f"verified {path}: sha256 + signature + TeamIdentifier={team}")
+          # python tarballs: digest, then unpack and verify the interpreter is a
+          # valid dev.pairling.python Developer ID build (CI must not re-sign).
+          for arch in ("arm64", "x64"):
+              path = f"dist/assets/pairling-python-{arch}.tar.gz"
+              if sha(path) != expected["python"][arch]["sha256"]:
+                  sys.exit(f"{path}: sha256 mismatch")
+              tmp = tempfile.mkdtemp()
+              with tarfile.open(path) as t:
+                  t.extractall(tmp)
+              py = f"{tmp}/python/bin/python3"
+              subprocess.run(["/usr/bin/codesign", "--verify", "--strict", py], check=True)
+              f = codesign_fields(py)
+              if f.get("TeamIdentifier") != team:
+                  sys.exit(f"{py}: TeamIdentifier {f.get('TeamIdentifier')!r} != {team}")
+              if f.get("Identifier") != "dev.pairling.python":
+                  sys.exit(f"{py}: Identifier {f.get('Identifier')!r} != dev.pairling.python")
+              print(f"verified {path}: sha256 + dev.pairling.python + TeamIdentifier={team}")
           PY
 
       - name: Assemble packages from mirrored sources
         env:
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
+          # CI passes pre-signed connectd AND pre-signed python as prebuilts; the
+          # build never re-vendors or re-signs (no Developer ID cert in CI).
           bash mac/packaging/build-npm-packages.sh \
             --release \
             --version "${TAG#v}" \
             --prebuilt-arm64 dist/assets/pairling-connectd-arm64 \
-            --prebuilt-x64 dist/assets/pairling-connectd-x64
+            --prebuilt-x64 dist/assets/pairling-connectd-x64 \
+            --prebuilt-python-arm64 dist/assets/pairling-python-arm64.tar.gz \
+            --prebuilt-python-x64 dist/assets/pairling-python-x64.tar.gz
           cat dist/npm/SHASUMS256.txt
 
       - name: Publish with provenance (runtime packages first, meta last)
