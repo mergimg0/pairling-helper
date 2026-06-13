@@ -1,0 +1,22 @@
+{
+  "name": "pairling-helper",
+  "version": "0.0.1",
+  "description": "Name reservation for the Pairling Mac companion. The real CLI is the `pairling` package.",
+  "homepage": "https://pairling.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mergimg0/pairling-helper.git"
+  },
+  "license": "UNLICENSED",
+  "author": "Pairling (https://pairling.dev)",
+  "type": "module",
+  "bin": {
+    "pairling-helper": "bin/redirect.mjs"
+  },
+  "files": [
+    "bin/redirect.mjs"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

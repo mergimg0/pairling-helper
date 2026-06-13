@@ -1,0 +1,32 @@
+{
+  "name": "@pairling/runtime-darwin-arm64",
+  "version": "0.0.0",
+  "description": "Pairling Mac runtime binaries for Apple Silicon. Installed automatically as an optional dependency of the `pairling` package — do not install directly.",
+  "homepage": "https://pairling.dev",
+  "bugs": {
+    "url": "https://github.com/mergimg0/pairling-helper/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mergimg0/pairling-helper.git"
+  },
+  "license": "UNLICENSED",
+  "author": "Pairling (https://pairling.dev)",
+  "files": [
+    "bin",
+    "python",
+    "manifest.json"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

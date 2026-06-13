@@ -1,0 +1,42 @@
+{
+  "name": "pairling",
+  "version": "0.0.1",
+  "description": "Pair your iPhone with the AI coding agents running on your Mac. CLI and local runtime installer for the Pairling iOS app.",
+  "keywords": [
+    "pairling",
+    "claude-code",
+    "codex",
+    "ios",
+    "companion",
+    "agents",
+    "cli"
+  ],
+  "homepage": "https://pairling.dev",
+  "bugs": {
+    "url": "https://github.com/mergimg0/pairling-helper/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mergimg0/pairling-helper.git"
+  },
+  "license": "UNLICENSED",
+  "author": "Pairling (https://pairling.dev)",
+  "type": "module",
+  "bin": {
+    "pairling": "bin/pairling.mjs"
+  },
+  "files": [
+    "bin/pairling.mjs",
+    "payload",
+    "payload-manifest.json"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

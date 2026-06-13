@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -n "${PAIRLING_REPO_ROOT:-}" ]]; then
+  REPO_ROOT="$PAIRLING_REPO_ROOT"
+else
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+fi
+
+export PYTHONDONTWRITEBYTECODE=1
+if [[ -z "${PYTHONPYCACHEPREFIX:-}" ]]; then
+  PYTHONPYCACHEPREFIX="${TMPDIR:-/tmp}/pairling-pycache-$(id -u)"
+  mkdir -p "$PYTHONPYCACHEPREFIX" 2>/dev/null || true
+  export PYTHONPYCACHEPREFIX
+fi
+
+if [[ "${1:-}" == "attach" ]]; then
+  shift
+  exec python3 "$REPO_ROOT/mac/packaging/pairling_attach.py" "$@"
+fi
+
+if [[ "${1:-}" == "connect-auth-open" ]]; then
+  shift || true
+  json_mode="false"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json)
+        json_mode="true"
+        shift
+        ;;
+      --help|-h)
+        printf 'usage: pairling connect-auth-open [--json]\n'
+        exit 0
+        ;;
+      *)
+        printf 'usage: pairling connect-auth-open [--json]\n' >&2
+        exit 2
+        ;;
+    esac
+  done
+  if output="$(/usr/bin/curl -sS --max-time 5 -X POST http://127.0.0.1:7774/auth/open 2>/dev/null)"; then
+    if python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("ok") else 1)' <<<"$output"; then
+      response_status=0
+    else
+      response_status=1
+    fi
+    if [[ "$json_mode" == "true" ]]; then
+      printf '%s\n' "$output"
+    else
+      python3 -c 'import json,sys; data=json.load(sys.stdin); print("Pairling Connect browser approval opened." if data.get("opened") else data.get("error", "Pairling Connect browser approval is not available."))' <<<"$output"
+    fi
+    exit "$response_status"
+  fi
+  if [[ "$json_mode" == "true" ]]; then
+    printf '{"ok":false,"opened":false,"auth_url_present":false,"error":"Pairling Connect auth endpoint unavailable."}\n'
+  else
+    printf 'Pairling Connect auth endpoint unavailable.\n' >&2
+  fi
+  exit 1
+fi
+
+exec "$REPO_ROOT/mac/install/install-runtime.sh" "$@"
