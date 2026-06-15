@@ -165,7 +165,7 @@ def build_manifest_payload(
             },
         },
         "endpoints": {
-            "public": ["/health", "/manifest", "/pair/start", "/pair/claim"],
+            "public": ["/health", "/manifest", "/pair/start", "/pair/claim", "/pair/psk-claim"],
             "authenticated": [
                 "/manifest",
                 "/sessions",

@@ -11,4 +11,4 @@ pairling setup
 ```
 
 - Product: https://pairling.dev
-- Source mirror: https://github.com/mergimg0/pairling-helper
+- Source mirror: https://pairling.dev

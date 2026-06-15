@@ -50,7 +50,7 @@ PAIRLING_RUNTIME_PORT="${PAIRLING_RUNTIME_PORT:-7773}"
 PAIRLING_DAEMON_LABEL="dev.pairling.companiond"
 PAIRLING_GUARDIAN_LABEL="dev.pairling.power-guardian"
 PAIRLING_CONNECTD_LABEL="dev.pairling.connectd"
-LEGACY_DAEMON_LABEL="com.mghome.notify-webhook"
+PAIRLING_PTYBROKER_LABEL="dev.pairling.ptybroker"
 APP_SUPPORT="${PAIRLING_APP_SUPPORT_ROOT:-${COMPANION_APP_SUPPORT_ROOT:-$HOME/Library/Application Support/Pairling}}"
 RUNTIME_ROOT="$APP_SUPPORT/runtime"
 RELEASES_ROOT="$RUNTIME_ROOT/releases"
@@ -68,9 +68,8 @@ MCP_CREDENTIAL="$APP_SUPPORT/mcp-bridge.json"
 INSTALL_HISTORY="$STATE_ROOT/install-history.jsonl"
 USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_DAEMON_LABEL.plist"
 CONNECTD_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_CONNECTD_LABEL.plist"
-LEGACY_USER_PLIST="$HOME/Library/LaunchAgents/$LEGACY_DAEMON_LABEL.plist"
+PTYBROKER_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_PTYBROKER_LABEL.plist"
 SYSTEM_PLIST="/Library/LaunchDaemons/$PAIRLING_GUARDIAN_LABEL.plist"
-LEGACY_SYSTEM_PLIST="/Library/LaunchDaemons/com.mghome.companion-power-guardian.plist"
 MCP_SERVER_DIR="$HOME/.claude/mcp-servers"
 MCP_SERVER_SHIM="$MCP_SERVER_DIR/phone-tools.py"
 PYTHON3_BIN="${PAIRLING_DAEMON_PYTHON:-${COMPANION_DAEMON_PYTHON:-$(command -v python3)}}"
@@ -86,6 +85,15 @@ DRY_RUN="${PAIRLING_DRY_RUN:-0}"
 
 log() {
   printf '%s\n' "$*"
+}
+
+display_path() {
+  local path="$1"
+  case "$path" in
+    "$HOME"/*) printf '~/%s\n' "${path#"$HOME"/}" ;;
+    "$HOME") printf '~\n' ;;
+    *) printf '%s\n' "$path" ;;
+  esac
 }
 
 is_dry_run() {
@@ -128,9 +136,13 @@ run_compile_checks() {
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/llm_route.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pairling_tools.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pairling_pairing.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pairling_psk.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pairling_relay_claims.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/request_proof.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/codex_approval.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pty_broker.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pty_broker_client.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pty_broker_service.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/terminal_screen_backend.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/terminal_text_sanitizer.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/push_dispatcher.py"
@@ -156,7 +168,28 @@ run_compile_checks() {
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/guardian/companion-power-guardian.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/guardian/guardian_contract.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/install/render-launchd.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/install/psk_dependency_check.py"
   rm -rf "$pycache_root"
+}
+
+run_psk_dependency_import_check() {
+  local python_bin="$1"
+  local companiond_path="$2"
+  local label="$3"
+  "$python_bin" "$REPO_ROOT/mac/install/psk_dependency_check.py" "$companiond_path" --label "$label"
+}
+
+run_psk_dependency_checks() {
+  run_psk_dependency_import_check "$PYTHON3_BIN" "$REPO_ROOT/mac/companiond" "source-tree preflight"
+}
+
+run_staged_psk_dependency_checks() {
+  local tmp="$1"
+  local staged_python="$PYTHON3_BIN"
+  if [[ -x "$tmp/python/bin/python3" ]]; then
+    staged_python="$tmp/python/bin/python3"
+  fi
+  run_psk_dependency_import_check "$staged_python" "$tmp/companiond" "staged runtime copy"
 }
 
 ensure_state() {
@@ -248,9 +281,13 @@ copy_release() {
   cp "$REPO_ROOT/mac/companiond/llm_route.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairling_tools.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairling_pairing.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/pairling_psk.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairling_relay_claims.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/request_proof.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/codex_approval.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pty_broker.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/pty_broker_client.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/pty_broker_service.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/terminal_screen_backend.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/terminal_text_sanitizer.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/push_dispatcher.py" "$tmp/companiond/"
@@ -270,6 +307,7 @@ copy_release() {
   cp "$REPO_ROOT/mac/guardian/guardian_contract.py" "$tmp/guardian/"
   build_connectd_binary "$tmp/connectd/pairling-connectd"
   stage_vendored_python "$tmp/python"
+  run_staged_psk_dependency_checks "$tmp"
   copy_runtime_source_tree "$tmp/mac" "$tmp/connectd/pairling-connectd"
   write_installed_pairling_launcher "$tmp/bin/pairling"
   chmod 755 "$tmp/bin/pairling" "$tmp/companiond/pairlingd.py" "$tmp/mcp/phone_tools.py" "$tmp/guardian/companion-power-guardian.py"
@@ -301,6 +339,10 @@ copy_runtime_source_tree() {
   printf '%s\n' "$BRANCH" > "$mac_root/SOURCE_BRANCH"
   printf '%s\n' "$SOURCE_DIRTY" > "$mac_root/SOURCE_DIRTY"
   cp "$REPO_ROOT/mac/companiond/"*.py "$mac_root/companiond/"
+  # WS2: co-locate the canonical App Attest validator with the daemon so
+  # app_attest_lan can import it in the staged runtime (the repo keeps the one
+  # source of truth in relay/). Non-fatal if absent — the gate fails closed.
+  cp "$REPO_ROOT/relay/app_attest_validator.py" "$mac_root/companiond/" 2>/dev/null || true
   cp "$REPO_ROOT/mac/companiond/providers/"*.py "$mac_root/companiond/providers/"
   cp "$REPO_ROOT/mac/companiond/integrations/__init__.py" "$mac_root/companiond/integrations/"
   cp "$REPO_ROOT/mac/companiond/integrations/aperture_cli/"*.py "$mac_root/companiond/integrations/aperture_cli/"
@@ -464,9 +506,13 @@ for rel in [
     "companiond/llm_route.py",
     "companiond/pairling_tools.py",
     "companiond/pairling_pairing.py",
+    "companiond/pairling_psk.py",
     "companiond/pairling_relay_claims.py",
     "companiond/request_proof.py",
+    "companiond/codex_approval.py",
     "companiond/pty_broker.py",
+    "companiond/pty_broker_client.py",
+    "companiond/pty_broker_service.py",
     "companiond/terminal_screen_backend.py",
     "companiond/terminal_text_sanitizer.py",
     "companiond/push_dispatcher.py",
@@ -519,9 +565,9 @@ manifest = {
     },
     "launchd": {
         "daemon_label": "dev.pairling.companiond",
+        "ptybroker_label": "dev.pairling.ptybroker",
         "connectd_label": "dev.pairling.connectd",
         "guardian_label": "dev.pairling.power-guardian",
-        "legacy_daemon_label": "com.mghome.notify-webhook",
     },
     "paths": {
         "app_support": app_support,
@@ -605,13 +651,40 @@ if [[ -n "${PAIRLING_REPO_ROOT:-}" ]]; then
   exec "$PAIRLING_REPO_ROOT/mac/packaging/bin/pairling" "$@"
 fi
 
+find_npm_pairling_shim() {
+  local wrapper_path="$1"
+  local old_ifs="$IFS"
+  local dir candidate
+  IFS=:
+  for dir in $PATH; do
+    [[ -n "$dir" ]] || dir="."
+    candidate="$dir/pairling"
+    if [[ -x "$candidate" && "$candidate" != "$wrapper_path" ]] && "$candidate" --shim-print-env >/dev/null 2>&1; then
+      IFS="$old_ifs"
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  IFS="$old_ifs"
+  return 1
+}
+
+case "${1:-}" in
+  setup|install|update|upgrade)
+    WRAPPER_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    if NPM_PAIRLING="$(find_npm_pairling_shim "$WRAPPER_PATH")"; then
+      exec "$NPM_PAIRLING" "$@"
+    fi
+    ;;
+esac
+
 APP_SUPPORT="${PAIRLING_APP_SUPPORT_ROOT:-${COMPANION_APP_SUPPORT_ROOT:-$HOME/Library/Application Support/Pairling}}"
 RUNTIME_PAIRLING="$APP_SUPPORT/runtime/current/bin/pairling"
 if [[ -x "$RUNTIME_PAIRLING" ]]; then
   exec "$RUNTIME_PAIRLING" "$@"
 fi
 
-printf 'Pairling runtime command is not installed. Run: npm install -g pairling && pairling setup (or use a repo-local mac/packaging/bin/pairling).\n' >&2
+printf 'Pairling runtime command is not installed. Run:\n  npm install -g pairling\n  pairling setup\nor use a repo-local mac/packaging/bin/pairling.\n' >&2
 exit 127
 SH
   chmod 755 "$tmp"
@@ -635,11 +708,10 @@ render_plists() {
 
 unload_legacy_daemon() {
   if is_dry_run; then
-    log "dry-run: would unload $LEGACY_DAEMON_LABEL"
+    log "dry-run: would check legacy predecessor cleanup"
     return
   fi
-  launchctl bootout "gui/$(id -u)/$LEGACY_DAEMON_LABEL" >/dev/null 2>&1 || true
-  launchctl bootout "gui/$(id -u)" "$LEGACY_USER_PLIST" >/dev/null 2>&1 || true
+  return 0
 }
 
 start_user_agent() {
@@ -668,6 +740,259 @@ start_connectd_agent() {
   launchctl kickstart -k "gui/$(id -u)/$PAIRLING_CONNECTD_LABEL"
 }
 
+ptybroker_live_session_count() {
+  local status_json
+  if status_json="$(ptybroker_status_json 2>/dev/null)"; then
+    python3 - "$status_json" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+status = payload.get("status") if isinstance(payload.get("status"), dict) else {}
+print(status.get("live_session_count", "unknown"))
+PY
+  else
+    printf '%s\n' "unknown"
+  fi
+}
+
+ptybroker_status_json() {
+  "$PYTHON3_BIN" - "$CURRENT_LINK" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+current = Path(sys.argv[1])
+sys.path.insert(0, str(current / "companiond"))
+from pty_broker_client import PTYBrokerClient, ensure_pty_broker_token
+
+companion = Path.home() / ".claude" / "companion"
+client = PTYBrokerClient(companion / "pty-broker.sock", ensure_pty_broker_token(companion), timeout=1.0)
+print(json.dumps({"ok": True, "status": client.status()}, sort_keys=True))
+PY
+}
+
+ptybroker_desired_revision() {
+  python3 - "$CURRENT_LINK" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+current = Path(sys.argv[1])
+for path in [current / "manifest.json", current / "mac" / "SOURCE_REVISION", current / "SOURCE_REVISION"]:
+    try:
+        if path.name == "manifest.json":
+            print(json.loads(path.read_text()).get("source_revision") or "")
+        else:
+            print(path.read_text().strip())
+        raise SystemExit(0)
+    except FileNotFoundError:
+        continue
+    except Exception:
+        continue
+print("")
+PY
+}
+
+ptybroker_live_revision() {
+  python3 - "${1:-{}}" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+status = payload.get("status") if isinstance(payload.get("status"), dict) else payload
+print(status.get("source_revision") or "")
+PY
+}
+
+ptybroker_deployment_state_json() {
+  python3 - "$CURRENT_LINK" "${1:-{}}" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+current = Path(sys.argv[1])
+payload = json.loads(sys.argv[2])
+live = payload.get("status") if isinstance(payload.get("status"), dict) else payload
+
+def read_revision(root: Path):
+    for path in [root / "manifest.json", root / "mac" / "SOURCE_REVISION", root / "SOURCE_REVISION"]:
+        try:
+            if path.name == "manifest.json":
+                return json.loads(path.read_text()).get("source_revision")
+            value = path.read_text().strip()
+            return value or None
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+    return None
+
+desired_root = current.resolve()
+desired = {
+    "runtime_root": str(desired_root),
+    "script_path": str(desired_root / "companiond" / "pty_broker_service.py"),
+    "source_revision": read_revision(desired_root),
+    "protocol_version": 1,
+}
+reasons = []
+live_root = live.get("runtime_root")
+if live_root:
+    if os.path.realpath(str(live_root)) != str(desired_root):
+        reasons.append("runtime_root_mismatch")
+else:
+    reasons.append("runtime_root_missing")
+live_script = live.get("script_path")
+if live_script:
+    if os.path.realpath(str(live_script)) != str(desired["script_path"]):
+        reasons.append("script_path_mismatch")
+else:
+    reasons.append("script_path_missing")
+live_revision = live.get("source_revision")
+if desired["source_revision"] and not live_revision:
+    reasons.append("source_revision_missing")
+elif live_revision and desired["source_revision"] and str(live_revision) != str(desired["source_revision"]):
+    reasons.append("source_revision_mismatch")
+try:
+    live_protocol = int(live.get("protocol_version") or 0)
+except (TypeError, ValueError):
+    live_protocol = 0
+if live_protocol != desired["protocol_version"]:
+    if not live.get("protocol_version"):
+        reasons.append("protocol_version_missing")
+    else:
+        reasons.append("protocol_version_mismatch")
+state = "current" if not reasons else "stale_deferred"
+print(json.dumps({
+    "state": state,
+    "restart_deferred": state == "stale_deferred",
+    "reasons": reasons,
+    "desired": desired,
+    "live": live,
+}, sort_keys=True))
+PY
+}
+
+ptybroker_report_deferred_restart() {
+  local state_json
+  state_json="$(ptybroker_deployment_state_json "$1")"
+  python3 - "$state_json" <<'PY'
+import json
+import sys
+
+state = json.loads(sys.argv[1])
+if state.get("state") != "stale_deferred":
+    raise SystemExit(0)
+live = state.get("live") if isinstance(state.get("live"), dict) else {}
+desired = state.get("desired") if isinstance(state.get("desired"), dict) else {}
+print(
+    "WARNING: ptybroker running older code; normal install preserved live PTYs; "
+    "broker restart is deferred; "
+    f"live_source_revision={live.get('source_revision')} "
+    f"desired_source_revision={desired.get('source_revision')} "
+    f"live_pid={live.get('pid')} "
+    f"live_session_count={live.get('live_session_count')}"
+)
+PY
+}
+
+ptybroker_state_field() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+value = payload
+for part in sys.argv[2].split("."):
+    if isinstance(value, dict):
+        value = value.get(part)
+    else:
+        value = None
+print("" if value is None else value)
+PY
+}
+
+ensure_ptybroker_agent() {
+  mkdir -p "$HOME/Library/LaunchAgents"
+  local rendered="$PLIST_BUILD_DIR/$PAIRLING_PTYBROKER_LABEL.plist"
+  local changed=0
+  if [[ ! -f "$PTYBROKER_USER_PLIST" ]] || ! cmp -s "$rendered" "$PTYBROKER_USER_PLIST"; then
+    cp "$rendered" "$PTYBROKER_USER_PLIST"
+    chmod 644 "$PTYBROKER_USER_PLIST"
+    changed=1
+  fi
+  if is_dry_run; then
+    if [[ "$changed" == "1" ]]; then
+      log "dry-run: rendered $PTYBROKER_USER_PLIST"
+    else
+      log "dry-run: $PTYBROKER_USER_PLIST unchanged"
+    fi
+    return
+  fi
+  if ! launchctl print "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1; then
+    launchctl bootstrap "gui/$(id -u)" "$PTYBROKER_USER_PLIST" >/dev/null 2>&1 || true
+    launchctl kickstart "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1 || true
+    return
+  fi
+  local status_json
+  if status_json="$(ptybroker_status_json 2>/dev/null)"; then
+    ptybroker_report_deferred_restart "$status_json"
+  else
+    log "WARNING: ptybroker status unreachable_socket; normal install preserved live PTYs but broker freshness is unknown; broker restart is deferred"
+  fi
+  if [[ "$changed" == "1" ]]; then
+    local live_count
+    live_count="$(ptybroker_live_session_count)"
+    log "ptybroker plist changed but broker is already loaded; preserving PTYs and deferring broker restart (live_sessions=$live_count)"
+  fi
+  if [[ ! -S "$HOME/.claude/companion/pty-broker.sock" ]]; then
+    launchctl kickstart "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1 || true
+  fi
+}
+
+reconcile_ptybroker() {
+  ensure_state
+  render_plists
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cp "$PLIST_BUILD_DIR/$PAIRLING_PTYBROKER_LABEL.plist" "$PTYBROKER_USER_PLIST"
+  chmod 644 "$PTYBROKER_USER_PLIST"
+  if is_dry_run; then
+    log "dry-run: would reconcile $PAIRLING_PTYBROKER_LABEL"
+    return
+  fi
+  if ! launchctl print "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1; then
+    launchctl bootstrap "gui/$(id -u)" "$PTYBROKER_USER_PLIST" >/dev/null 2>&1 || true
+    launchctl kickstart "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1 || true
+    log "Started $PAIRLING_PTYBROKER_LABEL"
+    return
+  fi
+  local status_json state_json live_count live_pid
+  if ! status_json="$(ptybroker_status_json 2>/dev/null)"; then
+    log "ERROR: ptybroker is loaded but status RPC is unreachable; refusing reconcile until socket is reachable or broker is manually stopped." >&2
+    exit 1
+  fi
+  state_json="$(ptybroker_deployment_state_json "$status_json")"
+  live_count="$(ptybroker_state_field "$state_json" "live.live_session_count")"
+  live_pid="$(ptybroker_state_field "$state_json" "live.pid")"
+  if [[ "${live_count:-0}" != "0" ]]; then
+    log "ERROR: ptybroker restart deferred: live_session_count=$live_count live_pid=$live_pid; close/drain live PTYs before broker code can be updated." >&2
+    exit 1
+  fi
+  log "Operator requested idle ptybroker reconcile; restarting broker live_pid=$live_pid live_session_count=0"
+  launchctl bootout "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1 || true
+  launchctl bootout "gui/$(id -u)" "$PTYBROKER_USER_PLIST" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$PTYBROKER_USER_PLIST" >/dev/null 2>&1 || true
+  launchctl kickstart -k "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL"
+  status_json="$(ptybroker_status_json)"
+  state_json="$(ptybroker_deployment_state_json "$status_json")"
+  if [[ "$(ptybroker_state_field "$state_json" "state")" != "current" ]]; then
+    log "ERROR: ptybroker restart completed but status is not current: $state_json" >&2
+    exit 1
+  fi
+  log "Reconciled $PAIRLING_PTYBROKER_LABEL with current runtime"
+}
+
 stop_user_agent() {
   if is_dry_run; then
     log "dry-run: would stop $PAIRLING_DAEMON_LABEL"
@@ -689,7 +1014,7 @@ stop_connectd_agent() {
 install_guardian_if_possible() {
   local rendered="$PLIST_BUILD_DIR/$PAIRLING_GUARDIAN_LABEL.plist"
   if [[ "${PAIRLING_INSTALL_GUARDIAN:-0}" != "1" ]]; then
-    log "Guardian LaunchDaemon rendered but not installed. Set PAIRLING_INSTALL_GUARDIAN=1 to install it."
+    log "Optional power guardian not installed; pairing can continue without the privileged sleep helper."
     return
   fi
   if is_dry_run; then
@@ -709,7 +1034,7 @@ install_guardian_if_possible() {
 }
 
 run_doctor() {
-  "$REPO_ROOT/mac/install/doctor.sh" --json
+  "$REPO_ROOT/mac/install/doctor.sh"
 }
 
 rollback() {
@@ -727,6 +1052,7 @@ rollback() {
     ln -s "$current_target" "$PREVIOUS_LINK"
   fi
   render_plists
+  ensure_ptybroker_agent
   start_user_agent
   start_connectd_agent
   append_history "rollback" "rolled back to $previous_target"
@@ -735,13 +1061,14 @@ rollback() {
 
 install_runtime() {
   log "Pairling setup preview:"
-  log "  app support: $APP_SUPPORT"
-  log "  logs: $LOGS_ROOT"
+  log "  app support: $(display_path "$APP_SUPPORT")"
+  log "  logs: $(display_path "$LOGS_ROOT")"
   log "  LaunchAgent: $PAIRLING_DAEMON_LABEL"
+  log "  PTY Broker LaunchAgent: $PAIRLING_PTYBROKER_LABEL"
   log "  Connect LaunchAgent: $PAIRLING_CONNECTD_LABEL"
   log "  runtime port: $PAIRLING_RUNTIME_PORT"
-  log "  old Pairling predecessor cleanup label: $LEGACY_DAEMON_LABEL"
   run_compile_checks
+  run_psk_dependency_checks
   ensure_state
   copy_release
   switch_current
@@ -749,6 +1076,7 @@ install_runtime() {
   install_shell_wrapper
   render_plists
   unload_legacy_daemon
+  ensure_ptybroker_agent
   start_user_agent
   start_connectd_agent
   install_guardian_if_possible
@@ -759,6 +1087,13 @@ install_runtime() {
     run_doctor || true
   fi
   log "Installed Pairling runtime $RELEASE_NAME"
+  if ! is_dry_run; then
+    log ""
+    if ! pair_runtime --qr; then
+      log "Pairling installed, but setup could not generate a pairing invitation. Run: pairling doctor --json; pairling pair --qr" >&2
+      exit 1
+    fi
+  fi
 }
 
 status_runtime() {
@@ -769,6 +1104,7 @@ start_runtime() {
   ensure_state
   render_plists
   unload_legacy_daemon
+  ensure_ptybroker_agent
   start_user_agent
   start_connectd_agent
   log "Started $PAIRLING_DAEMON_LABEL"
@@ -815,6 +1151,7 @@ pair_runtime() {
   payload_file="$(mktemp)"
   if python3 - "$PAIRLING_RUNTIME_PORT" "$ttl" "$REPO_ROOT" >"$payload_file" <<'PY'
 import json
+import ipaddress
 import os
 import socket
 import subprocess
@@ -877,6 +1214,42 @@ secret = str(
 )
 install_id = str(payload.get("install_id") or "")
 mac_name = str(((payload.get("pair_service") or {}).get("txt") or {}).get("mac_name") or socket.gethostname())
+# WS3: the Mac ephemeral ECDH public key (base64url) from /pair/start. Carrying it in the
+# pair URL is what lets the phone run PSK-authenticated ECDH from the OUT-OF-BAND (QR/paste)
+# payload — the secret never goes on the wire. Without it the phone falls back to the legacy
+# plaintext claim, so this field is the bridge that actually makes WS3 engage.
+mac_ake_pub = str(payload.get("mac_ake_pub") or (payload.get("claim") or {}).get("mac_ake_pub") or "")
+
+def is_ats_local_ipv4(value: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    if addr.version != 4 or addr.is_loopback or addr.is_link_local:
+        return False
+    return (
+        value.startswith("10.")
+        or value.startswith("192.168.")
+        or any(value.startswith(f"172.{i}.") for i in range(16, 32))
+    )
+
+def detected_lan_ip() -> str:
+    override = os.environ.get("PAIRLING_TEST_LAN_IP")
+    if override is not None:
+        value = override.strip()
+        return value if is_ats_local_ipv4(value) else ""
+    if os.environ.get("PAIRLING_DISABLE_LAN") == "1" or os.environ.get("PAIRLING_TEST_DISABLE_LAN") == "1":
+        return ""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(("8.8.8.8", 80))
+            ip = sock.getsockname()[0]
+        finally:
+            sock.close()
+        return ip if is_ats_local_ipv4(ip) else ""
+    except Exception:
+        return ""
 
 def detected_tailnet_ip() -> str:
     override = os.environ.get("PAIRLING_TEST_TAILSCALE_IP")
@@ -900,6 +1273,16 @@ def default_pair_route(port_number: int) -> dict:
         value = os.environ.get(key)
         if value:
             return {"base_url": value, "source": "explicit_override", "status": "override"}
+    # First-pair QR claims go through iOS URLSession before any persisted
+    # Pairling Connect route exists. TestFlight builds allow local HTTP via
+    # NSAllowsLocalNetworking, but ATS blocks plain HTTP to 100.64/10 tailnet
+    # addresses. Prefer ATS-local LAN/Bonjour bases for bootstrap; remote
+    # tailnet routes are validated and promoted after the claim.
+    lan_ip = detected_lan_ip()
+    if lan_ip:
+        return {"base_url": f"http://{lan_ip}:{port_number}", "source": "lan", "status": "fallback", "kind": "lan"}
+    if os.environ.get("PAIRLING_DISABLE_BONJOUR") != "1" and os.environ.get("PAIRLING_TEST_DISABLE_BONJOUR") != "1":
+        return {"base_url": f"http://{socket.gethostname()}.local:{port_number}", "source": "bonjour", "status": "fallback", "kind": "bonjour"}
     connect_routes = advertised_pairling_connect_routes(fetch_connectd_status(timeout_seconds=0.7))
     if connect_routes:
         route = connect_routes[0]
@@ -912,17 +1295,6 @@ def default_pair_route(port_number: int) -> dict:
     tailnet_ip = detected_tailnet_ip()
     if tailnet_ip:
         return {"base_url": f"http://{tailnet_ip}:{port_number}", "source": "standalone_tailnet", "status": "fallback"}
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            sock.connect(("8.8.8.8", 80))
-            ip = sock.getsockname()[0]
-        finally:
-            sock.close()
-        if ip and not ip.startswith(("127.", "169.254.")):
-            return {"base_url": f"http://{ip}:{port_number}", "source": "lan", "status": "fallback"}
-    except Exception:
-        pass
     return {"base_url": f"http://{socket.gethostname()}.local:{port_number}", "source": "bonjour", "status": "fallback"}
 
 pair_route = default_pair_route(int(port))
@@ -933,6 +1305,12 @@ if pair_id and secret:
         "pair_id": pair_id,
         "secret": secret,
     }
+    if mac_ake_pub:
+        # WS3: out-of-band delivery of the Mac ECDH key + protocol marker. The phone routes
+        # to PSK-authenticated ECDH (secret never transmitted) when both are present; their
+        # absence is the legacy plaintext claim. pv=2 == PSK protocol version.
+        pair_params["mac_ake_pub"] = mac_ake_pub
+        pair_params["pv"] = "2"
     if pair_route.get("source") == "pairling_connectd" and pair_route.get("status") == "ready":
         pair_params["route_source"] = "pairling_connectd"
         pair_params["route_status"] = "ready"
@@ -1228,6 +1606,7 @@ commands:
   status
   doctor --json
   doctor --first-run --json
+  reconcile-ptybroker
   pair
   connect-auth-open
   devices
@@ -1269,6 +1648,9 @@ case "$cmd" in
     ;;
   doctor)
     "$REPO_ROOT/mac/install/doctor.sh" "$@"
+    ;;
+  reconcile-ptybroker|--reconcile-ptybroker|--restart-ptybroker-if-idle)
+    reconcile_ptybroker
     ;;
   pair)
     pair_runtime "$@"

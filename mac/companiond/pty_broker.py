@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import base64
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ import select
 import shlex
 import signal
 import socket
+import secrets
 import struct
 import subprocess
 import termios
@@ -18,6 +20,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from terminal_text_sanitizer import TERMINAL_TEXT_MAX_CHARS, sanitize_terminal_text_input
 from terminal_screen_backend import create_terminal_screen_backend, detect_terminal_pending_input
@@ -41,6 +44,244 @@ _ABSOLUTE_PATH_ROOT_TOKENS = {
     "var",
 }
 _ANSI_COLOR_NAMES = ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white")
+_RPC_MAX_FRAME_BYTES = 8 * 1024 * 1024
+_TERMINAL_SURFACE_V2_NONCE_SALT = os.urandom(16).hex()
+BROKER_PROTOCOL_VERSION = 1
+BROKER_CODE_VERSION = "pty-broker-v1"
+
+
+def _read_broker_source_revision(runtime_root: Path | None) -> str | None:
+    if runtime_root is None:
+        return None
+    candidates = [
+        runtime_root / "manifest.json",
+        runtime_root / "mac" / "SOURCE_REVISION",
+        runtime_root / "SOURCE_REVISION",
+    ]
+    for path in candidates:
+        try:
+            if path.name == "manifest.json":
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                revision = payload.get("source_revision")
+                return str(revision) if revision else None
+            revision = path.read_text(encoding="utf-8").strip()
+            return revision or None
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+    return None
+
+
+def _file_sha256(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except Exception:
+        return None
+
+
+def ensure_pty_broker_token(companion_dir: Path) -> str:
+    token_path = companion_dir / "pty-broker-token"
+    try:
+        companion_dir.mkdir(parents=True, exist_ok=True)
+        if token_path.exists():
+            token = token_path.read_text(encoding="utf-8").strip()
+            if re.fullmatch(r"[0-9a-f]{64}", token):
+                try:
+                    os.chmod(token_path, 0o600)
+                except OSError:
+                    pass
+                return token
+        token = secrets.token_hex(32)
+        tmp = token_path.with_name(token_path.name + f".tmp.{os.getpid()}")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(token + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, token_path)
+        return token
+    except OSError:
+        # Fallback keeps the broker functional for test fixtures; production
+        # launchd and the daemon both use the file-backed path.
+        return secrets.token_hex(32)
+
+
+def _sha256_prefixed(material: dict) -> str:
+    return "sha256:" + hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _parse_session_ref(session_id: str) -> tuple[str, str]:
+    if ":" in session_id:
+        provider, native_id = session_id.split(":", 1)
+        return provider, native_id
+    return "claude", session_id
+
+
+def _terminal_surface_v2_cell_payload(cell) -> dict:
+    payload = {"text": str(getattr(cell, "text", ""))}
+    width = int(getattr(cell, "width", 1) or 1)
+    fg = str(getattr(cell, "fg", "default") or "default")
+    bg = str(getattr(cell, "bg", "default") or "default")
+    bold = bool(getattr(cell, "bold", False))
+    italic = bool(getattr(cell, "italic", False))
+    underline = bool(getattr(cell, "underline", False))
+    inverse = bool(getattr(cell, "inverse", False))
+    link_id = getattr(cell, "link_id", None)
+    if width != 1:
+        payload["width"] = width
+    if fg != "default":
+        payload["fg"] = fg
+    if bg != "default":
+        payload["bg"] = bg
+    if bold:
+        payload["bold"] = True
+    if italic:
+        payload["italic"] = True
+    if underline:
+        payload["underline"] = True
+    if inverse:
+        payload["inverse"] = True
+    if link_id is not None:
+        payload["link_id"] = link_id
+    return payload
+
+
+def terminal_surface_v2_payload_from_state(session_id: str, state) -> dict:
+    provider, native_id = _parse_session_ref(session_id)
+    row_payloads: list[dict] = []
+    links_payload: dict[str, dict] = {}
+    for link_id, link_value in (getattr(state, "links", None) or {}).items():
+        if isinstance(link_value, dict):
+            url = link_value.get("url")
+            label = link_value.get("label")
+        else:
+            url = str(link_value)
+            label = None
+        links_payload[str(link_id)] = {
+            "url": str(url) if url is not None else None,
+            "label": str(label) if label is not None else None,
+        }
+    for row in getattr(state, "visible_rows", ()):
+        cells = [_terminal_surface_v2_cell_payload(cell) for cell in getattr(row, "cells", ())]
+        row_material = {
+            "index": int(getattr(row, "index", 0)),
+            "wrapped": bool(getattr(row, "wrapped", False)),
+            "cells": cells,
+        }
+        row_payloads.append({
+            "index": row_material["index"],
+            "wrapped": row_material["wrapped"],
+            "dirty_generation": int(getattr(row, "dirty_generation", 0) or 0),
+            "cells_hash": _sha256_prefixed(row_material),
+            "cells": cells,
+        })
+    cursor = getattr(state, "cursor", None)
+    cursor_payload = {
+        "row": getattr(cursor, "row", None),
+        "column": getattr(cursor, "column", None),
+        "visible": bool(getattr(cursor, "visible", True)),
+        "style": str(getattr(cursor, "style", "block") or "block"),
+    }
+    dimensions = {
+        "rows": int(getattr(state, "rows", 0) or 0),
+        "columns": int(getattr(state, "columns", 0) or 0),
+    }
+    capabilities = list(getattr(state, "capabilities", ()) or ())
+    scrollback = {
+        "window_start": 0,
+        "window_size": len(row_payloads),
+        "total_rows": len(row_payloads),
+        "truncated_before": False,
+    }
+    pending_input = getattr(state, "pending_input", None)
+    pending_input_detection = getattr(state, "pending_input_detection", None)
+    if pending_input_detection is None:
+        pending_input_detection = {
+            "status": "unknown",
+            "parser_version": None,
+            "surface": "v2",
+            "confidence": None,
+            "reason": "detection_metadata_missing",
+        }
+    pending_input_state = "present" if isinstance(pending_input, dict) else (
+        "none" if pending_input_detection.get("status") == "ran" else "unknown"
+    )
+    hash_material = {
+        "schema_version": 2,
+        "session_id": session_id,
+        "provider": provider,
+        "native_id": native_id,
+        "source": getattr(state, "source", "broker_vt"),
+        "backend": getattr(state, "backend", "pty_broker"),
+        "capabilities": capabilities,
+        "degraded_reason": getattr(state, "degraded_reason", None),
+        "generation": int(getattr(state, "generation", 0) or 0),
+        "raw_offset": int(getattr(state, "raw_offset", 0) or 0),
+        "dimensions": dimensions,
+        "title": getattr(state, "title", None),
+        "alternate_screen": bool(getattr(state, "alternate_screen", False)),
+        "cursor": cursor_payload,
+        "scrollback": scrollback,
+        "rows": row_payloads,
+        "links": links_payload,
+        "pending_input": pending_input,
+        "pending_input_state": pending_input_state,
+        "pending_input_detection": pending_input_detection,
+    }
+    screen_hash = _sha256_prefixed(hash_material)
+    nonce = _sha256_prefixed({
+        "screen_hash": screen_hash,
+        "generation": hash_material["generation"],
+        "raw_offset": hash_material["raw_offset"],
+        "server_salt": _TERMINAL_SURFACE_V2_NONCE_SALT,
+    })
+    return {
+        **hash_material,
+        "screen_hash": screen_hash,
+        "nonce": nonce,
+        "changed_at": time.time(),
+        "event_limits": {
+            "max_event_bytes": 64 * 1024,
+            "truncated": False,
+            "truncation_reason": None,
+        },
+    }
+
+
+def _read_exact(conn: socket.socket, count: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = count
+    while remaining > 0:
+        chunk = conn.recv(remaining)
+        if not chunk:
+            raise EOFError("socket closed while reading frame")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _read_rpc_frame(conn: socket.socket) -> dict[str, Any]:
+    header = _read_exact(conn, 4)
+    length = struct.unpack(">I", header)[0]
+    if length <= 0 or length > _RPC_MAX_FRAME_BYTES:
+        raise ValueError("invalid RPC frame length")
+    payload = _read_exact(conn, length)
+    value = json.loads(payload.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("RPC frame must be a JSON object")
+    return value
+
+
+def _write_rpc_frame(conn: socket.socket, payload: dict[str, Any]) -> None:
+    data = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    conn.sendall(struct.pack(">I", len(data)) + data)
 
 
 def _is_direct_slash_invocation_text(text: str) -> bool:
@@ -752,9 +993,24 @@ class PTYBrokerSession:
 
 
 class PTYBrokerManager:
-    def __init__(self, socket_path: Path, log_dir: Path) -> None:
+    def __init__(
+        self,
+        socket_path: Path,
+        log_dir: Path,
+        token: str | None = None,
+        *,
+        runtime_root: Path | None = None,
+        script_path: Path | None = None,
+        source_revision: str | None = None,
+        started_at: float | None = None,
+    ) -> None:
         self.socket_path = socket_path
         self.log_dir = log_dir
+        self.token = token or secrets.token_hex(32)
+        self.script_path = Path(script_path or __file__).absolute()
+        self.runtime_root = Path(runtime_root).absolute() if runtime_root is not None else self.script_path.parent.parent
+        self.source_revision = source_revision if source_revision is not None else _read_broker_source_revision(self.runtime_root)
+        self.started_at = float(started_at or time.time())
         self._sessions: dict[str, PTYBrokerSession] = {}
         self._by_tty: dict[str, str] = {}
         self._lock = threading.RLock()
@@ -805,6 +1061,20 @@ class PTYBrokerManager:
                 self._by_tty[session.slave_tty] = session_id
         return session
 
+    def descriptor(self, session: PTYBrokerSession) -> dict:
+        return {
+            "session_id": session.session_id,
+            "provider": session.provider,
+            "native_id": session.native_id,
+            "project": session.project,
+            "slave_tty": session.slave_tty,
+            "pid": session.pid,
+            "raw_log_path": str(session.raw_log_path) if session.raw_log_path else None,
+            "generation": session.generation,
+            "started_at": session.started_at,
+            "alive": session.is_alive(),
+        }
+
     def get(self, session_id: str) -> PTYBrokerSession | None:
         with self._lock:
             return self._sessions.get(session_id)
@@ -814,15 +1084,73 @@ class PTYBrokerManager:
             sid = self._by_tty.get(tty_path)
             return self._sessions.get(sid or "")
 
-    def register_alias(self, alias_session_id: str, session: PTYBrokerSession) -> None:
+    def register_alias(self, alias_session_id: str, session: PTYBrokerSession | str) -> None:
+        if isinstance(session, str):
+            resolved = self.get(session)
+            if resolved is None:
+                return
+            session = resolved
         with self._lock:
             self._sessions[alias_session_id] = session
+
+    def list_sessions(self) -> list[dict]:
+        out: list[dict] = []
+        with self._lock:
+            seen: set[int] = set()
+            for session in self._sessions.values():
+                ident = id(session)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                if session.is_alive():
+                    out.append(self.descriptor(session))
+        return out
+
+    def live_sessions(self) -> list[dict]:
+        return [
+            {
+                "broker_id": item["session_id"],
+                "provider": item["provider"],
+                "native_id": item["native_id"],
+                "slave_tty": item["slave_tty"],
+                "pid": item["pid"],
+            }
+            for item in self.list_sessions()
+        ]
+
+    def status(self) -> dict:
+        live_sessions = self.list_sessions()
+        script_stat = None
+        try:
+            script_stat = self.script_path.stat()
+        except OSError:
+            pass
+        return {
+            "schema_version": 1,
+            "protocol_version": BROKER_PROTOCOL_VERSION,
+            "code_version": BROKER_CODE_VERSION,
+            "pid": os.getpid(),
+            "started_at": self.started_at,
+            "socket_path": str(self.socket_path),
+            "runtime_root": str(self.runtime_root),
+            "script_path": str(self.script_path),
+            "script_mtime": script_stat.st_mtime if script_stat is not None else None,
+            "script_sha256": _file_sha256(self.script_path),
+            "source_revision": self.source_revision,
+            "live_session_count": len(live_sessions),
+        }
 
     def snapshot(self, session_id: str, public_session_id: str | None = None) -> dict | None:
         session = self.get(session_id)
         if not session:
             return None
         return session.snapshot(public_session_id=public_session_id or session_id)
+
+    def snapshot_v2(self, session_id: str, public_session_id: str | None = None) -> dict | None:
+        session = self.get(session_id)
+        if not session:
+            return None
+        return terminal_surface_v2_payload_from_state(public_session_id or session_id, session.snapshot_v2())
 
     def control(self, session_id: str, action: dict) -> dict:
         session = self.get(session_id)
@@ -857,6 +1185,22 @@ class PTYBrokerManager:
             return None
         return session.raw_tail(since=since)
 
+    def _peer_uid_ok(self, conn: socket.socket) -> bool:
+        try:
+            if hasattr(os, "getpeereid"):
+                uid, _gid = os.getpeereid(conn.fileno())
+                return int(uid) == os.getuid()
+            if hasattr(socket, "SO_PEERCRED"):
+                data = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+                _pid, uid, _gid = struct.unpack("3i", data)
+                return int(uid) == os.getuid()
+        except Exception:
+            return False
+        return True
+
+    def _validate_token(self, value: object) -> bool:
+        return isinstance(value, str) and secrets.compare_digest(value, self.token)
+
     def _serve_attach_socket(self) -> None:
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(str(self.socket_path))
@@ -864,10 +1208,98 @@ class PTYBrokerManager:
         server.listen(8)
         while True:
             conn, _ = server.accept()
-            threading.Thread(target=self._handle_attach_client, args=(conn,), daemon=True).start()
+            threading.Thread(target=self._handle_socket_client, args=(conn,), daemon=True).start()
+
+    def _handle_socket_client(self, conn: socket.socket) -> None:
+        try:
+            first = conn.recv(1, socket.MSG_PEEK)
+        except OSError:
+            conn.close()
+            return
+        if first == b"{":
+            self._handle_attach_client(conn)
+        else:
+            self._handle_rpc_client(conn)
+
+    def _handle_rpc_client(self, conn: socket.socket) -> None:
+        with conn:
+            try:
+                if not self._peer_uid_ok(conn):
+                    _write_rpc_frame(conn, {"ok": False, "error": {"code": "unauthorized_peer", "message": "same-uid broker peer required"}})
+                    return
+                request = _read_rpc_frame(conn)
+                if not self._validate_token(request.get("token")):
+                    _write_rpc_frame(conn, {"ok": False, "error": {"code": "unauthorized", "message": "pty broker token required"}})
+                    return
+                response = self._dispatch_rpc(request)
+            except Exception as exc:
+                response = {"ok": False, "error": {"code": type(exc).__name__, "message": str(exc)[:300]}}
+            _write_rpc_frame(conn, response)
+
+    def _dispatch_rpc(self, request: dict[str, Any]) -> dict[str, Any]:
+        op = str(request.get("op") or "")
+        if op == "spawn":
+            session = self.spawn(
+                session_id=str(request.get("session_id") or ""),
+                provider=str(request.get("provider") or ""),
+                native_id=str(request.get("native_id") or ""),
+                project=str(request.get("project") or ""),
+                command=str(request.get("command") or ""),
+                rows=int(request.get("rows") or 30),
+                columns=int(request.get("columns") or 120),
+                env=request.get("env") if isinstance(request.get("env"), dict) else None,
+            )
+            return {"ok": True, "session": self.descriptor(session)}
+        if op == "get":
+            session = self.get(str(request.get("session_id") or ""))
+            return {"ok": True, "session": self.descriptor(session) if session else None}
+        if op == "get_by_tty":
+            session = self.get_by_tty(str(request.get("tty") or ""))
+            return {"ok": True, "session": self.descriptor(session) if session else None}
+        if op == "register_alias":
+            self.register_alias(str(request.get("alias") or ""), str(request.get("session_id") or ""))
+            return {"ok": True}
+        if op == "snapshot":
+            return {"ok": True, "snapshot": self.snapshot(
+                str(request.get("session_id") or ""),
+                public_session_id=str(request.get("public_session_id") or "") or None,
+            )}
+        if op == "snapshot_v2":
+            return {"ok": True, "surface": self.snapshot_v2(
+                str(request.get("session_id") or ""),
+                public_session_id=str(request.get("public_session_id") or "") or None,
+            )}
+        if op == "raw_tail":
+            tail = self.raw_tail(str(request.get("session_id") or ""), since=int(request.get("since") or 0))
+            if tail is None:
+                return {"ok": True, "tail": None}
+            data, next_offset, total, reset = tail
+            return {
+                "ok": True,
+                "tail": {
+                    "b64": base64.b64encode(data).decode("ascii"),
+                    "next_offset": next_offset,
+                    "total": total,
+                    "reset": reset,
+                },
+            }
+        if op == "control":
+            return {"ok": True, "result": self.control(str(request.get("session_id") or ""), request.get("action") if isinstance(request.get("action"), dict) else {})}
+        if op == "send_text":
+            return {"ok": True, "result": self.send_text(str(request.get("session_id") or ""), str(request.get("text") or ""))}
+        if op == "terminate":
+            return {"ok": True, "result": self.terminate(str(request.get("session_id") or ""), sig=int(request.get("sig") or signal.SIGTERM))}
+        if op == "list_sessions":
+            return {"ok": True, "sessions": self.list_sessions()}
+        if op == "status":
+            return {"ok": True, "status": self.status()}
+        return {"ok": False, "error": {"code": "unknown_op", "message": f"unknown broker op: {op}"}}
 
     def _handle_attach_client(self, conn: socket.socket) -> None:
         with conn:
+            if not self._peer_uid_ok(conn):
+                conn.sendall(b"pairling attach: same-uid broker peer required\n")
+                return
             line = b""
             while not line.endswith(b"\n") and len(line) < 4096:
                 chunk = conn.recv(1)
@@ -878,6 +1310,12 @@ class PTYBrokerManager:
                 hello = json.loads(line.decode("utf-8"))
             except Exception:
                 conn.sendall(b"pairling attach: bad hello\n")
+                return
+            if str(hello.get("op") or "attach") != "attach":
+                conn.sendall(b"pairling attach: bad operation\n")
+                return
+            if not self._validate_token(hello.get("token")):
+                conn.sendall(b"pairling attach: broker token required; update Pairling runtime and retry\n")
                 return
             session_id = str(hello.get("session_id") or "").strip()
             session = self.get(session_id)

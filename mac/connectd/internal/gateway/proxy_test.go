@@ -308,7 +308,7 @@ func TestNewHandlerAcceptsLoopbackUpstream(t *testing.T) {
 	}
 }
 
-func TestPrePairModeOnlyAllowsHealthManifestAndClaim(t *testing.T) {
+func TestPrePairModeOnlyAllowsHealthManifestRoutezAndClaims(t *testing.T) {
 	var forwarded []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		forwarded = append(forwarded, r.Method+" "+r.URL.Path)
@@ -324,8 +324,10 @@ func TestPrePairModeOnlyAllowsHealthManifestAndClaim(t *testing.T) {
 	}{
 		{http.MethodGet, "/health"},
 		{http.MethodGet, "/healthz"},
+		{http.MethodGet, "/routez"},
 		{http.MethodGet, "/manifest"},
 		{http.MethodPost, "/pair/claim"},
+		{http.MethodPost, "/pair/psk-claim"},
 	}
 	for _, tc := range allowed {
 		t.Run("allows "+tc.method+" "+tc.path, func(t *testing.T) {
@@ -349,6 +351,7 @@ func TestPrePairModeOnlyAllowsHealthManifestAndClaim(t *testing.T) {
 		{http.MethodPost, "/terminal-control", http.StatusNotFound},
 		{http.MethodPost, "/worker-kill", http.StatusNotFound},
 		{http.MethodPost, "/push/preferences", http.StatusNotFound},
+		{http.MethodPost, "/push/permission/allow", http.StatusNotFound},
 		{http.MethodPost, "/safety/ack", http.StatusNotFound},
 		{http.MethodPost, "/aperture-cli/open", http.StatusNotFound},
 		{http.MethodGet, "/health", http.StatusOK},
@@ -406,7 +409,13 @@ func TestPairlingConnectModeRequiresBearerForPostPairEndpointsAndRejectsRemotePa
 		t.Fatalf("pre-pair claim status = %d body = %s", rec.Code, rec.Body.String())
 	}
 
-	if fmt.Sprintf("%+v", forwarded) != "[POST /send-text POST /pair/claim]" {
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "http://pairling-connect.local/pair/psk-claim", strings.NewReader(`{}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pre-pair PSK claim status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	if fmt.Sprintf("%+v", forwarded) != "[POST /send-text POST /pair/claim POST /pair/psk-claim]" {
 		t.Fatalf("forwarded = %+v", forwarded)
 	}
 }
@@ -441,44 +450,48 @@ func TestPairlingConnectModeMatchesEndpointContract(t *testing.T) {
 	}
 }
 
-func TestPrePairClaimIsRateLimitedAndBodyLimited(t *testing.T) {
-	var upstreamCalls int
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamCalls++
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer upstream.Close()
-	limiter := NewMemoryRateLimiter(1, time.Minute)
-	handler := newTestHandlerWithMode(t, upstream.URL, defaultMaxBodyBytes, nil, ExposureModePrePair, limiter)
+func TestPrePairClaimsAreRateLimitedAndBodyLimited(t *testing.T) {
+	for _, path := range []string{"/pair/claim", "/pair/psk-claim"} {
+		t.Run(path, func(t *testing.T) {
+			var upstreamCalls int
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamCalls++
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer upstream.Close()
+			limiter := NewMemoryRateLimiter(1, time.Minute)
+			handler := newTestHandlerWithMode(t, upstream.URL, defaultMaxBodyBytes, nil, ExposureModePrePair, limiter)
 
-	req := httptest.NewRequest(http.MethodPost, "http://pairling-connect.local/pair/claim", strings.NewReader(`{}`))
-	req.RemoteAddr = "100.64.0.8:12345"
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("first claim status = %d body = %s", rec.Code, rec.Body.String())
-	}
+			req := httptest.NewRequest(http.MethodPost, "http://pairling-connect.local"+path, strings.NewReader(`{}`))
+			req.RemoteAddr = "100.64.0.8:12345"
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("first claim status = %d body = %s", rec.Code, rec.Body.String())
+			}
 
-	req = httptest.NewRequest(http.MethodPost, "http://pairling-connect.local/pair/claim", strings.NewReader(`{}`))
-	req.RemoteAddr = "100.64.0.8:12345"
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("second claim status = %d body = %s", rec.Code, rec.Body.String())
-	}
+			req = httptest.NewRequest(http.MethodPost, "http://pairling-connect.local"+path, strings.NewReader(`{}`))
+			req.RemoteAddr = "100.64.0.8:12345"
+			rec = httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusTooManyRequests {
+				t.Fatalf("second claim status = %d body = %s", rec.Code, rec.Body.String())
+			}
 
-	largeBody := strings.NewReader(strings.Repeat("x", int(prePairMaxBodyBytes)+1))
-	req = httptest.NewRequest(http.MethodPost, "http://pairling-connect.local/pair/claim", largeBody)
-	req.RemoteAddr = "100.64.0.9:12345"
-	req.ContentLength = prePairMaxBodyBytes + 1
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("large claim status = %d body = %s", rec.Code, rec.Body.String())
-	}
+			largeBody := strings.NewReader(strings.Repeat("x", int(prePairMaxBodyBytes)+1))
+			req = httptest.NewRequest(http.MethodPost, "http://pairling-connect.local"+path, largeBody)
+			req.RemoteAddr = "100.64.0.9:12345"
+			req.ContentLength = prePairMaxBodyBytes + 1
+			rec = httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("large claim status = %d body = %s", rec.Code, rec.Body.String())
+			}
 
-	if upstreamCalls != 1 {
-		t.Fatalf("upstream calls = %d, want 1", upstreamCalls)
+			if upstreamCalls != 1 {
+				t.Fatalf("upstream calls = %d, want 1", upstreamCalls)
+			}
+		})
 	}
 }
 

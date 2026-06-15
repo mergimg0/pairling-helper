@@ -43,6 +43,7 @@ type Snapshot struct {
 	TailnetIPCount       int               `json:"tailnet_ip_count"`
 	AuthURLPresent       bool              `json:"auth_url_present"`
 	ControlURLMode       string            `json:"control_url_mode"`
+	AuthKeyMode          string            `json:"auth_key_mode,omitempty"`
 	UpstreamReachable    bool              `json:"upstream_reachable"`
 	ListenerRunning      bool              `json:"listener_running"`
 	GatewayHealthy       bool              `json:"gateway_healthy"`
@@ -85,6 +86,14 @@ func (s *Store) SetControlURLMode(mode string) {
 			mode = DefaultControlURLMode
 		}
 		snapshot.ControlURLMode = mode
+	})
+}
+
+// SetAuthKeyMode records how this node authenticated: "tagged" (a tagged
+// auth key, key expiry disabled) or "interactive" (the legacy browser flow).
+func (s *Store) SetAuthKeyMode(mode string) {
+	s.update(func(snapshot *Snapshot) {
+		snapshot.AuthKeyMode = mode
 	})
 }
 

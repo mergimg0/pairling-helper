@@ -1,6 +1,6 @@
 {
   "name": "pairling",
-  "version": "0.2.0",
+  "version": "0.2.4",
   "description": "Pair your iPhone with the AI coding agents running on your Mac. CLI and local runtime installer for the Pairling iOS app.",
   "keywords": [
     "pairling",
@@ -13,11 +13,11 @@
   ],
   "homepage": "https://pairling.dev",
   "bugs": {
-    "url": "https://github.com/mergimg0/pairling-helper/issues"
+    "url": "https://pairling.dev/support"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mergimg0/pairling-helper.git"
+    "url": "https://pairling.dev"
   },
   "license": "UNLICENSED",
   "author": "Pairling (https://pairling.dev)",

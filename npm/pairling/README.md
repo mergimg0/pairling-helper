@@ -69,4 +69,4 @@ notarized, and hash-pinned by this package's integrity manifest.
 
 - Product: https://pairling.dev
 - Get started: https://pairling.dev/start
-- Source mirror & publish pipeline: https://github.com/mergimg0/pairling-helper
+- Source mirror & publish pipeline: https://pairling.dev

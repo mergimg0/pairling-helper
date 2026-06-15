@@ -47,6 +47,11 @@ func run(args []string) int {
 	controlURL := fs.String("control-url", "", "advanced: custom Tailscale-compatible control server URL")
 	maxBodyBytes := fs.Int64("max-body-bytes", 1_000_000, "maximum proxied request body size")
 	verbose := fs.Bool("verbose", false, "enable verbose tsnet backend logs")
+	// WS1: a tagged auth key (minted from an OAuth client scoped to
+	// tag:pairling-connect) registers this node pre-authorized AND with key
+	// expiry disabled — no 180-day re-auth cliff, no per-node REST call.
+	// Empty keeps the legacy interactive browser-auth path (back-compat).
+	authKeyTag := fs.String("auth-key-tag", defaultAuthKeyTag(), "tag applied to this node when registering with an auth key")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -85,6 +90,18 @@ func run(args []string) int {
 		Hostname:   *hostname,
 		ControlURL: strings.TrimSpace(*controlURL),
 		UserLogf:   userLogf(statusStore),
+	}
+	// WS1: tagged auth-key registration. A tagged node never expires its key,
+	// eliminating the 180-day re-auth cliff without any Tailscale REST call.
+	if authKey := loadTailscaleAuthKey(appSupport); authKey != "" {
+		srv.AuthKey = authKey
+		if tag := strings.TrimSpace(*authKeyTag); tag != "" {
+			srv.AdvertiseTags = []string{tag}
+		}
+		statusStore.SetAuthKeyMode("tagged")
+		log.Printf("pairling-connectd registering with tagged auth key (tag=%s)", strings.TrimSpace(*authKeyTag))
+	} else {
+		statusStore.SetAuthKeyMode("interactive")
 	}
 	if *verbose {
 		srv.Logf = func(format string, args ...any) {
@@ -144,6 +161,30 @@ func controlURLMode(raw string) string {
 		return status.DefaultControlURLMode
 	}
 	return status.CustomControlURLMode
+}
+
+// defaultAuthKeyTag is the ACL tag applied to Pairling Connect nodes that
+// register with a tagged auth key. Tagged nodes do not expire their keys.
+func defaultAuthKeyTag() string {
+	if tag := strings.TrimSpace(os.Getenv("PAIRLING_TS_AUTHKEY_TAG")); tag != "" {
+		return tag
+	}
+	return "tag:pairling-connect"
+}
+
+// loadTailscaleAuthKey resolves a tagged auth key, preferring the environment
+// (PAIRLING_TS_AUTHKEY) over a mode-600 credential file under Application
+// Support. Returns "" when neither is present (legacy interactive auth).
+func loadTailscaleAuthKey(appSupport string) string {
+	if key := strings.TrimSpace(os.Getenv("PAIRLING_TS_AUTHKEY")); key != "" {
+		return key
+	}
+	path := filepath.Join(appSupport, "connectd", "connectd-ts-authkey")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func listenPort(addr string) int {

@@ -62,7 +62,8 @@ PAIRLING_PORT = int(os.environ.get("PAIRLING_RUNTIME_PORT", "7773"))
 PAIRLING_LABEL = "dev.pairling.companiond"
 PAIRLING_GUARDIAN_LABEL = "dev.pairling.power-guardian"
 PAIRLING_CONNECTD_LABEL = "dev.pairling.connectd"
-LEGACY_LABEL = "com.mghome.notify-webhook"
+PAIRLING_PTYBROKER_LABEL = "dev.pairling.ptybroker"
+TEAM_ID = os.environ.get("PAIRLING_TEAM_ID", os.environ.get("PAIRLING_CONNECTD_TEAM_ID", "965AVD34A3"))
 APP_SUPPORT = Path(os.environ.get("PAIRLING_APP_SUPPORT_ROOT", os.environ.get("COMPANION_APP_SUPPORT_ROOT", str(home / "Library" / "Application Support" / "Pairling"))))
 LOGS_ROOT = Path(os.environ.get("PAIRLING_LOGS_ROOT", os.environ.get("COMPANION_LOGS_ROOT", str(home / "Library" / "Logs" / "Pairling"))))
 CURRENT = APP_SUPPORT / "runtime" / "current"
@@ -75,9 +76,8 @@ USER_PAIRLING = home / ".local" / "bin" / "pairling"
 PAIR_ROOT = APP_SUPPORT / "pair"
 USER_PLIST = home / "Library" / "LaunchAgents" / f"{PAIRLING_LABEL}.plist"
 CONNECTD_USER_PLIST = home / "Library" / "LaunchAgents" / f"{PAIRLING_CONNECTD_LABEL}.plist"
-LEGACY_USER_PLIST = home / "Library" / "LaunchAgents" / f"{LEGACY_LABEL}.plist"
+PTYBROKER_USER_PLIST = home / "Library" / "LaunchAgents" / f"{PAIRLING_PTYBROKER_LABEL}.plist"
 SYSTEM_PLIST = Path("/Library/LaunchDaemons") / f"{PAIRLING_GUARDIAN_LABEL}.plist"
-LEGACY_SYSTEM_PLIST = Path("/Library/LaunchDaemons/com.mghome.companion-power-guardian.plist")
 
 sys.path.insert(0, str(repo_root / "mac" / "companiond"))
 from pairling_connectd_status import fetch_connectd_status, redacted_connectd_summary
@@ -93,6 +93,23 @@ def add(identifier, ok, severity, summary, evidence=None):
         "summary": summary,
         "evidence": evidence,
     })
+
+
+def codesigning_identity_summary(output: str) -> dict:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    developer_id_lines = [line for line in lines if "Developer ID Application:" in line]
+    expected_team_present = any(f"({TEAM_ID})" in line for line in developer_id_lines)
+    valid_count = None
+    for line in lines:
+        match = re.search(r"(\d+)\s+valid identities found", line)
+        if match:
+            valid_count = int(match.group(1))
+            break
+    return {
+        "valid_identity_count": valid_count,
+        "developer_id_application_count": len(developer_id_lines),
+        "expected_team_present": expected_team_present,
+    }
 
 
 def run(args, timeout=5):
@@ -202,6 +219,103 @@ def active_pair_records(pair_root: Path) -> list[dict]:
     return records
 
 
+def desired_ptybroker_identity() -> dict:
+    revision = None
+    if manifest and manifest.get("source_revision"):
+        revision = str(manifest.get("source_revision"))
+    elif (CURRENT / "mac" / "SOURCE_REVISION").is_file():
+        try:
+            revision = (CURRENT / "mac" / "SOURCE_REVISION").read_text().strip() or None
+        except Exception:
+            revision = None
+    desired_root = CURRENT.resolve() if CURRENT.exists() else CURRENT
+    return {
+        "runtime_root": str(desired_root),
+        "script_path": str(desired_root / "companiond" / "pty_broker_service.py"),
+        "source_revision": revision,
+        "protocol_version": 1,
+    }
+
+
+def ptybroker_status_rpc() -> tuple[dict | None, str | None]:
+    try:
+        sys.path.insert(0, str(CURRENT / "companiond"))
+        from pty_broker_client import PTYBrokerClient, ensure_pty_broker_token
+
+        companion = home / ".claude" / "companion"
+        client = PTYBrokerClient(companion / "pty-broker.sock", ensure_pty_broker_token(companion), timeout=1.0)
+        status = client.status()
+        return status if isinstance(status, dict) else {}, None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def ptybroker_deployment_status(*, launchd_loaded: bool) -> dict:
+    desired = desired_ptybroker_identity()
+    base = {
+        "label": PAIRLING_PTYBROKER_LABEL,
+        "state": "unknown",
+        "restart_deferred": False,
+        "pid": None,
+        "live_session_count": None,
+        "live_source_revision": None,
+        "desired_source_revision": desired.get("source_revision"),
+        "desired_runtime_root": desired.get("runtime_root"),
+        "desired_script_path": desired.get("script_path"),
+        "evidence": None,
+    }
+    if not MANIFEST_PATH.is_file() and not CURRENT.exists():
+        return {**base, "state": "not_installed", "evidence": "runtime/current is missing"}
+    if not launchd_loaded:
+        return {**base, "state": "not_running", "evidence": "launchd label is not running"}
+    live, error = ptybroker_status_rpc()
+    if live is None:
+        return {**base, "state": "unreachable_socket", "evidence": error}
+    reasons = []
+    live_root = live.get("runtime_root")
+    if live_root:
+        if os.path.realpath(str(live_root)) != str(desired.get("runtime_root")):
+            reasons.append("runtime_root_mismatch")
+    else:
+        reasons.append("runtime_root_missing")
+    live_script = live.get("script_path")
+    if live_script:
+        if os.path.realpath(str(live_script)) != str(desired.get("script_path")):
+            reasons.append("script_path_mismatch")
+    else:
+        reasons.append("script_path_missing")
+    live_revision = live.get("source_revision")
+    if desired.get("source_revision") and not live_revision:
+        reasons.append("source_revision_missing")
+    elif live_revision and desired.get("source_revision") and str(live_revision) != str(desired.get("source_revision")):
+        reasons.append("source_revision_mismatch")
+    try:
+        live_protocol = int(live.get("protocol_version") or 0)
+    except (TypeError, ValueError):
+        live_protocol = 0
+    if live_protocol != int(desired.get("protocol_version") or 0):
+        if not live.get("protocol_version"):
+            reasons.append("protocol_version_missing")
+        else:
+            reasons.append("protocol_version_mismatch")
+    state = "current" if not reasons else "stale_deferred"
+    return {
+        **base,
+        "state": state,
+        "restart_deferred": state == "stale_deferred",
+        "pid": live.get("pid"),
+        "live_session_count": live.get("live_session_count"),
+        "live_source_revision": live_revision,
+        "live_runtime_root": live_root,
+        "live_script_path": live_script,
+        "protocol_version": live.get("protocol_version"),
+        "code_version": live.get("code_version"),
+        "started_at": live.get("started_at"),
+        "reasons": reasons,
+        "evidence": live,
+    }
+
+
 def first_run_stage(*, installed: bool, running: bool, pair_window_open: bool, remote_ready: bool) -> str:
     if not installed:
         return "helper_missing"
@@ -269,7 +383,13 @@ if manifest:
     runtime = manifest.get("runtime") if isinstance(manifest.get("runtime"), dict) else {}
     add("runtime_port", runtime.get("port") == PAIRLING_PORT, "error", "Runtime port is locked to 7773.", runtime.get("port"))
     launchd = manifest.get("launchd") if isinstance(manifest.get("launchd"), dict) else {}
-    add("launchd_labels", launchd.get("daemon_label") == PAIRLING_LABEL and launchd.get("connectd_label") == PAIRLING_CONNECTD_LABEL and launchd.get("guardian_label") == PAIRLING_GUARDIAN_LABEL, "error", "Manifest launchd labels are Pairling labels.", launchd)
+    launchd_evidence = {
+        "daemon_label": launchd.get("daemon_label"),
+        "ptybroker_label": launchd.get("ptybroker_label"),
+        "connectd_label": launchd.get("connectd_label"),
+        "guardian_label": launchd.get("guardian_label"),
+    }
+    add("launchd_labels", launchd.get("daemon_label") == PAIRLING_LABEL and launchd.get("ptybroker_label") == PAIRLING_PTYBROKER_LABEL and launchd.get("connectd_label") == PAIRLING_CONNECTD_LABEL and launchd.get("guardian_label") == PAIRLING_GUARDIAN_LABEL, "error", "Manifest launchd labels are Pairling labels.", launchd_evidence)
     mismatches = []
     for item in manifest.get("files") or []:
         rel = item.get("path")
@@ -365,9 +485,10 @@ try:
     add(
         "shell_pairling_wrapper",
         "runtime/current/bin/pairling" in pairling_text
-        and "/Users/mergimg0/projects/Pairling" not in pairling_text,
+        and "--shim-print-env" in pairling_text
+        and re.search(r"/Users/[^\\s'\"]+/projects/Pairling", pairling_text) is None,
         "error",
-        "User pairling command resolves through runtime/current unless PAIRLING_REPO_ROOT is explicitly set.",
+        "User pairling command resolves through Pairling without trapping npm setup on stale runtime/current.",
         str(USER_PAIRLING),
     )
 except Exception as exc:
@@ -412,6 +533,19 @@ except Exception as exc:
     add("connectd_launchagent_env", False, "error", "Cannot validate Pairling Connect LaunchAgent environment.", str(CONNECTD_USER_PLIST))
 
 try:
+    payload = load_plist(PTYBROKER_USER_PLIST)
+    args = payload.get("ProgramArguments") or []
+    add(
+        "ptybroker_launchagent_plist",
+        payload.get("Label") == PAIRLING_PTYBROKER_LABEL and any(str(CURRENT / "companiond" / "pty_broker_service.py") == value for value in args),
+        "error",
+        "Pairling PTY broker LaunchAgent points at runtime/current.",
+        {"label": payload.get("Label"), "args": args},
+    )
+except Exception as exc:
+    add("ptybroker_launchagent_plist", False, "error", f"Pairling PTY broker LaunchAgent plist unreadable: {type(exc).__name__}: {exc}", str(PTYBROKER_USER_PLIST))
+
+try:
     payload = load_plist(SYSTEM_PLIST)
     add("guardian_plist", payload.get("Label") == PAIRLING_GUARDIAN_LABEL, "warning", "Pairling guardian LaunchDaemon is rendered/installed.", {"label": payload.get("Label")})
 except Exception as exc:
@@ -425,16 +559,23 @@ code, out, err = run(["launchctl", "print", f"gui/{os.getuid()}/{PAIRLING_CONNEC
 add("connectd_launchagent_loaded", code == 0 and "state = running" in out, "error", "Pairling Connect LaunchAgent is running." if code == 0 else "Pairling Connect LaunchAgent is not loaded.", (out or err)[:2000])
 add("connectd_loaded_from_current", str(CURRENT / "connectd" / "pairling-connectd") in out, "error", "Loaded Pairling Connect LaunchAgent uses runtime/current.", out[:2000])
 
-code, out, err = run(["launchctl", "print", f"gui/{os.getuid()}/{LEGACY_LABEL}"])
-legacy_loaded = code == 0 and "state = running" in out
-add("legacy_daemon_unloaded", not legacy_loaded, "error", "Old Pairling predecessor launchd label is not loaded.", (out or err)[:2000])
-add("legacy_launchagent_removed", not LEGACY_USER_PLIST.exists(), "warning", "Legacy user LaunchAgent plist is absent.", str(LEGACY_USER_PLIST))
-add("legacy_guardian_removed", not LEGACY_SYSTEM_PLIST.exists(), "warning", "Legacy guardian LaunchDaemon plist is absent.", str(LEGACY_SYSTEM_PLIST))
+code, out, err = run(["launchctl", "print", f"gui/{os.getuid()}/{PAIRLING_PTYBROKER_LABEL}"])
+ptybroker_launchd_loaded = code == 0 and "state = running" in out
+add("ptybroker_launchagent_loaded", ptybroker_launchd_loaded, "error", "Pairling PTY broker LaunchAgent is running." if code == 0 else "Pairling PTY broker LaunchAgent is not loaded.", (out or err)[:2000])
+add("ptybroker_loaded_from_current", str(CURRENT / "companiond" / "pty_broker_service.py") in out, "error", "Loaded Pairling PTY broker uses runtime/current.", out[:2000])
+ptybroker_deployment = ptybroker_deployment_status(launchd_loaded=ptybroker_launchd_loaded)
+add(
+    "ptybroker_deployment_state",
+    ptybroker_deployment["state"] == "current",
+    "warning",
+    f"Pairling PTY broker deployment state is {ptybroker_deployment['state']}.",
+    ptybroker_deployment,
+)
 
 listeners_7773 = port_listeners(PAIRLING_PORT)
 listeners_7723 = port_listeners(7723)
 add("port_7773_listener", bool(listeners_7773) or tcp_accepts("127.0.0.1", PAIRLING_PORT), "error", "Runtime is listening on 7773.", listeners_7773)
-legacy_conflict = any("notify-webhook" in line or "Python" in line or "python" in line for line in listeners_7723)
+legacy_conflict = any("Python" in line or "python" in line for line in listeners_7723)
 add("legacy_port_7723_clear", not legacy_conflict, "error", "Legacy 7723 daemon is not conflicting.", listeners_7723)
 
 health = None
@@ -475,17 +616,20 @@ for name in ["claude", "codex"]:
 add("provider_clis_detected", True, "warning", "Provider CLI detection completed.", provider_evidence)
 
 release_blockers = []
-developer_id_identity = os.environ.get("PAIRLING_DEVELOPER_ID_IDENTITY", "Developer ID Application: Mergim Gashi (965AVD34A3)")
+developer_id_identity = os.environ.get("PAIRLING_DEVELOPER_ID_IDENTITY")
 code, out, err = run(["/usr/bin/security", "find-identity", "-v", "-p", "codesigning"], timeout=5)
-has_developer_id = code == 0 and developer_id_identity in out
+identity_evidence = codesigning_identity_summary(out)
+has_developer_id = code == 0 and (
+    (developer_id_identity in out) if developer_id_identity else identity_evidence["expected_team_present"]
+)
 if not has_developer_id:
-    release_blockers.append(f"Developer ID identity is missing from the login keychain: {developer_id_identity}")
+    release_blockers.append("Developer ID Application identity is missing from the login keychain for the expected team.")
 add(
     "developer_id_identity",
     has_developer_id,
     "warning",
     "Developer ID Application identity is available for public helper signing.",
-    (out or err)[:2000],
+    identity_evidence if code == 0 else {"error": (err or "security find-identity failed")[:200]},
 )
 
 notary_profile = os.environ.get("PAIRLING_NOTARY_PROFILE", "pairling-notary")
@@ -498,7 +642,7 @@ add(
     has_notary_profile,
     "warning",
     "Notary credentials are stored and can authenticate.",
-    (out or err)[:2000],
+    {"profile": notary_profile, "authenticated": has_notary_profile, "error": None if has_notary_profile else (err or out)[:200]},
 )
 
 # npm distribution: the staged pairling-connectd binary must be a valid
@@ -654,6 +798,7 @@ result = {
         "launchd_label": PAIRLING_LABEL,
         "guardian_label": PAIRLING_GUARDIAN_LABEL,
     },
+    "ptybroker": ptybroker_deployment,
     "paths": {
         "app_support": str(APP_SUPPORT),
         "logs": str(LOGS_ROOT),
@@ -662,9 +807,7 @@ result = {
         "pair_records": str(PAIR_ROOT),
     },
     "legacy": {
-        "daemon_label": LEGACY_LABEL,
         "port": 7723,
-        "loaded": legacy_loaded,
         "listeners": listeners_7723,
     },
     "release_blockers": release_blockers,

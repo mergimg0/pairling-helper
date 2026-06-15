@@ -4,14 +4,13 @@ set -euo pipefail
 PAIRLING_DAEMON_LABEL="dev.pairling.companiond"
 PAIRLING_GUARDIAN_LABEL="dev.pairling.power-guardian"
 PAIRLING_CONNECTD_LABEL="dev.pairling.connectd"
-LEGACY_DAEMON_LABEL="com.mghome.notify-webhook"
+PAIRLING_PTYBROKER_LABEL="dev.pairling.ptybroker"
 APP_SUPPORT="${PAIRLING_APP_SUPPORT_ROOT:-${COMPANION_APP_SUPPORT_ROOT:-$HOME/Library/Application Support/Pairling}}"
 LOGS_ROOT="${PAIRLING_LOGS_ROOT:-${COMPANION_LOGS_ROOT:-$HOME/Library/Logs/Pairling}}"
 USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_DAEMON_LABEL.plist"
 CONNECTD_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_CONNECTD_LABEL.plist"
-LEGACY_USER_PLIST="$HOME/Library/LaunchAgents/$LEGACY_DAEMON_LABEL.plist"
+PTYBROKER_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_PTYBROKER_LABEL.plist"
 SYSTEM_PLIST="/Library/LaunchDaemons/$PAIRLING_GUARDIAN_LABEL.plist"
-LEGACY_SYSTEM_PLIST="/Library/LaunchDaemons/com.mghome.companion-power-guardian.plist"
 YES="false"
 DELETE_STATE="false"
 DELETE_LOGS="false"
@@ -103,18 +102,11 @@ confirm
 
 bootout_user "$PAIRLING_DAEMON_LABEL" "$USER_PLIST"
 bootout_user "$PAIRLING_CONNECTD_LABEL" "$CONNECTD_USER_PLIST"
+bootout_user "$PAIRLING_PTYBROKER_LABEL" "$PTYBROKER_USER_PLIST"
 rm -f "$USER_PLIST"
 rm -f "$CONNECTD_USER_PLIST"
+rm -f "$PTYBROKER_USER_PLIST"
 bootout_system "$PAIRLING_GUARDIAN_LABEL" "$SYSTEM_PLIST"
-
-if [[ -f "$LEGACY_USER_PLIST" ]]; then
-  bootout_user "$LEGACY_DAEMON_LABEL" "$LEGACY_USER_PLIST"
-  printf 'Warning: legacy LaunchAgent still exists and was unloaded if possible: %s\n' "$LEGACY_USER_PLIST"
-fi
-
-if [[ -f "$LEGACY_SYSTEM_PLIST" ]]; then
-  printf 'Warning: legacy guardian LaunchDaemon still exists: %s\n' "$LEGACY_SYSTEM_PLIST"
-fi
 
 rm -rf "$APP_SUPPORT/pair" 2>/dev/null || true
 

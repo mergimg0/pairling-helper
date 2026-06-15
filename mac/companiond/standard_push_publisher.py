@@ -143,6 +143,8 @@ class TurnStateAlertPublisher:
             "last_update": last_update,
             "provider": provider,
             "tool": _bounded_optional(payload.get("tool"), 80),
+            "request_nonce": _bounded_optional(payload.get("request_nonce"), 160),
+            "mac_install_id": _bounded_optional(payload.get("mac_install_id"), 160),
         }
         return {
             "state_key": path.stem,
@@ -211,6 +213,11 @@ class TurnStateAlertPublisher:
             "session_id": native_id,
             "provider": provider,
         })
+        if kind == "action_required":
+            if visible.get("request_nonce"):
+                payload["request_nonce"] = visible.get("request_nonce")
+            if visible.get("mac_install_id"):
+                payload["mac_install_id"] = visible.get("mac_install_id")
         return payload
 
     def _route_session_id_for_event(self, session_id: str) -> str:

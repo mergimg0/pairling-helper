@@ -171,6 +171,10 @@ class DeviceRegistry:
             "device_display_name": "ALTER TABLE devices ADD COLUMN device_display_name TEXT",
             "superseded_by_device_id": "ALTER TABLE devices ADD COLUMN superseded_by_device_id TEXT",
             "proof_secret": "ALTER TABLE devices ADD COLUMN proof_secret TEXT",
+            # WS4: base64 X9.63 (uncompressed P-256 point) of the device's
+            # Secure-Enclave public key, registered at first pair. Used to
+            # verify zero-interaction re-pair challenge signatures.
+            "se_public_key_der": "ALTER TABLE devices ADD COLUMN se_public_key_der TEXT",
         }
         for column, statement in additive_columns.items():
             if column not in existing:
@@ -421,6 +425,37 @@ class DeviceRegistry:
                 conn=conn,
             )
             return token
+
+    def register_se_pubkey(self, device_id: str, se_public_key_der: str) -> bool:
+        """WS4: store the device's Secure-Enclave public key (base64 X9.63)."""
+        if not se_public_key_der:
+            return False
+        with self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE devices SET se_public_key_der = ? WHERE device_id = ?",
+                (se_public_key_der, device_id),
+            )
+            ok = cur.rowcount > 0
+            self.record_audit(
+                "device.register_se_pubkey",
+                device_id=device_id,
+                outcome="ok" if ok else "not_found",
+                conn=conn,
+            )
+            return ok
+
+    def get_se_pubkey(self, device_id: str) -> str | None:
+        """The registered SE public key for an ACTIVE device. Revoked devices
+        return None, so revocation also blocks zero-interaction re-pair."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT se_public_key_der FROM devices WHERE device_id = ? AND revoked_at IS NULL",
+                (device_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = row["se_public_key_der"]
+        return value if value else None
 
     def record_audit(
         self,

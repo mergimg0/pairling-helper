@@ -10,6 +10,7 @@ from pathlib import Path
 PAIRLING_DAEMON_LABEL = "dev.pairling.companiond"
 PAIRLING_GUARDIAN_LABEL = "dev.pairling.power-guardian"
 PAIRLING_CONNECTD_LABEL = "dev.pairling.connectd"
+PAIRLING_PTYBROKER_LABEL = "dev.pairling.ptybroker"
 PAIRLING_RUNTIME_PORT = "7773"
 
 
@@ -95,6 +96,27 @@ def connectd_plist(current: Path, logs: Path) -> dict:
     }
 
 
+def ptybroker_plist(current: Path, logs: Path, python_bin: str) -> dict:
+    app_support = current.parent.parent
+    return {
+        "Label": PAIRLING_PTYBROKER_LABEL,
+        "ProgramArguments": [
+            python_bin,
+            str(current / "companiond" / "pty_broker_service.py"),
+        ],
+        "EnvironmentVariables": {
+            "PAIRLING_APP_SUPPORT_ROOT": str(app_support),
+            "PAIRLING_LOGS_ROOT": str(logs),
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        },
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 10,
+        "StandardOutPath": str(logs / "ptybroker.log"),
+        "StandardErrorPath": str(logs / "ptybroker.err"),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--current-root", required=True)
@@ -110,6 +132,7 @@ def main() -> int:
     out = Path(args.output_dir)
 
     write_plist(out / f"{PAIRLING_DAEMON_LABEL}.plist", daemon_plist(current, logs, args.daemon_python))
+    write_plist(out / f"{PAIRLING_PTYBROKER_LABEL}.plist", ptybroker_plist(current, logs, args.daemon_python))
     write_plist(out / f"{PAIRLING_GUARDIAN_LABEL}.plist", guardian_plist(current, logs, args.guardian_python))
     write_plist(out / f"{PAIRLING_CONNECTD_LABEL}.plist", connectd_plist(current, logs))
     return 0

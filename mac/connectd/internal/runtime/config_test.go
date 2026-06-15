@@ -6,7 +6,7 @@ import (
 )
 
 func TestDefaultStateDirUsesPairlingApplicationSupport(t *testing.T) {
-	home := filepath.Join(string(filepath.Separator), "Users", "mergim")
+	home := filepath.Join(string(filepath.Separator), "Users", "example")
 	got := DefaultStateDir(home)
 	want := filepath.Join(home, "Library", "Application Support", "Pairling", "connectd", "tsnet-state")
 	if got != want {

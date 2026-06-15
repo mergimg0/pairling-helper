@@ -584,7 +584,7 @@ def _truncate_output(value: str, max_chars: int) -> str:
 def _mac_prompt(tool: str, input_payload: dict[str, Any]) -> tuple[str, str]:
     if tool == "vibe_check":
         return (
-            "You are checking whether a draft sounds like Mergim's usual voice. Return one of: yes, partial, no. Then give one concrete edit. Be concise. Do not rewrite the whole draft unless asked.",
+            "You are checking whether a draft sounds like the user's usual voice. Return one of: yes, partial, no. Then give one concrete edit. Be concise. Do not rewrite the whole draft unless asked.",
             "Draft:\n" + str(input_payload.get("draft") or ""),
         )
     if tool == "second_opinion":
@@ -618,7 +618,7 @@ def _deterministic_vibe_check(draft: str, *, reason: str) -> str:
         "further to",
     ]
     if any(phrase in lowered for phrase in formal_phrases):
-        issues.append("a little more formal than Mergim's usual direct style")
+        issues.append("a little more formal than the user's usual direct style")
         edit = "open with the ask directly and drop the polite padding."
     if len(text) > 700:
         issues.append("too long for a quick operational message")

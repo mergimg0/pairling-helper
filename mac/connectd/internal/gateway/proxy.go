@@ -235,7 +235,7 @@ func (h *Handler) allowedForAnyMethod(path string, header http.Header) bool {
 }
 
 func (h *Handler) requestBodyLimit(method, path string) int64 {
-	if method == http.MethodPost && path == "/pair/claim" && (h.mode == ExposureModePrePair || h.mode == ExposureModePairlingConnect) {
+	if method == http.MethodPost && isPrePairClaimPath(path) && (h.mode == ExposureModePrePair || h.mode == ExposureModePairlingConnect) {
 		if h.maxBodyBytes <= 0 || prePairMaxBodyBytes < h.maxBodyBytes {
 			return prePairMaxBodyBytes
 		}
@@ -259,7 +259,7 @@ func (h *Handler) requestBodyLimit(method, path string) int64 {
 }
 
 func (h *Handler) rateLimitPath(method, path string) bool {
-	return method == http.MethodPost && path == "/pair/claim" && (h.mode == ExposureModePrePair || h.mode == ExposureModePairlingConnect)
+	return method == http.MethodPost && isPrePairClaimPath(path) && (h.mode == ExposureModePrePair || h.mode == ExposureModePairlingConnect)
 }
 
 func prePairAllowed(method, path string) bool {
@@ -271,6 +271,10 @@ func prePairAllowed(method, path string) bool {
 	default:
 		return false
 	}
+}
+
+func isPrePairClaimPath(path string) bool {
+	return path == "/pair/claim" || path == "/pair/psk-claim"
 }
 
 func hasBearer(header http.Header) bool {
@@ -491,6 +495,7 @@ var postPaths = map[string]bool{
 	"/open":                                  true,
 	"/orchestrations":                        true,
 	"/pair/claim":                            true,
+	"/pair/psk-claim":                        true,
 	"/pair/revoke":                           true,
 	"/pair/rotate-token":                     true,
 	"/pair/start":                            true,
@@ -503,6 +508,7 @@ var postPaths = map[string]bool{
 	"/phone-tools/result":                    true,
 	"/push/live-activity-test":               true,
 	"/push/live-activity-token":              true,
+	"/push/permission/allow":                 true,
 	"/push/preferences":                      true,
 	"/push/test":                             true,
 	"/resume-session":                        true,
@@ -523,11 +529,13 @@ var prePairGetPaths = map[string]bool{
 	"/health":   true,
 	"/healthz":  true,
 	"/readyz":   true,
+	"/routez":   true,
 	"/manifest": true,
 }
 
 var prePairPostPaths = map[string]bool{
-	"/pair/claim": true,
+	"/pair/claim":     true,
+	"/pair/psk-claim": true,
 }
 
 type MemoryRateLimiter struct {

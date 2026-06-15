@@ -135,7 +135,7 @@ mkdir -p \
   "$MACPAY/mcp" \
   "$MACPAY/packaging/bin"
 
-cp "$REPO_ROOT/mac/VERSION" "$MACPAY/"
+printf '%s\n' "$VERSION" > "$MACPAY/VERSION"
 printf '%s\n' "$REVISION" > "$MACPAY/SOURCE_REVISION"
 printf '%s\n' "$BRANCH" > "$MACPAY/SOURCE_BRANCH"
 printf '%s\n' "$SOURCE_DIRTY" > "$MACPAY/SOURCE_DIRTY"

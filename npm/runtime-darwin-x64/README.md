@@ -16,4 +16,4 @@ signature and Team ID before staging it — an unsigned or re-signed binary is
 rejected, fail closed.
 
 - Product: https://pairling.dev
-- Source mirror & publish pipeline: https://github.com/mergimg0/pairling-helper
+- Source mirror & publish pipeline: https://pairling.dev

@@ -43,10 +43,11 @@ Runtime endpoints use per-device scoped Authorization: Bearer tokens:
   POST /pairling-tools/run body:JSON             daemon-first MCP tool router
   POST /phone-tools/availability body:JSON       foreground iPhone tool-listener availability
 
-Listens on PAIRLING_WEBHOOK_HOST/NOTIFY_WEBHOOK_HOST, loopback by default unless explicitly configured.
+Listens on PAIRLING_WEBHOOK_HOST, loopback by default unless explicitly configured.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import html
 import json
@@ -82,7 +83,7 @@ try:
         fetch_connectd_status,
         redacted_connectd_summary,
     )
-    from pairling_pairing import DEFAULT_PAIR_TTL_SECONDS, PairingAdvertiser, PairingError, PairingStore
+    from pairling_pairing import DEFAULT_PAIR_TTL_SECONDS, PairingAdvertiser, PairingError, PairingStore, ReauthStore
     from pairdrop_store import PairDropStore, PairDropStoreError
 except Exception:
     RUNTIME_AUTH_MODE = "scoped-device-bearer"
@@ -101,6 +102,7 @@ except Exception:
     PairingAdvertiser = None
     PairingError = None
     PairingStore = None
+    ReauthStore = None
     PairDropStore = None
     PairDropStoreError = ValueError
     app_support_root = None
@@ -186,9 +188,15 @@ except Exception:
     SafetyMonitorBridge = None
 
 try:
-    from pty_broker import PTYBrokerManager
+    from pty_broker_client import PTYBrokerClient, ensure_pty_broker_token
 except Exception:
-    PTYBrokerManager = None
+    PTYBrokerClient = None
+    ensure_pty_broker_token = None
+
+try:
+    from codex_approval import classify_codex_approval
+except Exception:
+    classify_codex_approval = None
 
 try:
     from terminal_text_sanitizer import (
@@ -297,7 +305,8 @@ AGENT_REGISTRY_DB = COMPANION_DIR / "agent-sessions.sqlite"
 TERMINAL_CAPTURE_DIR = COMPANION_DIR / "terminal-capture"
 TERMINAL_CAPTURE_MAP_DIR = TERMINAL_CAPTURE_DIR / "by-tty"
 PTY_BROKER_SOCKET = COMPANION_DIR / "pty-broker.sock"
-PTY_BROKER = PTYBrokerManager(PTY_BROKER_SOCKET, TERMINAL_CAPTURE_DIR) if PTYBrokerManager else None
+PTY_BROKER_TOKEN = ensure_pty_broker_token(COMPANION_DIR) if ensure_pty_broker_token else ""
+PTY_BROKER = PTYBrokerClient(PTY_BROKER_SOCKET, PTY_BROKER_TOKEN) if PTYBrokerClient and PTY_BROKER_TOKEN else None
 APP_SUPPORT_ROOT = app_support_root() if app_support_root else Path(os.environ.get(
     "PAIRLING_APP_SUPPORT_ROOT",
     str(HOME / "Library" / "Application Support" / "Pairling"),
@@ -314,6 +323,7 @@ PAIRING_STORE = (
     else None
 )
 PAIRING_ADVERTISER = PairingAdvertiser() if PairingAdvertiser else None
+REAUTH_STORE = ReauthStore(DEVICE_REGISTRY) if ReauthStore and DEVICE_REGISTRY else None
 RELAY_CLAIM_VERIFIER = (
     RelayClaimVerifier.from_environment(mac_install_id=PAIRING_STORE.install_id)
     if RelayClaimVerifier and PAIRING_STORE
@@ -335,6 +345,37 @@ STANDARD_TURN_PUSH_PUBLISHER = None
 MAC_HEALTH_PUSH_PUBLISHER = None
 SENTINEL_PUSH_PUBLISHER = None
 
+
+def _broker_value(session, key: str, default=None):
+    if isinstance(session, dict):
+        value = session.get(key, default)
+        return default if value is None else value
+    return getattr(session, key, default)
+
+
+def _broker_session_id(session) -> str:
+    return str(_broker_value(session, "session_id", "") or "")
+
+
+def _broker_slave_tty(session) -> str:
+    return str(_broker_value(session, "slave_tty", "") or "")
+
+
+def _broker_pid(session) -> int:
+    try:
+        return int(_broker_value(session, "pid", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _broker_raw_log_path(session) -> Path | None:
+    raw = _broker_value(session, "raw_log_path", None)
+    if isinstance(raw, Path):
+        return raw
+    if raw:
+        return Path(str(raw))
+    return None
+
 QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 ORCHESTRATIONS_DIR.mkdir(parents=True, exist_ok=True)
 HANDOFFS_DIR.mkdir(parents=True, exist_ok=True)
@@ -347,9 +388,7 @@ TERMINAL_CAPTURE_MAP_DIR.mkdir(parents=True, exist_ok=True)
 def _bind_host() -> str:
     if os.environ.get("PAIRLING_WEBHOOK_HOST"):
         return os.environ["PAIRLING_WEBHOOK_HOST"]
-    if os.environ.get("NOTIFY_WEBHOOK_HOST"):
-        return os.environ["NOTIFY_WEBHOOK_HOST"]
-    mode = os.environ.get("PAIRLING_BIND_MODE", os.environ.get("NOTIFY_WEBHOOK_BIND_MODE", "loopback")).strip().lower()
+    mode = os.environ.get("PAIRLING_BIND_MODE", "loopback").strip().lower()
     if mode in ("all", "tailnet_lan"):
         return "0.0.0.0"
     if mode == "loopback":
@@ -544,7 +583,7 @@ class _RuntimeAdmission:
             pass
         self._released = True
 
-PUBLIC_ENDPOINTS = {"/health", "/healthz", "/readyz", "/manifest", "/pair/start", "/pair/claim"}
+PUBLIC_ENDPOINTS = {"/health", "/healthz", "/readyz", "/manifest", "/pair/start", "/pair/claim", "/pair/psk-claim", "/pair/reauth-challenge", "/pair/reauth-claim"}
 
 # Internal hook tier: loopback-only endpoints used by Claude Code hooks to
 # write the session registry without device pairing. Gated by client IP AND
@@ -555,6 +594,7 @@ INTERNAL_LOOPBACK_PATHS = {
     "/internal/session-heartbeat",
     "/internal/session-close",
     "/internal/active-sessions",
+    "/internal/permission-request",
 }
 INTERNAL_HOOK_TOKEN_FILE = COMPANION_DIR / "internal-hook-token"
 
@@ -584,6 +624,42 @@ def _ensure_internal_hook_token() -> str:
 
 
 INTERNAL_HOOK_TOKEN = _ensure_internal_hook_token()
+
+
+SPAWN_SETTINGS_PATH = COMPANION_DIR / "pairling-spawn-settings.json"
+
+
+def _ensure_spawn_settings() -> None:
+    """Write the per-spawn claude settings overlay (the PermissionRequest producer
+    hook) into a Pairling-managed file passed to phone-spawned sessions via
+    --settings. This keeps the user's GLOBAL ~/.claude/settings.json UNTOUCHED:
+    the hook exists ONLY in sessions Pairling spawns, and the permission posture
+    is still inherited from the user's own settings (we add an observer hook,
+    never a mode). --settings hooks are auto-trusted (no review gate)."""
+    payload = {
+        "hooks": {
+            "PermissionRequest": [
+                {"hooks": [{
+                    "type": "command",
+                    "command": "node $HOME/.claude/hooks/dist/permission-request.mjs",
+                    "timeout": 10,
+                }]}
+            ]
+        }
+    }
+    try:
+        SPAWN_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SPAWN_SETTINGS_PATH.with_name(SPAWN_SETTINGS_PATH.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, SPAWN_SETTINGS_PATH)
+    except OSError:
+        pass
+
+
+_ensure_spawn_settings()
 
 
 def _session_backend() -> str:
@@ -629,6 +705,9 @@ def _discard_session_ready_event(session_id: str) -> None:
 POST_ONLY_ENDPOINTS = {
     "/pair/start",
     "/pair/claim",
+    "/pair/psk-claim",
+    "/pair/reauth-challenge",
+    "/pair/reauth-claim",
     "/pair/revoke",
     "/pair/rotate-token",
     "/aperture-cli/open",
@@ -660,6 +739,7 @@ POST_ONLY_ENDPOINTS = {
     "/cross-provider-action",
     "/send-text",
     "/terminal-control",
+    "/push/permission/allow",
     "/sigint",
     "/sigterm",
     "/upload",
@@ -675,6 +755,7 @@ HIGH_RISK_ENDPOINTS = {
     "/interrupt",
     "/llm-route",
     "/llm-route-stream",
+    "/push/permission/allow",
     "/pairling-tools/run",
     "/worker-kill",
     "/push/preferences",
@@ -860,6 +941,8 @@ def _required_scopes_for_request(path: str, method: str) -> set[str]:
         return {"health:read"}
     if path in {"/push/preferences", "/push/test", "/push/live-activity-token", "/push/live-activity-test"}:
         return {"pair:admin"}
+    if path == "/push/permission/allow":
+        return {"session:signal"}
     if path == "/sentinel/preferences" and method == "POST":
         return {"pair:admin"}
     if path in {"/sentinel/status", "/sentinel/preferences", "/sentinel/events"}:
@@ -878,6 +961,8 @@ def _required_scopes_for_request(path: str, method: str) -> set[str]:
         return {"session:signal"}
     if path in {"/spawn-session", "/resume-session", "/cross-provider-action"}:
         return {"session:spawn"}
+    if path == "/onestream-handoff":
+        return {"session:spawn"} if method == "POST" else {"sessions:read"}
     if path in {"/llm-route", "/llm-route-stream"}:
         return {"llm:route"}
     if path == "/pairling-tools/run":
@@ -1111,6 +1196,34 @@ def _agent_registry_bootstrap_schema(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_agent_sessions_provider_live "
         "ON agent_sessions(provider, closed_at, last_heartbeat)"
     )
+    # Per-tool approval queue (Lock-Screen "Permission request" card, Phase 2).
+    # Same daemon-owned DB. NO deadline/expiry columns by design: an unanswered
+    # prompt hangs at its native dialog forever until the user acts (Allow
+    # keystroke / in-app). Rows are recorded by the PermissionRequest hook via
+    # POST /internal/permission-request and resolved by the Allow path (Phase 3).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_approvals (
+            request_nonce   TEXT PRIMARY KEY,
+            provider        TEXT NOT NULL,
+            session_id      TEXT NOT NULL,
+            native_id       TEXT,
+            broker_id       TEXT,
+            terminal_tty    TEXT,
+            tool_name       TEXT NOT NULL,
+            tool_input_json TEXT NOT NULL,
+            command_preview TEXT,
+            permission_mode TEXT,
+            state           TEXT NOT NULL DEFAULT 'pending',
+            created_at      REAL NOT NULL,
+            resolved_at     REAL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_approvals_session "
+        "ON pending_approvals(session_id, state)"
+    )
     if _AGENT_REGISTRY_SCHEMA_READY:
         return
     with _AGENT_REGISTRY_SCHEMA_LOCK:
@@ -1149,6 +1262,149 @@ def _agent_registry_conn():
         raise
     finally:
         conn.close()
+
+
+def _approval_command_preview(tool_name: str, tool_input: dict) -> str:
+    """Render the one-line card text from a tool call's structured input."""
+    try:
+        if tool_name == "Bash":
+            return str(tool_input.get("command") or "").strip()[:300]
+        if tool_name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+            fp = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "").strip()
+            base = os.path.basename(fp) if fp else ""
+            return f"{tool_name} {base}".strip()[:300]
+        if tool_name == "WebFetch":
+            url = str(tool_input.get("url") or "").strip()
+            try:
+                host = urlparse(url).netloc or url
+            except Exception:
+                host = url
+            return f"Fetch {host}".strip()[:300]
+        return tool_name[:300]
+    except Exception:
+        return tool_name[:300]
+
+
+def _approval_resolve_session(provider: str, session_id: str) -> tuple[str, str, str]:
+    """Best-effort map a hook's session_id -> (native_id, broker_id, terminal_tty)
+    from the agent_sessions registry. For claude the hook session_id is the
+    claude_uuid; for codex it is the registry native_id. Empties on miss — the
+    Phase 3 Allow path re-resolves against the live broker before answering."""
+    try:
+        with _agent_registry_conn() as conn:
+            if provider == "claude":
+                row = conn.execute(
+                    "SELECT native_id, terminal_tty FROM agent_sessions "
+                    "WHERE provider='claude' AND claude_uuid=? AND closed_at IS NULL "
+                    "ORDER BY last_heartbeat DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+            else:
+                lookup_native = session_id
+                parsed_provider, parsed_native = _parse_agent_session_ref(session_id)
+                if parsed_provider == provider and parsed_native:
+                    lookup_native = parsed_native
+                row = conn.execute(
+                    "SELECT native_id, terminal_tty FROM agent_sessions "
+                    "WHERE provider=? AND native_id=? AND closed_at IS NULL "
+                    "ORDER BY last_heartbeat DESC LIMIT 1",
+                    (provider, lookup_native),
+                ).fetchone()
+            if not row:
+                return ("", "", "")
+            native_id = str(row["native_id"] or "")
+            broker_id = _qualified_session_id(provider, native_id) if native_id else ""
+            return (native_id, broker_id, str(row["terminal_tty"] or ""))
+    except Exception:
+        return ("", "", "")
+
+
+def _pending_approval_record(*, request_nonce: str, provider: str, session_id: str,
+                             tool_name: str, tool_input: dict, command_preview: str = "",
+                             permission_mode: str = "", broker_id: str = "",
+                             state: str = "pending") -> bool:
+    """Idempotently record a pending tool approval (INSERT OR IGNORE on the
+    hook-minted request_nonce). No deadline/expiry — by design. broker_id, when
+    supplied by the hook (from the broker's PAIRLING_BROKER_SESSION_ID env), is the
+    AUTHORITATIVE live broker session id — far more reliable than registry
+    reconciliation, since the SessionStart tty capture fails for broker PTYs (the
+    claude_uuid and the broker tty land on two unlinked rows)."""
+    now = _time.time()
+    native_id, resolved_broker, terminal_tty = _approval_resolve_session(provider, session_id)
+    if not broker_id:
+        broker_id = resolved_broker
+    row_state = state if state in {"pending", "attention"} else "pending"
+    try:
+        with _agent_registry_conn() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO pending_approvals
+                    (request_nonce, provider, session_id, native_id, broker_id,
+                     terminal_tty, tool_name, tool_input_json, command_preview,
+                     permission_mode, state, created_at, resolved_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (request_nonce, provider, session_id, native_id, broker_id,
+                 terminal_tty, tool_name, json.dumps(tool_input)[:8000],
+                 (command_preview or "")[:300], permission_mode, row_state, now),
+            )
+        return True
+    except Exception:
+        return False
+
+
+def _pending_approval_get(request_nonce: str) -> dict | None:
+    try:
+        with _agent_registry_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM pending_approvals WHERE request_nonce=?",
+                (request_nonce,),
+            ).fetchone()
+            return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def _pending_approval_cas(request_nonce: str, expected: str, new: str) -> bool:
+    """Compare-and-set the approval state. Returns True iff THIS call performed the
+    transition — so a duplicate Allow (state already != expected) is a safe no-op."""
+    try:
+        with _agent_registry_conn() as conn:
+            cur = conn.execute(
+                "UPDATE pending_approvals SET state=?, resolved_at=? "
+                "WHERE request_nonce=? AND state=?",
+                (new, _time.time(), request_nonce, expected),
+            )
+            return cur.rowcount > 0
+    except Exception:
+        return False
+
+
+def _pending_approvals_open() -> list[dict]:
+    try:
+        with _agent_registry_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pending_approvals WHERE state IN ('pending', 'attention') "
+                "ORDER BY created_at ASC LIMIT 500"
+            ).fetchall()
+            return [dict(row) for row in rows]
+    except Exception:
+        return []
+
+
+def _pending_approval_resolve_terminal(request_nonce: str, new_state: str) -> bool:
+    if new_state not in {"session_gone", "expired_session"}:
+        return False
+    try:
+        with _agent_registry_conn() as conn:
+            cur = conn.execute(
+                "UPDATE pending_approvals SET state=?, resolved_at=? "
+                "WHERE request_nonce=? AND state IN ('pending', 'attention')",
+                (new_state, _time.time(), request_nonce),
+            )
+            return cur.rowcount > 0
+    except Exception:
+        return False
 
 
 def _pretrust_claude_project(project: str) -> None:
@@ -1823,7 +2079,7 @@ def _guardian_listener_entries(power_state: dict | None) -> list[str]:
 
 
 def _probe_listener_entries() -> list[str]:
-    host = BOUND_HOST or os.environ.get("NOTIFY_WEBHOOK_BOUND_HOST", "")
+    host = BOUND_HOST or os.environ.get("PAIRLING_BOUND_HOST", "")
     entries: list[str] = []
     ok, out, _ = _run_text(["/usr/sbin/lsof", "-nP", f"-iTCP:{PORT}", "-sTCP:LISTEN"], timeout=3)
     if ok:
@@ -1974,7 +2230,7 @@ def _normalize_guardian_state(state: dict | None) -> dict | None:
             "lan_ips": [],
         },
         "daemon": {
-            "notify_webhook_pid": os.getpid(),
+            "pairling_pid": os.getpid(),
             "listen": (listener_entries := _listener_entries()),
             "reachable_local": bool(listener_entries),
             "reachable_tailnet": facts.get("daemon_reachable"),
@@ -2089,7 +2345,7 @@ def _health_routes(coordinator: dict, power_state: dict | None = None) -> list[d
             "last_ok_at": None,
         })
     if not routes:
-        host = os.environ.get("NOTIFY_WEBHOOK_BOUND_HOST", f"0.0.0.0")
+        host = os.environ.get("PAIRLING_BOUND_HOST", f"0.0.0.0")
         base_url = host if host.startswith("http") else f"http://{host}:{PORT}"
         routes.append({
             "kind": "manual",
@@ -2622,8 +2878,8 @@ def _inject_rate_check(session_id: str, max_per_min: int = 30) -> tuple[bool, in
     return True, 0
 
 # Project paths matching any of these glob-ish substrings are filtered out of
-# /corpus, /sessions, and bucket rollups. Mergim has hundreds of one-shot
-# biotech research scratch dirs that drown out signal — exclude by default.
+# /corpus, /sessions, and bucket rollups. Users can accumulate many one-shot
+# research scratch dirs that drown out signal — exclude by default.
 PROJECT_EXCLUDE_PATTERNS = [
     "biotech-labs/synth-synth-",        # ephemeral synth-* worktrees
     "biotech-labs/crohns-research/scripts",   # bench-research scratch
@@ -2731,8 +2987,8 @@ def _encode_project_dir(project_path: str) -> str:
     directory name under ~/.claude/projects/.
 
     Claude Code encodes ALL of `/`, `.`, and `_` as `-`. This means a path
-    like /Users/mghome/.claude/state/sentinel/projects/onestream-378da5/terminals/orange_team
-    becomes -Users-mghome--claude-state-sentinel-projects-onestream-378da5-terminals-orange-team
+    like /Users/example/.claude/state/sentinel/projects/onestream-378da5/terminals/orange_team
+    becomes -Users-example--claude-state-sentinel-projects-onestream-378da5-terminals-orange-team
     (note: `.claude` → `-claude` so two consecutive `-`; `orange_team` → `orange-team`).
 
     The previous implementation only handled `/` and broke for sentinel
@@ -2744,7 +3000,7 @@ def _encode_project_dir(project_path: str) -> str:
 
 
 # Sentinel session paths look like:
-#   /Users/mghome/.claude/state/sentinel/projects/<bucket>-<6hex>/terminals/<mode>
+#   /Users/example/.claude/state/sentinel/projects/<bucket>-<6hex>/terminals/<mode>
 # We strip the sentinel prefix + the 6-hex suffix to recover the underlying
 # project bucket name (e.g. "proofforge"). Regular projects use their basename.
 _SENTINEL_PROJECTS_RE = re.compile(
@@ -4526,8 +4782,8 @@ def _terminal_surface_source(raw_session: str) -> dict:
                 "available": True,
                 "source": "broker_vt",
                 "reason": "broker_vt",
-                "broker_id": session.session_id,
-                "tty": session.slave_tty,
+                "broker_id": _broker_session_id(session),
+                "tty": _broker_slave_tty(session),
                 "can_control": True,
             }
 
@@ -4544,13 +4800,13 @@ def _terminal_surface_source(raw_session: str) -> dict:
         if broker_id and PTY_BROKER is not None:
             session = PTY_BROKER.get(broker_id)
             if session is not None:
-                PTY_BROKER.register_alias(qualified, session)
+                PTY_BROKER.register_alias(qualified, _broker_session_id(session))
                 return {
                     "available": True,
                     "source": "broker_vt",
                     "reason": "broker_vt",
-                    "broker_id": session.session_id,
-                    "tty": session.slave_tty,
+                    "broker_id": _broker_session_id(session),
+                    "tty": _broker_slave_tty(session),
                     "can_control": True,
                 }
         capture_path = _terminal_capture_from_metadata(metadata)
@@ -5573,7 +5829,9 @@ def _turn_state_path(provider: str, native_id: str) -> Path:
 def _write_agent_turn_state(provider: str, native_id: str, state: str, *,
                             tool: str | None = None, effort: str | None = None,
                             started_at: float | None = None,
-                            event: str = "daemon") -> dict:
+                            event: str = "daemon",
+                            request_nonce: str | None = None,
+                            mac_install_id: str | None = None) -> dict:
     now = _time.time()
     prior: dict = {}
     path = _turn_state_path(provider, native_id)
@@ -5583,7 +5841,7 @@ def _write_agent_turn_state(provider: str, native_id: str, state: str, *,
     except Exception:
         prior = {}
     payload = {
-        "session_id": native_id,
+        "session_id": _qualified_session_id(provider, native_id) if provider == "codex" else native_id,
         "state": state,
         "tool": tool,
         "started_at": float(started_at or prior.get("started_at") or now),
@@ -5591,6 +5849,10 @@ def _write_agent_turn_state(provider: str, native_id: str, state: str, *,
         "effort": effort if effort is not None else prior.get("effort"),
         "event": event,
     }
+    if request_nonce:
+        payload["request_nonce"] = str(request_nonce)
+    if mac_install_id:
+        payload["mac_install_id"] = str(mac_install_id)
     try:
         TURN_STATE_DIR.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
@@ -5600,6 +5862,132 @@ def _write_agent_turn_state(provider: str, native_id: str, state: str, *,
         pass
     _publish_live_activity_turn_state(provider, native_id, payload)
     return payload
+
+
+_CODEX_APPROVAL_NONCES: dict[str, str] = {}
+_CODEX_APPROVAL_SCREEN_KEYS: dict[str, str] = {}
+
+
+def _rows_from_broker_snapshot(snapshot: dict | None) -> list[str]:
+    if not isinstance(snapshot, dict):
+        return []
+    rows = snapshot.get("rows")
+    if isinstance(rows, list):
+        text_rows: list[str] = []
+        for row in rows:
+            if isinstance(row, str):
+                text_rows.append(row)
+            elif isinstance(row, dict):
+                cells = row.get("cells")
+                if isinstance(cells, list):
+                    text_rows.append("".join(str(cell.get("text") or "") for cell in cells if isinstance(cell, dict)).rstrip())
+        return text_rows
+    return []
+
+
+def _approval_screen_key(snapshot: dict | None) -> str:
+    if not isinstance(snapshot, dict):
+        return ""
+    return ":".join(str(snapshot.get(key) or "") for key in ("screen_hash", "generation", "raw_offset", "nonce"))
+
+
+def _clear_codex_approval(broker_id: str, session: dict) -> None:
+    nonce = _CODEX_APPROVAL_NONCES.pop(broker_id, None)
+    _CODEX_APPROVAL_SCREEN_KEYS.pop(broker_id, None)
+    native_id = str(session.get("native_id") or "")
+    if nonce:
+        row = _pending_approval_get(nonce)
+        row_state = str((row or {}).get("state") or "")
+        if row_state in {"attention", "pending"}:
+            _pending_approval_cas(nonce, row_state, "resolved_local")
+    if native_id:
+        _write_agent_turn_state("codex", native_id, "idle", event="codex_approval_cleared")
+
+
+def _scan_codex_approvals_once() -> None:
+    if PTY_BROKER is None or classify_codex_approval is None:
+        return
+    try:
+        live = {
+            str(session.get("session_id") or ""): session
+            for session in PTY_BROKER.list_sessions()
+            if isinstance(session, dict)
+            and session.get("provider") == "codex"
+            and session.get("session_id")
+            and session.get("native_id")
+        }
+    except Exception:
+        return
+    for broker_id, session in live.items():
+        try:
+            snapshot = PTY_BROKER.snapshot(broker_id)
+        except Exception:
+            continue
+        rows = _rows_from_broker_snapshot(snapshot)
+        screen_key = _approval_screen_key(snapshot)
+        if _CODEX_APPROVAL_SCREEN_KEYS.get(broker_id) == screen_key and _CODEX_APPROVAL_NONCES.get(broker_id):
+            continue
+        pending = (snapshot or {}).get("pending_input") if isinstance(snapshot, dict) else None
+        if not isinstance(pending, dict):
+            pending = None
+        approval = classify_codex_approval(pending, rows, screen_key=screen_key)
+        if not approval:
+            if broker_id in _CODEX_APPROVAL_NONCES:
+                _clear_codex_approval(broker_id, session)
+            continue
+        summary = str(approval.get("summary") or approval.get("command") or "codex approval")[:300]
+        dialog_material = "|".join([broker_id, str(approval.get("dialog_key") or screen_key), summary])
+        nonce = "codex-scrape-" + hashlib.sha256(dialog_material.encode("utf-8")).hexdigest()[:24]
+        _CODEX_APPROVAL_SCREEN_KEYS[broker_id] = screen_key
+        if _CODEX_APPROVAL_NONCES.get(broker_id) == nonce:
+            continue
+        native_id = str(session.get("native_id") or "")
+        _pending_approval_record(
+            request_nonce=nonce,
+            provider="codex",
+            session_id=_qualified_session_id("codex", native_id),
+            tool_name="Bash",
+            tool_input={"command": str(approval.get("command") or ""), "summary": summary},
+            command_preview=summary,
+            permission_mode="",
+            broker_id=broker_id,
+            state="attention",
+        )
+        _CODEX_APPROVAL_NONCES[broker_id] = nonce
+        _write_agent_turn_state(
+            "codex",
+            native_id,
+            "attention",
+            tool=summary[:80],
+            event="codex_approval",
+            request_nonce=nonce,
+            mac_install_id=getattr(PAIRING_STORE, "install_id", "") if PAIRING_STORE else "",
+        )
+    for broker_id in list(_CODEX_APPROVAL_NONCES.keys()):
+        if broker_id not in live:
+            _CODEX_APPROVAL_NONCES.pop(broker_id, None)
+            _CODEX_APPROVAL_SCREEN_KEYS.pop(broker_id, None)
+
+
+def _start_codex_approval_scanner() -> threading.Thread | None:
+    if PTY_BROKER is None or classify_codex_approval is None:
+        return None
+    try:
+        interval = max(0.25, float(os.environ.get("PAIRLING_CODEX_APPROVAL_POLL_S", "1.0")))
+    except Exception:
+        interval = 1.0
+
+    def run() -> None:
+        while True:
+            try:
+                _scan_codex_approvals_once()
+            except Exception as exc:
+                print(f"[codex-approval-scan] skipped: {type(exc).__name__}: {str(exc)[:120]}", file=sys.stderr, flush=True)
+            _time.sleep(interval)
+
+    thread = threading.Thread(target=run, name="pairling-codex-approval-scan", daemon=True)
+    thread.start()
+    return thread
 
 
 def _publish_live_activity_turn_state(provider: str, native_id: str, payload: dict) -> None:
@@ -6846,6 +7234,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._handle_internal_session_close(q)
                 elif u.path == "/internal/active-sessions":
                     self._handle_internal_active_sessions(q)
+                elif u.path == "/internal/permission-request":
+                    self._handle_internal_permission_request(q)
             finally:
                 admission.release()
             return
@@ -7006,6 +7396,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_pair_start(q)
             elif u.path == "/pair/claim":
                 self._handle_pair_claim(q)
+            elif u.path == "/pair/psk-claim":
+                self._handle_pair_psk_claim(q)
+            elif u.path == "/pair/reauth-challenge":
+                self._handle_pair_reauth_challenge(q)
+            elif u.path == "/pair/reauth-claim":
+                self._handle_pair_reauth_claim(q)
             elif u.path == "/pair/revoke":
                 self._handle_pair_revoke(q)
             elif u.path == "/pair/rotate-token":
@@ -7088,6 +7484,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_push_preferences(q)
             elif u.path == "/push/test":
                 self._handle_push_test(q)
+            elif u.path == "/push/permission/allow":
+                self._handle_push_permission_allow(q)
             elif u.path == "/push/live-activity-token":
                 self._handle_push_live_activity_token(q)
             elif u.path == "/push/live-activity-test":
@@ -7157,6 +7555,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_worker_kill(q)
             elif u.path == "/spawn-session":
                 self._handle_spawn_session(q)
+            elif u.path == "/onestream-handoff":
+                self._handle_onestream_handoff(q)
             elif u.path == "/resume-session":
                 self._handle_resume_session(q)
             elif u.path == "/cross-provider-action":
@@ -7348,6 +7748,45 @@ class Handler(BaseHTTPRequestHandler):
             })
         items.sort(key=lambda r: r["started_at"], reverse=True)
         self._send_json({"ok": True, "count": len(items), "sessions": items})
+
+    def _handle_internal_permission_request(self, q):
+        # PermissionRequest hook producer (claude + codex). Notify-only: record
+        # the pending approval; the agent's native dialog is the durable block.
+        # Phase 3 fires the APNs card + wires the Allow keystroke here.
+        payload = self._read_internal_json()
+        if payload is None:
+            return
+        provider = str(payload.get("provider") or "claude").strip().lower()
+        if provider not in ("claude", "codex"):
+            provider = "claude"
+        session_id = str(payload.get("session_id") or "").strip()
+        tool_name = str(payload.get("tool_name") or "").strip()
+        tool_input = payload.get("tool_input")
+        if not isinstance(tool_input, dict):
+            tool_input = {}
+        if not session_id or not tool_name:
+            self._send_json({
+                "ok": False,
+                "error": {"code": "bad_request", "message": "session_id and tool_name required"},
+            }, status=400)
+            return
+        request_nonce = str(payload.get("request_nonce") or "").strip() or secrets.token_hex(16)
+        command_preview = _approval_command_preview(tool_name, tool_input)
+        ok = _pending_approval_record(
+            request_nonce=request_nonce,
+            provider=provider,
+            session_id=session_id,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            command_preview=command_preview,
+            permission_mode=str(payload.get("permission_mode") or "")[:40],
+            broker_id=str(payload.get("broker_session_id") or "").strip(),
+        )
+        self._send_json({
+            "ok": bool(ok),
+            "request_nonce": request_nonce,
+            "command_preview": command_preview,
+        })
 
     # ----- /open: open path on Mac (existing behavior) -----
     def _handle_open(self, q):
@@ -7604,6 +8043,21 @@ class Handler(BaseHTTPRequestHandler):
                 },
             }, status=503)
             return
+        # P0-B: rate-limit unauthenticated pair starts per source IP so an
+        # on-LAN attacker cannot mint a flood of invitations.
+        allowed, retry_after = _request_rate_check(
+            f"pair_start:{self.client_address[0]}", max_per_min=5
+        )
+        if not allowed:
+            self.send_response(429)
+            self.send_header("Retry-After", str(retry_after))
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "ok": False,
+                "error": {"code": "rate_limited", "message": "too many pair starts"},
+            }).encode("utf-8"))
+            return
         try:
             payload = self._read_json_object()
             ttl = int(payload.get("ttl_seconds") or DEFAULT_PAIR_TTL_SECONDS)
@@ -7621,6 +8075,8 @@ class Handler(BaseHTTPRequestHandler):
             "ok": True,
             "pair_id": started.pair_id,
             "secret": started.secret,
+            "attest_challenge": started.attest_challenge,
+            "mac_ake_pub": started.mac_ake_pub,
             "expires_at": started.expires_at,
             "install_id": started.install_id,
             "runtime_port": PORT,
@@ -7635,6 +8091,10 @@ class Handler(BaseHTTPRequestHandler):
                 "url": "pairling://pair",
                 "pair_id": started.pair_id,
                 "secret": started.secret,
+                "pairing_nonce": started.pairing_nonce,
+                "attest_challenge": started.attest_challenge,
+                "mac_ake_pub": started.mac_ake_pub,
+                "pv": "2" if started.mac_ake_pub else "1",
             },
         })
 
@@ -7657,6 +8117,11 @@ class Handler(BaseHTTPRequestHandler):
                 device_name=str(payload.get("device_name") or "Pairling iPhone"),
                 host_chain=host_chain,
                 cert_pin=None,
+                pairing_nonce=str(payload.get("pairing_nonce") or ""),
+                se_public_key_der=str(payload.get("se_public_key_der") or ""),
+                attest_object=(payload.get("direct_attest_object") if isinstance(payload.get("direct_attest_object"), dict) else None),
+                attest_key_id=str(payload.get("attest_key_id") or ""),
+                attest_environment=str(payload.get("attest_environment") or ""),
                 attested_claim_ticket=payload.get("attested_claim_ticket"),
                 relay_device_id=payload.get("relay_device_id"),
                 relay_required=bool(relay_claims_required and relay_claims_required()),
@@ -7697,6 +8162,127 @@ class Handler(BaseHTTPRequestHandler):
                 "routes": runtime_routes,
             },
         })
+
+    def _handle_pair_psk_claim(self, q):
+        # WS3: PSK-authenticated ECDH claim. The secret is NEVER received; the
+        # phone proves knowledge of it by completing the key exchange. The
+        # bearer token is returned AES-GCM-sealed under K_token, so a passive
+        # on-LAN sniffer learns nothing.
+        if PAIRING_STORE is None:
+            self._send_json({"ok": False, "error": {"code": "pairing_unavailable", "message": "Pairing store is unavailable"}}, status=503)
+            return
+        allowed, retry_after = _request_rate_check(f"pair_psk:{self.client_address[0]}", max_per_min=5)
+        if not allowed:
+            self.send_response(429)
+            self.send_header("Retry-After", str(retry_after))
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": False, "error": {"code": "rate_limited", "message": "too many psk claims"}}).encode("utf-8"))
+            return
+        try:
+            payload = self._read_json_object()
+            host_chain = self._pairing_host_chain()
+            claim, k_token, aad, mac_confirm = PAIRING_STORE.psk_claim_pair(
+                pair_id=str(payload.get("pair_id") or ""),
+                b_pub_b64=str(payload.get("b_pub") or ""),
+                confirm_b64=str(payload.get("confirm") or ""),
+                device_name=str(payload.get("device_name") or "Pairling iPhone"),
+                host_chain=host_chain,
+                se_public_key_der=str(payload.get("se_public_key_der") or ""),
+                attest_object=(payload.get("direct_attest_object") if isinstance(payload.get("direct_attest_object"), dict) else None),
+                attest_key_id=str(payload.get("attest_key_id") or ""),
+                attest_environment=str(payload.get("attest_environment") or ""),
+                attested_claim_ticket=payload.get("attested_claim_ticket"),
+                relay_device_id=payload.get("relay_device_id"),
+                relay_required=bool(relay_claims_required and relay_claims_required()),
+                relay_claim_verifier=RELAY_CLAIM_VERIFIER,
+            )
+            nonce, enc_token = PAIRING_STORE.seal_psk_token(k_token, claim.device.token, aad)
+            if PAIRING_ADVERTISER is not None:
+                PAIRING_ADVERTISER.stop()
+        except PairingError as exc:
+            self._send_json({"ok": False, "error": {"code": exc.code, "message": exc.message}}, status=exc.status)
+            return
+        except ValueError as exc:
+            self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
+            return
+        runtime_routes = self._pairing_runtime_routes(list(claim.host_chain))
+        transport = "pairling-connect" if any(
+            route.get("source") == "pairling_connectd" and route.get("status") == "ready"
+            for route in runtime_routes
+        ) else "http-local"
+        self._send_json({
+            "ok": True,
+            "device": {
+                "id": claim.device.device_id,
+                "proof_secret": claim.device.proof_secret,
+                "scopes": list(claim.device.scopes),
+                "relay_device_id": claim.relay_device_id,
+                "attestation_status": claim.attestation_status,
+            },
+            "enc_token": base64.b64encode(enc_token).decode("ascii"),
+            "nonce": base64.b64encode(nonce).decode("ascii"),
+            "mac_confirm": base64.b64encode(mac_confirm).decode("ascii"),
+            "install_id": claim.device.install_id,
+            "runtime": {
+                "port": claim.runtime_port,
+                "host_chain": list(claim.host_chain),
+                "cert_pin": claim.cert_pin,
+                "transport": transport,
+                "routes": runtime_routes,
+            },
+        })
+
+    def _handle_pair_reauth_challenge(self, q):
+        if REAUTH_STORE is None:
+            self._send_json({"ok": False, "error": {"code": "pairing_unavailable", "message": "reauth unavailable"}}, status=503)
+            return
+        allowed, retry_after = _request_rate_check(f"pair_reauth:{self.client_address[0]}", max_per_min=10)
+        if not allowed:
+            self.send_response(429)
+            self.send_header("Retry-After", str(retry_after))
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": False, "error": {"code": "rate_limited", "message": "too many reauth attempts"}}).encode("utf-8"))
+            return
+        try:
+            payload = self._read_json_object()
+        except ValueError as exc:
+            self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
+            return
+        device_id = str(payload.get("device_id") or "")
+        if not device_id:
+            self._send_json({"ok": False, "error": {"code": "device_id_required", "message": "device_id required"}}, status=400)
+            return
+        # A challenge is issued for ANY device_id (even unknown / revoked) so
+        # this endpoint never reveals whether a device exists.
+        challenge = REAUTH_STORE.issue_challenge(device_id)
+        self._send_json({"ok": True, "challenge": challenge, "ttl_seconds": REAUTH_STORE.ttl_seconds})
+
+    def _handle_pair_reauth_claim(self, q):
+        if REAUTH_STORE is None or DEVICE_REGISTRY is None:
+            self._send_json({"ok": False, "error": {"code": "pairing_unavailable", "message": "reauth unavailable"}}, status=503)
+            return
+        try:
+            payload = self._read_json_object()
+        except ValueError as exc:
+            self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
+            return
+        device_id = str(payload.get("device_id") or "")
+        challenge = str(payload.get("challenge") or "")
+        signature_b64 = str(payload.get("signature") or "")
+        try:
+            signature = base64.b64decode(signature_b64) if signature_b64 else b""
+        except Exception:
+            signature = b""
+        verified = REAUTH_STORE.verify_and_consume(device_id, challenge, signature)
+        new_token = DEVICE_REGISTRY.rotate_token(device_id) if verified else None
+        if not verified or not new_token:
+            # Uniform failure: never distinguish unknown device / no SE key /
+            # bad signature / expired-or-used challenge. No enumeration oracle.
+            self._send_json({"ok": False, "error": {"code": "reauth_failed", "message": "reauth failed"}}, status=401)
+            return
+        self._send_json({"ok": True, "device": {"id": device_id, "token": new_token}})
 
     def _handle_pair_revoke(self, q):
         if DEVICE_REGISTRY is None:
@@ -9814,13 +10400,13 @@ class Handler(BaseHTTPRequestHandler):
             if broker_id:
                 session = PTY_BROKER.get(broker_id)
                 if session:
-                    PTY_BROKER.register_alias(qualified, session)
+                    PTY_BROKER.register_alias(qualified, _broker_session_id(session))
                     return qualified, session
             tty = reg.get("terminal_tty") or ""
             if tty:
                 session = PTY_BROKER.get_by_tty(tty)
                 if session:
-                    PTY_BROKER.register_alias(qualified, session)
+                    PTY_BROKER.register_alias(qualified, _broker_session_id(session))
                     return qualified, session
         if provider == "claude":
             session_id = _claude_native_session_id(raw_session)
@@ -9831,7 +10417,7 @@ class Handler(BaseHTTPRequestHandler):
                 session = PTY_BROKER.get_by_tty(tty)
                 if session:
                     qualified = _qualified_session_id("claude", session_id)
-                    PTY_BROKER.register_alias(qualified, session)
+                    PTY_BROKER.register_alias(qualified, _broker_session_id(session))
                     return qualified, session
         return None
 
@@ -9840,16 +10426,16 @@ class Handler(BaseHTTPRequestHandler):
         if not found:
             return None
         public_session_id, session = found
-        return session.snapshot(public_session_id=public_session_id)
+        return PTY_BROKER.snapshot(_broker_session_id(session), public_session_id=public_session_id) if PTY_BROKER else None
 
     def _broker_surface_v2_snapshot(self, raw_session: str) -> dict | None:
         found = self._broker_session_for(raw_session)
         if not found:
             return None
         public_session_id, session = found
-        if not hasattr(session, "snapshot_v2"):
+        if PTY_BROKER is None or not hasattr(PTY_BROKER, "snapshot_v2"):
             return None
-        return _terminal_surface_v2_payload_from_state(public_session_id, session.snapshot_v2())
+        return PTY_BROKER.snapshot_v2(_broker_session_id(session), public_session_id=public_session_id)
 
     def _terminal_surface_tty(self, raw_session: str) -> tuple[str, str, str]:
         provider, native_id = _parse_agent_session_ref(raw_session)
@@ -10152,10 +10738,10 @@ class Handler(BaseHTTPRequestHandler):
                 "provider": provider,
                 "native_id": native_id,
                 "session_id": public_session_id,
-                "broker_id": session.session_id,
-                "tty": session.slave_tty,
-                "tty_candidates": [session.slave_tty] if session.slave_tty else [],
-                "pid": session.pid,
+                "broker_id": _broker_session_id(session),
+                "tty": _broker_slave_tty(session),
+                "tty_candidates": [_broker_slave_tty(session)] if _broker_slave_tty(session) else [],
+                "pid": _broker_pid(session),
             }
 
         if provider == "claude":
@@ -10529,7 +11115,7 @@ class Handler(BaseHTTPRequestHandler):
           2. **PG claude_uuid lookup**: for continuous-claude `s-…` ids, fetch
              claude_uuid + project from PG and exact-match `<claude_uuid>.jsonl`
              in the encoded project dir. This is essential when N sessions
-             share a project (e.g. 4 terminals all in /Users/mghome) — without
+             share a project (e.g. 4 terminals all in /Users/example) — without
              it, all N collide on the most-recent-JSONL fallback.
           3. Last-ditch: PG project lookup → most recent JSONL in dir. Only
              fires when claude_uuid is unknown (pre-migration zombie sessions).
@@ -11716,6 +12302,109 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": {"code": exc.code, "message": exc.message}}, status=exc.status)
             return
         self._send_json(result)
+
+    def _handle_push_permission_allow(self, q):
+        # "Allow" from the phone's Lock-Screen card: answer the waiting permission
+        # dialog by injecting Enter into the broker PTY (the same key path
+        # /terminal-control uses). Idempotent on request_nonce (duplicate Allow is a
+        # no-op); deny lives in-app via "Open Session". NO timeout / NO auto-deny.
+        try:
+            payload = self._read_json_object()
+        except Exception:
+            self._send_json({"ok": False, "error": {"code": "bad_json", "message": "invalid JSON"}}, status=400)
+            return
+        request_nonce = str(payload.get("request_nonce") or "").strip()
+        if not request_nonce:
+            self._send_json({"ok": False, "error": {"code": "bad_request", "message": "request_nonce required"}}, status=400)
+            return
+        row = _pending_approval_get(request_nonce)
+        if not row:
+            self._send_json({"ok": False, "error": {"code": "not_found", "message": "unknown request_nonce"}}, status=404)
+            return
+        current_state = str(row.get("state") or "")
+        if current_state == "allowed":
+            self._send_json({
+                "ok": False,
+                "state": current_state,
+                "error": {
+                    "code": "approval_in_progress",
+                    "message": "permission approval is already being injected",
+                },
+            }, status=409)
+            return
+        if current_state not in {"pending", "attention"}:
+            # Already resolved (double-tap / re-delivery) — safe idempotent no-op.
+            self._send_json({"ok": True, "state": str(row.get("state") or ""), "already_resolved": True})
+            return
+        if not _pending_approval_cas(request_nonce, current_state, "allowed"):
+            latest = _pending_approval_get(request_nonce) or {}
+            latest_state = str(latest.get("state") or "")
+            if latest_state == "allowed":
+                self._send_json({
+                    "ok": False,
+                    "state": latest_state,
+                    "error": {
+                        "code": "approval_in_progress",
+                        "message": "permission approval is already being injected",
+                    },
+                }, status=409)
+            else:
+                self._send_json({"ok": True, "state": latest_state, "already_resolved": True})
+            return
+        provider = str(row.get("provider") or "claude")
+        injected = {"ok": False, "reason": "no broker session"}
+        # 1) Authoritative: the broker session id the hook captured from the broker's
+        #    own PAIRLING_BROKER_SESSION_ID env — no fragile tty reconciliation.
+        broker_id = str(row.get("broker_id") or "")
+        if broker_id and PTY_BROKER is not None:
+            try:
+                injected = PTY_BROKER.control(broker_id, {"type": "key", "key": "enter"})
+            except Exception as e:
+                injected = {"ok": False, "reason": f"{type(e).__name__}: {str(e)[:120]}"}
+        # 2) Fallback: resolve via /terminal-control's resolver (registry -> broker).
+        if not injected.get("ok"):
+            native_id = str(row.get("native_id") or "")
+            if not native_id:
+                native_id, _b, _t = _approval_resolve_session(provider, str(row.get("session_id") or ""))
+            if native_id and PTY_BROKER is not None:
+                try:
+                    bid = self._terminal_control_target(_qualified_session_id(provider, native_id)).get("broker_id")
+                    if bid:
+                        injected = PTY_BROKER.control(bid, {"type": "key", "key": "enter"})
+                except Exception:
+                    pass
+        if not injected.get("ok"):
+            _pending_approval_cas(request_nonce, "allowed", current_state)
+            latest = _pending_approval_get(request_nonce) or {}
+            self._send_json({
+                "ok": False,
+                "state": str(latest.get("state") or current_state),
+                "broker_id": broker_id,
+                "injected": injected,
+                "error": {
+                    "code": "injection_failed",
+                    "message": "permission approval could not be delivered to the broker PTY",
+                },
+            }, status=409)
+            return
+        if not _pending_approval_cas(request_nonce, "allowed", "released"):
+            latest = _pending_approval_get(request_nonce) or {}
+            latest_state = str(latest.get("state") or "")
+            if latest_state == "released":
+                self._send_json({"ok": True, "state": "released", "broker_id": broker_id, "injected": injected})
+            else:
+                self._send_json({
+                    "ok": False,
+                    "state": latest_state or "allowed",
+                    "broker_id": broker_id,
+                    "injected": injected,
+                    "error": {
+                        "code": "release_state_failed",
+                        "message": "permission approval was injected but the state transition did not complete",
+                    },
+                }, status=409)
+            return
+        self._send_json({"ok": True, "state": "released", "broker_id": broker_id, "injected": injected})
 
     def _handle_push_test(self, q):
         if PUSH_DISPATCHER is None:
@@ -13493,12 +14182,22 @@ Worker instructions:
             broker_env = generated.get("env") if isinstance(generated.get("env"), dict) else None
             command = _aperture_cli_command_for_context(launch_context, project) if _aperture_cli_command_for_context else ""
         elif provider == "codex":
+            # Inherit the user's OWN host posture (~/.codex/config.toml:
+            # approval_policy + sandbox_mode). Pairling imposes NO permission flag
+            # — we never twist the user's workspace to manufacture cards. The
+            # approval card is opportunistic: it surfaces ONLY if the user's own
+            # config prompts (codex approval detection is the Phase 5 screen-scrape,
+            # which touches no config).
             command = (
-                f"exec codex --dangerously-bypass-approvals-and-sandbox "
+                f"exec codex "
                 f"-C {shlex.quote(project)} --add-dir {shlex.quote(project)}"
             )
         else:
-            command = "exec claude --dangerously-skip-permissions"
+            # Inherit the user's OWN host posture (~/.claude/settings.json). No
+            # imposed permission flag. The PermissionRequest producer hook is
+            # injected PER-SPAWN via --settings (phone sessions only) so the user's
+            # global settings stay untouched; the hook is an observer, never a mode.
+            command = f"exec claude --settings {shlex.quote(str(SPAWN_SETTINGS_PATH))}"
         if not command:
             self._send_json({"ok": False, "error": "Aperture CLI launch command unavailable"}, status=503)
             return
@@ -13520,20 +14219,27 @@ Worker instructions:
                 command=command,
                 rows=30,
                 columns=120,
-                env=broker_env,
+                # Mark phone-spawned sessions so the global PermissionRequest hook
+                # self-enables ONLY here (no-op for the user's own claude sessions).
+                env={**(broker_env or {}), "PAIRLING_PHONE_SESSION": "1",
+                     "PAIRLING_BROKER_SESSION_ID": broker_session_id},
             )
             ok = True
         except Exception as e:
             reason = f"{type(e).__name__}: {e}"
 
         if ok and session is not None:
-            _write_terminal_capture_mapping(
-                session.slave_tty,
-                session.raw_log_path,
-                provider=provider,
-                project=project,
-                capture_id=capture_id,
-            )
+            session_tty = _broker_slave_tty(session)
+            session_log = _broker_raw_log_path(session)
+            session_pid = _broker_pid(session)
+            if session_tty and session_log:
+                _write_terminal_capture_mapping(
+                    session_tty,
+                    session_log,
+                    provider=provider,
+                    project=project,
+                    capture_id=capture_id,
+                )
             if launch_context is not None:
                 launch_meta = {
                     "spawned_by": "pairling",
@@ -13560,10 +14266,10 @@ Worker instructions:
                 provider,
                 native_id,
                 project,
-                pid=session.pid,
-                terminal_tty=session.slave_tty,
+                pid=session_pid,
+                terminal_tty=session_tty,
                 metadata={
-                    "terminal_log": str(session.raw_log_path) if session.raw_log_path else None,
+                    "terminal_log": str(session_log) if session_log else None,
                     "capture_backend": "pty_broker",
                     "capture_id": capture_id,
                     "broker_id": broker_session_id,
@@ -13583,9 +14289,9 @@ Worker instructions:
                     "project": project,
                     "provider": provider,
                     "native_id": native_id,
-                    "tty": session.slave_tty if session else "",
-                    "pid": session.pid if session else 0,
-                    "terminal_log": str(session.raw_log_path) if session and session.raw_log_path else None,
+                    "tty": _broker_slave_tty(session) if session else "",
+                    "pid": _broker_pid(session) if session else 0,
+                    "terminal_log": str(_broker_raw_log_path(session)) if session and _broker_raw_log_path(session) else None,
                     "capture_backend": "pty_broker",
                     "broker_id": broker_session_id,
                     "broker_socket": str(PTY_BROKER_SOCKET),
@@ -13614,9 +14320,9 @@ Worker instructions:
             "provider": provider,
             "native_id": native_id,
             "session_id": broker_session_id,
-            "tty": session.slave_tty,
-            "pid": session.pid,
-            "terminal_log": str(session.raw_log_path) if session.raw_log_path else None,
+            "tty": _broker_slave_tty(session),
+            "pid": _broker_pid(session),
+            "terminal_log": str(_broker_raw_log_path(session)) if _broker_raw_log_path(session) else None,
             "capture_backend": "pty_broker",
             "terminal_source": "broker_vt",
             "broker_id": broker_session_id,
@@ -13634,6 +14340,98 @@ Worker instructions:
         })
 
     # ----- /spawn-session: open a new broker-owned agent CLI session -----
+    def _handle_onestream_handoff(self, q):
+        """OneStream -> Pairling handoff ingestion (W1b).
+
+        POST: validate (fail-closed, mirroring the iOS PairlingHandoffReader),
+              compose the steering draft, and store the handoff under
+              HANDOFFS_DIR using the schemaVersion-1 record shape. Returns the
+              composed draft so the caller can confirm what a session would
+              ingest.
+        GET:  list pending (unconsumed) OneStream handoffs.
+
+        Auth: POST requires session:spawn, GET requires sessions:read (see
+        _required_scopes_for_request). Additive route — does not spawn directly
+        (OneStream has no Mac project path); a consumer composes/spawns later.
+        """
+        if self.command == "GET":
+            items = []
+            try:
+                paths = sorted(HANDOFFS_DIR.glob("onestream-*.json"))
+            except OSError:
+                paths = []
+            for p in paths:
+                try:
+                    rec = json.loads(p.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(rec, dict) or rec.get("consumed"):
+                    continue
+                items.append({
+                    "handoff_id": rec.get("handoff_id") or p.stem,
+                    "source": rec.get("source") or "OneStream",
+                    "generatedAt": rec.get("generatedAt"),
+                    "suggestedPrompt": rec.get("suggestedPrompt") or "",
+                    "transcriptText": rec.get("transcriptText") or "",
+                    "composeDraft": rec.get("composeDraft") or "",
+                    "workflowHint": rec.get("workflowHint"),
+                })
+            self._send_json({"ok": True, "handoffs": items})
+            return
+
+        # POST — store a new handoff.
+        try:
+            payload = json.loads(self._read_body() or b"{}")
+        except json.JSONDecodeError:
+            self.send_error(400, "body must be JSON")
+            return
+        if not isinstance(payload, dict):
+            self.send_error(400, "body must be JSON object")
+            return
+
+        # Fail-closed validation — mirror iOS PairlingHandoffReader.decode().
+        schema_version = payload.get("schemaVersion")
+        if schema_version != 1:
+            self._send_json(
+                {"ok": False, "error": f"unsupported schemaVersion {schema_version!r} (expected 1)"},
+                status=400,
+            )
+            return
+        transcript_text = str(payload.get("transcriptText") or "").strip()
+        if not transcript_text:
+            self._send_json({"ok": False, "error": "handoff contains no transcript"}, status=400)
+            return
+
+        suggested_prompt = str(payload.get("suggestedPrompt") or "").strip()
+        # composeDraft mirrors PairlingHandoffReader.composeDraft(from:).
+        compose_draft = (
+            f"{suggested_prompt}\n\n---\n{transcript_text}" if suggested_prompt else transcript_text
+        )
+
+        handoff_id = "onestream-" + secrets.token_hex(6)
+        record = {
+            "schemaVersion": 1,
+            "handoff_id": handoff_id,
+            "source": str(payload.get("source") or "OneStream")[:64],
+            "generatedAt": payload.get("generatedAt"),
+            "receivedAt": _time.time(),
+            "workflowHint": payload.get("workflowHint"),
+            "suggestedPrompt": suggested_prompt,
+            "transcriptText": transcript_text,
+            "segments": payload.get("segments") if isinstance(payload.get("segments"), list) else [],
+            "composeDraft": compose_draft,
+            "consumed": False,
+        }
+        try:
+            (HANDOFFS_DIR / f"{handoff_id}.json").write_text(
+                json.dumps(record, indent=2, sort_keys=True)
+            )
+        except OSError as exc:
+            self._send_json({"ok": False, "error": f"could not store handoff: {exc}"}, status=500)
+            return
+
+        self._send_json({"ok": True, "handoff_id": handoff_id, "composeDraft": compose_draft})
+
     def _handle_spawn_session(self, q):
         """Spawn a new Claude/Codex session. Pairling-owned PTYs are the
         default path; Terminal.app can attach as a client via `pairling attach`.
@@ -13767,20 +14565,20 @@ Worker instructions:
             capture_log_path = TERMINAL_CAPTURE_DIR / f"codex-{capture_id}.log"
             inner = (
                 f"cd {shlex.quote(project)} && "
-                f"exec codex --dangerously-bypass-approvals-and-sandbox "
+                f"exec codex "
                 f"-C {shlex.quote(project)} --add-dir {shlex.quote(project)}"
             )
             shell_cmd = _terminal_script_command(capture_log_path, inner, interactive_shell=True)
         else:
             capture_id = secrets.token_hex(12)
             capture_log_path = TERMINAL_CAPTURE_DIR / f"claude-{capture_id}.log"
-            inner = f"cd {shlex.quote(project)} && claude --dangerously-skip-permissions"
+            inner = f"cd {shlex.quote(project)} && claude"
             shell_cmd = _terminal_script_command(capture_log_path, inner)
         as_escaped_cmd = _as_escape(shell_cmd)
 
         # Set Terminal's custom title to the project basename so /inject-now's
         # window-title matcher can find this window later. Terminal's auto-
-        # title shows running command + cwd (e.g. "mghome — claude") which
+        # title shows running command + cwd (e.g. "project — claude") which
         # rarely contains the project name; explicit custom title fixes that.
         basename = os.path.basename(project.rstrip("/")) or provider
         title = f"{provider}:{basename}" if provider == "codex" else basename
@@ -13942,12 +14740,12 @@ Worker instructions:
         if provider == "codex":
             shell_cmd = (
                 f"cd '{shell_safe_path}' && "
-                f"codex --dangerously-bypass-approvals-and-sandbox -C '{shell_safe_path}' --add-dir '{shell_safe_path}' \"$(cat '{shell_safe_prompt}')\""
+                f"codex -C '{shell_safe_path}' --add-dir '{shell_safe_path}' \"$(cat '{shell_safe_prompt}')\""
             )
         else:
             shell_cmd = (
                 f"cd '{shell_safe_path}' && "
-                f"claude --dangerously-skip-permissions \"$(cat '{shell_safe_prompt}')\""
+                f"claude \"$(cat '{shell_safe_prompt}')\""
             )
         script = f'''
         tell application "Terminal"
@@ -14079,19 +14877,19 @@ Worker instructions:
                 "native_id": native_id,
                 "session_id": broker_session_id,
                 "project": project,
-                "tty": existing.slave_tty,
-                "pid": existing.pid,
-                "terminal_log": str(existing.raw_log_path) if existing.raw_log_path else None,
+                "tty": _broker_slave_tty(existing),
+                "pid": _broker_pid(existing),
+                "terminal_log": str(_broker_raw_log_path(existing)) if _broker_raw_log_path(existing) else None,
                 "capture_backend": "pty_broker",
                 "terminal_source": "broker_vt",
-                "broker_id": existing.session_id,
+                "broker_id": _broker_session_id(existing),
                 "broker_socket": str(PTY_BROKER_SOCKET),
                 "attach_command": f"pairling attach {broker_session_id}",
             })
             return
 
         command = (
-            f"exec codex resume --dangerously-bypass-approvals-and-sandbox "
+            f"exec codex resume "
             f"-C {shlex.quote(project)} --add-dir {shlex.quote(project)} "
             f"{shlex.quote(native_id)}"
         )
@@ -14109,6 +14907,8 @@ Worker instructions:
                 command=command,
                 rows=30,
                 columns=120,
+                env={"PAIRLING_PHONE_SESSION": "1",
+                     "PAIRLING_BROKER_SESSION_ID": broker_session_id},
             )
             ok = True
         except Exception as e:
@@ -14116,23 +14916,27 @@ Worker instructions:
 
         if ok and session is not None:
             capture_id = secrets.token_hex(12)
-            _write_terminal_capture_mapping(
-                session.slave_tty,
-                session.raw_log_path,
-                provider=provider,
-                project=project,
-                capture_id=capture_id,
-            )
+            session_tty = _broker_slave_tty(session)
+            session_log = _broker_raw_log_path(session)
+            session_pid = _broker_pid(session)
+            if session_tty and session_log:
+                _write_terminal_capture_mapping(
+                    session_tty,
+                    session_log,
+                    provider=provider,
+                    project=project,
+                    capture_id=capture_id,
+                )
             _agent_registry_upsert(
                 "codex",
                 native_id,
                 project,
-                pid=session.pid,
-                terminal_tty=session.slave_tty,
+                pid=session_pid,
+                terminal_tty=session_tty,
                 metadata={
                     "spawned_by": "phone-companion",
                     "resume_target": native_id,
-                    "terminal_log": str(session.raw_log_path) if session.raw_log_path else None,
+                    "terminal_log": str(session_log) if session_log else None,
                     "capture_backend": "pty_broker",
                     "capture_id": capture_id,
                     "terminal_source": "broker_vt",
@@ -14151,9 +14955,9 @@ Worker instructions:
                     "provider": provider,
                     "project": project,
                     "native_id": native_id,
-                    "tty": session.slave_tty if session else "",
-                    "pid": session.pid if session else 0,
-                    "terminal_log": str(session.raw_log_path) if session and session.raw_log_path else None,
+                    "tty": _broker_slave_tty(session) if session else "",
+                    "pid": _broker_pid(session) if session else 0,
+                    "terminal_log": str(_broker_raw_log_path(session)) if session and _broker_raw_log_path(session) else None,
                     "capture_backend": "pty_broker",
                     "terminal_source": "broker_vt",
                     "broker_id": broker_session_id,
@@ -14175,9 +14979,9 @@ Worker instructions:
             "native_id": native_id,
             "session_id": broker_session_id,
             "project": project,
-            "tty": session.slave_tty,
-            "pid": session.pid,
-            "terminal_log": str(session.raw_log_path) if session.raw_log_path else None,
+            "tty": _broker_slave_tty(session),
+            "pid": _broker_pid(session),
+            "terminal_log": str(_broker_raw_log_path(session)) if _broker_raw_log_path(session) else None,
             "capture_backend": "pty_broker",
             "terminal_source": "broker_vt",
             "broker_id": broker_session_id,
@@ -14248,7 +15052,7 @@ Worker instructions:
         capture_log_path = TERMINAL_CAPTURE_DIR / f"codex-{capture_id}.log"
         inner = (
             f"cd {shlex.quote(project)} && "
-            f"exec codex resume --dangerously-bypass-approvals-and-sandbox "
+            f"exec codex resume "
             f"-C {shlex.quote(project)} --add-dir {shlex.quote(project)} "
             f"{shlex.quote(native_id)}"
         )
@@ -14383,8 +15187,8 @@ Worker instructions:
                 _agent_registry_update_control(
                     "codex",
                     native_id,
-                    pid=session.pid,
-                    terminal_tty=session.slave_tty,
+                    pid=_broker_pid(session),
+                    terminal_tty=_broker_slave_tty(session),
                     state="running",
                     reopen=True,
                 )
@@ -14399,16 +15203,16 @@ Worker instructions:
                 state="applied" if result.get("ok") else "failed",
                 phases=_receipt_phases(validated=True, applied=bool(result.get("ok")), pty_written=bool(result.get("ok"))),
                 backend="pty_broker",
-                tty=session.slave_tty,
-                pid=session.pid,
+                tty=_broker_slave_tty(session),
+                pid=_broker_pid(session),
                 source_offset_after=source_offset_after,
             )
             _store_action_receipt(device_id, receipt_session_id, client_action_id, body_hash, receipt, action_kind="send_text", audit_action={"type": "send_text", "chars": len(text)})
             body = json.dumps({
                 "ok": bool(result.get("ok")),
-                "tty": session.slave_tty,
-                "pid": session.pid,
-                "broker_id": session.session_id,
+                "tty": _broker_slave_tty(session),
+                "pid": _broker_pid(session),
+                "broker_id": _broker_session_id(session),
                 "reason": result.get("reason"),
                 "receipt": receipt,
             }).encode()
@@ -14689,16 +15493,16 @@ Worker instructions:
                 state="applied" if result.get("ok") else "failed",
                 phases=_receipt_phases(validated=True, applied=bool(result.get("ok")), pty_written=bool(result.get("ok"))),
                 backend="pty_broker",
-                tty=broker_session.slave_tty,
-                pid=broker_session.pid,
+                tty=_broker_slave_tty(broker_session),
+                pid=_broker_pid(broker_session),
                 source_offset_after=source_offset_after,
             )
             _store_action_receipt(receipt_context["device_id"], receipt_session_id, receipt_context["client_action_id"], receipt_context["body_hash"], receipt, action_kind="send_text", audit_action={"type": "send_text", "chars": len(text)})
             body = json.dumps({
                 "ok": bool(result.get("ok")),
-                "tty": broker_session.slave_tty,
-                "pid": broker_session.pid,
-                "broker_id": broker_session.session_id,
+                "tty": _broker_slave_tty(broker_session),
+                "pid": _broker_pid(broker_session),
+                "broker_id": _broker_session_id(broker_session),
                 "reason": result.get("reason"),
                 "receipt": receipt,
             }).encode()
@@ -14918,10 +15722,11 @@ Worker instructions:
             broker_found = self._broker_session_for(_qualified_session_id("codex", native_id))
             if broker_found and PTY_BROKER:
                 _, broker_session = broker_found
+                broker_id = _broker_session_id(broker_session)
                 if sig == signal.SIGINT:
-                    result = PTY_BROKER.control(broker_session.session_id, {"type": "key", "key": "ctrl_c"})
+                    result = PTY_BROKER.control(broker_id, {"type": "key", "key": "ctrl_c"})
                 else:
-                    result = PTY_BROKER.terminate(broker_session.session_id, sig)
+                    result = PTY_BROKER.terminate(broker_id, sig)
                 ok = bool(result.get("ok"))
                 if ok:
                     _write_agent_turn_state("codex", native_id, "idle", event=sig_name.lower())
@@ -14929,10 +15734,10 @@ Worker instructions:
                     _agent_registry_mark_closed("codex", native_id)
                 send_signal_result(
                     ok,
-                    result.get("pid") or broker_session.pid,
+                    result.get("pid") or _broker_pid(broker_session),
                     result.get("error") or result.get("reason"),
                     200 if ok else int(result.get("status") or 502),
-                    broker_id=broker_session.session_id,
+                    broker_id=broker_id,
                 )
                 return
 
@@ -14979,19 +15784,20 @@ Worker instructions:
         broker_found = self._broker_session_for(_qualified_session_id("claude", session_id))
         if broker_found and PTY_BROKER:
             _, broker_session = broker_found
+            broker_id = _broker_session_id(broker_session)
             if sig == signal.SIGINT:
-                result = PTY_BROKER.control(broker_session.session_id, {"type": "key", "key": "ctrl_c"})
+                result = PTY_BROKER.control(broker_id, {"type": "key", "key": "ctrl_c"})
             else:
-                result = PTY_BROKER.terminate(broker_session.session_id, sig)
+                result = PTY_BROKER.terminate(broker_id, sig)
             ok = bool(result.get("ok"))
             if ok and sig == signal.SIGTERM:
                 self._mark_session_closed(session_id)
             send_signal_result(
                 ok,
-                result.get("pid") or broker_session.pid,
+                result.get("pid") or _broker_pid(broker_session),
                 result.get("error") or result.get("reason"),
                 200 if ok else int(result.get("status") or 502),
-                broker_id=broker_session.session_id,
+                broker_id=broker_id,
             )
             return
 
@@ -17663,9 +18469,9 @@ Worker instructions:
         params. Save to ~/Pairling/uploads/<bucket>/<8-hex>-<name>
         where <bucket> is derived from the session's project path:
 
-          - regular project (e.g. /Users/mghome/projects/proofforge)
+          - regular project (e.g. /Users/example/projects/proofforge)
             → bucket = "proofforge"
-          - sentinel session (e.g. /Users/mghome/.claude/state/sentinel/projects/proofforge-079c4a/terminals/orange_team)
+          - sentinel session (e.g. /Users/example/.claude/state/sentinel/projects/proofforge-079c4a/terminals/orange_team)
             → bucket = "proofforge"  (regex strips -<6hex> suffix)
           - fallback when session unknown
             → bucket = "misc"
@@ -18420,15 +19226,82 @@ def _maybe_backfill_claude_registry_from_pg() -> None:
         print(f"[registry-backfill] skipped: {type(exc).__name__}", file=sys.stderr, flush=True)
 
 
+def _reconcile_broker_sessions_on_boot() -> None:
+    if PTY_BROKER is None:
+        return
+    survivors: dict[str, dict] = {}
+    deadline = _time.time() + 10
+    last_error = ""
+    while _time.time() < deadline:
+        try:
+            survivors = {
+                str(item.get("session_id") or ""): item
+                for item in PTY_BROKER.list_sessions()
+                if isinstance(item, dict) and item.get("session_id")
+            }
+            break
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {str(exc)[:120]}"
+            _time.sleep(0.25)
+    if last_error and not survivors:
+        print(f"[broker-reconcile] deferred: {last_error}", file=sys.stderr, flush=True)
+        return
+
+    for provider in ("claude", "codex"):
+        for row in _agent_registry_live(provider):
+            metadata = _registry_metadata_from_row(row)
+            broker_id = str(metadata.get("broker_id") or "").strip()
+            native_id = str(row.get("native_id") or "").strip()
+            if not broker_id or not native_id:
+                continue
+            desc = survivors.get(broker_id)
+            if desc is None:
+                _agent_registry_mark_closed(provider, native_id)
+                continue
+            _agent_registry_update_control(
+                provider,
+                native_id,
+                pid=_broker_pid(desc),
+                terminal_tty=_broker_slave_tty(desc),
+                state="running",
+                reopen=True,
+            )
+
+    for approval in _pending_approvals_open():
+        broker_id = str(approval.get("broker_id") or "").strip()
+        request_nonce = str(approval.get("request_nonce") or "").strip()
+        provider = str(approval.get("provider") or "").strip() or "claude"
+        native_id = str(approval.get("native_id") or "").strip()
+        if not native_id:
+            _native, _broker, _tty = _approval_resolve_session(provider, str(approval.get("session_id") or ""))
+            native_id = _native
+        if broker_id and broker_id in survivors:
+            if native_id:
+                _write_agent_turn_state(
+                    provider,
+                    native_id,
+                    "attention",
+                    tool=str(approval.get("command_preview") or approval.get("tool_name") or "")[:80],
+                    event="broker_reconcile",
+                    request_nonce=request_nonce,
+                    mac_install_id=getattr(PAIRING_STORE, "install_id", "") if PAIRING_STORE else "",
+                )
+            continue
+        if request_nonce:
+            _pending_approval_resolve_terminal(request_nonce, "session_gone")
+
+
 if __name__ == "__main__":
     host = _bind_host()
     BOUND_HOST = host
-    os.environ["NOTIFY_WEBHOOK_BOUND_HOST"] = host
+    os.environ["PAIRLING_BOUND_HOST"] = host
     _maybe_backfill_claude_registry_from_pg()
+    _reconcile_broker_sessions_on_boot()
     LIVE_ACTIVITY_PUBLISHER = _start_live_activity_publisher()
     STANDARD_TURN_PUSH_PUBLISHER = _start_standard_turn_push_publisher()
     MAC_HEALTH_PUSH_PUBLISHER = _start_mac_health_push_publisher()
     SENTINEL_PUSH_PUBLISHER = _start_sentinel_push_publisher()
+    _start_codex_approval_scanner()
     server = _PairlingThreadingHTTPServer((host, PORT), Handler)
     server.daemon_threads = True
     print(f"pairlingd listening on {host}:{PORT}", file=sys.stderr, flush=True)
