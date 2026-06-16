@@ -747,7 +747,20 @@ ptybroker_live_session_count() {
 import json
 import sys
 
-payload = json.loads(sys.argv[1])
+def load_json_arg(raw):
+    text = str(raw or "").strip()
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in "{[":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+            return value
+        except json.JSONDecodeError:
+            continue
+    return {}
+
+payload = load_json_arg(sys.argv[1])
 status = payload.get("status") if isinstance(payload.get("status"), dict) else {}
 print(status.get("live_session_count", "unknown"))
 PY
@@ -799,7 +812,20 @@ ptybroker_live_revision() {
 import json
 import sys
 
-payload = json.loads(sys.argv[1])
+def load_json_arg(raw):
+    text = str(raw or "").strip()
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in "{[":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+            return value
+        except json.JSONDecodeError:
+            continue
+    return {}
+
+payload = load_json_arg(sys.argv[1])
 status = payload.get("status") if isinstance(payload.get("status"), dict) else payload
 print(status.get("source_revision") or "")
 PY
@@ -813,7 +839,20 @@ import sys
 from pathlib import Path
 
 current = Path(sys.argv[1])
-payload = json.loads(sys.argv[2])
+def load_json_arg(raw):
+    text = str(raw or "").strip()
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in "{[":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+            return value
+        except json.JSONDecodeError:
+            continue
+    return {}
+
+payload = load_json_arg(sys.argv[2])
 live = payload.get("status") if isinstance(payload.get("status"), dict) else payload
 
 def read_revision(root: Path):
@@ -881,7 +920,20 @@ ptybroker_report_deferred_restart() {
 import json
 import sys
 
-state = json.loads(sys.argv[1])
+def load_json_arg(raw):
+    text = str(raw or "").strip()
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in "{[":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+            return value
+        except json.JSONDecodeError:
+            continue
+    return {}
+
+state = load_json_arg(sys.argv[1])
 if state.get("state") != "stale_deferred":
     raise SystemExit(0)
 live = state.get("live") if isinstance(state.get("live"), dict) else {}
@@ -902,7 +954,20 @@ ptybroker_state_field() {
 import json
 import sys
 
-payload = json.loads(sys.argv[1])
+def load_json_arg(raw):
+    text = str(raw or "").strip()
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in "{[":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+            return value
+        except json.JSONDecodeError:
+            continue
+    return {}
+
+payload = load_json_arg(sys.argv[1])
 value = payload
 for part in sys.argv[2].split("."):
     if isinstance(value, dict):
@@ -1089,7 +1154,7 @@ install_runtime() {
   log "Installed Pairling runtime $RELEASE_NAME"
   if ! is_dry_run; then
     log ""
-    if ! pair_runtime --qr; then
+    if ! PAIRLING_CONNECTD_ROUTE_WAIT_SECONDS="${PAIRLING_CONNECTD_ROUTE_WAIT_SECONDS:-35}" pair_runtime --qr; then
       log "Pairling installed, but setup could not generate a pairing invitation. Run: pairling doctor --json; pairling pair --qr" >&2
       exit 1
     fi
@@ -1156,6 +1221,7 @@ import os
 import socket
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.error
 import urllib.request
@@ -1268,34 +1334,64 @@ def detected_tailnet_ip() -> str:
             return ip
     return ""
 
+def connectd_route_wait_seconds() -> float:
+    try:
+        return min(max(float(os.environ.get("PAIRLING_CONNECTD_ROUTE_WAIT_SECONDS") or "0"), 0.0), 60.0)
+    except ValueError:
+        return 0.0
+
+def connectd_route_poll_seconds() -> float:
+    try:
+        return min(max(float(os.environ.get("PAIRLING_CONNECTD_ROUTE_POLL_SECONDS") or "0.5"), 0.1), 2.0)
+    except ValueError:
+        return 0.5
+
+def status_could_be_ready_soon(status: dict) -> bool:
+    if not status:
+        return True
+    if status.get("auth_url_present"):
+        return False
+    return True
+
+def ready_connectd_route():
+    wait_seconds = connectd_route_wait_seconds()
+    poll_seconds = connectd_route_poll_seconds()
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        status = fetch_connectd_status(timeout_seconds=0.7)
+        connect_routes = advertised_pairling_connect_routes(status)
+        if connect_routes:
+            return connect_routes[0]
+        if wait_seconds <= 0 or time.monotonic() >= deadline or not status_could_be_ready_soon(status):
+            return None
+        time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+
 def default_pair_route(port_number: int) -> dict:
     for key in ("PAIRLING_PAIR_BASE_URL", "PAIRLING_PUBLIC_BASE_URL"):
         value = os.environ.get(key)
         if value:
             return {"base_url": value, "source": "explicit_override", "status": "override"}
-    # First-pair QR claims go through iOS URLSession before any persisted
-    # Pairling Connect route exists. TestFlight builds allow local HTTP via
-    # NSAllowsLocalNetworking, but ATS blocks plain HTTP to 100.64/10 tailnet
-    # addresses. Prefer ATS-local LAN/Bonjour bases for bootstrap; remote
-    # tailnet routes are validated and promoted after the claim.
-    lan_ip = detected_lan_ip()
-    if lan_ip:
-        return {"base_url": f"http://{lan_ip}:{port_number}", "source": "lan", "status": "fallback", "kind": "lan"}
-    if os.environ.get("PAIRLING_DISABLE_BONJOUR") != "1" and os.environ.get("PAIRLING_TEST_DISABLE_BONJOUR") != "1":
-        return {"base_url": f"http://{socket.gethostname()}.local:{port_number}", "source": "bonjour", "status": "fallback", "kind": "bonjour"}
-    connect_routes = advertised_pairling_connect_routes(fetch_connectd_status(timeout_seconds=0.7))
-    if connect_routes:
-        route = connect_routes[0]
+    # Remote-first pairing: if connectd reports a ready Pairling Connect route,
+    # the QR advertises that route and the iOS app claims it through the
+    # embedded pre-pair transport. LAN/Bonjour are explicit degraded fallbacks
+    # when Pairling Connect is not ready.
+    route = ready_connectd_route()
+    if route:
         return {
             "base_url": route["base_url"],
             "source": route["source"],
             "status": route["status"],
             "kind": route["kind"],
         }
+    lan_ip = detected_lan_ip()
+    if lan_ip:
+        return {"base_url": f"http://{lan_ip}:{port_number}", "source": "lan", "status": "fallback", "kind": "lan"}
+    if os.environ.get("PAIRLING_DISABLE_BONJOUR") != "1" and os.environ.get("PAIRLING_TEST_DISABLE_BONJOUR") != "1":
+        return {"base_url": f"http://{socket.gethostname()}.local:{port_number}", "source": "bonjour", "status": "fallback", "kind": "bonjour"}
     tailnet_ip = detected_tailnet_ip()
     if tailnet_ip:
-        return {"base_url": f"http://{tailnet_ip}:{port_number}", "source": "standalone_tailnet", "status": "fallback"}
-    return {"base_url": f"http://{socket.gethostname()}.local:{port_number}", "source": "bonjour", "status": "fallback"}
+        return {"base_url": f"http://{tailnet_ip}:{port_number}", "source": "standalone_tailnet", "status": "fallback", "kind": "standalone_tailnet"}
+    return {"base_url": f"http://{socket.gethostname()}.local:{port_number}", "source": "bonjour", "status": "fallback", "kind": "bonjour"}
 
 pair_route = default_pair_route(int(port))
 base_url = str(pair_route.get("base_url") or "")
@@ -1315,6 +1411,11 @@ if pair_id and secret:
         pair_params["route_source"] = "pairling_connectd"
         pair_params["route_status"] = "ready"
         pair_params["route_kind"] = str(pair_route.get("kind") or "tailnet")
+        pair_params["route_contract"] = "pairling-runtime-v1"
+    elif pair_route.get("status") == "fallback":
+        pair_params["route_source"] = "local_fallback"
+        pair_params["route_status"] = "degraded"
+        pair_params["route_kind"] = str(pair_route.get("kind") or pair_route.get("source") or "local")
         pair_params["route_contract"] = "pairling-runtime-v1"
     manual = {
         "base_url": base_url,
