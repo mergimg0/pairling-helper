@@ -64,6 +64,7 @@ KIND_CATEGORY = {
     "mac_route_risk": "PAIRLING_MAC_HEALTH",
     "worker_pressure": "PAIRLING_WORKER_SENTINEL",
     "deploy_result": "PAIRLING_TURN_DONE",
+    "remote_join": "PAIRLING_REMOTE_JOIN",
     "push_diagnostic": "PAIRLING_PUSH_DIAGNOSTIC",
 }
 KIND_ALERT = {
@@ -78,9 +79,10 @@ KIND_ALERT = {
     "mac_route_risk": ("Mac route timed out", "The paired Mac route needs attention."),
     "worker_pressure": ("Pairling worker pressure", "Worker or token pressure needs review."),
     "deploy_result": ("Deploy result ready", "A build or deploy result is available."),
+    "remote_join": ("New device paired remotely", "A device joined your Mac over the internet."),
     "push_diagnostic": ("Pairling push test", "Push delivery is configured for this device."),
 }
-TIME_SENSITIVE_KINDS = {"session_attention", "mac_health", "worker_sentinel", "action_required", "turn_failed", "tool_risk", "mac_route_risk", "worker_pressure"}
+TIME_SENSITIVE_KINDS = {"session_attention", "mac_health", "worker_sentinel", "action_required", "turn_failed", "tool_risk", "mac_route_risk", "worker_pressure", "remote_join"}
 
 
 class PushDispatcherError(Exception):
@@ -490,6 +492,34 @@ class PairlingPushDispatcher:
         self.apns_sender = apns_sender or LocalAPNSProvider(config_path=registry_path.parent / "config.json", now_fn=now_fn)
         self.relay_sender = relay_sender or RelayEventSender(now_fn=now_fn)
         self._lock = threading.RLock()
+
+    def broadcast_alert(self, *, exclude_device_id, event_id, kind, route, title, body, pairling_extra=None):
+        """Best-effort: send an alert to every registered device except
+        exclude_device_id. Per-device failures are swallowed. Returns a count.
+        Used to warn already-paired devices of a remote, funnel-origin join."""
+        data = self._read()
+        sent = 0
+        errors = 0
+        for device in data.get("devices", []):
+            device_id = str(device.get("device_id") or "")
+            token = str(device.get("apns_token") or "")
+            if not token or device_id == exclude_device_id:
+                continue
+            try:
+                self.apns_sender.send_alert(
+                    token=token,
+                    event_id=f"{event_id}:{device_id}",
+                    kind=kind,
+                    route=route,
+                    title=title,
+                    body=body,
+                    pairling_extra=pairling_extra,
+                    interruption_level="time-sensitive",
+                )
+                sent += 1
+            except Exception:
+                errors += 1
+        return {"sent": sent, "errors": errors}
 
     def backfill_live_activity_environments(self, *, device_id: str | None = None) -> dict[str, Any]:
         """Repair older Live Activity token rows that predate explicit APNs environments."""

@@ -1,6 +1,6 @@
 {
   "name": "pairling",
-  "version": "0.2.5",
+  "version": "0.2.7",
   "description": "Pair your iPhone with the AI coding agents running on your Mac. CLI and local runtime installer for the Pairling iOS app.",
   "keywords": [
     "pairling",

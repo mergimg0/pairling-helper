@@ -1,6 +1,6 @@
 {
   "name": "@pairling/runtime-darwin-arm64",
-  "version": "0.2.5",
+  "version": "0.2.7",
   "description": "Pairling Mac runtime binaries for Apple Silicon. Installed automatically as an optional dependency of the `pairling` package \u2014 do not install directly.",
   "homepage": "https://pairling.dev",
   "bugs": {

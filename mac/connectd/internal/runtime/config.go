@@ -56,6 +56,25 @@ func HostnameFromInstallID(installID string) string {
 	return "pairling-" + slug
 }
 
+// StableHostname returns a tailnet hostname that survives a regenerated
+// install_id. It persists the first computed hostname under the state directory
+// and reuses it thereafter, so a reinstall that only changes install_id does not
+// change the *.ts.net name, which would otherwise reset the Funnel certificate.
+// If the state directory is wiped, a fresh node and name are created regardless.
+func StableHostname(appSupportRoot, stateDir string) string {
+	path := filepath.Join(stateDir, "hostname")
+	if data, err := os.ReadFile(path); err == nil {
+		if name := strings.TrimSpace(string(data)); name != "" {
+			return name
+		}
+	}
+	name := HostnameFromInstallID(LoadInstallID(appSupportRoot))
+	if err := os.MkdirAll(stateDir, 0o700); err == nil {
+		_ = os.WriteFile(path, []byte(name+"\n"), 0o600)
+	}
+	return name
+}
+
 func loadInstallIDCandidate(path string) string {
 	data, err := os.ReadFile(path)
 	if err != nil {

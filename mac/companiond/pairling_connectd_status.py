@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import urllib.parse
 import urllib.request
 from typing import Any
@@ -10,7 +11,9 @@ from typing import Any
 CONNECTD_STATUS_URL = "http://127.0.0.1:7774/status"
 PAIRLING_CONNECT_ROUTE_SOURCE = "pairling_connectd"
 PAIRLING_CONNECT_ROUTE_KIND = "tailnet"
+PAIRLING_CONNECT_FUNNEL_KIND = "funnel"
 PAIRLING_CONNECT_PORT = 7773
+PAIRLING_CONNECT_FUNNEL_PORT = 443
 
 
 def fetch_connectd_status(timeout_seconds: float = 1.5) -> dict[str, Any]:
@@ -41,7 +44,8 @@ def advertised_pairling_connect_routes(status: dict[str, Any]) -> list[dict[str,
             continue
         if route.get("source") != PAIRLING_CONNECT_ROUTE_SOURCE:
             continue
-        if route.get("kind") != PAIRLING_CONNECT_ROUTE_KIND:
+        kind = route.get("kind")
+        if kind not in (PAIRLING_CONNECT_ROUTE_KIND, PAIRLING_CONNECT_FUNNEL_KIND):
             continue
         if route.get("status") != "ready":
             continue
@@ -50,16 +54,25 @@ def advertised_pairling_connect_routes(status: dict[str, Any]) -> list[dict[str,
             port = int(route.get("port") or 0)
         except (TypeError, ValueError):
             continue
-        if port != PAIRLING_CONNECT_PORT or not _is_tailnet_host(host):
-            continue
-        base_url = _sanitized_base_url(route.get("base_url"), host, port)
+        if kind == PAIRLING_CONNECT_FUNNEL_KIND:
+            # Funnel route: public https on a *.ts.net host, lowest priority. The
+            # tailnet branch below is unchanged and not loosened.
+            base_url = _sanitized_funnel_base_url(route.get("base_url"), host, port)
+            default_id = "pairling-connect-funnel"
+            default_priority = 10
+        else:
+            if port != PAIRLING_CONNECT_PORT or not _is_tailnet_host(host):
+                continue
+            base_url = _sanitized_base_url(route.get("base_url"), host, port)
+            default_id = "pairling-connect-tailnet"
+            default_priority = 100
         if not base_url:
             continue
         valid = {
-            "id": str(route.get("id") or "pairling-connect-tailnet"),
-            "kind": PAIRLING_CONNECT_ROUTE_KIND,
+            "id": str(route.get("id") or default_id),
+            "kind": kind,
             "source": PAIRLING_CONNECT_ROUTE_SOURCE,
-            "priority": int(route.get("priority") or 100),
+            "priority": int(route.get("priority") or default_priority),
             "base_url": base_url,
             "host": host,
             "port": port,
@@ -87,6 +100,9 @@ def redacted_connectd_summary(status: dict[str, Any]) -> dict[str, Any]:
         "route": routes[0] if routes else None,
         "auth_url_present": bool(status.get("auth_url_present")) if isinstance(status, dict) else False,
         "tailnet_ip_count": int(status.get("tailnet_ip_count") or 0) if isinstance(status, dict) else 0,
+        "tailnet_node_id": _identity_string(status.get("tailnet_node_id")) if isinstance(status, dict) else "",
+        "tags": _identity_list(status.get("tags")) if isinstance(status, dict) else [],
+        "tailnet_ips": _identity_list(status.get("tailnet_ips")) if isinstance(status, dict) else [],
         "listener_running": bool(status.get("listener_running")) if isinstance(status, dict) else False,
         "upstream_reachable": bool(status.get("upstream_reachable")) if isinstance(status, dict) else False,
         "local_pairing_available": True,
@@ -128,6 +144,26 @@ def _next_action(status: dict[str, Any], route_ready: bool) -> dict[str, str]:
     }
 
 
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if isinstance(item, (str, int, float))]
+
+
+_IDENTITY_SECRET_RE = re.compile(r"(tskey|authkey|client_secret|nlprivate)", re.I)
+
+
+def _identity_string(value: Any) -> str:
+    raw = str(value or "").strip()
+    if _IDENTITY_SECRET_RE.search(raw):
+        return "[redacted]"
+    return raw
+
+
+def _identity_list(value: Any) -> list[str]:
+    return [_identity_string(item) for item in _string_list(value)]
+
+
 def _sanitized_base_url(value: Any, host: str, port: int) -> str | None:
     raw = str(value or f"http://{host}:{port}").strip()
     try:
@@ -137,6 +173,20 @@ def _sanitized_base_url(value: Any, host: str, port: int) -> str | None:
     if parsed.scheme != "http" or parsed.hostname != host or parsed.port != port:
         return None
     return urllib.parse.urlunparse(("http", f"{host}:{port}", "", "", "", ""))
+
+
+def _sanitized_funnel_base_url(value: Any, host: str, port: int) -> str | None:
+    # A funnel route is accepted only as https on a *.ts.net host at port 443.
+    if not host.endswith(".ts.net") or port != PAIRLING_CONNECT_FUNNEL_PORT:
+        return None
+    raw = str(value or f"https://{host}").strip()
+    try:
+        parsed = urllib.parse.urlparse(raw)
+    except Exception:
+        return None
+    if parsed.scheme != "https" or parsed.hostname != host or parsed.port not in (None, PAIRLING_CONNECT_FUNNEL_PORT):
+        return None
+    return urllib.parse.urlunparse(("https", host, "", "", "", ""))
 
 
 def _is_tailnet_host(host: str) -> bool:

@@ -20,7 +20,9 @@ const (
 	RouteIDPairlingConnect = "pairling-connect-tailnet"
 	RouteSourceConnectd    = "pairling_connectd"
 	RouteKindTailnet       = "tailnet"
+	RouteKindFunnel        = "funnel"
 	RouteStatusReady       = "ready"
+	RouteIDFunnel          = "pairling-connect-funnel"
 )
 
 type AdvertisedRoute struct {
@@ -39,7 +41,12 @@ type Snapshot struct {
 	SchemaVersion        int               `json:"schema_version"`
 	AuthState            string            `json:"auth_state"`
 	Hostname             string            `json:"hostname"`
+	FunnelHostname       string            `json:"funnel_hostname,omitempty"`
 	TailnetIP            string            `json:"tailnet_ip,omitempty"`
+	TailnetNodeID        string            `json:"tailnet_node_id,omitempty"`
+	Tags                 []string          `json:"tags,omitempty"`
+	TailnetIPs           []string          `json:"tailnet_ips,omitempty"`
+	TailnetLockEnabled   *bool             `json:"tailnet_lock_enabled,omitempty"`
 	TailnetIPCount       int               `json:"tailnet_ip_count"`
 	AuthURLPresent       bool              `json:"auth_url_present"`
 	ControlURLMode       string            `json:"control_url_mode"`
@@ -115,6 +122,15 @@ func (s *Store) SetConnectdVersion(version string) {
 	})
 }
 
+// SetFunnelHostname records the public *.ts.net hostname of the Funnel listener.
+// Empty when Funnel is disabled, which keeps the snapshot and advertised routes
+// byte-identical to the no-funnel build.
+func (s *Store) SetFunnelHostname(host string) {
+	s.update(func(snapshot *Snapshot) {
+		snapshot.FunnelHostname = strings.TrimSpace(host)
+	})
+}
+
 func (s *Store) SetAuthPending(message string) {
 	s.update(func(snapshot *Snapshot) {
 		snapshot.AuthState = "pending"
@@ -141,6 +157,20 @@ func (s *Store) SetTailnetIP(ip string) {
 		} else {
 			snapshot.TailnetIPCount = 1
 		}
+	})
+}
+
+func (s *Store) SetTailnetIdentity(nodeID string, tags, ips []string) {
+	s.update(func(snapshot *Snapshot) {
+		snapshot.TailnetNodeID = sanitizeIdentityValue(nodeID)
+		snapshot.Tags = sanitizeIdentityValues(tags)
+		snapshot.TailnetIPs = sanitizeIdentityValues(ips)
+	})
+}
+
+func (s *Store) SetTailnetLockEnabled(enabled bool) {
+	s.update(func(snapshot *Snapshot) {
+		snapshot.TailnetLockEnabled = &enabled
 	})
 }
 
@@ -229,7 +259,7 @@ func advertisedRoutes(snapshot Snapshot) []AdvertisedRoute {
 	if port <= 0 {
 		port = DefaultListenPort
 	}
-	return []AdvertisedRoute{{
+	routes := []AdvertisedRoute{{
 		ID:       RouteIDPairlingConnect,
 		Kind:     RouteKindTailnet,
 		Source:   RouteSourceConnectd,
@@ -239,6 +269,22 @@ func advertisedRoutes(snapshot Snapshot) []AdvertisedRoute {
 		Port:     port,
 		Status:   RouteStatusReady,
 	}}
+	// Additive funnel route, lowest priority so it is used only for the off-LAN
+	// bootstrap and dropped once the tailnet route is reachable. Present only when
+	// Funnel is enabled (a hostname is set); the health gate above already holds.
+	if host := strings.TrimSpace(snapshot.FunnelHostname); host != "" {
+		routes = append(routes, AdvertisedRoute{
+			ID:       RouteIDFunnel,
+			Kind:     RouteKindFunnel,
+			Source:   RouteSourceConnectd,
+			Priority: 10,
+			BaseURL:  "https://" + host,
+			Host:     host,
+			Port:     443,
+			Status:   RouteStatusReady,
+		})
+	}
+	return routes
 }
 
 func gatewayEventIsFailure(path string, status int, outcome string) bool {
@@ -269,6 +315,26 @@ var secretPattern = regexp.MustCompile(`(?i)(sk-[A-Za-z0-9._-]+|[A-Za-z0-9._-]*s
 var authURLPattern = regexp.MustCompile(`https://login\.tailscale\.com/a/[A-Za-z0-9._~!$&'()*+,;=:@%/?-]+`)
 var bearerPattern = regexp.MustCompile(`(?i)Bearer\s+[A-Za-z0-9._~+/=-]+`)
 var tailscaleAuthKeyPattern = regexp.MustCompile(`(?i)tskey-[A-Za-z0-9._-]+`)
+var identitySecretPattern = regexp.MustCompile(`(?i)(authkey|nlprivate)`)
+
+func sanitizeIdentityValues(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	cleaned := make([]string, 0, len(values))
+	for _, value := range values {
+		cleaned = append(cleaned, sanitizeIdentityValue(value))
+	}
+	return cleaned
+}
+
+func sanitizeIdentityValue(value string) string {
+	value = strings.TrimSpace(value)
+	if identitySecretPattern.MatchString(value) {
+		return "[redacted]"
+	}
+	return redact(value)
+}
 
 func extractAuthURL(value string) (string, bool) {
 	raw := authURLPattern.FindString(value)

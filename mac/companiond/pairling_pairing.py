@@ -159,6 +159,9 @@ class PairClaim:
     cert_pin: str | None
     relay_device_id: str | None = None
     attestation_status: str = "none"
+    # Increment 5: True only when a direct App Attest attestation was verified for
+    # this claim. Distinct from attestation_status, which is the relay-path field.
+    direct_attestation_verified: bool = False
 
 
 class PairingError(Exception):
@@ -401,6 +404,42 @@ class PairingStore:
             raise PairingError("pair_locked", 429, "too many claim attempts")
         return record, path, now
 
+    def _verify_claim_attestation(
+        self,
+        *,
+        pair_id: str,
+        record: dict,
+        attest_object: dict | None,
+        attest_key_id: str,
+        attest_environment: str,
+        require: bool,
+        force_production: bool,
+    ) -> bool:
+        """Verify direct App Attest. Returns True when a valid attestation was
+        verified, False when none was required and none supplied. Raises on
+        failure or when required-and-missing. force_production pins the
+        environment so a funnel client cannot send 'development'."""
+        if not (require or _direct_attest_required() or attest_object):
+            return False
+        if not attest_object:
+            raise PairingError("direct_attest_required", 403, "app attest required")
+        if _verify_direct_attestation is None:
+            raise PairingError("direct_attest_unavailable", 503, "app attest validator unavailable")
+        environment = "production" if force_production else attest_environment
+        try:
+            _verify_direct_attestation(
+                attestation=attest_object,
+                pair_id=pair_id,
+                attest_challenge=str(record.get("attest_challenge") or ""),
+                key_id=attest_key_id,
+                environment=environment,
+            )
+        except PairingError:
+            raise
+        except Exception:
+            raise PairingError("direct_attest_invalid", 403, "app attest validation failed")
+        return True
+
     def _finalize_claim(
         self,
         *,
@@ -420,31 +459,24 @@ class PairingStore:
         relay_device_id: str | None,
         relay_required: bool,
         relay_claim_verifier,
+        funnel_origin: bool = False,
+        attestation_verified: bool | None = None,
     ) -> PairClaim:
         """Post-authentication finalize, shared by legacy and PSK claims. The
         caller holds _claim_lock and has already proven secret-knowledge (legacy
         compare or PSK key-confirmation): App Attest, relay ticket, device
         creation, SE pubkey registration, record teardown."""
-        # WS2: direct-LAN App Attest. When required (or opportunistically
-        # supplied), the claimant must present a valid Apple attestation bound to
-        # this invitation. Fails closed if the validator is unavailable while on.
-        if _direct_attest_required() or attest_object:
-            if not attest_object:
-                raise PairingError("direct_attest_required", 403, "app attest required")
-            if _verify_direct_attestation is None:
-                raise PairingError("direct_attest_unavailable", 503, "app attest validator unavailable")
-            try:
-                _verify_direct_attestation(
-                    attestation=attest_object,
-                    pair_id=pair_id,
-                    attest_challenge=str(record.get("attest_challenge") or ""),
-                    key_id=attest_key_id,
-                    environment=attest_environment,
-                )
-            except PairingError:
-                raise
-            except Exception:
-                raise PairingError("direct_attest_invalid", 403, "app attest validation failed")
+        # WS2 + Increment 5: direct App Attest. For a funnel-origin claim it is a
+        # hard, fail-closed requirement (verified earlier, before the derive). For
+        # LAN and tailnet claims it stays opportunistic. attestation_verified
+        # carries a result the caller already computed (the funnel pre-derive
+        # check); otherwise verify here.
+        if attestation_verified is None:
+            attestation_verified = self._verify_claim_attestation(
+                pair_id=pair_id, record=record, attest_object=attest_object,
+                attest_key_id=attest_key_id, attest_environment=attest_environment,
+                require=funnel_origin, force_production=funnel_origin,
+            )
         relay_status = "none"
         verified_relay_device_id = relay_device_id
         relay_pair_secret = None
@@ -512,6 +544,7 @@ class PairingStore:
                 cert_pin,
                 verified_relay_device_id,
                 relay_status,
+                bool(attestation_verified),
             )
         except Exception:
             self._delete_record(marker)
@@ -535,6 +568,7 @@ class PairingStore:
         relay_device_id: str | None = None,
         relay_required: bool = False,
         relay_claim_verifier=None,
+        funnel_origin: bool = False,
     ) -> tuple[PairClaim, bytes, bytes, bytes]:
         """WS3 PSK-authenticated ECDH claim. The secret is NEVER received; the
         caller proves knowledge of it by completing the authenticated key
@@ -549,6 +583,18 @@ class PairingStore:
         except Exception:
             raise PairingError("psk_bad_key", 400, "invalid psk material")
         with self._claim_lock:
+            attestation_verified = None
+            if funnel_origin:
+                # Funnel claims prove a genuine device BEFORE the attempt counter
+                # and the ECDH derive, so an un-attested spray cannot lock out a
+                # live invitation or force crypto work. Fail-closed regardless of
+                # the env default, with the environment pinned to production.
+                funnel_record, _ = self._load_record(pair_id)
+                attestation_verified = self._verify_claim_attestation(
+                    pair_id=pair_id, record=funnel_record, attest_object=attest_object,
+                    attest_key_id=attest_key_id, attest_environment=attest_environment,
+                    require=True, force_production=True,
+                )
             record, path, now = self._precheck_claim(pair_id)
             secret = str(record.get("secret") or "")
             mac_priv_b64 = str(record.get("mac_ake_priv") or "")
@@ -578,6 +624,7 @@ class PairingStore:
                 attested_claim_ticket=attested_claim_ticket,
                 relay_device_id=relay_device_id, relay_required=relay_required,
                 relay_claim_verifier=relay_claim_verifier,
+                funnel_origin=funnel_origin, attestation_verified=attestation_verified,
             )
             aad = _psk.transcript(pair_id, a_pub, b_pub)
             mac_confirm = _psk.confirm_tag(k_confirm, _psk.CONFIRM_MAC, pair_id, a_pub, b_pub)

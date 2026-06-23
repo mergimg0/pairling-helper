@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import plistlib
 from pathlib import Path
 
@@ -11,6 +12,7 @@ PAIRLING_DAEMON_LABEL = "dev.pairling.companiond"
 PAIRLING_GUARDIAN_LABEL = "dev.pairling.power-guardian"
 PAIRLING_CONNECTD_LABEL = "dev.pairling.connectd"
 PAIRLING_PTYBROKER_LABEL = "dev.pairling.ptybroker"
+PAIRLING_MINTD_LABEL = "dev.pairling.mintd"
 PAIRLING_RUNTIME_PORT = "7773"
 
 
@@ -20,21 +22,27 @@ def write_plist(path: Path, payload: dict) -> None:
         plistlib.dump(payload, fh, sort_keys=False)
 
 
-def daemon_plist(current: Path, logs: Path, python_bin: str) -> dict:
+def daemon_plist(current: Path, logs: Path, python_bin: str, mint_enabled: bool = False) -> dict:
+    env = {
+        "PAIRLING_RUNTIME_PORT": PAIRLING_RUNTIME_PORT,
+        "COMPANION_DAEMON_PORT": PAIRLING_RUNTIME_PORT,
+        "PAIRLING_BIND_MODE": "all",
+        "PAIRLING_APP_SUPPORT_ROOT": str(current.parent.parent),
+        "PAIRLING_LOGS_ROOT": str(logs),
+        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    }
+    if mint_enabled:
+        # Architecture B is on only when the separate-uid mint broker is
+        # installed. Persisting the flag here keeps it across daemon restarts
+        # and reboots, instead of relying on an ephemeral launchctl setenv.
+        env["PAIRLING_MINT_ENABLED"] = "1"
     return {
         "Label": PAIRLING_DAEMON_LABEL,
         "ProgramArguments": [
             python_bin,
             str(current / "companiond" / "pairlingd.py"),
         ],
-        "EnvironmentVariables": {
-            "PAIRLING_RUNTIME_PORT": PAIRLING_RUNTIME_PORT,
-            "COMPANION_DAEMON_PORT": PAIRLING_RUNTIME_PORT,
-            "PAIRLING_BIND_MODE": "all",
-            "PAIRLING_APP_SUPPORT_ROOT": str(current.parent.parent),
-            "PAIRLING_LOGS_ROOT": str(logs),
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        },
+        "EnvironmentVariables": env,
         "RunAtLoad": True,
         "KeepAlive": True,
         "ThrottleInterval": 10,
@@ -96,6 +104,39 @@ def connectd_plist(current: Path, logs: Path) -> dict:
     }
 
 
+def mintd_plist(current: Path, logs: Path) -> dict:
+    system_root = Path("/Library/Application Support/Pairling")
+    system_logs = Path("/Library/Logs/Pairling")
+    return {
+        "Label": PAIRLING_MINTD_LABEL,
+        "UserName": "_pairling_mint",
+        "GroupName": "staff",
+        "ProgramArguments": [
+            str(system_root / "mint" / "pairling-tailnet-mintd"),
+            "--secret-path",
+            str(system_root / "mint" / "client_secret.json"),
+            "--socket-path",
+            str(system_root / "run" / "mintd" / "mintd.sock"),
+            "--state-path",
+            str(system_root / "mint" / "state.json"),
+            "--audit-path",
+            str(system_root / "mint" / "audit.jsonl"),
+            "--alert-path",
+            str(system_root / "run" / "mintd" / "alerts.jsonl"),
+            "--authorized-uid",
+            str(os.getuid()),
+        ],
+        "EnvironmentVariables": {
+            "PATH": "/Applications/Tailscale.app/Contents/MacOS:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        },
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 10,
+        "StandardOutPath": str(system_logs / "mintd.log"),
+        "StandardErrorPath": str(system_logs / "mintd.err"),
+    }
+
+
 def ptybroker_plist(current: Path, logs: Path, python_bin: str) -> dict:
     app_support = current.parent.parent
     return {
@@ -125,16 +166,19 @@ def main() -> int:
     parser.add_argument("--daemon-python", default="/usr/local/bin/python3")
     parser.add_argument("--guardian-python", default="/usr/bin/python3")
     parser.add_argument("--mirror-python", default="/usr/local/bin/python3", help=argparse.SUPPRESS)
+    parser.add_argument("--mint-enabled", action="store_true",
+                        help="set PAIRLING_MINT_ENABLED=1 in the companiond env (Architecture B)")
     args = parser.parse_args()
 
     current = Path(args.current_root)
     logs = Path(args.logs_root)
     out = Path(args.output_dir)
 
-    write_plist(out / f"{PAIRLING_DAEMON_LABEL}.plist", daemon_plist(current, logs, args.daemon_python))
+    write_plist(out / f"{PAIRLING_DAEMON_LABEL}.plist", daemon_plist(current, logs, args.daemon_python, args.mint_enabled))
     write_plist(out / f"{PAIRLING_PTYBROKER_LABEL}.plist", ptybroker_plist(current, logs, args.daemon_python))
     write_plist(out / f"{PAIRLING_GUARDIAN_LABEL}.plist", guardian_plist(current, logs, args.guardian_python))
     write_plist(out / f"{PAIRLING_CONNECTD_LABEL}.plist", connectd_plist(current, logs))
+    write_plist(out / f"{PAIRLING_MINTD_LABEL}.plist", mintd_plist(current, logs))
     return 0
 
 

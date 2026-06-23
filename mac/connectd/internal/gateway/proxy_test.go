@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,6 +19,12 @@ import (
 type recordingLogger struct {
 	mu     sync.Mutex
 	events []Event
+}
+
+type peerNodeResolverFunc func(context.Context, string) (string, bool)
+
+func (f peerNodeResolverFunc) PeerNodeID(ctx context.Context, remoteAddr string) (string, bool) {
+	return f(ctx, remoteAddr)
 }
 
 func (l *recordingLogger) Log(event Event) {
@@ -417,6 +424,70 @@ func TestPairlingConnectModeRequiresBearerForPostPairEndpointsAndRejectsRemotePa
 
 	if fmt.Sprintf("%+v", forwarded) != "[POST /send-text POST /pair/claim POST /pair/psk-claim]" {
 		t.Fatalf("forwarded = %+v", forwarded)
+	}
+}
+
+func TestPairlingConnectStripsForgedPeerNodeHeader(t *testing.T) {
+	var forwardedHeader string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwardedHeader = r.Header.Get("X-Pairling-Peer-Node")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	handler := newTestHandlerWithMode(t, upstream.URL, 1024, nil, ExposureModePairlingConnect, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "http://pairling-connect.local/send-text", strings.NewReader(`{"tailnet_node_id":"forged-body"}`))
+	req.Header.Set("Authorization", "Bearer device-token")
+	req.Header.Set("X-Pairling-Peer-Node", "forged-header")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if forwardedHeader != "" {
+		t.Fatalf("forged peer-node header forwarded to upstream: %q", forwardedHeader)
+	}
+}
+
+func TestPairlingConnectSetsPeerNodeHeaderFromResolver(t *testing.T) {
+	var forwardedHeader string
+	var resolvedRemote string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwardedHeader = r.Header.Get("X-Pairling-Peer-Node")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewHandler(Options{
+		Upstream:     upstreamURL,
+		MaxBodyBytes: 1024,
+		Mode:         ExposureModePairlingConnect,
+		PeerNodeResolver: peerNodeResolverFunc(func(_ context.Context, remoteAddr string) (string, bool) {
+			resolvedRemote = remoteAddr
+			return "nPeerCNTRL", true
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "http://pairling-connect.local/send-text", strings.NewReader(`{}`))
+	req.RemoteAddr = "100.64.0.50:12345"
+	req.Header.Set("Authorization", "Bearer device-token")
+	req.Header.Set("X-Pairling-Peer-Node", "forged-header")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if resolvedRemote != "100.64.0.50:12345" {
+		t.Fatalf("resolver remote addr = %q", resolvedRemote)
+	}
+	if forwardedHeader != "nPeerCNTRL" {
+		t.Fatalf("peer-node header = %q, want trusted resolver value", forwardedHeader)
 	}
 }
 

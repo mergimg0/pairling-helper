@@ -56,8 +56,10 @@ jobs:
         run: |
           mkdir -p dist/assets
           gh release download "$TAG" --pattern 'pairling-connectd-*' --dir dist/assets
+          gh release download "$TAG" --pattern 'pairling-tailnet-mintd-*' --dir dist/assets
           gh release download "$TAG" --pattern 'pairling-python-*.tar.gz' --dir dist/assets
-          chmod 755 dist/assets/pairling-connectd-arm64 dist/assets/pairling-connectd-x64
+          chmod 755 dist/assets/pairling-connectd-arm64 dist/assets/pairling-connectd-x64 \
+                    dist/assets/pairling-tailnet-mintd-arm64 dist/assets/pairling-tailnet-mintd-x64
 
       - name: Verify assets against committed digests and Team ID
         run: |
@@ -86,6 +88,18 @@ jobs:
               if f.get("TeamIdentifier") != team:
                   sys.exit(f"{path}: TeamIdentifier {f.get('TeamIdentifier')!r} != {team}")
               print(f"verified {path}: sha256 + signature + TeamIdentifier={team}")
+          # mintd binaries: digest + Developer ID signature + Team ID + Identifier.
+          for arch in ("arm64", "x64"):
+              path = f"dist/assets/pairling-tailnet-mintd-{arch}"
+              if sha(path) != expected["mintd"][arch]["sha256"]:
+                  sys.exit(f"{path}: sha256 mismatch")
+              subprocess.run(["/usr/bin/codesign", "--verify", "--strict", path], check=True)
+              f = codesign_fields(path)
+              if f.get("TeamIdentifier") != team:
+                  sys.exit(f"{path}: TeamIdentifier {f.get('TeamIdentifier')!r} != {team}")
+              if f.get("Identifier") != "dev.pairling.mintd":
+                  sys.exit(f"{path}: Identifier {f.get('Identifier')!r} != dev.pairling.mintd")
+              print(f"verified {path}: sha256 + dev.pairling.mintd + TeamIdentifier={team}")
           # python tarballs: digest, then unpack and verify the interpreter is a
           # valid dev.pairling.python Developer ID build (CI must not re-sign).
           for arch in ("arm64", "x64"):
@@ -109,13 +123,15 @@ jobs:
         env:
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
-          # CI passes pre-signed connectd AND pre-signed python as prebuilts; the
+          # CI passes pre-signed connectd, mintd, AND python as prebuilts; the
           # build never re-vendors or re-signs (no Developer ID cert in CI).
           bash mac/packaging/build-npm-packages.sh \
             --release \
             --version "${TAG#v}" \
             --prebuilt-arm64 dist/assets/pairling-connectd-arm64 \
             --prebuilt-x64 dist/assets/pairling-connectd-x64 \
+            --prebuilt-mintd-arm64 dist/assets/pairling-tailnet-mintd-arm64 \
+            --prebuilt-mintd-x64 dist/assets/pairling-tailnet-mintd-x64 \
             --prebuilt-python-arm64 dist/assets/pairling-python-arm64.tar.gz \
             --prebuilt-python-x64 dist/assets/pairling-python-x64.tar.gz
           cat dist/npm/SHASUMS256.txt

@@ -92,6 +92,7 @@ function detectRosetta() {
 function shimEnv() {
   const runtimeDir = runtimePackageDir();
   const connectd = runtimeDir ? join(runtimeDir, "bin", "pairling-connectd") : null;
+  const mintd = runtimeDir ? join(runtimeDir, "bin", "pairling-tailnet-mintd") : null;
   const vendoredPython = runtimeDir ? join(runtimeDir, "python", "bin", "python3") : null;
   return {
     packageRoot,
@@ -100,6 +101,7 @@ function shimEnv() {
     payloadRoot,
     runtimePackageDir: runtimeDir,
     connectdPath: connectd && existsSync(connectd) ? connectd : null,
+    mintdPath: mintd && existsSync(mintd) ? mintd : null,
     vendoredPython: vendoredPython && existsSync(vendoredPython) ? vendoredPython : null,
     stagedCli: stagedCliPath(),
     stagedRuntimeVersion: stagedRuntimeVersion(),
@@ -187,10 +189,10 @@ function main() {
 
   if (existsSync(payloadCli)) {
     const env = shimEnv();
-    if (!env.runtimePackageDir || !env.connectdPath) {
+    if (!env.runtimePackageDir || !env.connectdPath || !env.mintdPath) {
       process.stderr.write(
         [
-          "pairling: the platform runtime package is missing.",
+          "pairling: the platform runtime package is missing or incomplete.",
           "",
           `Expected: @pairling/runtime-darwin-${process.arch === "arm64" ? "arm64" : "x64"}`,
           "",
@@ -206,6 +208,7 @@ function main() {
     delegate(payloadCli, args, {
       PAIRLING_REPO_ROOT: join(payloadRoot, "."),
       PAIRLING_CONNECTD_PREBUILT: env.connectdPath,
+      PAIRLING_MINTD_PREBUILT: env.mintdPath,
       PAIRLING_DAEMON_PYTHON: env.vendoredPython,
     });
     return;

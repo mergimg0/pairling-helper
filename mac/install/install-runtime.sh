@@ -51,6 +51,7 @@ PAIRLING_DAEMON_LABEL="dev.pairling.companiond"
 PAIRLING_GUARDIAN_LABEL="dev.pairling.power-guardian"
 PAIRLING_CONNECTD_LABEL="dev.pairling.connectd"
 PAIRLING_PTYBROKER_LABEL="dev.pairling.ptybroker"
+PAIRLING_MINTD_LABEL="dev.pairling.mintd"
 APP_SUPPORT="${PAIRLING_APP_SUPPORT_ROOT:-${COMPANION_APP_SUPPORT_ROOT:-$HOME/Library/Application Support/Pairling}}"
 RUNTIME_ROOT="$APP_SUPPORT/runtime"
 RELEASES_ROOT="$RUNTIME_ROOT/releases"
@@ -70,6 +71,12 @@ USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_DAEMON_LABEL.plist"
 CONNECTD_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_CONNECTD_LABEL.plist"
 PTYBROKER_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_PTYBROKER_LABEL.plist"
 SYSTEM_PLIST="/Library/LaunchDaemons/$PAIRLING_GUARDIAN_LABEL.plist"
+MINTD_SYSTEM_PLIST="/Library/LaunchDaemons/$PAIRLING_MINTD_LABEL.plist"
+MINTD_SYSTEM_ROOT="/Library/Application Support/Pairling"
+MINTD_SECRET_DIR="$MINTD_SYSTEM_ROOT/mint"
+MINTD_RUN_DIR="$MINTD_SYSTEM_ROOT/run/mintd"
+MINTD_SYSTEM_BINARY="$MINTD_SECRET_DIR/pairling-tailnet-mintd"
+MINTD_LOGS_DIR="/Library/Logs/Pairling"
 MCP_SERVER_DIR="$HOME/.claude/mcp-servers"
 MCP_SERVER_SHIM="$MCP_SERVER_DIR/phone-tools.py"
 PYTHON3_BIN="${PAIRLING_DAEMON_PYTHON:-${COMPANION_DAEMON_PYTHON:-$(command -v python3)}}"
@@ -306,12 +313,13 @@ copy_release() {
   cp "$REPO_ROOT/mac/guardian/companion-power-guardian.py" "$tmp/guardian/"
   cp "$REPO_ROOT/mac/guardian/guardian_contract.py" "$tmp/guardian/"
   build_connectd_binary "$tmp/connectd/pairling-connectd"
+  build_mintd_binary "$tmp/connectd/pairling-tailnet-mintd"
   stage_vendored_python "$tmp/python"
   run_staged_psk_dependency_checks "$tmp"
-  copy_runtime_source_tree "$tmp/mac" "$tmp/connectd/pairling-connectd"
+  copy_runtime_source_tree "$tmp/mac" "$tmp/connectd/pairling-connectd" "$tmp/connectd/pairling-tailnet-mintd"
   write_installed_pairling_launcher "$tmp/bin/pairling"
   chmod 755 "$tmp/bin/pairling" "$tmp/companiond/pairlingd.py" "$tmp/mcp/phone_tools.py" "$tmp/guardian/companion-power-guardian.py"
-  chmod 755 "$tmp/connectd/pairling-connectd"
+  chmod 755 "$tmp/connectd/pairling-connectd" "$tmp/connectd/pairling-tailnet-mintd"
   chmod 644 "$tmp/companiond/"*.py "$tmp/mcp/"*.py "$tmp/guardian/"*.py
   chmod 644 "$tmp/companiond/providers/"*.py
   chmod 644 "$tmp/companiond/integrations/"*.py "$tmp/companiond/integrations/aperture_cli/"*.py
@@ -325,6 +333,7 @@ copy_release() {
 copy_runtime_source_tree() {
   local mac_root="$1"
   local connectd_binary="$2"
+  local mintd_binary="$3"
   mkdir -p \
     "$mac_root/companiond" \
     "$mac_root/companiond/providers" \
@@ -351,12 +360,13 @@ copy_runtime_source_tree() {
   cp -R "$REPO_ROOT/mac/connectd/cmd" "$mac_root/connectd/"
   cp -R "$REPO_ROOT/mac/connectd/internal" "$mac_root/connectd/"
   cp "$connectd_binary" "$mac_root/connectd/bin/pairling-connectd"
+  cp "$mintd_binary" "$mac_root/connectd/bin/pairling-tailnet-mintd"
   cp "$REPO_ROOT/mac/guardian/"*.py "$mac_root/guardian/"
   cp "$REPO_ROOT/mac/install/"*.sh "$mac_root/install/"
   cp "$REPO_ROOT/mac/install/"*.py "$mac_root/install/"
   cp "$REPO_ROOT/mac/mcp/"*.py "$mac_root/mcp/"
   cp "$REPO_ROOT/mac/packaging/bin/pairling" "$mac_root/packaging/bin/"
-  chmod 755 "$mac_root/connectd/bin/pairling-connectd" "$mac_root/install/"*.sh "$mac_root/mcp/phone_tools.py" "$mac_root/packaging/bin/pairling"
+  chmod 755 "$mac_root/connectd/bin/pairling-connectd" "$mac_root/connectd/bin/pairling-tailnet-mintd" "$mac_root/install/"*.sh "$mac_root/mcp/phone_tools.py" "$mac_root/packaging/bin/pairling"
   chmod 644 "$mac_root/VERSION" "$mac_root/SOURCE_REVISION" "$mac_root/SOURCE_BRANCH" "$mac_root/SOURCE_DIRTY"
 }
 
@@ -480,6 +490,57 @@ build_connectd_binary() {
   )
 }
 
+build_mintd_binary() {
+  local out="$1"
+  local prebuilt_env="${PAIRLING_MINTD_PREBUILT:-}"
+  if [[ -n "$prebuilt_env" ]]; then
+    if [[ ! -f "$prebuilt_env" ]]; then
+      log "ERROR: PAIRLING_MINTD_PREBUILT points at a missing file: $prebuilt_env" >&2
+      exit 1
+    fi
+    local required_team="${PAIRLING_MINTD_TEAM_ID:-${PAIRLING_CONNECTD_TEAM_ID:-965AVD34A3}}"
+    if [[ "$required_team" != "-" ]]; then
+      if ! /usr/bin/codesign --verify --strict "$prebuilt_env" >/dev/null 2>&1; then
+        log "ERROR: mintd binary failed codesign verification; refusing to stage: $prebuilt_env" >&2
+        exit 1
+      fi
+      local team
+      team="$(/usr/bin/codesign -dvv "$prebuilt_env" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+      if [[ "$team" != "$required_team" ]]; then
+        log "ERROR: mintd binary TeamIdentifier '${team:-none}' does not match required '$required_team'; refusing to stage: $prebuilt_env" >&2
+        exit 1
+      fi
+    fi
+    cp "$prebuilt_env" "$out"
+    chmod 755 "$out"
+    return
+  fi
+  local prebuilt="$REPO_ROOT/mac/connectd/bin/pairling-tailnet-mintd"
+  if [[ -x "$prebuilt" ]]; then
+    cp "$prebuilt" "$out"
+    chmod 755 "$out"
+    return
+  fi
+  local go_bin
+  go_bin="$(command -v go || true)"
+  if [[ -z "$go_bin" ]]; then
+    for candidate in /opt/homebrew/bin/go /usr/local/go/bin/go /usr/local/bin/go; do
+      if [[ -x "$candidate" ]]; then
+        go_bin="$candidate"
+        break
+      fi
+    done
+  fi
+  if [[ -z "$go_bin" ]]; then
+    log "ERROR: go is required to build pairling-tailnet-mintd" >&2
+    exit 1
+  fi
+  (
+    cd "$REPO_ROOT/mac/connectd"
+    "$go_bin" build -o "$out" ./cmd/pairling-tailnet-mintd
+  )
+}
+
 write_manifest() {
   local root="$1"
   python3 - "$REPO_ROOT" "$root" "$VERSION" "$REVISION" "$BRANCH" "$SOURCE_DIRTY" "$APP_SUPPORT" "$LOGS_ROOT" "$DEVICES_DB" "$PAIRLING_RUNTIME_PORT" <<'PY'
@@ -535,6 +596,7 @@ for rel in [
     "companiond/providers/external.py",
     "companiond/providers/registry.py",
     "connectd/pairling-connectd",
+    "connectd/pairling-tailnet-mintd",
     "mcp/phone_tools.py",
     "guardian/companion-power-guardian.py",
     "guardian/guardian_contract.py",
@@ -567,6 +629,7 @@ manifest = {
         "daemon_label": "dev.pairling.companiond",
         "ptybroker_label": "dev.pairling.ptybroker",
         "connectd_label": "dev.pairling.connectd",
+        "mintd_label": "dev.pairling.mintd",
         "guardian_label": "dev.pairling.power-guardian",
     },
     "paths": {
@@ -577,7 +640,6 @@ manifest = {
     },
     "migration": {
         "legacy_port": 7723,
-        "legacy_daemon_unloaded_by_setup": True,
         "public_v1_dual_bind": False,
     },
     "packaging": {
@@ -691,6 +753,19 @@ SH
   mv "$tmp" "$target"
 }
 
+mintd_provisioned() {
+  # Architecture B (minting) is enabled in the companiond env once the
+  # separate-uid mint broker has been installed by the explicit, consent-gated
+  # `pairling enable-silent-join` flow. The broker's LaunchDaemon plist lives in
+  # /Library/LaunchDaemons (root:wheel 0644, world-readable), so this steady-
+  # state check needs no elevated privileges, and a plain setup never prompts
+  # for a password. Architecture A (browser-login) stays the fallback whenever the
+  # broker is absent; the credential gate is enforced at install time by
+  # enable_silent_join + install_mintd_if_possible.
+  if is_dry_run; then return 1; fi
+  [[ -f "$MINTD_SYSTEM_PLIST" ]]
+}
+
 render_plists() {
   # Prefer the staged vendored interpreter whenever it exists, so start/
   # rollback (which don't re-stage) also run the daemon under dev.pairling.python.
@@ -698,20 +773,17 @@ render_plists() {
   if [[ -x "$CURRENT_LINK/python/bin/python3" ]]; then
     daemon_python="$CURRENT_LINK/python/bin/python3"
   fi
-  python3 "$REPO_ROOT/mac/install/render-launchd.py" \
-    --current-root "$CURRENT_LINK" \
-    --logs-root "$LOGS_ROOT" \
-    --output-dir "$PLIST_BUILD_DIR" \
-    --daemon-python "$daemon_python" \
+  local -a render_args=(
+    --current-root "$CURRENT_LINK"
+    --logs-root "$LOGS_ROOT"
+    --output-dir "$PLIST_BUILD_DIR"
+    --daemon-python "$daemon_python"
     --guardian-python "$GUARDIAN_PYTHON_BIN"
-}
-
-unload_legacy_daemon() {
-  if is_dry_run; then
-    log "dry-run: would check legacy predecessor cleanup"
-    return
+  )
+  if mintd_provisioned; then
+    render_args+=(--mint-enabled)
   fi
-  return 0
+  python3 "$REPO_ROOT/mac/install/render-launchd.py" "${render_args[@]}"
 }
 
 start_user_agent() {
@@ -1076,6 +1148,16 @@ stop_connectd_agent() {
   launchctl bootout "gui/$(id -u)" "$CONNECTD_USER_PLIST" >/dev/null 2>&1 || true
 }
 
+stop_mintd_daemon() {
+  if is_dry_run; then
+    log "dry-run: would stop $PAIRLING_MINTD_LABEL"
+    return
+  fi
+  if sudo -n true >/dev/null 2>&1; then
+    sudo launchctl bootout system "$MINTD_SYSTEM_PLIST" >/dev/null 2>&1 || true
+  fi
+}
+
 install_guardian_if_possible() {
   local rendered="$PLIST_BUILD_DIR/$PAIRLING_GUARDIAN_LABEL.plist"
   if [[ "${PAIRLING_INSTALL_GUARDIAN:-0}" != "1" ]]; then
@@ -1096,6 +1178,176 @@ install_guardian_if_possible() {
   else
     log "Skipping guardian install: passwordless sudo is unavailable. Re-run with privileges when ready."
   fi
+}
+
+mintd_uid_in_range() {
+  local uid="$1"
+  [[ "$uid" =~ ^[0-9]+$ && "$uid" -ge 450 && "$uid" -le 499 ]]
+}
+
+ensure_mintd_service_account() {
+  if dscl . -read /Users/_pairling_mint >/dev/null 2>&1; then
+    local uid real
+    uid="$(dscl . -read /Users/_pairling_mint UniqueID | awk '{print $2}')"
+    real="$(dscl . -read /Users/_pairling_mint RealName 2>/dev/null | sed '1d;s/^ //')"
+    if ! mintd_uid_in_range "$uid"; then
+      log "Skipping mintd install: _pairling_mint UID $uid is outside 450-499." >&2
+      return 1
+    fi
+    if [[ "$real" != "Pairling Mint Broker" ]]; then
+      log "Skipping mintd install: _pairling_mint RealName is not Pairling Mint Broker." >&2
+      return 1
+    fi
+    return 0
+  fi
+  local uid=""
+  for candidate in $(seq 450 499); do
+    if ! dscl . -list /Users UniqueID | awk -v uid="$candidate" '$2 == uid {found=1} END {exit found ? 0 : 1}'; then
+      uid="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$uid" ]]; then
+    log "Skipping mintd install: no free macOS role-account UID in 450-499." >&2
+    return 1
+  fi
+  local pw
+  pw="$(uuidgen)-$(uuidgen)"
+  sudo sysadminctl -addUser _pairling_mint -fullName "Pairling Mint Broker" -UID "$uid" -GID 20 -shell /usr/bin/false -home /var/empty -password "$pw" -roleAccount >/dev/null
+  unset pw
+}
+
+install_mintd_if_possible() {
+  local rendered="$PLIST_BUILD_DIR/$PAIRLING_MINTD_LABEL.plist"
+  local mintd_secret="$MINTD_SECRET_DIR/client_secret.json"
+  if is_dry_run; then
+    log "dry-run: would install $PAIRLING_MINTD_LABEL when privileged setup is available"
+    return
+  fi
+  if ! sudo -n true >/dev/null 2>&1; then
+    log "Skipping mintd install: passwordless sudo is unavailable. Architecture A fallback remains available."
+    return
+  fi
+  if ! sudo test -f "$mintd_secret"; then
+    log "Skipping mintd install: OAuth client secret is not provisioned at $mintd_secret."
+    return
+  fi
+  ensure_mintd_service_account || return
+  sudo chmod 0600 "$mintd_secret"
+  sudo chown _pairling_mint:staff "$mintd_secret"
+  sudo install -d -m 0700 -o _pairling_mint -g staff "$MINTD_SECRET_DIR"
+  sudo install -d -m 0750 -o _pairling_mint -g staff "$MINTD_RUN_DIR"
+  sudo install -d -m 0750 -o _pairling_mint -g staff "$MINTD_LOGS_DIR"
+  sudo install -m 0755 -o root -g wheel "$CURRENT_LINK/connectd/pairling-tailnet-mintd" "$MINTD_SYSTEM_BINARY"
+  sudo cp "$rendered" "$MINTD_SYSTEM_PLIST"
+  sudo chown root:wheel "$MINTD_SYSTEM_PLIST"
+  sudo chmod 644 "$MINTD_SYSTEM_PLIST"
+  sudo launchctl bootout system "$MINTD_SYSTEM_PLIST" >/dev/null 2>&1 || true
+  sudo launchctl bootstrap system "$MINTD_SYSTEM_PLIST" >/dev/null 2>&1 || true
+  sudo launchctl kickstart -k "system/$PAIRLING_MINTD_LABEL"
+}
+
+enable_silent_join() {
+  local client_secret_path=""
+  local assume_yes="0"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --client-secret) shift; client_secret_path="${1:-}" ;;
+      --yes) assume_yes="1" ;;
+      --help|-h) log "usage: pairling enable-silent-join [--client-secret PATH] [--yes]"; return 0 ;;
+      *) log "usage: pairling enable-silent-join [--client-secret PATH] [--yes]" >&2; exit 2 ;;
+    esac
+    shift
+  done
+
+  if is_dry_run; then
+    log "dry-run: would explain the mint broker, request one-time consent, and install $PAIRLING_MINTD_LABEL under interactive sudo"
+    return 0
+  fi
+
+  if [[ ! -x "$CURRENT_LINK/connectd/pairling-tailnet-mintd" ]]; then
+    log "ERROR: the mint broker binary is not staged. Run 'pairling setup' first." >&2
+    exit 1
+  fi
+
+  cat <<EOF
+
+Enable silent tailnet join (Architecture B)
+-------------------------------------------
+This installs a small background service, the mint broker ($PAIRLING_MINTD_LABEL).
+It runs under its own macOS account (_pairling_mint), not as the Pairling daemon
+and not as you. It holds your Tailscale OAuth client secret so the Pairling
+daemon never can: the daemon may ask it for one short-lived, single-use phone
+key per pairing, and nothing more.
+
+Installing a system service and a dedicated account needs administrator rights,
+so you approve this one time now. After that, every future pairing joins your
+tailnet silently, with no browser step.
+
+You provide a Tailscale OAuth client (scope auth_keys, tag tag:pairling-phone)
+that you create in your own Tailscale admin console. The secret is stored
+readable only by _pairling_mint, is never committed, and is never read by the
+Pairling daemon. If you skip this, pairing still works over the browser path
+(Architecture A); silent join stays off.
+
+EOF
+
+  local secret_json=""
+  if [[ -n "$client_secret_path" ]]; then
+    [[ -f "$client_secret_path" ]] || { log "ERROR: --client-secret file not found: $client_secret_path" >&2; exit 1; }
+    secret_json="$(cat "$client_secret_path")"
+  elif [[ -t 0 ]]; then
+    log "Paste the Tailscale OAuth client JSON (with client_id and client_secret), then press Ctrl-D:"
+    secret_json="$(cat)"
+  else
+    log "ERROR: no Tailscale OAuth client provided. Re-run with --client-secret PATH (a JSON file with client_id and client_secret)." >&2
+    exit 1
+  fi
+
+  if ! printf '%s' "$secret_json" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+sys.exit(0 if isinstance(d, dict) and d.get("client_id") and d.get("client_secret") else 1)' >/dev/null 2>&1; then
+    log "ERROR: the provided credential is not valid JSON with non-empty client_id and client_secret." >&2
+    exit 1
+  fi
+
+  if [[ "$assume_yes" != "1" ]]; then
+    if [[ ! -t 0 ]]; then
+      log "ERROR: enabling silent join needs explicit consent. Re-run with --yes to confirm." >&2
+      exit 1
+    fi
+    printf 'Install the mint broker and enable silent join now? [y/N] '
+    local reply=""
+    read -r reply
+    case "$reply" in
+      y|Y|yes|YES) : ;;
+      *) log "Silent join not enabled. Pairing continues over the browser path."; return 0 ;;
+    esac
+  fi
+
+  if ! sudo -v; then
+    log "Administrator approval was not granted. Silent join stays off; pairing still works over the browser path." >&2
+    exit 1
+  fi
+
+  local mintd_secret="$MINTD_SECRET_DIR/client_secret.json"
+  local tmp_secret
+  tmp_secret="$(mktemp)"
+  chmod 600 "$tmp_secret"
+  printf '%s' "$secret_json" > "$tmp_secret"
+  sudo install -d -m 0700 "$MINTD_SECRET_DIR"
+  sudo install -m 0600 "$tmp_secret" "$mintd_secret"
+  rm -f "$tmp_secret"
+
+  install_mintd_if_possible
+  if [[ ! -f "$MINTD_SYSTEM_PLIST" ]]; then
+    log "ERROR: the mint broker did not install. Silent join is not enabled; pairing still works over the browser path." >&2
+    exit 1
+  fi
+
+  render_plists
+  start_user_agent
+  log "Silent tailnet join is enabled. Run 'pairling pair --qr' to pair; future pairings join your tailnet with no browser step."
 }
 
 run_doctor() {
@@ -1131,6 +1383,7 @@ install_runtime() {
   log "  LaunchAgent: $PAIRLING_DAEMON_LABEL"
   log "  PTY Broker LaunchAgent: $PAIRLING_PTYBROKER_LABEL"
   log "  Connect LaunchAgent: $PAIRLING_CONNECTD_LABEL"
+  log "  Mint LaunchDaemon: $PAIRLING_MINTD_LABEL"
   log "  runtime port: $PAIRLING_RUNTIME_PORT"
   run_compile_checks
   run_psk_dependency_checks
@@ -1140,7 +1393,6 @@ install_runtime() {
   install_mcp_adapter_shim
   install_shell_wrapper
   render_plists
-  unload_legacy_daemon
   ensure_ptybroker_agent
   start_user_agent
   start_connectd_agent
@@ -1152,6 +1404,11 @@ install_runtime() {
     run_doctor || true
   fi
   log "Installed Pairling runtime $RELEASE_NAME"
+  if ! mintd_provisioned; then
+    log ""
+    log "Silent tailnet join (no browser step) is available but not yet enabled."
+    log "Turn it on once, using your own Tailscale account: pairling enable-silent-join"
+  fi
   if ! is_dry_run; then
     log ""
     if ! PAIRLING_CONNECTD_ROUTE_WAIT_SECONDS="${PAIRLING_CONNECTD_ROUTE_WAIT_SECONDS:-35}" pair_runtime --qr; then
@@ -1168,7 +1425,6 @@ status_runtime() {
 start_runtime() {
   ensure_state
   render_plists
-  unload_legacy_daemon
   ensure_ptybroker_agent
   start_user_agent
   start_connectd_agent
@@ -1176,6 +1432,7 @@ start_runtime() {
 }
 
 stop_runtime() {
+  stop_mintd_daemon
   stop_connectd_agent
   stop_user_agent
   log "Stopped $PAIRLING_DAEMON_LABEL"
@@ -1285,6 +1542,9 @@ mac_name = str(((payload.get("pair_service") or {}).get("txt") or {}).get("mac_n
 # payload — the secret never goes on the wire. Without it the phone falls back to the legacy
 # plaintext claim, so this field is the bridge that actually makes WS3 engage.
 mac_ake_pub = str(payload.get("mac_ake_pub") or (payload.get("claim") or {}).get("mac_ake_pub") or "")
+# The daemon computes pv authoritatively (3 when minting is enabled server-side,
+# 2 for PSK-only). Read it from the same top-level-or-claim shape as mac_ake_pub.
+claim_pv = str(payload.get("pv") or (payload.get("claim") or {}).get("pv") or "")
 
 def is_ats_local_ipv4(value: str) -> bool:
     try:
@@ -1404,9 +1664,15 @@ if pair_id and secret:
     if mac_ake_pub:
         # WS3: out-of-band delivery of the Mac ECDH key + protocol marker. The phone routes
         # to PSK-authenticated ECDH (secret never transmitted) when both are present; their
-        # absence is the legacy plaintext claim. pv=2 == PSK protocol version.
+        # absence is the legacy plaintext claim. pv=3 requests the B sealed-authkey
+        # extension when minting is available; pv=2 remains the PSK-only marker.
         pair_params["mac_ake_pub"] = mac_ake_pub
-        pair_params["pv"] = "2"
+        # Prefer the daemon's authoritative claim.pv so the QR can't downgrade to
+        # pv=2 when the CLI shell lacks PAIRLING_MINT_ENABLED (the daemon has the
+        # mint state, the CLI env may not). Fall back to the env marker only for a
+        # legacy daemon that does not advertise pv.
+        mint_enabled = os.environ.get("PAIRLING_MINT_ENABLED", "").strip().lower() in {"1", "true", "yes"}
+        pair_params["pv"] = claim_pv if claim_pv in {"2", "3"} else ("3" if mint_enabled else "2")
     if pair_route.get("source") == "pairling_connectd" and pair_route.get("status") == "ready":
         pair_params["route_source"] = "pairling_connectd"
         pair_params["route_status"] = "ready"
@@ -1417,6 +1683,15 @@ if pair_id and secret:
         pair_params["route_status"] = "degraded"
         pair_params["route_kind"] = str(pair_route.get("kind") or pair_route.get("source") or "local")
         pair_params["route_contract"] = "pairling-runtime-v1"
+    # D1: carry the silent-join capability so the phone can warn before the QR is
+    # consumed. Only emitted when unavailable (e.g. under tailnet lock); the iOS
+    # parser defaults to available when the param is absent.
+    claim_block = payload.get("claim") or {}
+    if claim_block.get("silent_join_available") is False:
+        pair_params["silent_join_available"] = "false"
+        reason = str(claim_block.get("silent_join_unavailable_reason") or "")
+        if reason:
+            pair_params["silent_join_unavailable_reason"] = reason
     manual = {
         "base_url": base_url,
         "pair_id": pair_id,
@@ -1715,6 +1990,7 @@ commands:
   rotate-token <device_id>
   logs
   diagnose --redact
+  enable-silent-join [--client-secret PATH] [--yes]
   uninstall
   rollback
 EOF
@@ -1755,6 +2031,9 @@ case "$cmd" in
     ;;
   pair)
     pair_runtime "$@"
+    ;;
+  enable-silent-join)
+    enable_silent_join "$@"
     ;;
   devices)
     devices_runtime

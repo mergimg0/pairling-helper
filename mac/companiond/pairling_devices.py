@@ -171,6 +171,7 @@ class DeviceRegistry:
             "device_display_name": "ALTER TABLE devices ADD COLUMN device_display_name TEXT",
             "superseded_by_device_id": "ALTER TABLE devices ADD COLUMN superseded_by_device_id TEXT",
             "proof_secret": "ALTER TABLE devices ADD COLUMN proof_secret TEXT",
+            "tailnet_node_id": "ALTER TABLE devices ADD COLUMN tailnet_node_id TEXT",
             # WS4: base64 X9.63 (uncompressed P-256 point) of the device's
             # Secure-Enclave public key, registered at first pair. Used to
             # verify zero-interaction re-pair challenge signatures.
@@ -360,6 +361,40 @@ class DeviceRegistry:
                 proof_secret=row["proof_secret"],
                 scopes=scopes,
             )
+
+    def tailnet_node_id(self, device_id: str) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT tailnet_node_id FROM devices WHERE device_id = ?",
+                (device_id,),
+            ).fetchone()
+            return None if row is None else row["tailnet_node_id"]
+
+    def set_tailnet_node_id_if_absent(self, device_id: str, node_id: str) -> bool:
+        node_id = str(node_id or "").strip()
+        if not device_id or not node_id:
+            return False
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE devices
+                SET tailnet_node_id = ?
+                WHERE device_id = ?
+                  AND revoked_at IS NULL
+                  AND (tailnet_node_id IS NULL OR tailnet_node_id = '')
+                """,
+                (node_id, device_id),
+            )
+            changed = cur.rowcount > 0
+            if changed:
+                self.record_audit(
+                    "device.tailnet_node_id.bound",
+                    device_id=device_id,
+                    outcome="ok",
+                    detail={"tailnet_node_id": node_id},
+                    conn=conn,
+                )
+            return changed
 
     def revoke_device(self, device_id: str, *, reason: str = "revoked") -> bool:
         with self.connect() as conn:

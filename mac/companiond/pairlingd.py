@@ -57,6 +57,7 @@ import copy
 import secrets
 import shlex
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -124,6 +125,23 @@ try:
 except Exception:
     RelayClaimVerifier = None
     relay_claims_required = None
+
+# Fail loud at boot: the PSK pair-claim path cannot carry a relay attested-claim
+# ticket, so a relay-required config breaks every PSK pairing with an
+# attested_claim_required 403, and the modern PSK-first client has no fallback.
+# Surface it at startup instead of silently at pair time. Default-off, so this
+# only fires on an explicit opt-in.
+if relay_claims_required is not None and relay_claims_required():
+    import sys as _sys
+    print(
+        "PAIRLING STARTUP WARNING: PAIRLING_RELAY_CLAIMS_REQUIRED is set, but "
+        "/pair/psk-claim cannot carry a relay attested-claim ticket. Every PSK "
+        "pairing will fail with attested_claim_required 403 and the PSK-first "
+        "client has no fallback. Disable relay-required pairing, or add ticket "
+        "support to the PSK claim path, before pairing over PSK.",
+        file=_sys.stderr,
+        flush=True,
+    )
 
 try:
     from push_dispatcher import PairlingPushDispatcher, PushDispatcherError
@@ -282,6 +300,8 @@ os.environ["PATH"] = (
 
 PORT = RUNTIME_PORT
 HOME = Path.home()
+MINT_SOCKET_PATH = "/Library/Application Support/Pairling/run/mintd/mintd.sock"
+MINT_ALERT_PATH = Path("/Library/Application Support/Pairling/run/mintd/alerts.jsonl")
 DEFAULT_COORDINATOR_HOST = (
     os.environ.get("PAIRLING_HOSTNAME")
     or os.environ.get("COMPANION_COORDINATOR_HOST")
@@ -882,9 +902,18 @@ def _is_pairdrop_path(path: str) -> bool:
     return path == "/pairdrop/events" or path.startswith("/pairdrop/")
 
 
-def _pairdrop_gateway_provenance_ok(headers) -> bool:
+def _pairdrop_gateway_provenance_ok(headers, client_address=None) -> bool:
     getter = headers.get if hasattr(headers, "get") else lambda key, default=None: default
-    return str(getter("X-Pairling-Connect-Gateway", "") or "") == "pairling-connectd"
+    header_ok = str(getter("X-Pairling-Connect-Gateway", "") or "") == "pairling-connectd"
+    if not header_ok:
+        return False
+    # The gateway header alone is spoofable, so in the default loopback-only bind
+    # also require the loopback hop from connectd. Under PAIRLING_BIND_MODE=all a
+    # direct-LAN client is non-loopback, so waive the loopback requirement there
+    # to avoid breaking that path.
+    if os.environ.get("PAIRLING_BIND_MODE", "loopback").strip().lower() == "all":
+        return True
+    return _loopback_client_address(client_address)
 
 
 def _is_pairdrop_mutation(path: str, method: str) -> bool:
@@ -988,6 +1017,54 @@ def _bearer_token(headers) -> str | None:
         token = auth[7:].strip()
         return token or None
     return None
+
+
+def _loopback_client_address(client_address) -> bool:
+    if not client_address:
+        return False
+    return str(client_address[0]) in ("127.0.0.1", "::1")
+
+
+def _funnel_origin_request(headers, client_address) -> bool:
+    """True only when a request bears connectd's funnel-origin marker AND arrives
+    over the loopback hop from connectd. The marker alone is spoofable, so the
+    loopback peer is required: the connectd-to-pairlingd hop is loopback and is
+    unreachable from the internet, so an internet client cannot forge the marker.
+    A funnel-enabled install uses this to hard-require App Attest (Increment 5)
+    and to refuse /pair/start for funnel-origin requests (Increment 4)."""
+    if not _loopback_client_address(client_address):
+        return False
+    getter = headers.get if hasattr(headers, "get") else lambda key, default=None: default
+    return str(getter("X-Pairling-Funnel-Origin", "") or "").strip() == "1"
+
+
+def _connectd_peer_node_id(headers) -> str:
+    getter = headers.get if hasattr(headers, "get") else lambda key, default=None: default
+    value = str(getter("X-Pairling-Peer-Node", "") or "").strip()
+    if not value or len(value) > 128:
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        return ""
+    return value
+
+
+def _maybe_persist_tailnet_node_id(headers, client_address, auth_result) -> bool:
+    if DEVICE_REGISTRY is None or auth_result is None or not getattr(auth_result, "ok", False):
+        return False
+    device_id = str(getattr(auth_result, "device_id", "") or "").strip()
+    if not device_id:
+        return False
+    if not _loopback_client_address(client_address):
+        return False
+    if not _pairdrop_gateway_provenance_ok(headers, client_address):
+        return False
+    node_id = _connectd_peer_node_id(headers)
+    if not node_id:
+        return False
+    try:
+        return bool(DEVICE_REGISTRY.set_tailnet_node_id_if_absent(device_id, node_id))
+    except Exception:
+        return False
 
 
 def _auth_cache_key(token: str, *, method: str, path: str, required_scopes: set[str]) -> tuple | None:
@@ -2064,6 +2141,81 @@ def _lan_ips(power_state: dict | None = None) -> list[str]:
     return _cached_probe("lan_ips", _HEALTH_PROBE_CACHE_SECONDS, _probe_lan_ips)
 
 
+def _mint_phone_authkey(pair_id: str) -> dict | None:
+    if not _pairling_mint_enabled():
+        return None
+    path = os.environ.get("PAIRLING_MINT_SOCKET") or MINT_SOCKET_PATH
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(float(os.environ.get("PAIRLING_MINT_TIMEOUT_SECONDS", "0.8")))
+            sock.connect(path)
+            sock.sendall(json.dumps({"op": "mint_phone_key", "pair_id": pair_id}).encode("utf-8") + b"\n")
+            with sock.makefile("rb") as fh:
+                raw = fh.readline(8192)
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return None
+    key = str(payload.get("authkey") or "")
+    if not key:
+        return None
+    try:
+        expires_at = int(payload.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        expires_at = 0
+    return {
+        "authkey": key,
+        "key_id": payload.get("key_id"),
+        "expires_at": expires_at,
+    }
+
+
+def _pairling_mint_enabled() -> bool:
+    return os.environ.get("PAIRLING_MINT_ENABLED", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _silent_join_capability(mint_enabled: bool, connectd_status: dict | None) -> tuple[bool, str]:
+    """D1: whether a cellular/funnel phone can complete a silent join. Minting must
+    be enabled, and the tailnet must not be under network lock (mintd refuses to
+    mint under lock, mintd.go:165-171). Pure, so the phone is told up front."""
+    if not mint_enabled:
+        return False, "mint_disabled"
+    if connectd_status and connectd_status.get("tailnet_lock_enabled"):
+        return False, "tailnet_lock"
+    return True, ""
+
+
+def _mintd_alert_snapshot(limit: int = 5) -> list[dict]:
+    path = Path(os.environ.get("PAIRLING_MINT_ALERT_PATH") or MINT_ALERT_PATH)
+    try:
+        lines = path.read_text().splitlines()
+    except Exception:
+        return []
+    allowed = {"event", "ts", "pair_id", "key_id", "uid", "window"}
+    alerts: list[dict] = []
+    for line in lines[-max(1, limit):]:
+        try:
+            item = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(item, dict):
+            continue
+        sanitized = {key: item[key] for key in allowed if key in item}
+        if sanitized:
+            alerts.append(sanitized)
+    return alerts
+
+
+def _attach_mintd_alerts(coordinator: dict) -> dict:
+    alerts = _mintd_alert_snapshot()
+    if not alerts:
+        return coordinator
+    out = dict(coordinator)
+    out["mintd_alerts"] = alerts
+    return out
+
+
 def _guardian_listener_entries(power_state: dict | None) -> list[str]:
     if not isinstance(power_state, dict):
         return []
@@ -2440,6 +2592,7 @@ def _health_payload(full_power: bool = False, authenticated: bool = False, auth_
     if connect.get("summary") is not None:
         coordinator = dict(coordinator)
         coordinator["pairling_connect"] = connect["summary"]
+    coordinator = _attach_mintd_alerts(coordinator)
     routes = _health_routes(coordinator, power_state)
     ok = coordinator.get("posture") in ("ready", "warning")
     runtime_info = _runtime_info_snapshot()
@@ -2505,6 +2658,7 @@ def _mac_health_alert_snapshot() -> dict:
     coordinator = _apply_pairling_connect_posture(
         coordinator, _normalize_guardian_state(state), _pairling_connect_health()
     )
+    coordinator = _attach_mintd_alerts(coordinator)
     return {
         "ok": coordinator.get("posture") in ("ready", "warning"),
         "schema_version": 1,
@@ -7302,7 +7456,7 @@ class Handler(BaseHTTPRequestHandler):
             }, status=401)
             return
 
-        if _is_pairdrop_path(u.path) and not _pairdrop_gateway_provenance_ok(self.headers):
+        if _is_pairdrop_path(u.path) and not _pairdrop_gateway_provenance_ok(self.headers, self.client_address):
             admission.release()
             self._send_json({
                 "ok": False,
@@ -7358,6 +7512,9 @@ class Handler(BaseHTTPRequestHandler):
                 }, status=proof_result.status)
                 return
 
+        if self.pairling_auth is not None:
+            _maybe_persist_tailnet_node_id(self.headers, self.client_address, self.pairling_auth)
+
         if self.pairling_auth is not None and _is_high_risk_endpoint(u.path) and DEVICE_REGISTRY is not None:
             max_per_min = _rate_limit_for_high_risk_endpoint(u.path)
             allowed, retry = _request_rate_check(f"{self.pairling_auth.device_id}:{u.path}", max_per_min=max_per_min)
@@ -7393,7 +7550,13 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == "/manifest":
                 self._handle_manifest(q)
             elif u.path == "/pair/start":
-                self._handle_pair_start(q)
+                if _funnel_origin_request(self.headers, self.client_address):
+                    # Belt-and-suspenders: /pair/start returns the 192-bit secret
+                    # in plaintext and must never be served to a funnel-origin
+                    # request, even if connectd's allowlist ever drifted.
+                    self._send_json({"ok": False, "error": {"code": "funnel_forbidden", "message": "pair start is not available over funnel"}}, status=403)
+                else:
+                    self._handle_pair_start(q)
             elif u.path == "/pair/claim":
                 self._handle_pair_claim(q)
             elif u.path == "/pair/psk-claim":
@@ -8043,8 +8206,13 @@ class Handler(BaseHTTPRequestHandler):
                 },
             }, status=503)
             return
-        # P0-B: rate-limit unauthenticated pair starts per source IP so an
-        # on-LAN attacker cannot mint a flood of invitations.
+        # Rate-limit pair starts. NOTE: self.client_address[0] is the loopback
+        # peer for any request proxied through connectd (the upstream is
+        # 127.0.0.1), so this is a GLOBAL circuit breaker, not a per-source-IP
+        # defense. /pair/start is loopback-only today (connectd denies it at the
+        # gateway), so only local callers reach it. Real per-client throttling for
+        # the public funnel path is owned by connectd (see the funnel-hardening
+        # plan, Increment 2); do not rely on this key for per-attacker isolation.
         allowed, retry_after = _request_rate_check(
             f"pair_start:{self.client_address[0]}", max_per_min=5
         )
@@ -8068,6 +8236,15 @@ class Handler(BaseHTTPRequestHandler):
                 else {"ok": False, "reason": "advertiser_unavailable"}
             )
             pairling_connect_routes = self._pairling_connect_routes()
+            connectd_status = {}
+            if fetch_connectd_status is not None:
+                try:
+                    connectd_status = fetch_connectd_status(timeout_seconds=0.7) or {}
+                except Exception:
+                    connectd_status = {}
+            silent_join_available, silent_join_reason = _silent_join_capability(
+                _pairling_mint_enabled(), connectd_status
+            )
         except ValueError as exc:
             self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
             return
@@ -8094,7 +8271,9 @@ class Handler(BaseHTTPRequestHandler):
                 "pairing_nonce": started.pairing_nonce,
                 "attest_challenge": started.attest_challenge,
                 "mac_ake_pub": started.mac_ake_pub,
-                "pv": "2" if started.mac_ake_pub else "1",
+                "pv": "3" if started.mac_ake_pub and _pairling_mint_enabled() else "2" if started.mac_ake_pub else "1",
+                "silent_join_available": silent_join_available,
+                "silent_join_unavailable_reason": silent_join_reason,
             },
         })
 
@@ -8182,6 +8361,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             payload = self._read_json_object()
             host_chain = self._pairing_host_chain()
+            funnel_origin = _funnel_origin_request(self.headers, self.client_address)
             claim, k_token, aad, mac_confirm = PAIRING_STORE.psk_claim_pair(
                 pair_id=str(payload.get("pair_id") or ""),
                 b_pub_b64=str(payload.get("b_pub") or ""),
@@ -8196,8 +8376,72 @@ class Handler(BaseHTTPRequestHandler):
                 relay_device_id=payload.get("relay_device_id"),
                 relay_required=bool(relay_claims_required and relay_claims_required()),
                 relay_claim_verifier=RELAY_CLAIM_VERIFIER,
+                funnel_origin=funnel_origin,
             )
             nonce, enc_token = PAIRING_STORE.seal_psk_token(k_token, claim.device.token, aad)
+            # Seal proof_secret (the request-proof HMAC key) under K_token for
+            # clients that can unseal it, so it never crosses a plaintext transport
+            # in the clear. The bearer token is already sealed; proof_secret was
+            # not, which leaked it to a passive sniffer on the LAN path. Back-compat:
+            # a client that does not send seal_proof_secret still receives the
+            # cleartext field in the response below.
+            seal_proof = bool(payload.get("seal_proof_secret"))
+            proof_secret_nonce = None
+            enc_proof_secret = None
+            if seal_proof:
+                proof_secret_aad = aad + b"\npairling.psk.proof_secret.v1"
+                proof_secret_nonce, enc_proof_secret = PAIRING_STORE.seal_psk_token(
+                    k_token, claim.device.proof_secret, proof_secret_aad
+                )
+            try:
+                protocol_version = int(payload.get("pv") or 0)
+            except (TypeError, ValueError):
+                protocol_version = 0
+            # Increment 5: validate pv to the known set and gate the mint. A
+            # funnel-origin claim mints only with a verified App Attest, so a
+            # script holding a stolen secret cannot obtain a tagged auth key.
+            if protocol_version not in (1, 2, 3):
+                protocol_version = 0
+            mint_allowed = protocol_version >= 3 and (
+                not funnel_origin or claim.direct_attestation_verified
+            )
+            tailnet_authkey = _mint_phone_authkey(str(payload.get("pair_id") or "")) if mint_allowed else None
+            authkey_nonce = None
+            enc_authkey = None
+            if tailnet_authkey:
+                authkey_aad = aad + b"\npairling.psk.enc_authkey.v1"
+                authkey_nonce, enc_authkey = PAIRING_STORE.seal_psk_token(
+                    k_token,
+                    str(tailnet_authkey.get("authkey") or ""),
+                    authkey_aad,
+                )
+                if funnel_origin:
+                    # Operator visibility: a remote, funnel-origin join has no
+                    # proximity backstop, so make it loud and auditable, and push a
+                    # revoke prompt to the already-paired devices (D4).
+                    try:
+                        import sys as _sys
+                        _sys.stderr.write(
+                            "PAIRLING FUNNEL JOIN: a remote device paired over Funnel "
+                            f"(device_id={claim.device.device_id}); no proximity backstop, "
+                            "review and revoke if unexpected.\n"
+                        )
+                        _sys.stderr.flush()
+                    except Exception:
+                        pass
+                    if PUSH_DISPATCHER is not None:
+                        try:
+                            PUSH_DISPATCHER.broadcast_alert(
+                                exclude_device_id=claim.device.device_id,
+                                event_id=f"funnel_join:{claim.device.device_id}",
+                                kind="remote_join",
+                                route="pairling-connect",
+                                title="New device paired remotely",
+                                body="A device joined your Mac over the internet. Tap to review or revoke.",
+                                pairling_extra={"device_id": claim.device.device_id, "revoke_path": "/pair/revoke"},
+                            )
+                        except Exception:
+                            pass
             if PAIRING_ADVERTISER is not None:
                 PAIRING_ADVERTISER.stop()
         except PairingError as exc:
@@ -8211,15 +8455,20 @@ class Handler(BaseHTTPRequestHandler):
             route.get("source") == "pairling_connectd" and route.get("status") == "ready"
             for route in runtime_routes
         ) else "http-local"
-        self._send_json({
+        device_block = {
+            "id": claim.device.device_id,
+            "scopes": list(claim.device.scopes),
+            "relay_device_id": claim.relay_device_id,
+            "attestation_status": claim.attestation_status,
+        }
+        if seal_proof and enc_proof_secret is not None and proof_secret_nonce is not None:
+            device_block["enc_proof_secret"] = base64.b64encode(enc_proof_secret).decode("ascii")
+            device_block["proof_secret_nonce"] = base64.b64encode(proof_secret_nonce).decode("ascii")
+        else:
+            device_block["proof_secret"] = claim.device.proof_secret
+        response = {
             "ok": True,
-            "device": {
-                "id": claim.device.device_id,
-                "proof_secret": claim.device.proof_secret,
-                "scopes": list(claim.device.scopes),
-                "relay_device_id": claim.relay_device_id,
-                "attestation_status": claim.attestation_status,
-            },
+            "device": device_block,
             "enc_token": base64.b64encode(enc_token).decode("ascii"),
             "nonce": base64.b64encode(nonce).decode("ascii"),
             "mac_confirm": base64.b64encode(mac_confirm).decode("ascii"),
@@ -8231,7 +8480,11 @@ class Handler(BaseHTTPRequestHandler):
                 "transport": transport,
                 "routes": runtime_routes,
             },
-        })
+        }
+        if authkey_nonce and enc_authkey:
+            response["enc_authkey"] = base64.b64encode(enc_authkey).decode("ascii")
+            response["authkey_nonce"] = base64.b64encode(authkey_nonce).decode("ascii")
+        self._send_json(response)
 
     def _handle_pair_reauth_challenge(self, q):
         if REAUTH_STORE is None:

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -23,6 +25,8 @@ import (
 	"dev.pairling/connectd/internal/gateway"
 	runtimecfg "dev.pairling/connectd/internal/runtime"
 	"dev.pairling/connectd/internal/status"
+	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 )
 
@@ -37,7 +41,7 @@ func run(args []string) int {
 	home, _ := os.UserHomeDir()
 	appSupport := runtimecfg.DefaultAppSupportRoot(home)
 	defaultStateDir := runtimecfg.DefaultStateDir(home)
-	defaultHostname := runtimecfg.HostnameFromInstallID(runtimecfg.LoadInstallID(appSupport))
+	defaultHostname := runtimecfg.StableHostname(appSupport, defaultStateDir)
 
 	upstreamRaw := fs.String("upstream", "http://127.0.0.1:7773", "Pairling daemon upstream URL")
 	listenAddr := fs.String("listen", ":7773", "tailnet-only service listen address")
@@ -52,6 +56,12 @@ func run(args []string) int {
 	// expiry disabled — no 180-day re-auth cliff, no per-node REST call.
 	// Empty keeps the legacy interactive browser-auth path (back-compat).
 	authKeyTag := fs.String("auth-key-tag", defaultAuthKeyTag(), "tag applied to this node when registering with an auth key")
+	funnelDefault := false
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("PAIRLING_CONNECT_FUNNEL"))) {
+	case "1", "true", "on", "yes":
+		funnelDefault = true
+	}
+	funnelEnabled := fs.Bool("funnel", funnelDefault, "expose a public Tailscale Funnel listener for the pre-pair bootstrap claim (off by default)")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -115,6 +125,9 @@ func run(args []string) int {
 		Mode:         gateway.ExposureModePairlingConnect,
 		Logger:       gatewayLogger{store: statusStore},
 		RateLimiter:  gateway.NewMemoryRateLimiter(20, 5*time.Minute),
+		PeerNodeResolver: tailscalePeerNodeResolver{localClient: func() (whoIsClient, error) {
+			return srv.LocalClient()
+		}},
 	})
 	if err != nil {
 		log.Printf("cannot create gateway: %v", err)
@@ -131,6 +144,61 @@ func run(args []string) int {
 	statusStore.SetListenerRunning(true)
 	go monitorTailnetIPs(ctx, srv, statusStore)
 
+	// Increment 1: optional public Funnel listener for the pre-pair bootstrap
+	// claim, off by default. A SEPARATE handler in ExposureModeFunnelBootstrap,
+	// never the tailnet pairling_connect handler, so the bearer post-pair surface
+	// is structurally unreachable over Funnel. A failure to open is logged and
+	// recorded but does not bring down the tailnet listener.
+	// Increment 8: PSK-required boot precondition. On a funnel-enabled install the
+	// legacy plaintext /pair/claim must be impossible, so refuse to open the
+	// public listener unless PSK is required (the daemon default). A PSK-off
+	// misconfiguration would otherwise risk a secret-on-the-wire claim path.
+	pskRequired := true
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("PAIRLING_PSK_REQUIRED"))) {
+	case "0", "false", "no", "off":
+		pskRequired = false
+	}
+	if *funnelEnabled && !pskRequired {
+		log.Printf("refusing to open funnel listener: PAIRLING_PSK_REQUIRED must be on for a funnel-enabled install")
+	}
+	var funnelServer *http.Server
+	if *funnelEnabled && pskRequired {
+		funnelMacIDHash := ""
+		if id := strings.TrimSpace(runtimecfg.LoadInstallID(appSupport)); id != "" {
+			sum := sha256.Sum256([]byte(id))
+			funnelMacIDHash = hex.EncodeToString(sum[:])
+		}
+		funnelHandler, ferr := gateway.NewHandler(gateway.Options{
+			Upstream:        upstream,
+			MaxBodyBytes:    *maxBodyBytes,
+			Mode:            gateway.ExposureModeFunnelBootstrap,
+			Logger:          gatewayLogger{store: statusStore},
+			FunnelLimiter:   gateway.NewFunnelLimiter(120, 5, 6),
+			FunnelMacIDHash: funnelMacIDHash,
+		})
+		if ferr != nil {
+			log.Printf("cannot create funnel gateway: %v", ferr)
+			return 1
+		}
+		funnelLn, ferr := srv.ListenFunnel("tcp", ":443", tsnet.FunnelOnly())
+		if ferr != nil {
+			statusStore.SetLastError(ferr.Error())
+			log.Printf("cannot start funnel listener: %v", ferr)
+		} else {
+			funnelServer = &http.Server{Handler: funnelHandler, ReadHeaderTimeout: 10 * time.Second}
+			if domains := srv.CertDomains(); len(domains) > 0 {
+				statusStore.SetFunnelHostname(domains[0])
+				log.Printf("pairling-connectd funnel listener open host=%s", domains[0])
+			}
+			go func() {
+				if serr := funnelServer.Serve(funnelLn); serr != nil && !errors.Is(serr, http.ErrServerClosed) {
+					statusStore.SetLastError(serr.Error())
+					log.Printf("funnel server stopped: %v", serr)
+				}
+			}()
+		}
+	}
+
 	log.Printf("pairling-connectd hostname=%s state_dir=%s listen=%s upstream=%s status=%s", *hostname, *stateDir, *listenAddr, upstream.String(), *statusAddr)
 	server := &http.Server{
 		Handler:           handler,
@@ -145,6 +213,7 @@ func run(args []string) int {
 	select {
 	case <-ctx.Done():
 		shutdownHTTPServer(server)
+		shutdownHTTPServer(funnelServer)
 		return 0
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -366,12 +435,28 @@ func monitorTailnetIPs(ctx context.Context, srv *tsnet.Server, store *status.Sto
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	update := func() {
+		identity := NodeIdentity{}
+		if lc, err := srv.LocalClient(); err == nil {
+			if lock, err := lc.NetworkLockStatus(ctx); err == nil {
+				store.SetTailnetLockEnabled(lock.Enabled)
+			}
+			if st, err := lc.StatusWithoutPeers(ctx); err == nil {
+				identity = nodeIdentityFromStatus(st)
+				store.SetTailnetIdentity(identity.NodeID, identity.Tags, identity.TailnetIPs)
+			}
+		}
+		if len(identity.TailnetIPs) > 0 {
+			store.SetTailnetIP(identity.TailnetIPs[0])
+			store.SetAuthenticated()
+			return
+		}
 		ip4, _ := srv.TailscaleIPs()
 		if ip4.IsValid() {
 			store.SetTailnetIP(ip4.String())
 			store.SetAuthenticated()
 			return
 		}
+		store.SetTailnetIdentity("", nil, nil)
 		store.SetAuthPending("")
 	}
 	update()
@@ -383,4 +468,68 @@ func monitorTailnetIPs(ctx context.Context, srv *tsnet.Server, store *status.Sto
 			update()
 		}
 	}
+}
+
+type NodeIdentity struct {
+	NodeID     string
+	Tags       []string
+	TailnetIPs []string
+}
+
+type whoIsClient interface {
+	WhoIs(ctx context.Context, remoteAddr string) (*apitype.WhoIsResponse, error)
+}
+
+type tailscalePeerNodeResolver struct {
+	localClient func() (whoIsClient, error)
+}
+
+func (r tailscalePeerNodeResolver) PeerNodeID(ctx context.Context, remoteAddr string) (string, bool) {
+	if r.localClient == nil {
+		return "", false
+	}
+	lc, err := r.localClient()
+	if err != nil || lc == nil {
+		return "", false
+	}
+	who, err := lc.WhoIs(ctx, remoteAddr)
+	if err != nil {
+		return "", false
+	}
+	return peerNodeIDFromWhoIs(who)
+}
+
+func peerNodeIDFromWhoIs(who *apitype.WhoIsResponse) (string, bool) {
+	if who == nil || who.Node == nil {
+		return "", false
+	}
+	nodeID := strings.TrimSpace(string(who.Node.StableID))
+	if nodeID == "" {
+		return "", false
+	}
+	for _, tag := range who.Node.Tags {
+		if tag == "tag:pairling-phone" {
+			return nodeID, true
+		}
+	}
+	return "", false
+}
+
+func nodeIdentityFromStatus(st *ipnstate.Status) NodeIdentity {
+	if st == nil || st.Self == nil {
+		return NodeIdentity{}
+	}
+	self := st.Self
+	identity := NodeIdentity{NodeID: string(self.ID)}
+	if self.Tags != nil {
+		for _, tag := range self.Tags.All() {
+			identity.Tags = append(identity.Tags, tag)
+		}
+	}
+	for _, ip := range self.TailscaleIPs {
+		if ip.IsValid() {
+			identity.TailnetIPs = append(identity.TailnetIPs, ip.String())
+		}
+	}
+	return identity
 }
