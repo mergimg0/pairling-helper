@@ -300,8 +300,6 @@ os.environ["PATH"] = (
 
 PORT = RUNTIME_PORT
 HOME = Path.home()
-MINT_SOCKET_PATH = "/Library/Application Support/Pairling/run/mintd/mintd.sock"
-MINT_ALERT_PATH = Path("/Library/Application Support/Pairling/run/mintd/alerts.jsonl")
 DEFAULT_COORDINATOR_HOST = (
     os.environ.get("PAIRLING_HOSTNAME")
     or os.environ.get("COMPANION_COORDINATOR_HOST")
@@ -2141,81 +2139,6 @@ def _lan_ips(power_state: dict | None = None) -> list[str]:
     return _cached_probe("lan_ips", _HEALTH_PROBE_CACHE_SECONDS, _probe_lan_ips)
 
 
-def _mint_phone_authkey(pair_id: str) -> dict | None:
-    if not _pairling_mint_enabled():
-        return None
-    path = os.environ.get("PAIRLING_MINT_SOCKET") or MINT_SOCKET_PATH
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(float(os.environ.get("PAIRLING_MINT_TIMEOUT_SECONDS", "0.8")))
-            sock.connect(path)
-            sock.sendall(json.dumps({"op": "mint_phone_key", "pair_id": pair_id}).encode("utf-8") + b"\n")
-            with sock.makefile("rb") as fh:
-                raw = fh.readline(8192)
-        payload = json.loads(raw.decode("utf-8"))
-    except Exception:
-        return None
-    if not isinstance(payload, dict) or not payload.get("ok"):
-        return None
-    key = str(payload.get("authkey") or "")
-    if not key:
-        return None
-    try:
-        expires_at = int(payload.get("expires_at") or 0)
-    except (TypeError, ValueError):
-        expires_at = 0
-    return {
-        "authkey": key,
-        "key_id": payload.get("key_id"),
-        "expires_at": expires_at,
-    }
-
-
-def _pairling_mint_enabled() -> bool:
-    return os.environ.get("PAIRLING_MINT_ENABLED", "").strip().lower() in {"1", "true", "yes"}
-
-
-def _silent_join_capability(mint_enabled: bool, connectd_status: dict | None) -> tuple[bool, str]:
-    """D1: whether a cellular/funnel phone can complete a silent join. Minting must
-    be enabled, and the tailnet must not be under network lock (mintd refuses to
-    mint under lock, mintd.go:165-171). Pure, so the phone is told up front."""
-    if not mint_enabled:
-        return False, "mint_disabled"
-    if connectd_status and connectd_status.get("tailnet_lock_enabled"):
-        return False, "tailnet_lock"
-    return True, ""
-
-
-def _mintd_alert_snapshot(limit: int = 5) -> list[dict]:
-    path = Path(os.environ.get("PAIRLING_MINT_ALERT_PATH") or MINT_ALERT_PATH)
-    try:
-        lines = path.read_text().splitlines()
-    except Exception:
-        return []
-    allowed = {"event", "ts", "pair_id", "key_id", "uid", "window"}
-    alerts: list[dict] = []
-    for line in lines[-max(1, limit):]:
-        try:
-            item = json.loads(line)
-        except Exception:
-            continue
-        if not isinstance(item, dict):
-            continue
-        sanitized = {key: item[key] for key in allowed if key in item}
-        if sanitized:
-            alerts.append(sanitized)
-    return alerts
-
-
-def _attach_mintd_alerts(coordinator: dict) -> dict:
-    alerts = _mintd_alert_snapshot()
-    if not alerts:
-        return coordinator
-    out = dict(coordinator)
-    out["mintd_alerts"] = alerts
-    return out
-
-
 def _guardian_listener_entries(power_state: dict | None) -> list[str]:
     if not isinstance(power_state, dict):
         return []
@@ -2592,7 +2515,6 @@ def _health_payload(full_power: bool = False, authenticated: bool = False, auth_
     if connect.get("summary") is not None:
         coordinator = dict(coordinator)
         coordinator["pairling_connect"] = connect["summary"]
-    coordinator = _attach_mintd_alerts(coordinator)
     routes = _health_routes(coordinator, power_state)
     ok = coordinator.get("posture") in ("ready", "warning")
     runtime_info = _runtime_info_snapshot()
@@ -2658,7 +2580,6 @@ def _mac_health_alert_snapshot() -> dict:
     coordinator = _apply_pairling_connect_posture(
         coordinator, _normalize_guardian_state(state), _pairling_connect_health()
     )
-    coordinator = _attach_mintd_alerts(coordinator)
     return {
         "ok": coordinator.get("posture") in ("ready", "warning"),
         "schema_version": 1,
@@ -8236,15 +8157,6 @@ class Handler(BaseHTTPRequestHandler):
                 else {"ok": False, "reason": "advertiser_unavailable"}
             )
             pairling_connect_routes = self._pairling_connect_routes()
-            connectd_status = {}
-            if fetch_connectd_status is not None:
-                try:
-                    connectd_status = fetch_connectd_status(timeout_seconds=0.7) or {}
-                except Exception:
-                    connectd_status = {}
-            silent_join_available, silent_join_reason = _silent_join_capability(
-                _pairling_mint_enabled(), connectd_status
-            )
         except ValueError as exc:
             self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
             return
@@ -8271,9 +8183,7 @@ class Handler(BaseHTTPRequestHandler):
                 "pairing_nonce": started.pairing_nonce,
                 "attest_challenge": started.attest_challenge,
                 "mac_ake_pub": started.mac_ake_pub,
-                "pv": "3" if started.mac_ake_pub and _pairling_mint_enabled() else "2" if started.mac_ake_pub else "1",
-                "silent_join_available": silent_join_available,
-                "silent_join_unavailable_reason": silent_join_reason,
+                "pv": "2" if started.mac_ake_pub else "1",
             },
         })
 
@@ -8393,55 +8303,6 @@ class Handler(BaseHTTPRequestHandler):
                 proof_secret_nonce, enc_proof_secret = PAIRING_STORE.seal_psk_token(
                     k_token, claim.device.proof_secret, proof_secret_aad
                 )
-            try:
-                protocol_version = int(payload.get("pv") or 0)
-            except (TypeError, ValueError):
-                protocol_version = 0
-            # Increment 5: validate pv to the known set and gate the mint. A
-            # funnel-origin claim mints only with a verified App Attest, so a
-            # script holding a stolen secret cannot obtain a tagged auth key.
-            if protocol_version not in (1, 2, 3):
-                protocol_version = 0
-            mint_allowed = protocol_version >= 3 and (
-                not funnel_origin or claim.direct_attestation_verified
-            )
-            tailnet_authkey = _mint_phone_authkey(str(payload.get("pair_id") or "")) if mint_allowed else None
-            authkey_nonce = None
-            enc_authkey = None
-            if tailnet_authkey:
-                authkey_aad = aad + b"\npairling.psk.enc_authkey.v1"
-                authkey_nonce, enc_authkey = PAIRING_STORE.seal_psk_token(
-                    k_token,
-                    str(tailnet_authkey.get("authkey") or ""),
-                    authkey_aad,
-                )
-                if funnel_origin:
-                    # Operator visibility: a remote, funnel-origin join has no
-                    # proximity backstop, so make it loud and auditable, and push a
-                    # revoke prompt to the already-paired devices (D4).
-                    try:
-                        import sys as _sys
-                        _sys.stderr.write(
-                            "PAIRLING FUNNEL JOIN: a remote device paired over Funnel "
-                            f"(device_id={claim.device.device_id}); no proximity backstop, "
-                            "review and revoke if unexpected.\n"
-                        )
-                        _sys.stderr.flush()
-                    except Exception:
-                        pass
-                    if PUSH_DISPATCHER is not None:
-                        try:
-                            PUSH_DISPATCHER.broadcast_alert(
-                                exclude_device_id=claim.device.device_id,
-                                event_id=f"funnel_join:{claim.device.device_id}",
-                                kind="remote_join",
-                                route="pairling-connect",
-                                title="New device paired remotely",
-                                body="A device joined your Mac over the internet. Tap to review or revoke.",
-                                pairling_extra={"device_id": claim.device.device_id, "revoke_path": "/pair/revoke"},
-                            )
-                        except Exception:
-                            pass
             if PAIRING_ADVERTISER is not None:
                 PAIRING_ADVERTISER.stop()
         except PairingError as exc:
@@ -8481,9 +8342,6 @@ class Handler(BaseHTTPRequestHandler):
                 "routes": runtime_routes,
             },
         }
-        if authkey_nonce and enc_authkey:
-            response["enc_authkey"] = base64.b64encode(enc_authkey).decode("ascii")
-            response["authkey_nonce"] = base64.b64encode(authkey_nonce).decode("ascii")
         self._send_json(response)
 
     def _handle_pair_reauth_challenge(self, q):

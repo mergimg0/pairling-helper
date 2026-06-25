@@ -11,6 +11,11 @@ USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_DAEMON_LABEL.plist"
 CONNECTD_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_CONNECTD_LABEL.plist"
 PTYBROKER_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_PTYBROKER_LABEL.plist"
 SYSTEM_PLIST="/Library/LaunchDaemons/$PAIRLING_GUARDIAN_LABEL.plist"
+# Legacy: the silent-join mint broker, removed from the product. Torn down below.
+MINTD_SYSTEM_LABEL="dev.pairling.mintd"
+MINTD_SYSTEM_PLIST="/Library/LaunchDaemons/$MINTD_SYSTEM_LABEL.plist"
+MINTD_SYSTEM_DIR="/Library/Application Support/Pairling/mint"
+MINTD_SERVICE_ACCOUNT="_pairling_mint"
 YES="false"
 DELETE_STATE="false"
 DELETE_LOGS="false"
@@ -98,6 +103,32 @@ bootout_system() {
   fi
 }
 
+# Legacy teardown: the silent-join mint broker (dev.pairling.mintd) was removed
+# from the product. Machines that ran the old `enable-silent-join` still carry a
+# root LaunchDaemon, a stored Tailscale OAuth secret under the system mint dir,
+# and the _pairling_mint role account. Remove all three. Best-effort, sudo-gated.
+teardown_legacy_mintd() {
+  if [[ ! -f "$MINTD_SYSTEM_PLIST" && ! -d "$MINTD_SYSTEM_DIR" ]] \
+     && ! id -u "$MINTD_SERVICE_ACCOUNT" >/dev/null 2>&1; then
+    return
+  fi
+  if is_dry_run; then
+    printf 'dry-run: would remove the legacy silent-join mint broker (%s, %s, user %s)\n' \
+      "$MINTD_SYSTEM_PLIST" "$MINTD_SYSTEM_DIR" "$MINTD_SERVICE_ACCOUNT"
+    return
+  fi
+  if sudo -n true >/dev/null 2>&1; then
+    sudo launchctl bootout "system/$MINTD_SYSTEM_LABEL" >/dev/null 2>&1 || true
+    sudo launchctl bootout system "$MINTD_SYSTEM_PLIST" >/dev/null 2>&1 || true
+    sudo rm -f "$MINTD_SYSTEM_PLIST"
+    sudo rm -rf "$MINTD_SYSTEM_DIR"
+    sudo /usr/sbin/sysadminctl -deleteUser "$MINTD_SERVICE_ACCOUNT" >/dev/null 2>&1 || true
+    printf 'Removed the legacy silent-join mint broker.\n'
+  else
+    printf 'Skipping legacy mint-broker removal: passwordless sudo is unavailable.\n' >&2
+  fi
+}
+
 confirm
 
 bootout_user "$PAIRLING_DAEMON_LABEL" "$USER_PLIST"
@@ -107,6 +138,7 @@ rm -f "$USER_PLIST"
 rm -f "$CONNECTD_USER_PLIST"
 rm -f "$PTYBROKER_USER_PLIST"
 bootout_system "$PAIRLING_GUARDIAN_LABEL" "$SYSTEM_PLIST"
+teardown_legacy_mintd
 
 rm -rf "$APP_SUPPORT/pair" 2>/dev/null || true
 

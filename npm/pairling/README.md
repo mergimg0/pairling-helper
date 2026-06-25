@@ -27,11 +27,11 @@ Then open Pairling on your iPhone and scan the QR code that `setup` prints.
 - Stages the runtime under `~/Library/Application Support/Pairling/runtime/`
   (versioned releases, atomic `current` symlink flip, `pairling rollback`).
 - Installs user-domain LaunchAgents (`dev.pairling.companiond`,
-  `dev.pairling.connectd`). No root. The optional power guardian and the
-  optional silent-join mint broker are separate, explicit, sudo-gated steps.
+  `dev.pairling.connectd`). No root. The optional power guardian is a separate,
+  explicit, sudo-gated step.
 - Verifies the payload against the package's integrity manifest and verifies
-  the Developer ID signature of the bundled `pairling-connectd` and
-  `pairling-tailnet-mintd` binaries before staging — fail closed.
+  the Developer ID signature of the bundled `pairling-connectd` binary before
+  staging — fail closed.
 
 ## Commands
 
@@ -51,9 +51,8 @@ pairling uninstall [--yes]
   appears in a published manifest.
 - **Provenance:** releases are published via npm Trusted Publishing (OIDC) with
   provenance attestations. Verify with `npm audit signatures`.
-- **Readable payload:** the runtime is Python/bash source plus two signed Go
-  binaries (`pairling-connectd` and the `pairling-tailnet-mintd` broker);
-  inspect it with `npm pack pairling --dry-run`.
+- **Readable payload:** the runtime is Python/bash source plus one signed Go
+  binary (`pairling-connectd`); inspect it with `npm pack pairling --dry-run`.
 - **Integrity chain:** CI records SHA-256 of every payload file in
   `payload-manifest.json`; `pairling setup` re-verifies before staging;
   `pairling doctor` re-verifies the staged runtime and the binary signature.
@@ -62,10 +61,10 @@ pairling uninstall [--yes]
 
 ## Platform packages
 
-The compiled runtime binaries (`pairling-connectd` and the optional
-`pairling-tailnet-mintd` silent-join broker) ship as platform-filtered optional
-dependencies: `@pairling/runtime-darwin-arm64` and `@pairling/runtime-darwin-x64`
-— signed, notarized, and hash-pinned by each package's integrity manifest.
+The compiled runtime binary (`pairling-connectd`) ships via platform-filtered
+optional dependencies: `@pairling/runtime-darwin-arm64` and
+`@pairling/runtime-darwin-x64` — signed, notarized, and hash-pinned by each
+package's integrity manifest.
 
 ## Links
 

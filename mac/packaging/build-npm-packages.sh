@@ -21,8 +21,6 @@ ALLOW_DIRTY="0"
 RELEASE_MODE="0"
 PREBUILT_ARM64=""
 PREBUILT_X64=""
-PREBUILT_MINTD_ARM64=""
-PREBUILT_MINTD_X64=""
 PREBUILT_PYTHON_ARM64=""
 PREBUILT_PYTHON_X64=""
 VENDOR_PYTHON="0"
@@ -45,8 +43,6 @@ Options:
   --prebuilt-arm64 PATH   Use an already-built/signed arm64 pairling-connectd
                           instead of building (CI assembly mode).
   --prebuilt-x64 PATH     Same for x64.
-  --prebuilt-mintd-arm64 PATH  Already-built/signed arm64 pairling-tailnet-mintd.
-  --prebuilt-mintd-x64 PATH    Same for x64.
   --allow-dirty           Permit a dirty source tree (dev builds only).
 
 Environment:
@@ -64,8 +60,6 @@ while [[ $# -gt 0 ]]; do
     --notarize) NOTARIZE="1"; shift ;;
     --prebuilt-arm64) PREBUILT_ARM64="${2:-}"; shift 2 ;;
     --prebuilt-x64) PREBUILT_X64="${2:-}"; shift 2 ;;
-    --prebuilt-mintd-arm64) PREBUILT_MINTD_ARM64="${2:-}"; shift 2 ;;
-    --prebuilt-mintd-x64) PREBUILT_MINTD_X64="${2:-}"; shift 2 ;;
     --prebuilt-python-arm64) PREBUILT_PYTHON_ARM64="${2:-}"; shift 2 ;;
     --prebuilt-python-x64) PREBUILT_PYTHON_X64="${2:-}"; shift 2 ;;
     --vendor-python) VENDOR_PYTHON="1"; shift ;;
@@ -107,7 +101,7 @@ fi
 
 if [[ "$RELEASE_MODE" == "1" ]]; then
   [[ "$SOURCE_DIRTY" == "false" || "$ALLOW_DIRTY" == "1" ]] || fail "source tree is dirty; commit first (or --allow-dirty for non-release builds)."
-  [[ -n "$SIGN_IDENTITY" && "$SIGN_IDENTITY" != "-" ]] || { [[ -n "$PREBUILT_ARM64" ]] && [[ -n "$PREBUILT_MINTD_ARM64" ]]; } || fail "--release requires PAIRLING_SIGN_IDENTITY (Developer ID) or prebuilt signed connectd AND mintd binaries."
+  [[ -n "$SIGN_IDENTITY" && "$SIGN_IDENTITY" != "-" ]] || [[ -n "$PREBUILT_ARM64" ]] || fail "--release requires PAIRLING_SIGN_IDENTITY (Developer ID) or prebuilt signed connectd binaries."
   # A release ships the vendored CPython (P3 custody) in the runtime packages.
   VENDOR_PYTHON="1"
   # Custody guard: CI has no Developer ID cert, so it MUST supply pre-signed
@@ -203,9 +197,6 @@ verify_prebuilt() {
 build_arch() {
   local goarch="$1" out="$2" pkg="${3:-./cmd/pairling-connectd}"
   local identifier="dev.pairling.connectd"
-  case "$pkg" in
-    *pairling-tailnet-mintd) identifier="dev.pairling.mintd" ;;
-  esac
   command -v go >/dev/null 2>&1 || fail "go toolchain is required to build $(basename "$pkg")"
   (
     cd "$REPO_ROOT/mac/connectd"
@@ -240,29 +231,6 @@ if [[ "$NOTARIZE" == "1" ]]; then
   notarize_binary "$CONNECTD_X64" pairling-connectd-x64
 fi
 
-# --- mintd binaries (the privileged tailnet mint broker) --------------------
-# Shipped in each per-arch runtime package alongside connectd so a Go-less Mac
-# can enable Architecture B without a toolchain. Same fail-closed signing as
-# connectd: setup re-verifies the Developer ID signature and Team ID before it
-# will stage this binary (install-runtime.sh build_mintd_binary).
-MINTD_ARM64="$BIN_BUILD/pairling-tailnet-mintd-arm64"
-MINTD_X64="$BIN_BUILD/pairling-tailnet-mintd-x64"
-if [[ -n "$PREBUILT_MINTD_ARM64" ]]; then
-  verify_prebuilt "$PREBUILT_MINTD_ARM64"; cp "$PREBUILT_MINTD_ARM64" "$MINTD_ARM64"
-else
-  build_arch arm64 "$MINTD_ARM64" ./cmd/pairling-tailnet-mintd
-fi
-if [[ -n "$PREBUILT_MINTD_X64" ]]; then
-  verify_prebuilt "$PREBUILT_MINTD_X64"; cp "$PREBUILT_MINTD_X64" "$MINTD_X64"
-else
-  build_arch amd64 "$MINTD_X64" ./cmd/pairling-tailnet-mintd
-fi
-chmod 755 "$MINTD_ARM64" "$MINTD_X64"
-if [[ "$NOTARIZE" == "1" ]]; then
-  notarize_binary "$MINTD_ARM64" pairling-tailnet-mintd-arm64
-  notarize_binary "$MINTD_X64" pairling-tailnet-mintd-x64
-fi
-
 team_of() {
   /usr/bin/codesign -dvv "$1" 2>&1 | sed -n 's/^TeamIdentifier=//p'
 }
@@ -288,15 +256,13 @@ verify_prebuilt_python() {
 }
 
 stage_runtime() {
-  local arch="$1" binary="$2" mintd_binary="$3" prebuilt_python="$4"
+  local arch="$1" binary="$2" prebuilt_python="$3"
   local dir="$STAGE/runtime-darwin-$arch"
   mkdir -p "$dir/bin"
   cp "$REPO_ROOT/npm/runtime-darwin-$arch/package.json" "$dir/package.json"
   cp "$REPO_ROOT/npm/runtime-darwin-$arch/README.md" "$dir/README.md"
   cp "$binary" "$dir/bin/pairling-connectd"
   chmod 755 "$dir/bin/pairling-connectd"
-  cp "$mintd_binary" "$dir/bin/pairling-tailnet-mintd"
-  chmod 755 "$dir/bin/pairling-tailnet-mintd"
 
   # P3 CPython. Custody rule (same as connectd): the Developer ID signing only
   # happens on the release Mac. A prebuilt python tarball (already signed +
@@ -326,14 +292,13 @@ stage_runtime() {
     python_id="$(/usr/bin/codesign -dvv "$python_bin" 2>&1 | sed -n 's/^Identifier=//p')"
   fi
 
-  python3 - "$dir/manifest.json" "$dir/bin/pairling-connectd" "$VERSION" "$REVISION" "$(team_of "$dir/bin/pairling-connectd")" "$dir/bin/pairling-tailnet-mintd" "$(team_of "$dir/bin/pairling-tailnet-mintd")" "${python_bin:-}" "${python_team:-}" "${python_id:-}" <<'PY'
+  python3 - "$dir/manifest.json" "$dir/bin/pairling-connectd" "$VERSION" "$REVISION" "$(team_of "$dir/bin/pairling-connectd")" "${python_bin:-}" "${python_team:-}" "${python_id:-}" <<'PY'
 import hashlib, json, sys
-out, binary, version, revision, team, mintd_bin, mintd_team, python_bin, python_team, python_id = sys.argv[1:]
+out, binary, version, revision, team, python_bin, python_team, python_id = sys.argv[1:]
 def sha(p):
     return hashlib.sha256(open(p, "rb").read()).hexdigest()
 files = [
     {"path": "bin/pairling-connectd", "sha256": sha(binary), "team_id": team or None},
-    {"path": "bin/pairling-tailnet-mintd", "sha256": sha(mintd_bin), "team_id": mintd_team or None},
 ]
 if python_bin:
     files.append({
@@ -351,8 +316,8 @@ json.dump({
 open(out, "a").write("\n")
 PY
 }
-stage_runtime arm64 "$CONNECTD_ARM64" "$MINTD_ARM64" "$PREBUILT_PYTHON_ARM64"
-stage_runtime x64 "$CONNECTD_X64" "$MINTD_X64" "$PREBUILT_PYTHON_X64"
+stage_runtime arm64 "$CONNECTD_ARM64" "$PREBUILT_PYTHON_ARM64"
+stage_runtime x64 "$CONNECTD_X64" "$PREBUILT_PYTHON_X64"
 
 # Set versions + pin optionalDependencies exactly (never mutates npm/ sources).
 python3 - "$STAGE" "$VERSION" <<'PY'
@@ -375,10 +340,10 @@ path.write_text(json.dumps(data, indent=2) + "\n")
 PY
 
 # --- payload integrity manifest ---------------------------------------------
-python3 - "$STAGE/pairling" "$VERSION" "$REVISION" "$SOURCE_DIRTY" "$(team_of "$CONNECTD_ARM64")" "$CONNECTD_ARM64" "$(team_of "$CONNECTD_X64")" "$CONNECTD_X64" "$(team_of "$MINTD_ARM64")" "$MINTD_ARM64" "$(team_of "$MINTD_X64")" "$MINTD_X64" <<'PY'
+python3 - "$STAGE/pairling" "$VERSION" "$REVISION" "$SOURCE_DIRTY" "$(team_of "$CONNECTD_ARM64")" "$CONNECTD_ARM64" "$(team_of "$CONNECTD_X64")" "$CONNECTD_X64" <<'PY'
 import hashlib, json, sys
 from pathlib import Path
-pkg, version, revision, dirty, team_arm, bin_arm, team_x64, bin_x64, mintd_team_arm, mintd_arm, mintd_team_x64, mintd_x64 = sys.argv[1:]
+pkg, version, revision, dirty, team_arm, bin_arm, team_x64, bin_x64 = sys.argv[1:]
 pkg = Path(pkg)
 payload = pkg / "payload"
 files = []
@@ -398,10 +363,6 @@ manifest = {
         "darwin-arm64": {"sha256": hashlib.sha256(open(bin_arm, "rb").read()).hexdigest(), "team_id": team_arm or None},
         "darwin-x64": {"sha256": hashlib.sha256(open(bin_x64, "rb").read()).hexdigest(), "team_id": team_x64 or None},
     },
-    "mintd": {
-        "darwin-arm64": {"sha256": hashlib.sha256(open(mintd_arm, "rb").read()).hexdigest(), "team_id": mintd_team_arm or None},
-        "darwin-x64": {"sha256": hashlib.sha256(open(mintd_x64, "rb").read()).hexdigest(), "team_id": mintd_team_x64 or None},
-    },
     "files": files,
 }
 (pkg / "payload-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
@@ -417,9 +378,7 @@ done
 # Keep the raw binaries next to the tarballs for the GitHub Release asset flow.
 cp "$CONNECTD_ARM64" "$DIST_DIR/pairling-connectd-arm64"
 cp "$CONNECTD_X64" "$DIST_DIR/pairling-connectd-x64"
-cp "$MINTD_ARM64" "$DIST_DIR/pairling-tailnet-mintd-arm64"
-cp "$MINTD_X64" "$DIST_DIR/pairling-tailnet-mintd-x64"
-(cd "$DIST_DIR" && /usr/bin/shasum -a 256 pairling-connectd-arm64 pairling-connectd-x64 pairling-tailnet-mintd-arm64 pairling-tailnet-mintd-x64 > CONNECTD-SHASUMS256.txt)
+(cd "$DIST_DIR" && /usr/bin/shasum -a 256 pairling-connectd-arm64 pairling-connectd-x64 > CONNECTD-SHASUMS256.txt)
 
 log "Built npm packages $VERSION (source $REVISION, dirty=$SOURCE_DIRTY)"
 log "  dist: $DIST_DIR"
