@@ -20,12 +20,11 @@ on:
         required: true
         type: string
       channel:
-        description: npm dist-tag to publish under. Use "next" for a pre-release validation lane, then promote to "latest" with `npm dist-tag add` after device proof.
+        description: npm dist-tag. This workflow only ever publishes to "next"; "latest" is promoted separately via `npm dist-tag add` after device proof.
         required: false
-        default: latest
+        default: next
         type: choice
         options:
-          - latest
           - next
 
 permissions: {}
@@ -131,13 +130,32 @@ jobs:
       - name: Publish with provenance (runtime packages first, meta last)
         env:
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
-          CHANNEL: ${{ inputs.channel || 'latest' }}
+          EVENT_NAME: ${{ github.event_name }}
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          DISPATCH_CHANNEL: ${{ inputs.channel }}
         run: |
           VERSION="${TAG#v}"
-          # Publish under the chosen dist-tag. Default "latest"; "next" is the
-          # pre-release validation lane — promote to latest later, after device
-          # proof, with `npm dist-tag add <pkg>@$VERSION latest` for all three
-          # packages (pairling, @pairling/runtime-darwin-arm64, -x64).
+          # FAIL-CLOSED dist-tag policy. This workflow publishes ONLY to `next`.
+          # `latest` is never produced by an automated publish; an operator
+          # promotes it with `npm dist-tag add <pkg>@$VERSION latest` for all
+          # three packages after on-device proof.
+          if [ "$EVENT_NAME" = "release" ]; then
+            # A release event must be a GitHub pre-release. A normal (non-pre)
+            # release implies intent to ship latest, which this workflow refuses:
+            # fail closed and force promotion via npm dist-tag add.
+            if [ "$IS_PRERELEASE" != "true" ]; then
+              echo "::error::Refusing to publish: GitHub Release is not a pre-release. This workflow only publishes to next; promote to latest with npm dist-tag add after device proof." >&2
+              exit 1
+            fi
+            CHANNEL="next"
+          else
+            CHANNEL="${DISPATCH_CHANNEL:-next}"
+          fi
+          # Hard guard: never publish to anything but next, whatever computed it.
+          if [ "$CHANNEL" != "next" ]; then
+            echo "::error::Refusing to publish to dist-tag '$CHANNEL'. This workflow only publishes to next; latest is promoted via npm dist-tag add." >&2
+            exit 1
+          fi
           echo "publishing channel: $CHANNEL"
           # Idempotent: skip any version already on the registry so a re-run
           # after fixing a per-package trusted-publisher gap only publishes the
