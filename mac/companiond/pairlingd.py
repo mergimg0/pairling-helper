@@ -728,6 +728,7 @@ POST_ONLY_ENDPOINTS = {
     "/pair/reauth-claim",
     "/pair/revoke",
     "/pair/rotate-token",
+    "/pair/bind-node",
     "/aperture-cli/open",
     "/open",
     "/inject",
@@ -811,6 +812,12 @@ PROOF_REQUIRED_ENDPOINTS = HIGH_RISK_ENDPOINTS | {
     "/phone-tools/availability",
     "/phone-tools/next",
     "/phone-tools/result",
+    # Minimal proof-required POST whose only purpose is to trip the interactive
+    # provenance bind in _maybe_persist_tailnet_node_id. The iOS post-pair proof
+    # probes the embedded route with GET (never proof-required), so the bind for
+    # an untagged D2 interactive node never fired. A proof-required POST here
+    # reaches proof_verified=True and binds the device's tailnet_node_id.
+    "/pair/bind-node",
 }
 
 MAX_REQUEST_BODY_BYTES = 1_000_000
@@ -1046,7 +1053,31 @@ def _connectd_peer_node_id(headers) -> str:
     return value
 
 
-def _maybe_persist_tailnet_node_id(headers, client_address, auth_result) -> bool:
+def _connectd_peer_provenance(headers):
+    """Parse the connectd-injected X-Pairling-Peer-Provenance header strictly.
+
+    connectd strips any client-supplied copy first, so when this header is
+    present it is trustworthy. Three outcomes, kept deliberately distinct:
+
+    * header ABSENT -> return None. Legacy-eligible: an old connectd that sends
+      X-Pairling-Peer-Node but no provenance keeps the bearer-only bind.
+    * header EXACTLY "tagged" (tag:pairling-phone minted node) or "interactive"
+      (untagged Pairling iOS D2 node) -> return that exact value.
+    * header PRESENT but any other value (including empty) -> return "" as an
+      invalid sentinel. Distinct from None so a present-but-invalid value is
+      rejected, never silently downgraded to the legacy path.
+    """
+    getter = headers.get if hasattr(headers, "get") else lambda key, default=None: default
+    raw = getter("X-Pairling-Peer-Provenance", None)
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if value in ("tagged", "interactive"):
+        return value
+    return ""
+
+
+def _maybe_persist_tailnet_node_id(headers, client_address, auth_result, proof_verified=False) -> bool:
     if DEVICE_REGISTRY is None or auth_result is None or not getattr(auth_result, "ok", False):
         return False
     device_id = str(getattr(auth_result, "device_id", "") or "").strip()
@@ -1056,8 +1087,25 @@ def _maybe_persist_tailnet_node_id(headers, client_address, auth_result) -> bool
         return False
     if not _pairdrop_gateway_provenance_ok(headers, client_address):
         return False
+    provenance = _connectd_peer_provenance(headers)
     node_id = _connectd_peer_node_id(headers)
     if not node_id:
+        return False
+    if provenance is None:
+        # Legacy: an old connectd sent a peer-node header but no provenance.
+        # Bind after bearer auth, preserving the pre-Stage-2 behavior.
+        pass
+    elif provenance == "tagged":
+        # tag:pairling-phone minted node: bearer auth is sufficient to bind.
+        pass
+    elif provenance == "interactive":
+        # Untagged, less-trusted Pairling iOS D2 node: bind only after the
+        # request also passed request-proof, never on bearer auth alone.
+        if not proof_verified:
+            return False
+    else:
+        # Present-but-invalid provenance value: reject. Do NOT downgrade to the
+        # legacy path just because the value is unrecognized.
         return False
     try:
         return bool(DEVICE_REGISTRY.set_tailnet_node_id_if_absent(device_id, node_id))
@@ -7397,6 +7445,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(405, "POST required")
             return
 
+        proof_verified = False
         if (
             self.pairling_auth is not None
             and _requires_request_proof(u.path, self.command)
@@ -7432,9 +7481,15 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 }, status=proof_result.status)
                 return
+            proof_verified = True
 
         if self.pairling_auth is not None:
-            _maybe_persist_tailnet_node_id(self.headers, self.client_address, self.pairling_auth)
+            _maybe_persist_tailnet_node_id(
+                self.headers,
+                self.client_address,
+                self.pairling_auth,
+                proof_verified=proof_verified,
+            )
 
         if self.pairling_auth is not None and _is_high_risk_endpoint(u.path) and DEVICE_REGISTRY is not None:
             max_per_min = _rate_limit_for_high_risk_endpoint(u.path)
@@ -7490,6 +7545,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_pair_revoke(q)
             elif u.path == "/pair/rotate-token":
                 self._handle_pair_rotate_token(q)
+            elif u.path == "/pair/bind-node":
+                self._handle_pair_bind_node(q)
             elif u.path == "/healthz":
                 self._handle_healthz(q)
             elif u.path == "/power-state":
@@ -8429,6 +8486,28 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": {"code": "device_not_found"}}, status=404)
             return
         self._send_json({"ok": True, "device_id": device_id, "token": token})
+
+    def _handle_pair_bind_node(self, q):
+        # Minimal proof-required POST whose sole purpose is to trip the
+        # interactive provenance bind. The bind itself already ran in
+        # _maybe_persist_tailnet_node_id BEFORE routing (it fires only when this
+        # request was bearer-authed AND passed request-proof, which a POST to a
+        # PROOF_REQUIRED_ENDPOINTS path is). Here we only report whether the
+        # device now carries a tailnet_node_id. NO other side effects.
+        if self.pairling_auth is None:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "missing_token",
+                    "message": "Authorization: Bearer token required",
+                },
+            }, status=401)
+            return
+        bound = bool(
+            DEVICE_REGISTRY
+            and DEVICE_REGISTRY.tailnet_node_id(self.pairling_auth.device_id)
+        )
+        self._send_json({"ok": True, "tailnet_node_id_bound": bound})
 
     def _handle_power_state(self, q):
         self._send_json(_cached_health_payload(

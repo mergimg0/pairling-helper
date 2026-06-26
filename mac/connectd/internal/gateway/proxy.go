@@ -21,6 +21,18 @@ const pairDropSmallFileMaxBodyBytes int64 = 10 * 1024 * 1024
 const pairDropUploadChunkMaxBodyBytes int64 = 1024 * 1024
 const peerNodeHeader = "X-Pairling-Peer-Node"
 
+// peerProvenanceHeader tells pairlingd how connectd identified the peer node:
+// "tagged" (the old minted tag:pairling-phone path) or "interactive" (an
+// untagged, user-owned Pairling iOS node admitted via the D2 sign-in path).
+// connectd deletes any inbound copy before re-injecting the resolver's value, so
+// a client can never forge it.
+const peerProvenanceHeader = "X-Pairling-Peer-Provenance"
+
+const (
+	provenanceTagged      = "tagged"
+	provenanceInteractive = "interactive"
+)
+
 // funnelOriginHeader marks a request that arrived over the public Funnel
 // listener. connectd sets it only on the funnel handler and deletes any inbound
 // copy first; every other handler deletes it, so a client can never forge it.
@@ -50,7 +62,7 @@ type Logger interface {
 }
 
 type PeerNodeResolver interface {
-	PeerNodeID(ctx context.Context, remoteAddr string) (string, bool)
+	PeerNodeID(ctx context.Context, remoteAddr string) (nodeID string, provenance string, ok bool)
 }
 
 type Event struct {
@@ -222,14 +234,16 @@ func (h *Handler) rewrite(r *httputil.ProxyRequest) {
 	r.Out.Host = h.upstream.Host
 	r.Out.Header.Del("X-Forwarded-For")
 	r.Out.Header.Del(peerNodeHeader)
+	r.Out.Header.Del(peerProvenanceHeader)
 	r.Out.Header.Del(funnelOriginHeader)
 	if h.mode == ExposureModeFunnelBootstrap {
 		r.Out.Header.Set(funnelOriginHeader, "1")
 	}
 	if h.peerNodeResolver != nil {
-		if nodeID, ok := h.peerNodeResolver.PeerNodeID(in.Context(), in.RemoteAddr); ok {
+		if nodeID, provenance, ok := h.peerNodeResolver.PeerNodeID(in.Context(), in.RemoteAddr); ok {
 			if nodeID = strings.TrimSpace(nodeID); nodeID != "" {
 				r.Out.Header.Set(peerNodeHeader, nodeID)
+				r.Out.Header.Set(peerProvenanceHeader, provenance)
 			}
 		}
 	}

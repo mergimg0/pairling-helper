@@ -21,9 +21,9 @@ type recordingLogger struct {
 	events []Event
 }
 
-type peerNodeResolverFunc func(context.Context, string) (string, bool)
+type peerNodeResolverFunc func(context.Context, string) (string, string, bool)
 
-func (f peerNodeResolverFunc) PeerNodeID(ctx context.Context, remoteAddr string) (string, bool) {
+func (f peerNodeResolverFunc) PeerNodeID(ctx context.Context, remoteAddr string) (string, string, bool) {
 	return f(ctx, remoteAddr)
 }
 
@@ -451,9 +451,11 @@ func TestPairlingConnectStripsForgedPeerNodeHeader(t *testing.T) {
 
 func TestPairlingConnectSetsPeerNodeHeaderFromResolver(t *testing.T) {
 	var forwardedHeader string
+	var forwardedProvenance string
 	var resolvedRemote string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		forwardedHeader = r.Header.Get("X-Pairling-Peer-Node")
+		forwardedProvenance = r.Header.Get("X-Pairling-Peer-Provenance")
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer upstream.Close()
@@ -465,9 +467,9 @@ func TestPairlingConnectSetsPeerNodeHeaderFromResolver(t *testing.T) {
 		Upstream:     upstreamURL,
 		MaxBodyBytes: 1024,
 		Mode:         ExposureModePairlingConnect,
-		PeerNodeResolver: peerNodeResolverFunc(func(_ context.Context, remoteAddr string) (string, bool) {
+		PeerNodeResolver: peerNodeResolverFunc(func(_ context.Context, remoteAddr string) (string, string, bool) {
 			resolvedRemote = remoteAddr
-			return "nPeerCNTRL", true
+			return "nPeerCNTRL", "tagged", true
 		}),
 	})
 	if err != nil {
@@ -488,6 +490,103 @@ func TestPairlingConnectSetsPeerNodeHeaderFromResolver(t *testing.T) {
 	}
 	if forwardedHeader != "nPeerCNTRL" {
 		t.Fatalf("peer-node header = %q, want trusted resolver value", forwardedHeader)
+	}
+	if forwardedProvenance != "tagged" {
+		t.Fatalf("peer-provenance header = %q, want tagged", forwardedProvenance)
+	}
+}
+
+// TestRewriteStripsForgedProvenanceAndReinjectsFromResolver proves the rewrite
+// step deletes BOTH client-supplied X-Pairling-Peer-Node and
+// X-Pairling-Peer-Provenance headers, then re-injects them from the resolver's
+// trusted return values. A forged "tagged" provenance from the client must not
+// survive when the resolver reports "interactive".
+func TestRewriteStripsForgedProvenanceAndReinjectsFromResolver(t *testing.T) {
+	var forwardedHeader string
+	var forwardedProvenance string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwardedHeader = r.Header.Get("X-Pairling-Peer-Node")
+		forwardedProvenance = r.Header.Get("X-Pairling-Peer-Provenance")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewHandler(Options{
+		Upstream:     upstreamURL,
+		MaxBodyBytes: 1024,
+		Mode:         ExposureModePairlingConnect,
+		PeerNodeResolver: peerNodeResolverFunc(func(_ context.Context, _ string) (string, string, bool) {
+			return "nResolverIOS", "interactive", true
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "http://pairling-connect.local/send-text", strings.NewReader(`{}`))
+	req.RemoteAddr = "100.64.0.50:12345"
+	req.Header.Set("Authorization", "Bearer device-token")
+	req.Header.Set("X-Pairling-Peer-Node", "forged-node")
+	req.Header.Set("X-Pairling-Peer-Provenance", "tagged")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if forwardedHeader != "nResolverIOS" {
+		t.Fatalf("peer-node header = %q, want resolver value nResolverIOS", forwardedHeader)
+	}
+	if forwardedProvenance != "interactive" {
+		t.Fatalf("peer-provenance header = %q, want resolver value interactive", forwardedProvenance)
+	}
+}
+
+// TestRewriteInjectsNoHeadersWhenResolverRejects proves that when the resolver
+// returns ok=false, NEITHER the peer-node NOR the peer-provenance header reaches
+// the upstream, and any client-supplied copies are stripped.
+func TestRewriteInjectsNoHeadersWhenResolverRejects(t *testing.T) {
+	var sawNode bool
+	var sawProvenance bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, sawNode = r.Header["X-Pairling-Peer-Node"]
+		_, sawProvenance = r.Header["X-Pairling-Peer-Provenance"]
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewHandler(Options{
+		Upstream:     upstreamURL,
+		MaxBodyBytes: 1024,
+		Mode:         ExposureModePairlingConnect,
+		PeerNodeResolver: peerNodeResolverFunc(func(_ context.Context, _ string) (string, string, bool) {
+			return "", "", false
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "http://pairling-connect.local/send-text", strings.NewReader(`{}`))
+	req.RemoteAddr = "100.64.0.50:12345"
+	req.Header.Set("Authorization", "Bearer device-token")
+	req.Header.Set("X-Pairling-Peer-Node", "forged-node")
+	req.Header.Set("X-Pairling-Peer-Provenance", "interactive")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if sawNode {
+		t.Fatal("peer-node header reached upstream when resolver rejected")
+	}
+	if sawProvenance {
+		t.Fatal("peer-provenance header reached upstream when resolver rejected")
 	}
 }
 

@@ -484,35 +484,59 @@ type tailscalePeerNodeResolver struct {
 	localClient func() (whoIsClient, error)
 }
 
-func (r tailscalePeerNodeResolver) PeerNodeID(ctx context.Context, remoteAddr string) (string, bool) {
+func (r tailscalePeerNodeResolver) PeerNodeID(ctx context.Context, remoteAddr string) (string, string, bool) {
 	if r.localClient == nil {
-		return "", false
+		return "", "", false
 	}
 	lc, err := r.localClient()
 	if err != nil || lc == nil {
-		return "", false
+		return "", "", false
 	}
 	who, err := lc.WhoIs(ctx, remoteAddr)
 	if err != nil {
-		return "", false
+		return "", "", false
 	}
 	return peerNodeIDFromWhoIs(who)
 }
 
-func peerNodeIDFromWhoIs(who *apitype.WhoIsResponse) (string, bool) {
+// peerNodeIDFromWhoIs resolves a peer's tailnet node ID and its provenance from
+// a WhoIs response. The node ID is always the WhoIs StableID; it is never
+// derived from any client-controlled value. Two provenance paths are admitted:
+//
+//   - "tagged": the old minted path, where the node carries tag:pairling-phone.
+//   - "interactive": an untagged, user-owned Pairling iOS node from the D2
+//     sign-in path, identified by a WhoIs hostname with the pairling-ios- prefix.
+//
+// connectd's hostname gate here is defense-in-depth; pairlingd performs the real
+// bearer + request-proof gate. As a guard against a non-iOS node spoofing the
+// pairling-ios- hostname, an untagged node is rejected when its Hostinfo reports
+// a non-empty OS that is not iOS.
+func peerNodeIDFromWhoIs(who *apitype.WhoIsResponse) (string, string, bool) {
 	if who == nil || who.Node == nil {
-		return "", false
+		return "", "", false
 	}
 	nodeID := strings.TrimSpace(string(who.Node.StableID))
 	if nodeID == "" {
-		return "", false
+		return "", "", false
 	}
 	for _, tag := range who.Node.Tags {
 		if tag == "tag:pairling-phone" {
-			return nodeID, true
+			return nodeID, "tagged", true
 		}
 	}
-	return "", false
+	hostname := who.Node.ComputedName
+	if hostname == "" && who.Node.Hostinfo.Valid() {
+		hostname = who.Node.Hostinfo.Hostname()
+	}
+	if strings.HasPrefix(strings.ToLower(hostname), "pairling-ios-") {
+		if who.Node.Hostinfo.Valid() {
+			if os := who.Node.Hostinfo.OS(); os != "" && !strings.EqualFold(os, "iOS") {
+				return "", "", false
+			}
+		}
+		return nodeID, "interactive", true
+	}
+	return "", "", false
 }
 
 func nodeIdentityFromStatus(st *ipnstate.Status) NodeIdentity {
