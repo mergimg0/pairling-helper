@@ -2400,6 +2400,23 @@ def _pairling_connect_health() -> dict:
     return _cached_probe("pairling_connect_health", _HEALTH_PROBE_CACHE_SECONDS, probe)
 
 
+def _coordinator_from_pairling_connect(connect: dict) -> dict:
+    ready = bool(connect.get("ready"))
+    return {
+        "role": "primary_coordinator",
+        "host": DEFAULT_COORDINATOR_HOST,
+        "posture": "ready" if ready else "unknown",
+        "severity": "ok" if ready else "unknown",
+        "summary": (
+            "Pairling Connect route is ready."
+            if ready
+            else "Pairling Connect route is not ready."
+        ),
+        "stale": False,
+        "tailnet_axis": "pairling_connect",
+    }
+
+
 # Guardian checks whose failure is fully compensated by a ready Pairling
 # Connect route: both only measure the standalone-Tailscale axis.
 _TAILNET_AXIS_CHECK_IDS = {"tailscale_ip", "daemon_reachable"}
@@ -2555,11 +2572,9 @@ def _routez_payload(auth_result=None) -> dict:
 
 
 def _health_payload(full_power: bool = False, authenticated: bool = False, auth_result=None) -> dict:
-    state, path, age, error = _read_guardian_state()
-    power_state = _normalize_guardian_state(state)
-    coordinator = _coordinator_from_guardian(power_state, age, error)
     connect = _pairling_connect_health()
-    coordinator = _apply_pairling_connect_posture(coordinator, power_state, connect)
+    power_state = None
+    coordinator = _coordinator_from_pairling_connect(connect)
     if connect.get("summary") is not None:
         coordinator = dict(coordinator)
         coordinator["pairling_connect"] = connect["summary"]
@@ -2599,11 +2614,6 @@ def _health_payload(full_power: bool = False, authenticated: bool = False, auth_
             "high_risk_count": 0,
             "updated_at": _time.time(),
         }
-    if full_power:
-        payload["guardian_path"] = path
-        payload["guardian_error"] = error
-        payload["guardian_sample_age_seconds"] = age
-        payload["power_state"] = power_state
     return payload
 
 
@@ -2623,11 +2633,11 @@ def _cached_health_payload(full_power: bool = False, authenticated: bool = False
 
 
 def _mac_health_alert_snapshot() -> dict:
-    state, _path, age, error = _read_guardian_state()
-    coordinator = _coordinator_from_guardian(state, age, error)
-    coordinator = _apply_pairling_connect_posture(
-        coordinator, _normalize_guardian_state(state), _pairling_connect_health()
-    )
+    connect = _pairling_connect_health()
+    coordinator = _coordinator_from_pairling_connect(connect)
+    if connect.get("summary") is not None:
+        coordinator = dict(coordinator)
+        coordinator["pairling_connect"] = connect["summary"]
     return {
         "ok": coordinator.get("posture") in ("ready", "warning"),
         "schema_version": 1,
@@ -2659,7 +2669,7 @@ def _health_diff_digest(payload: dict) -> str:
 def _orchestration_preflight_from_health(health: dict) -> tuple[dict, dict]:
     power_state = health.get("power_state") if isinstance(health.get("power_state"), dict) else None
     if power_state is None:
-        power_state = (_read_guardian_state()[0] or {})
+        power_state = {}
     coordinator = health.get("coordinator") or {}
     route = (health.get("routes") or [{}])[0]
     runtime_info = health.get("runtime") if isinstance(health.get("runtime"), dict) else {}
