@@ -456,10 +456,22 @@ AUTH_RESULT_CACHE_SECONDS = max(0.0, float(os.environ.get("PAIRLING_AUTH_RESULT_
 AUTH_RESULT_CACHE_MAX = max(16, int(os.environ.get("PAIRLING_AUTH_RESULT_CACHE_MAX", "512")))
 RUNTIME_MAX_ACTIVE_FAST_REQUESTS = max(2, int(os.environ.get("PAIRLING_RUNTIME_MAX_ACTIVE_FAST_REQUESTS", "4")))
 RUNTIME_MAX_ACTIVE_REQUESTS = max(4, int(os.environ.get("PAIRLING_RUNTIME_MAX_ACTIVE_REQUESTS", "12")))
-RUNTIME_MAX_ACTIVE_STREAMS = max(2, int(os.environ.get("PAIRLING_RUNTIME_MAX_ACTIVE_STREAMS", "6")))
+RUNTIME_MAX_ACTIVE_DASHBOARD_STREAMS = max(2, int(os.environ.get("PAIRLING_RUNTIME_MAX_ACTIVE_DASHBOARD_STREAMS", "8")))
+RUNTIME_MAX_ACTIVE_STREAMS = max(2, int(os.environ.get(
+    "PAIRLING_RUNTIME_MAX_ACTIVE_DETAIL_STREAMS",
+    os.environ.get("PAIRLING_RUNTIME_MAX_ACTIVE_STREAMS", "6"),
+)))
+RUNTIME_MAX_ACTIVE_AUX_STREAMS = max(2, int(os.environ.get("PAIRLING_RUNTIME_MAX_ACTIVE_AUX_STREAMS", "4")))
 RUNTIME_MAX_ACTIVE_CONNECTIONS = max(
-    RUNTIME_MAX_ACTIVE_FAST_REQUESTS + RUNTIME_MAX_ACTIVE_REQUESTS + RUNTIME_MAX_ACTIVE_STREAMS + 2,
-    int(os.environ.get("PAIRLING_RUNTIME_MAX_ACTIVE_CONNECTIONS", "24")),
+    (
+        RUNTIME_MAX_ACTIVE_FAST_REQUESTS
+        + RUNTIME_MAX_ACTIVE_REQUESTS
+        + RUNTIME_MAX_ACTIVE_DASHBOARD_STREAMS
+        + RUNTIME_MAX_ACTIVE_STREAMS
+        + RUNTIME_MAX_ACTIVE_AUX_STREAMS
+        + 2
+    ),
+    int(os.environ.get("PAIRLING_RUNTIME_MAX_ACTIVE_CONNECTIONS", "28")),
 )
 TERMINAL_TRUTH_OSASCRIPT_TIMEOUT_SECONDS = max(
     0.5,
@@ -564,7 +576,9 @@ _auth_result_cache_lock = threading.Lock()
 _auth_result_cache: dict[tuple, tuple[float, object]] = {}
 _FAST_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_FAST_REQUESTS)
 _REQUEST_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_REQUESTS)
+_DASHBOARD_STREAM_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_DASHBOARD_STREAMS)
 _STREAM_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_STREAMS)
+_AUX_STREAM_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_AUX_STREAMS)
 _CONNECTION_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_CONNECTIONS)
 _STREAM_ENDPOINTS = {
     "/health-stream",
@@ -580,6 +594,16 @@ _STREAM_ENDPOINTS = {
     "/commands-stream",
     "/invocations-stream",
     "/turn-state-stream",
+    "/llm-route-stream",
+}
+_DASHBOARD_STREAM_ENDPOINTS = {
+    "/health-stream",
+    "/sessions-stream",
+}
+_AUX_STREAM_ENDPOINTS = {
+    "/activity-stream",
+    "/commands-stream",
+    "/invocations-stream",
     "/llm-route-stream",
 }
 _FAST_ENDPOINTS = {"/health", "/healthz", "/readyz", "/routez", "/power-state", "/manifest"}
@@ -1975,6 +1999,14 @@ def _runtime_admission_for_path(path: str) -> _RuntimeAdmission:
         if _FAST_ADMISSION_SEMAPHORE.acquire(blocking=False):
             return _RuntimeAdmission(_FAST_ADMISSION_SEMAPHORE, True)
         return _RuntimeAdmission(None, False, "fast_capacity_exceeded")
+    if path in _DASHBOARD_STREAM_ENDPOINTS:
+        if _DASHBOARD_STREAM_ADMISSION_SEMAPHORE.acquire(blocking=False):
+            return _RuntimeAdmission(_DASHBOARD_STREAM_ADMISSION_SEMAPHORE, True)
+        return _RuntimeAdmission(None, False, "dashboard_stream_capacity_exceeded")
+    if path in _AUX_STREAM_ENDPOINTS:
+        if _AUX_STREAM_ADMISSION_SEMAPHORE.acquire(blocking=False):
+            return _RuntimeAdmission(_AUX_STREAM_ADMISSION_SEMAPHORE, True)
+        return _RuntimeAdmission(None, False, "aux_stream_capacity_exceeded")
     if path in _STREAM_ENDPOINTS:
         if _STREAM_ADMISSION_SEMAPHORE.acquire(blocking=False):
             return _RuntimeAdmission(_STREAM_ADMISSION_SEMAPHORE, True)
@@ -2800,6 +2832,7 @@ def _pid_for_tty_command(tty: str, command_name: str) -> int:
 
 
 _codex_terminal_scan_cache: dict[str, object] = {"ts": 0.0, "rows": []}
+_claude_terminal_scan_cache: dict[str, object] = {"ts": 0.0, "rows": []}
 _codex_task_boundary_cache: dict[str, dict[str, object]] = {}
 
 
@@ -2829,6 +2862,11 @@ def _is_codex_cli_command(command: str) -> bool:
         or "/codex/codex" in lower
         or re.search(r"(^|/)codex(\s|$)", lower) is not None
     )
+
+
+def _is_claude_cli_command(command: str) -> bool:
+    lower = (command or "").lower()
+    return re.search(r"(^|/)claude(\s|$)", lower) is not None
 
 
 def _codex_live_terminal_rows() -> list[dict]:
@@ -2883,6 +2921,56 @@ def _codex_live_terminal_rows() -> list[dict]:
     return rows
 
 
+def _claude_live_terminal_rows() -> list[dict]:
+    now = _time.time()
+    cached_ts = float(_claude_terminal_scan_cache.get("ts") or 0)
+    if now - cached_ts < 2:
+        return list(_claude_terminal_scan_cache.get("rows") or [])
+    try:
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,tty=,lstart=,command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+
+    by_tty: dict[str, dict] = {}
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(None, 7)
+        if len(parts) < 8 or not parts[0].isdigit():
+            continue
+        tty_name = parts[1]
+        command = parts[7]
+        if tty_name == "??" or not _is_claude_cli_command(command):
+            continue
+        try:
+            started = datetime.strptime(" ".join(parts[2:7]), "%a %b %d %H:%M:%S %Y").timestamp()
+        except Exception:
+            started = 0.0
+        pid = int(parts[0])
+        tty = f"/dev/{tty_name}"
+        cwd = _process_cwd(pid)
+        if not cwd:
+            continue
+        current = by_tty.get(tty)
+        if current is None or pid < int(current.get("pid") or 0):
+            by_tty[tty] = {
+                "pid": pid,
+                "tty": tty,
+                "project": cwd,
+                "started_at": started,
+                "command": command,
+            }
+    rows = list(by_tty.values())
+    _claude_terminal_scan_cache["ts"] = now
+    _claude_terminal_scan_cache["rows"] = rows
+    return rows
+
+
 def _codex_discover_terminal_control(project: str, observed_started_at: float) -> dict | None:
     if not project or observed_started_at <= 0:
         return None
@@ -2896,6 +2984,109 @@ def _codex_discover_terminal_control(project: str, observed_started_at: float) -
     best = candidates[0]
     delta = abs(float(best.get("started_at") or 0) - observed_started_at)
     return best if delta <= 600 else None
+
+
+def _codex_terminal_native_id(row: dict) -> str:
+    tty = str(row.get("tty") or "")
+    project = str(row.get("project") or "")
+    started = int(float(row.get("started_at") or 0))
+    seed = f"{tty}|{project}|{started}"
+    return "terminal-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def _claude_terminal_native_id(row: dict) -> str:
+    tty = str(row.get("tty") or "")
+    project = str(row.get("project") or "")
+    started = int(float(row.get("started_at") or 0))
+    seed = f"{tty}|{project}|{started}"
+    return "terminal-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def _codex_register_terminal_only_rows(seen: set[str]) -> None:
+    for terminal in _codex_live_terminal_rows():
+        tty = str(terminal.get("tty") or "")
+        project = str(terminal.get("project") or "")
+        pid = int(terminal.get("pid") or 0)
+        if not project or not pid or not re.match(r"^/dev/ttys[0-9]{3,}$", tty):
+            continue
+        existing = _agent_registry_get_by_tty("codex", tty)
+        if existing and not existing.get("closed_at"):
+            native_id = existing.get("native_id") or ""
+            if native_id in seen:
+                continue
+            _agent_registry_update_control(
+                "codex",
+                native_id,
+                pid=pid,
+                terminal_tty=tty,
+                state="running",
+                reopen=True,
+            )
+            continue
+        native_id = _codex_terminal_native_id(terminal)
+        if native_id in seen:
+            continue
+        _agent_registry_upsert(
+            "codex",
+            native_id,
+            project,
+            pid=pid,
+            terminal_tty=tty,
+            state="running",
+            metadata={
+                "discovered_by": "terminal_scan",
+                "terminal_only": True,
+                "command": str(terminal.get("command") or "")[:500],
+            },
+            working_on="Live Codex terminal",
+        )
+
+
+def _registry_row_has_live_terminal(row: dict, command_name: str) -> bool:
+    tty = str(row.get("terminal_tty") or "")
+    if not re.match(r"^/dev/ttys[0-9]{3,}$", tty):
+        return False
+    return bool(_pid_for_tty_command(tty, command_name))
+
+
+def _claude_register_terminal_only_rows(seen: set[str]) -> None:
+    for terminal in _claude_live_terminal_rows():
+        tty = str(terminal.get("tty") or "")
+        project = str(terminal.get("project") or "")
+        pid = int(terminal.get("pid") or 0)
+        if not project or not pid or not re.match(r"^/dev/ttys[0-9]{3,}$", tty):
+            continue
+        existing = _agent_registry_get_by_tty("claude", tty)
+        if existing and not existing.get("closed_at"):
+            native_id = existing.get("native_id") or ""
+            if native_id in seen:
+                continue
+            _agent_registry_update_control(
+                "claude",
+                native_id,
+                pid=pid,
+                terminal_tty=tty,
+                state="running",
+                reopen=True,
+            )
+            continue
+        native_id = _claude_terminal_native_id(terminal)
+        if native_id in seen:
+            continue
+        _agent_registry_upsert(
+            "claude",
+            native_id,
+            project,
+            pid=pid,
+            terminal_tty=tty,
+            state="running",
+            metadata={
+                "discovered_by": "terminal_scan",
+                "terminal_only": True,
+                "command": str(terminal.get("command") or "")[:500],
+            },
+            working_on="Live Claude terminal",
+        )
 
 
 # Phase 4 B.3: warm claude --continue pool. Maintains up to one long-running
@@ -4388,8 +4579,10 @@ class ClaudeSessionsSqliteBackend:
         if live_only:
             source = [
                 row for row in _agent_registry_live("claude")
-                if row.get("claude_uuid")
-                and float(row.get("last_heartbeat") or 0) > cutoff
+                if (
+                    row.get("claude_uuid")
+                    and float(row.get("last_heartbeat") or 0) > cutoff
+                ) or _registry_row_has_live_terminal(row, "claude")
             ]
         else:
             source = _agent_registry_recent("claude", since_min=within_min, limit=1000)
@@ -4415,7 +4608,7 @@ class ClaudeSessionsSqliteBackend:
     def collect_rows(self, since_min: int, live_only: bool, limit: int) -> list[dict]:
         rows: list[dict] = []
         for row in _agent_registry_recent("claude", since_min=since_min, limit=1000):
-            if not row.get("claude_uuid"):
+            if not row.get("claude_uuid") and not _registry_row_has_live_terminal(row, "claude"):
                 continue
             if live_only and row.get("closed_at") is not None:
                 continue
@@ -4908,17 +5101,7 @@ def _terminal_surface_source(raw_session: str) -> dict:
     if provider not in AGENT_PROVIDERS:
         return {"available": False, "source": "unavailable", "reason": "unsupported_provider"}
 
-    if PTY_BROKER is not None:
-        session = PTY_BROKER.get(qualified)
-        if session is not None:
-            return {
-                "available": True,
-                "source": "broker_vt",
-                "reason": "broker_vt",
-                "broker_id": _broker_session_id(session),
-                "tty": _broker_slave_tty(session),
-                "can_control": True,
-            }
+    broker_error = ""
 
     if provider == "codex":
         reg = _agent_registry_get("codex", native_id) or {}
@@ -4931,9 +5114,16 @@ def _terminal_surface_source(raw_session: str) -> dict:
             metadata = {}
         broker_id = str(metadata.get("broker_id") or "").strip()
         if broker_id and PTY_BROKER is not None:
-            session = PTY_BROKER.get(broker_id)
+            try:
+                session = PTY_BROKER.get(broker_id)
+            except Exception as e:
+                session = None
+                broker_error = str(e)[:160]
             if session is not None:
-                PTY_BROKER.register_alias(qualified, _broker_session_id(session))
+                try:
+                    PTY_BROKER.register_alias(qualified, _broker_session_id(session))
+                except Exception:
+                    pass
                 return {
                     "available": True,
                     "source": "broker_vt",
@@ -4972,7 +5162,59 @@ def _terminal_surface_source(raw_session: str) -> dict:
             "can_control": True,
         }
 
-    return {"available": False, "source": "unavailable", "reason": "no_terminal_tty"}
+    if provider == "claude":
+        reg = _agent_registry_get("claude", native_id) or {}
+        metadata = {}
+        try:
+            metadata = json.loads(reg.get("metadata_json") or "{}")
+            if not isinstance(metadata, dict):
+                metadata = {}
+        except Exception:
+            metadata = {}
+        broker_id = str(metadata.get("broker_id") or "").strip()
+        if broker_id and PTY_BROKER is not None:
+            try:
+                session = PTY_BROKER.get(broker_id)
+            except Exception as e:
+                session = None
+                broker_error = str(e)[:160]
+            if session is not None:
+                try:
+                    PTY_BROKER.register_alias(qualified, _broker_session_id(session))
+                except Exception:
+                    pass
+                return {
+                    "available": True,
+                    "source": "broker_vt",
+                    "reason": "broker_vt",
+                    "broker_id": _broker_session_id(session),
+                    "tty": _broker_slave_tty(session),
+                    "can_control": True,
+                }
+        tty = str(reg.get("terminal_tty") or "")
+        if not tty:
+            return {"available": False, "source": "unavailable", "reason": broker_error or "no_terminal_tty"}
+        if not re.match(r"^/dev/ttys[0-9]{3,}$", tty):
+            return {"available": False, "source": "unavailable", "reason": "invalid_tty", "tty": tty}
+        capture_path = _terminal_capture_for_tty(tty, reg.get("project"))
+        if capture_path and capture_path.exists():
+            return {
+                "available": True,
+                "source": "script_capture",
+                "reason": "script_capture",
+                "terminal_log": str(capture_path),
+                "tty": tty,
+                "can_control": True,
+            }
+        return {
+            "available": True,
+            "source": "terminal_app_contents",
+            "reason": "terminal_app_contents",
+            "tty": tty,
+            "can_control": True,
+        }
+
+    return {"available": False, "source": "unavailable", "reason": broker_error or "no_terminal_tty"}
 
 
 def _terminal_surface_capabilities(raw_session: str) -> dict:
@@ -5324,8 +5566,8 @@ def _session_runtime_truth_from_parts(
         control_state = "blocked"
         blocked_reason = contradictions[0]["code"] if contradictions else "terminal_surface_degraded"
     elif selected_surface == "v1_fallback":
-        control_state = "read_only"
-        blocked_reason = "v1_fallback"
+        control_state = "eligible" if selected.get("screen_hash") and selected.get("nonce") else "read_only"
+        blocked_reason = None if control_state == "eligible" else "v1_fallback"
     else:
         control_state = "unavailable"
         blocked_reason = "terminal_surface_unavailable"
@@ -6156,6 +6398,8 @@ def _decorate_claude_session_row(row: dict, native_id: str, claude_pid: int = 0,
     row["provider"] = "claude"
     row["native_id"] = native_id
     row["id"] = _qualified_session_id("claude", native_id)
+    row["terminal_tty"] = terminal_tty
+    row["pid"] = claude_pid
     capabilities = list(CLAUDE_SESSION_CAPABILITIES)
     if terminal_tty and _terminal_capture_for_tty(terminal_tty, row.get("project")):
         capabilities.append("terminal_output")
@@ -6177,6 +6421,35 @@ def _decorate_claude_session_row(row: dict, native_id: str, claude_pid: int = 0,
             _registry_metadata_from_row(_agent_registry_get_by_tty("claude", terminal_tty)),
         )
     return row
+
+
+def _collapse_live_session_rows_by_terminal(rows: list[dict]) -> list[dict]:
+    by_tty: dict[tuple[str, str], dict] = {}
+    passthrough: list[dict] = []
+    for row in rows:
+        provider = str(row.get("provider") or "")
+        tty = str(row.get("terminal_tty") or "")
+        if row.get("closed_at") is not None or not provider or not re.match(r"^/dev/ttys[0-9]{3,}$", tty):
+            passthrough.append(row)
+            continue
+        key = (provider, tty)
+        current = by_tty.get(key)
+        if current is None or _session_row_terminal_score(row) > _session_row_terminal_score(current):
+            by_tty[key] = row
+    return passthrough + list(by_tty.values())
+
+
+def _session_row_terminal_score(row: dict) -> tuple[int, int, int, int, int]:
+    caps = set(row.get("capabilities") or [])
+    control = row.get("controllability") if isinstance(row.get("controllability"), dict) else {}
+    native_id = str(row.get("native_id") or row.get("id") or "")
+    return (
+        1 if bool(control.get("can_send_text") or control.get("can_terminate")) else 0,
+        0 if native_id.startswith("terminal-") else 1,
+        1 if row.get("claude_uuid") else 0,
+        1 if "transcript" in caps else 0,
+        int(row.get("last_heartbeat") or 0),
+    )
 
 
 def _refresh_claude_observed_activity(row: dict, project: str | None, claude_uuid: str | None) -> None:
@@ -6539,6 +6812,10 @@ def _codex_control_overlay(row: dict, observed_mtime: float | None = None, *, ve
     state_payload = _codex_turn_state_payload(row.get("native_id") or "", apply_boundary=False)
     can_send = bool(tty)
     can_signal = bool(pid)
+    if tty:
+        row["terminal_tty"] = tty
+    if pid:
+        row["pid"] = pid
     caps = set(row.get("capabilities") or [])
     if state_payload or can_send or can_signal:
         caps.add("live_state")
@@ -6608,6 +6885,8 @@ def _codex_pending_registry_rows(seen: set[str], live_only: bool, active_within_
             "last_heartbeat": int(heartbeat or _time.time()),
             "stale_seconds": stale_seconds,
             "source_freshness": "registry_stale_process_alive" if heartbeat < cutoff and process_alive else "registry_live",
+            "terminal_tty": tty,
+            "pid": pid,
             "first_prompt": None,
             "state": "running",
             "tool": None,
@@ -6700,7 +6979,7 @@ def _list_codex_sessions(live_only: bool, active_within_min: int) -> list[dict]:
 
 
 def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> list[dict]:
-    """Read-only Codex provider: persisted rollouts, no process control yet."""
+    """Codex provider backed by transcripts plus live terminal discovery."""
     index = _codex_index_map()
     history = _codex_history_map()
     cutoff = _time.time() - max(1, active_within_min) * 60
@@ -6760,12 +7039,14 @@ def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> li
             row["tool"] = state_payload.get("tool")
             row["turn_started_at"] = state_payload.get("started_at")
             row["effort"] = state_payload.get("effort")
-        rows.append(_codex_control_overlay(row, st.st_mtime, verify_process=False))
+        rows.append(_codex_control_overlay(row, st.st_mtime, verify_process=True))
         if len(rows) >= 50:
             break
+    _codex_register_terminal_only_rows(seen)
     rows.extend(_codex_pending_registry_rows(seen, live_only, active_within_min))
     if not live_only:
         rows.extend(_codex_recent_closed_registry_rows(seen, active_within_min))
+    rows = _collapse_live_session_rows_by_terminal(rows)
     rows.sort(
         key=lambda r: (
             1 if (r.get("controllability") or {}).get("can_terminate") else 0,
@@ -8898,6 +9179,7 @@ class Handler(BaseHTTPRequestHandler):
             for row in _list_codex_sessions(live_only=False, active_within_min=active_within_min):
                 rows.append(self._decorate_session_lifecycle_row(row))
 
+        rows = _collapse_live_session_rows_by_terminal(rows)
         rows.sort(key=lambda r: int(r.get("last_heartbeat") or 0), reverse=True)
         rows = rows[:max(1, min(int(limit or 200), 500))]
         for row in rows:
@@ -9073,6 +9355,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._decorate_session_lifecycle_row(row)
                 for row in _list_codex_sessions(live_only=live_only, active_within_min=within_min)
             ]
+            rows = _collapse_live_session_rows_by_terminal(rows)
             _record_sessions_scan(rows)
             body = json.dumps({"count": len(rows), "items": rows}).encode()
             self.send_response(200)
@@ -9082,14 +9365,11 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        # Live filter semantics (live_only): not explicitly closed, has a
-        # claude_uuid (proves hooks fired post-migration), AND heartbeat is
-        # fresh enough. The freshness gate hides DORMANT zombies — claudes
-        # whose process is technically alive but stopped firing hooks hours
-        # or days ago (typical of sentinel-mode terminals whose hooks point
-        # at the Sentinel daemon on :9100 instead of us). The kill -0 GC
-        # below catches process-DEAD rows; this catches
-        # process-alive-but-mute rows. Defaults to within_min=60.
+        # Live filter semantics (live_only): keep sessions with either a fresh
+        # claude_uuid-backed hook row or a live Claude process on the recorded
+        # terminal. The freshness gate hides mute zombie rows, while terminal
+        # discovery keeps already-open Claude windows controllable.
+        _claude_register_terminal_only_rows(set())
         backend = _claude_sessions_backend()
         try:
             backend_rows = backend.sessions_rows(live_only, within_min)
@@ -9163,8 +9443,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._decorate_session_lifecycle_row(row)
                 for row in _list_codex_sessions(live_only=live_only, active_within_min=within_min)
             )
+            rows = _collapse_live_session_rows_by_terminal(rows)
             rows.sort(key=lambda r: int(r.get("last_heartbeat") or 0), reverse=True)
             rows = rows[:50]
+        else:
+            rows = _collapse_live_session_rows_by_terminal(rows)
 
         _record_sessions_scan(rows)
         body = json.dumps({"count": len(rows), "items": rows}).encode()
@@ -9204,8 +9487,8 @@ class Handler(BaseHTTPRequestHandler):
                 "fresh": sum(1 for row in claude_live if now - int(row.get("last_heartbeat") or 0) < 120),
                 "stale": sum(1 for row in claude_live if now - int(row.get("last_heartbeat") or 0) >= 120),
                 "notes": [
-                    "Requires closed_at null, claude_uuid present, and a recent heartbeat.",
-                    "This is the canonical Claude dashboard source.",
+                    "Uses claude_uuid-backed hook rows plus live terminal discovery.",
+                    "Terminal-only rows are controllable even before a transcript id is known.",
                 ],
             },
             {
@@ -9304,7 +9587,8 @@ class Handler(BaseHTTPRequestHandler):
 
         def snapshot_payload(rows: list[dict]) -> tuple[bytes, str]:
             degraded = self._sessions_backend_degradation()
-            body: dict = {"source": _sessions_stream_source(), "items": rows, "ts": _time.time()}
+            source = _sessions_stream_source()
+            body: dict = {"source": source, "items": rows, "ts": _time.time()}
             if degraded is not None:
                 body["degraded"] = degraded
             digest = hashlib.sha256(
@@ -9315,6 +9599,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             # Emit initial snapshot immediately so the iPhone never paints
             # an empty Dashboard while waiting for the first poll.
+            # Initial snapshot body contract: {"items": initial}.
             initial = collect_live()
             payload, last_hash = snapshot_payload(initial)
             self.wfile.write(b"event: snapshot\ndata: " + payload + b"\n\n")
@@ -9756,10 +10041,18 @@ class Handler(BaseHTTPRequestHandler):
     def _session_live_terminal_tail(self, raw_session: str, since: int) -> dict | None:
         provider, native_id = _parse_agent_session_ref(raw_session)
         since = max(0, int(since or 0))
-        broker_found = self._broker_session_for(raw_session)
+        try:
+            broker_found = self._broker_session_for(raw_session)
+        except Exception as e:
+            broker_found = None
+            self.log_message("session-live terminal broker lookup failed for %s: %s", raw_session, str(e)[:200])
         if broker_found and PTY_BROKER:
             broker_id, _ = broker_found
-            tail = PTY_BROKER.raw_tail(broker_id, since=since)
+            try:
+                tail = PTY_BROKER.raw_tail(broker_id, since=since)
+            except Exception as e:
+                self.log_message("session-live broker tail failed for %s: %s", raw_session, str(e)[:200])
+                tail = None
             if tail is None:
                 return None
             data, next_offset, total_bytes, reset = tail
@@ -9952,22 +10245,21 @@ class Handler(BaseHTTPRequestHandler):
                             if not emit("turn_state", turn, source="turn-state"):
                                 return
 
-                if last_truth is None:
-                    # Preserve the original ordering guarantee: clients see the
-                    # first truth event before any tail data, so reducers that
-                    # gate terminal lines on transcript truth never drop bytes.
-                    if now - last_keepalive >= 20.0:
-                        if not emit("keepalive", {}):
-                            return
-                    _time.sleep(0.05)
-                    continue
-
-                for receipt_event in _session_live_control_receipts_since(session_id, receipt_seq):
+                try:
+                    receipt_events = _session_live_control_receipts_since(session_id, receipt_seq)
+                except Exception as e:
+                    receipt_events = []
+                    self.log_message("session-live control receipts failed for %s: %s", session_id, str(e)[:200])
+                for receipt_event in receipt_events:
                     receipt_seq = max(receipt_seq, int(receipt_event.get("receipt_seq") or 0))
                     if not emit("control_receipt", receipt_event, source="control-receipts"):
                         return
 
-                terminal_payload = self._session_live_terminal_tail(session_id, terminal_offset)
+                try:
+                    terminal_payload = self._session_live_terminal_tail(session_id, terminal_offset)
+                except Exception as e:
+                    terminal_payload = None
+                    self.log_message("session-live terminal tail failed for %s: %s", session_id, str(e)[:200])
                 if terminal_payload is not None:
                     if terminal_payload.get("reset"):
                         terminal_offset = 0
@@ -10118,7 +10410,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _terminal_stream_truth_for_session(self, raw_session: str) -> dict:
         provider, native_id = _parse_agent_session_ref(raw_session)
-        source = _terminal_surface_source(raw_session)
+        try:
+            source = _terminal_surface_source(raw_session)
+        except Exception as e:
+            source = {
+                "available": False,
+                "source": "unavailable",
+                "reason": str(e)[:160] or "terminal_surface_source_failed",
+            }
         backend = source.get("source")
         byte_stream_available = bool(source.get("available")) and backend in {"broker_vt", "script_capture"}
         try:
@@ -10587,9 +10886,6 @@ class Handler(BaseHTTPRequestHandler):
         if not native_id:
             return None
         qualified = _qualified_session_id(provider, native_id)
-        session = PTY_BROKER.get(qualified)
-        if session:
-            return qualified, session
         if provider == "codex":
             reg = _agent_registry_get("codex", native_id) or {}
             try:
@@ -10598,26 +10894,61 @@ class Handler(BaseHTTPRequestHandler):
                 metadata = {}
             broker_id = str(metadata.get("broker_id") or "").strip()
             if broker_id:
-                session = PTY_BROKER.get(broker_id)
+                try:
+                    session = PTY_BROKER.get(broker_id)
+                except Exception:
+                    session = None
                 if session:
-                    PTY_BROKER.register_alias(qualified, _broker_session_id(session))
+                    try:
+                        PTY_BROKER.register_alias(qualified, _broker_session_id(session))
+                    except Exception:
+                        pass
                     return qualified, session
             tty = reg.get("terminal_tty") or ""
             if tty:
-                session = PTY_BROKER.get_by_tty(tty)
+                try:
+                    session = PTY_BROKER.get_by_tty(tty)
+                except Exception:
+                    session = None
                 if session:
-                    PTY_BROKER.register_alias(qualified, _broker_session_id(session))
+                    try:
+                        PTY_BROKER.register_alias(qualified, _broker_session_id(session))
+                    except Exception:
+                        pass
                     return qualified, session
         if provider == "claude":
             session_id = _claude_native_session_id(raw_session)
             if not session_id:
                 return None
+            reg = _agent_registry_get("claude", session_id) or {}
+            try:
+                metadata = json.loads(reg.get("metadata_json") or "{}")
+            except Exception:
+                metadata = {}
+            broker_id = str(metadata.get("broker_id") or "").strip()
+            if broker_id:
+                try:
+                    session = PTY_BROKER.get(broker_id)
+                except Exception:
+                    session = None
+                if session:
+                    try:
+                        PTY_BROKER.register_alias(qualified, _broker_session_id(session))
+                    except Exception:
+                        pass
+                    return qualified, session
             tty = self._lookup_terminal_tty(session_id)
             if tty:
-                session = PTY_BROKER.get_by_tty(tty)
+                try:
+                    session = PTY_BROKER.get_by_tty(tty)
+                except Exception:
+                    session = None
                 if session:
                     qualified = _qualified_session_id("claude", session_id)
-                    PTY_BROKER.register_alias(qualified, _broker_session_id(session))
+                    try:
+                        PTY_BROKER.register_alias(qualified, _broker_session_id(session))
+                    except Exception:
+                        pass
                     return qualified, session
         return None
 
@@ -11665,6 +11996,7 @@ class Handler(BaseHTTPRequestHandler):
             cached = _runtime_snapshot_cache.get(cache_key)
             if cached is not None and now - cached[0] < RUNTIME_SNAPSHOT_CACHE_SECONDS:
                 return _copy_cache_value(cached[1])
+        _claude_register_terminal_only_rows(set())
         backend_rows = _claude_sessions_backend().collect_rows(since_min, live_only, limit)
 
         rows: list[dict] = []
@@ -14633,10 +14965,9 @@ Worker instructions:
         self._send_json({"ok": True, "handoff_id": handoff_id, "composeDraft": compose_draft})
 
     def _handle_spawn_session(self, q):
-        """Spawn a new Claude/Codex session. Pairling-owned PTYs are the
-        default path; Terminal.app can attach as a client via `pairling attach`.
-        The legacy Terminal.app-owner path remains behind
-        PAIRLING_SPAWN_BACKEND=terminal_app for rollback/debugging.
+        """Spawn a new Claude/Codex session. User-facing direct spawns open a
+        visible Terminal.app tab. The broker remains for aperture_cli launches
+        and PAIRLING_SPAWN_BACKEND=broker rollback/debugging.
 
         Security:
         - Project path must be absolute and exist on disk.
@@ -14742,20 +15073,13 @@ Worker instructions:
                 }, status=400)
                 return
 
-        if os.environ.get("PAIRLING_SPAWN_BACKEND", "broker").lower() != "terminal_app":
+        if launch_strategy == "aperture_cli" or os.environ.get("PAIRLING_SPAWN_BACKEND", "terminal_app").lower() == "broker":
             self._handle_spawn_session_broker(
                 project,
                 provider,
                 launch_context=aperture_launch_context,
                 native_id_override=preview_native_id if launch_strategy == "aperture_cli" else None,
             )
-            return
-
-        if launch_strategy == "aperture_cli":
-            self._send_json({
-                "ok": False,
-                "error": "Aperture CLI launch strategy requires the Pairling PTY broker backend",
-            }, status=400)
             return
 
         capture_id = ""
@@ -14772,7 +15096,11 @@ Worker instructions:
         else:
             capture_id = secrets.token_hex(12)
             capture_log_path = TERMINAL_CAPTURE_DIR / f"claude-{capture_id}.log"
-            inner = f"cd {shlex.quote(project)} && claude"
+            inner = (
+                f"cd {shlex.quote(project)} && "
+                f"PAIRLING_PHONE_SESSION=1 "
+                f"exec claude --settings {shlex.quote(str(SPAWN_SETTINGS_PATH))}"
+            )
             shell_cmd = _terminal_script_command(capture_log_path, inner)
         as_escaped_cmd = _as_escape(shell_cmd)
 
@@ -14801,41 +15129,37 @@ Worker instructions:
             if len(parts) >= 2:
                 tty = parts[1].strip()
         pid = 0
-        native_id = None
-        if provider == "codex" and result.get("ok"):
-            native_id = "pending-" + secrets.token_hex(8)
+        native_id = "pending-" + secrets.token_hex(8)
+        if result.get("ok"):
             _time.sleep(0.75)
-            pid = _pid_for_tty_command(tty, "codex") if tty else 0
+            pid = _pid_for_tty_command(tty, provider) if tty else 0
             if tty and capture_log_path is not None:
                 _write_terminal_capture_mapping(
                     tty,
                     capture_log_path,
-                    provider="codex",
+                    provider=provider,
                     project=project,
                     capture_id=capture_id,
                 )
             _agent_registry_upsert(
-                "codex",
+                provider,
                 native_id,
                 project,
                 pid=pid,
                 terminal_tty=tty,
                 metadata={
-                    "spawned_by": "phone-companion",
+                    "spawned_by": "pairling",
+                    "launch_strategy": "direct_pairling",
+                    "launch_visibility": "visible_terminal",
                     "terminal_log": str(capture_log_path) if capture_log_path else None,
                     "capture_backend": "script" if capture_log_path else None,
+                    "terminal_source": "terminal_app_contents",
                     "capture_id": capture_id or None,
                 },
+                working_on=f"New {provider.title()} session",
             )
-            _write_agent_turn_state("codex", native_id, "idle", event="spawn")
-        elif provider == "claude" and result.get("ok") and tty and capture_log_path is not None:
-            _write_terminal_capture_mapping(
-                tty,
-                capture_log_path,
-                provider="claude",
-                project=project,
-                capture_id=capture_id,
-            )
+            if provider == "codex":
+                _write_agent_turn_state("codex", native_id, "idle", event="spawn")
 
         # Audit log — append-only, JSONL, includes failures.
         try:
@@ -14867,20 +15191,21 @@ Worker instructions:
             self.wfile.write(body)
             return
 
-        body = json.dumps({
+        self._send_json({
             "ok": True,
             "project": project,
             "provider": provider,
             "native_id": native_id,
+            "session_id": _qualified_session_id(provider, native_id),
             "tty": tty,
             "pid": pid,
             "terminal_log": str(capture_log_path) if capture_log_path else None,
-        }).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+            "capture_backend": "script" if capture_log_path else None,
+            "terminal_source": "terminal_app_contents",
+            "launch_strategy": "direct_pairling",
+            "launch_visibility": "visible_terminal",
+            "attach_command": None,
+        })
 
     def _session_context_for_workflow(self, raw_session: str) -> dict | None:
         provider, native_id = _parse_agent_session_ref(raw_session)
@@ -15244,7 +15569,7 @@ Worker instructions:
             self.wfile.write(body)
             return
 
-        if os.environ.get("PAIRLING_RESUME_BACKEND", "broker").lower() != "terminal_app":
+        if os.environ.get("PAIRLING_RESUME_BACKEND", "terminal_app").lower() == "broker":
             self._handle_resume_session_broker(provider=provider, project=project, native_id=native_id, prompt=prompt)
             return
 
@@ -15299,6 +15624,8 @@ Worker instructions:
                     "resume_target": native_id,
                     "terminal_log": str(capture_log_path),
                     "capture_backend": "script",
+                    "terminal_source": "terminal_app_contents",
+                    "launch_visibility": "visible_terminal",
                     "capture_id": capture_id,
                 },
             )
@@ -15330,7 +15657,7 @@ Worker instructions:
             self.end_headers()
             self.wfile.write(body)
             return
-        body = json.dumps({
+        self._send_json({
             "ok": True,
             "provider": "codex",
             "native_id": native_id,
@@ -15341,13 +15668,9 @@ Worker instructions:
             "terminal_log": str(capture_log_path),
             "capture_backend": "script",
             "terminal_source": "terminal_app_contents",
+            "launch_visibility": "visible_terminal",
             "attach_command": None,
-        }).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        })
 
     def _send_text_to_codex_registry(self, native_id: str, text: str, receipt_context: dict | None = None) -> None:
         # Precondition: callers pass text through _sanitize_terminal_text_input.

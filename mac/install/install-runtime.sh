@@ -1366,10 +1366,11 @@ def default_pair_route(port_number: int) -> dict:
         value = os.environ.get(key)
         if value:
             return {"base_url": value, "source": "explicit_override", "status": "override"}
-    # Remote-first pairing: if connectd reports a ready Pairling Connect route,
-    # the QR advertises that route and the iOS app claims it through the
-    # embedded pre-pair transport. LAN/Bonjour are explicit degraded fallbacks
-    # when Pairling Connect is not ready.
+    # First-pair bootstrap: prefer LAN when it exists. iOS blocks plain HTTP to
+    # a tailnet IP before the embedded Pairling Connect route is ready.
+    lan_ip = detected_lan_ip()
+    if lan_ip:
+        return {"base_url": f"http://{lan_ip}:{port_number}", "source": "lan", "status": "fallback", "kind": "lan"}
     route = ready_connectd_route()
     if route:
         return {
@@ -1378,9 +1379,6 @@ def default_pair_route(port_number: int) -> dict:
             "status": route["status"],
             "kind": route["kind"],
         }
-    lan_ip = detected_lan_ip()
-    if lan_ip:
-        return {"base_url": f"http://{lan_ip}:{port_number}", "source": "lan", "status": "fallback", "kind": "lan"}
     if os.environ.get("PAIRLING_DISABLE_BONJOUR") != "1" and os.environ.get("PAIRLING_TEST_DISABLE_BONJOUR") != "1":
         return {"base_url": f"http://{socket.gethostname()}.local:{port_number}", "source": "bonjour", "status": "fallback", "kind": "bonjour"}
     tailnet_ip = detected_tailnet_ip()

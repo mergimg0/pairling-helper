@@ -723,6 +723,7 @@ var postPaths = map[string]bool{
 	"/open":                                  true,
 	"/orchestrations":                        true,
 	"/pair/claim":                            true,
+	"/pair/bind-node":                        true,
 	"/pair/psk-claim":                        true,
 	"/pair/revoke":                           true,
 	"/pair/rotate-token":                     true,
