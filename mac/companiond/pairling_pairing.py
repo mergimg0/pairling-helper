@@ -358,6 +358,7 @@ class PairingStore:
         relay_device_id: str | None = None,
         relay_required: bool = False,
         relay_claim_verifier=None,
+        require_direct_attest: bool = False,
     ) -> PairClaim:
         with self._claim_lock:
             record, path, now = self._precheck_claim(pair_id)
@@ -384,6 +385,7 @@ class PairingStore:
                 attested_claim_ticket=attested_claim_ticket,
                 relay_device_id=relay_device_id, relay_required=relay_required,
                 relay_claim_verifier=relay_claim_verifier,
+                require_direct_attest=require_direct_attest,
             )
 
     def _precheck_claim(self, pair_id: str) -> tuple[dict, Path, float]:
@@ -460,6 +462,7 @@ class PairingStore:
         relay_required: bool,
         relay_claim_verifier,
         funnel_origin: bool = False,
+        require_direct_attest: bool = False,
         attestation_verified: bool | None = None,
     ) -> PairClaim:
         """Post-authentication finalize, shared by legacy and PSK claims. The
@@ -475,7 +478,8 @@ class PairingStore:
             attestation_verified = self._verify_claim_attestation(
                 pair_id=pair_id, record=record, attest_object=attest_object,
                 attest_key_id=attest_key_id, attest_environment=attest_environment,
-                require=funnel_origin, force_production=funnel_origin,
+                require=funnel_origin or require_direct_attest,
+                force_production=funnel_origin or require_direct_attest,
             )
         relay_status = "none"
         verified_relay_device_id = relay_device_id
@@ -569,6 +573,7 @@ class PairingStore:
         relay_required: bool = False,
         relay_claim_verifier=None,
         funnel_origin: bool = False,
+        require_direct_attest: bool = False,
     ) -> tuple[PairClaim, bytes, bytes, bytes]:
         """WS3 PSK-authenticated ECDH claim. The secret is NEVER received; the
         caller proves knowledge of it by completing the authenticated key
@@ -584,14 +589,14 @@ class PairingStore:
             raise PairingError("psk_bad_key", 400, "invalid psk material")
         with self._claim_lock:
             attestation_verified = None
-            if funnel_origin:
-                # Funnel claims prove a genuine device BEFORE the attempt counter
+            if funnel_origin or require_direct_attest:
+                # Public network claims prove a genuine device BEFORE the attempt counter
                 # and the ECDH derive, so an un-attested spray cannot lock out a
-                # live invitation or force crypto work. Fail-closed regardless of
+                # live invitation or force crypto work. Fail closed regardless of
                 # the env default, with the environment pinned to production.
-                funnel_record, _ = self._load_record(pair_id)
+                hard_attest_record, _ = self._load_record(pair_id)
                 attestation_verified = self._verify_claim_attestation(
-                    pair_id=pair_id, record=funnel_record, attest_object=attest_object,
+                    pair_id=pair_id, record=hard_attest_record, attest_object=attest_object,
                     attest_key_id=attest_key_id, attest_environment=attest_environment,
                     require=True, force_production=True,
                 )
@@ -624,7 +629,8 @@ class PairingStore:
                 attested_claim_ticket=attested_claim_ticket,
                 relay_device_id=relay_device_id, relay_required=relay_required,
                 relay_claim_verifier=relay_claim_verifier,
-                funnel_origin=funnel_origin, attestation_verified=attestation_verified,
+                funnel_origin=funnel_origin, require_direct_attest=require_direct_attest,
+                attestation_verified=attestation_verified,
             )
             aad = _psk.transcript(pair_id, a_pub, b_pub)
             mac_confirm = _psk.confirm_tag(k_confirm, _psk.CONFIRM_MAC, pair_id, a_pub, b_pub)

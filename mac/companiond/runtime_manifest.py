@@ -71,7 +71,7 @@ def build_runtime_info(
     source_branch = os.environ.get("COMPANION_SOURCE_BRANCH", "unknown")
     source_dirty = None
     installed_at = os.environ.get("COMPANION_INSTALLED_AT")
-    install_root = str(script.parent.parent) if script.parent.name in {"companiond", "guardian"} else str(script.parent)
+    install_root = str(script.parent.parent) if script.parent.name == "companiond" else str(script.parent)
     source_hash = None
     verified = False
     verification_error = manifest_error
@@ -122,6 +122,7 @@ def public_runtime_info(info: dict[str, Any]) -> dict[str, Any]:
     return {
         "name": info.get("name") or RUNTIME_NAME,
         "runtime_version": info.get("runtime_version"),
+        "source_revision": info.get("source_revision"),
         "contract_version": info.get("contract_version") or CONTRACT_VERSION,
         "compat_mode": info.get("compat_mode") or COMPAT_MODE,
         "launchd_label": info.get("launchd_label") or DAEMON_LABEL,

@@ -20,6 +20,7 @@ const prePairMaxBodyBytes int64 = 16 * 1024
 const pairDropSmallFileMaxBodyBytes int64 = 10 * 1024 * 1024
 const pairDropUploadChunkMaxBodyBytes int64 = 1024 * 1024
 const peerNodeHeader = "X-Pairling-Peer-Node"
+const internalTokenHeader = "X-Pairling-Internal-Token"
 
 // peerProvenanceHeader tells pairlingd how connectd identified the peer node:
 // "tagged" (the old minted tag:pairling-phone path) or "interactive" (an
@@ -233,6 +234,7 @@ func (h *Handler) rewrite(r *httputil.ProxyRequest) {
 	}
 	r.Out.Host = h.upstream.Host
 	r.Out.Header.Del("X-Forwarded-For")
+	r.Out.Header.Del(internalTokenHeader)
 	r.Out.Header.Del(peerNodeHeader)
 	r.Out.Header.Del(peerProvenanceHeader)
 	r.Out.Header.Del(funnelOriginHeader)
@@ -513,6 +515,9 @@ func Allowed(method, path string) bool {
 	if !supportedMethod(method) {
 		return false
 	}
+	if containsEscapedPathSeparator(path) {
+		return false
+	}
 	switch method {
 	case http.MethodGet:
 		return getPaths[path] || dynamicGETPath(path)
@@ -528,7 +533,15 @@ func Allowed(method, path string) bool {
 }
 
 func allowedForAnyMethod(path string) bool {
+	if containsEscapedPathSeparator(path) {
+		return false
+	}
 	return getPaths[path] || postPaths[path] || dynamicGETPath(path) || dynamicPOSTPath(path) || dynamicPUTPath(path) || dynamicDELETEPath(path)
+}
+
+func containsEscapedPathSeparator(path string) bool {
+	lower := strings.ToLower(path)
+	return strings.Contains(lower, "%2f") || strings.Contains(lower, "%5c")
 }
 
 func localUpstream(upstream *url.URL) bool {
@@ -672,7 +685,6 @@ var getPaths = map[string]bool{
 	"/pickers/permissions":          true,
 	"/pickers/resume":               true,
 	"/pickers/resume/preview":       true,
-	"/power-state":                  true,
 	"/provider-status":              true,
 	"/push/status":                  true,
 	"/recent-projects":              true,

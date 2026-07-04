@@ -27,11 +27,9 @@ Then open Pairling on your iPhone and scan the QR code that `setup` prints.
 - Stages the runtime under `~/Library/Application Support/Pairling/runtime/`
   (versioned releases, atomic `current` symlink flip, `pairling rollback`).
 - Installs user-domain LaunchAgents (`dev.pairling.companiond`,
-  `dev.pairling.connectd`). No root. The optional power guardian is a separate,
-  explicit, sudo-gated step.
-- Verifies the payload against the package's integrity manifest and verifies
-  the Developer ID signature of the bundled `pairling-connectd` binary before
-  staging — fail closed.
+  `dev.pairling.connectd`, `dev.pairling.ptybroker`). No root helper is installed.
+- Verifies the package payload manifest and the Developer ID signature of the
+  bundled `pairling-connectd` binary before staging — fail closed.
 
 ## Commands
 
@@ -54,8 +52,9 @@ pairling uninstall [--yes]
 - **Readable payload:** the runtime is Python/bash source plus one signed Go
   binary (`pairling-connectd`); inspect it with `npm pack pairling --dry-run`.
 - **Integrity chain:** CI records SHA-256 of every payload file in
-  `payload-manifest.json`; `pairling setup` re-verifies before staging;
-  `pairling doctor` re-verifies the staged runtime and the binary signature.
+  `payload-manifest.json`; `pairling setup` verifies that manifest and the
+  binary signature before staging; `pairling doctor` re-verifies the staged
+  runtime and the binary signature.
 - **Local-first:** the daemon serves your devices with per-device scoped bearer
   tokens. npm being down can never affect an installed Mac.
 

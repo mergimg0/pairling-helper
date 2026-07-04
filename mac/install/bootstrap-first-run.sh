@@ -98,6 +98,37 @@ run_step() {
   printf '%s' "$status"
 }
 
+run_step_setup() {
+  # The setup step renders the guided screen, so its output must reach the
+  # controlling terminal while a copy is still written to setup.log for the audit
+  # record. This wrapper sends the live view to the controlling terminal through
+  # tee and writes a full transcript into the log. It reads the setup exit code
+  # from PIPESTATUS, the left side of the pipe, not tee, and emits only the
+  # status digit on its own stdout, so the surrounding command substitution reads
+  # a clean status. The terminal guard actually writes one empty line to
+  # /dev/tty, because the device node can test as writable when there is no
+  # controlling terminal. When that write fails, the wrapper falls back to the
+  # plain capture, so a headless launch still writes setup.log and never errors.
+  local name="$1"
+  shift
+  local log_file="$ARTIFACT_ROOT/$name.log"
+  set +e
+  if { : >/dev/tty; } 2>/dev/null; then
+    # PAIRLING_WIZARD tells install-runtime.sh to render even though its own
+    # stdout is piped here. tee writes the transcript to the log and sends its
+    # own stdout to the controlling terminal, so the screen is shown and the log
+    # stays a complete audit artifact. Stdin is inherited, so an interactive
+    # first-run still drives the recovery menu, which is gated on [ -t 0 ].
+    PAIRLING_WIZARD=1 "$@" 2>&1 | tee "$log_file" >/dev/tty
+    local status="${PIPESTATUS[0]}"
+  else
+    "$@" >"$log_file" 2>&1
+    local status=$?
+  fi
+  set -e
+  printf '%s' "$status"
+}
+
 run_json_step() {
   local name="$1"
   local output_file="$ARTIFACT_ROOT/$name.json"
@@ -109,7 +140,7 @@ run_json_step() {
   printf '%s' "$status"
 }
 
-setup_status="$(run_step setup "$REPO_ROOT/mac/install/install-runtime.sh" setup)"
+setup_status="$(run_step_setup setup "$REPO_ROOT/mac/install/install-runtime.sh" setup)"
 doctor_before_status="$(run_json_step doctor-before "$REPO_ROOT/mac/install/doctor.sh" --first-run --json)"
 
 pair_status="0"

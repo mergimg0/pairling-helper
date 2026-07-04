@@ -220,6 +220,8 @@ func TestAllowedPairDropContentRouteIsGetOnlyAndPathStrict(t *testing.T) {
 		{http.MethodPost, "/pairdrop/files/pd_0123456789abcdef0123456789abcdef/content"},
 		{http.MethodGet, "/pairdrop/files/pd_0123456789abcdef0123456789abcdef/content/extra"},
 		{http.MethodGet, "/pairdrop/files/pd_0123456789abcdef0123456789abcdef/extra/content"},
+		{http.MethodGet, "/pairdrop/files/pd_0123456789abcdef0123456789abcdef%2fextra/content"},
+		{http.MethodGet, "/pairdrop/files/pd_0123456789abcdef0123456789abcdef%5cextra/content"},
 	}
 	for _, tc := range rejected {
 		if Allowed(tc.method, tc.path) {
@@ -446,6 +448,28 @@ func TestPairlingConnectStripsForgedPeerNodeHeader(t *testing.T) {
 	}
 	if forwardedHeader != "" {
 		t.Fatalf("forged peer-node header forwarded to upstream: %q", forwardedHeader)
+	}
+}
+
+func TestPairlingConnectStripsInternalTokenHeader(t *testing.T) {
+	var forwardedHeader string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwardedHeader = r.Header.Get("X-Pairling-Internal-Token")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	handler := newTestHandlerWithMode(t, upstream.URL, 1024, nil, ExposureModePairlingConnect, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "http://pairling-connect.local/send-text", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer device-token")
+	req.Header.Set("X-Pairling-Internal-Token", "forged-internal-token")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if forwardedHeader != "" {
+		t.Fatalf("internal token header forwarded to upstream: %q", forwardedHeader)
 	}
 }
 

@@ -16,11 +16,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to publish (e.g. v0.1.0). Idempotent — skips versions already on the registry.
+        description: Release tag to publish (e.g. v0.1.0). The version must not already exist on npm.
         required: true
         type: string
       channel:
-        description: npm dist-tag. This workflow only ever publishes to "next"; "latest" is promoted separately via `npm dist-tag add` after device proof.
+        description: npm dist-tag. This workflow only ever publishes to "next"; promote "latest" with the product repo gated promote-npm-latest.sh after device proof.
         required: false
         default: next
         type: choice
@@ -118,6 +118,8 @@ jobs:
         run: |
           # CI passes pre-signed connectd AND python as prebuilts; the build
           # never re-vendors or re-signs (no Developer ID cert in CI).
+          PRODUCT_SOURCE_REVISION="$(python3 -c 'import json; print(json.load(open("RELEASE-BINARIES.json"))["source_revision"])')"
+          export PAIRLING_SOURCE_REVISION="$PRODUCT_SOURCE_REVISION"
           bash mac/packaging/build-npm-packages.sh \
             --release \
             --version "${TAG#v}" \
@@ -136,15 +138,15 @@ jobs:
         run: |
           VERSION="${TAG#v}"
           # FAIL-CLOSED dist-tag policy. This workflow publishes ONLY to `next`.
-          # `latest` is never produced by an automated publish; an operator
-          # promotes it with `npm dist-tag add <pkg>@$VERSION latest` for all
-          # three packages after on-device proof.
+          # `latest` is never produced by this workflow. Promote it from the
+          # product repo with mac/packaging/promote-npm-latest.sh after the
+          # release gate and on-device proof pass.
           if [ "$EVENT_NAME" = "release" ]; then
             # A release event must be a GitHub pre-release. A normal (non-pre)
             # release implies intent to ship latest, which this workflow refuses:
-            # fail closed and force promotion via npm dist-tag add.
+            # fail closed and force promotion through the gated product repo script.
             if [ "$IS_PRERELEASE" != "true" ]; then
-              echo "::error::Refusing to publish: GitHub Release is not a pre-release. This workflow only publishes to next; promote to latest with npm dist-tag add after device proof." >&2
+              echo "::error::Refusing to publish: GitHub Release is not a pre-release. This workflow only publishes to next; promote latest with mac/packaging/promote-npm-latest.sh after the release gate and device proof pass." >&2
               exit 1
             fi
             CHANNEL="next"
@@ -153,22 +155,35 @@ jobs:
           fi
           # Hard guard: never publish to anything but next, whatever computed it.
           if [ "$CHANNEL" != "next" ]; then
-            echo "::error::Refusing to publish to dist-tag '$CHANNEL'. This workflow only publishes to next; latest is promoted via npm dist-tag add." >&2
+            echo "::error::Refusing to publish to dist-tag '$CHANNEL'. This workflow only publishes to next; latest is promoted with mac/packaging/promote-npm-latest.sh after release gates pass." >&2
             exit 1
           fi
           echo "publishing channel: $CHANNEL"
-          # Idempotent: skip any version already on the registry so a re-run
-          # after fixing a per-package trusted-publisher gap only publishes the
-          # missing packages (re-publishing an existing version is a hard error).
-          publish_if_absent() {
-            local pkg="$1" tarball="$2"
-            if npm view "$pkg@$VERSION" version >/dev/null 2>&1; then
-              echo "skip: $pkg@$VERSION already published"
-              return 0
+          ensure_unpublished() {
+            local pkg="$1" out err status
+            out="$(mktemp)"
+            err="$(mktemp)"
+            if npm view "$pkg@$VERSION" version --json >"$out" 2>"$err"; then
+              echo "::error::$pkg@$VERSION is already published. Bump the release version and create a new tag." >&2
+              rm -f "$out" "$err"
+              exit 1
+            else
+              status=$?
+              if ! grep -Eq 'E404|No match found' "$err"; then
+                echo "::error::Could not verify npm registry state for $pkg@$VERSION" >&2
+                cat "$err" >&2
+                rm -f "$out" "$err"
+                exit "$status"
+              fi
             fi
+            rm -f "$out" "$err"
+          }
+          publish_new() {
+            local pkg="$1" tarball="$2"
+            ensure_unpublished "$pkg"
             echo "publishing $pkg@$VERSION --tag $CHANNEL"
             npm publish "$tarball" --provenance --access public --tag "$CHANNEL"
           }
-          publish_if_absent "@pairling/runtime-darwin-arm64" "dist/npm/pairling-runtime-darwin-arm64-$VERSION.tgz"
-          publish_if_absent "@pairling/runtime-darwin-x64" "dist/npm/pairling-runtime-darwin-x64-$VERSION.tgz"
-          publish_if_absent "pairling" "dist/npm/pairling-$VERSION.tgz"
+          publish_new "@pairling/runtime-darwin-arm64" "dist/npm/pairling-runtime-darwin-arm64-$VERSION.tgz"
+          publish_new "@pairling/runtime-darwin-x64" "dist/npm/pairling-runtime-darwin-x64-$VERSION.tgz"
+          publish_new "pairling" "dist/npm/pairling-$VERSION.tgz"

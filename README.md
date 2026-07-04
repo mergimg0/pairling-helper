@@ -43,9 +43,8 @@ RELEASE-BINARIES.json     SHA-256 + Apple Team ID of the signed binaries for
    digests and the pinned Team ID (`965AVD34A3`), assembles the packages from
    the mirrored sources, and publishes to npm with `--provenance` — so the
    attestation pins the exact commit whose committed digests pin the binaries.
-4. On the consuming Mac, `pairling setup` independently re-verifies the
-   payload against `payload-manifest.json` and refuses any `pairling-connectd`
-   that fails `codesign --verify --strict` or carries a different Team ID.
+4. On the consuming Mac, `pairling setup` refuses any `pairling-connectd` that
+   fails `codesign --verify --strict` or carries a different Team ID.
 
 ## Verifying a release
 

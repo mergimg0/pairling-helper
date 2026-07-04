@@ -60,7 +60,6 @@ home = Path.home()
 
 PAIRLING_PORT = int(os.environ.get("PAIRLING_RUNTIME_PORT", "7773"))
 PAIRLING_LABEL = "dev.pairling.companiond"
-PAIRLING_GUARDIAN_LABEL = "dev.pairling.power-guardian"
 PAIRLING_CONNECTD_LABEL = "dev.pairling.connectd"
 PAIRLING_PTYBROKER_LABEL = "dev.pairling.ptybroker"
 TEAM_ID = os.environ.get("PAIRLING_TEAM_ID", os.environ.get("PAIRLING_CONNECTD_TEAM_ID", "965AVD34A3"))
@@ -77,7 +76,7 @@ PAIR_ROOT = APP_SUPPORT / "pair"
 USER_PLIST = home / "Library" / "LaunchAgents" / f"{PAIRLING_LABEL}.plist"
 CONNECTD_USER_PLIST = home / "Library" / "LaunchAgents" / f"{PAIRLING_CONNECTD_LABEL}.plist"
 PTYBROKER_USER_PLIST = home / "Library" / "LaunchAgents" / f"{PAIRLING_PTYBROKER_LABEL}.plist"
-SYSTEM_PLIST = Path("/Library/LaunchDaemons") / f"{PAIRLING_GUARDIAN_LABEL}.plist"
+CLAUDE_INJECTOR = home / "Applications" / "ClaudeInjector.app" / "Contents" / "MacOS" / "ClaudeInjector"
 
 sys.path.insert(0, str(repo_root / "mac" / "companiond"))
 from pairling_connectd_status import fetch_connectd_status, redacted_connectd_summary
@@ -175,6 +174,8 @@ def detected_tailnet_ip() -> str | None:
 
 
 def permission_readiness() -> dict:
+    helper_installed = CLAUDE_INJECTOR.exists()
+    grantee_path = str(CLAUDE_INJECTOR if helper_installed else Path("/usr/bin/osascript"))
     return {
         "ios_local_network": {
             "required_for": ["bonjour_pairing", "lan_route_validation"],
@@ -187,10 +188,16 @@ def permission_readiness() -> dict:
         "mac_accessibility": {
             "required_for": ["terminal_ui_synthesis"],
             "status": "not_required_until_terminal_control",
+            "grantee_path": grantee_path,
+            "helper_installed": helper_installed,
+            "helper_path": str(CLAUDE_INJECTOR),
+            "doctor_probe": "reports_required_grantee",
         },
         "mac_automation": {
             "required_for": ["terminal_app_control"],
             "status": "not_required_by_default",
+            "grantee_path": grantee_path,
+            "doctor_probe": "reports_required_grantee",
         },
         "privacy_database": "not_modified",
     }
@@ -248,6 +255,37 @@ def ptybroker_status_rpc() -> tuple[dict | None, str | None]:
         return status if isinstance(status, dict) else {}, None
     except Exception as exc:
         return None, f"{type(exc).__name__}: {exc}"
+
+
+def safety_monitor_status() -> dict:
+    # Report the live SafetyMonitorBridge status, not a guess from local files.
+    # The bridge is imported from the staged companiond, the same copy the daemon
+    # runs. When no runtime is staged or the import fails, report a structured
+    # value with installed false, so the doctor JSON stays pure and never leaks a
+    # traceback. The bridge itself defaults to installed false when the future
+    # PairlingSafety.app is not present, which is today's true value.
+    try:
+        sys.path.insert(0, str(CURRENT / "companiond"))
+        from safety_monitor import SafetyMonitorBridge
+        bridge = SafetyMonitorBridge(APP_SUPPORT, home)
+        status = bridge.status()
+        return {
+            "installed": bool(status.get("installed")),
+            "full_disk_access": status.get("full_disk_access") or "unknown",
+            "system_extension_status": status.get("system_extension_status"),
+            "secure_mode_state": status.get("secure_mode_state"),
+            "live_artifact": status.get("live_artifact"),
+            "disk_usage_warning": status.get("disk_usage_warning"),
+            "summary": status.get("summary") or "",
+            "source": "live_bridge_status",
+        }
+    except Exception as exc:
+        return {
+            "installed": False,
+            "full_disk_access": "unknown",
+            "source": "live_bridge_status",
+            "error": str(exc)[:200],
+        }
 
 
 def ptybroker_deployment_status(*, launchd_loaded: bool) -> dict:
@@ -387,9 +425,8 @@ if manifest:
         "daemon_label": launchd.get("daemon_label"),
         "ptybroker_label": launchd.get("ptybroker_label"),
         "connectd_label": launchd.get("connectd_label"),
-        "guardian_label": launchd.get("guardian_label"),
     }
-    add("launchd_labels", launchd.get("daemon_label") == PAIRLING_LABEL and launchd.get("ptybroker_label") == PAIRLING_PTYBROKER_LABEL and launchd.get("connectd_label") == PAIRLING_CONNECTD_LABEL and launchd.get("guardian_label") == PAIRLING_GUARDIAN_LABEL, "error", "Manifest launchd labels are Pairling labels.", launchd_evidence)
+    add("launchd_labels", launchd.get("daemon_label") == PAIRLING_LABEL and launchd.get("ptybroker_label") == PAIRLING_PTYBROKER_LABEL and launchd.get("connectd_label") == PAIRLING_CONNECTD_LABEL, "error", "Manifest launchd labels are Pairling labels.", launchd_evidence)
     mismatches = []
     for item in manifest.get("files") or []:
         rel = item.get("path")
@@ -413,15 +450,13 @@ else:
 
 compile_targets = [
     repo_root / "mac" / "install" / "render-launchd.py",
-    repo_root / "mac" / "guardian" / "guardian_contract.py",
-    repo_root / "mac" / "guardian" / "companion-power-guardian.py",
 ]
 compile_errors = []
 for target in compile_targets:
     code, out, err = run(["python3", "-m", "py_compile", str(target)])
     if code != 0:
         compile_errors.append(f"{target}: {err or out}")
-add("lifecycle_sources_compile", not compile_errors, "error", "Lifecycle/guardian sources compile." if not compile_errors else "Lifecycle/guardian compile failed.", compile_errors)
+add("lifecycle_sources_compile", not compile_errors, "error", "Lifecycle sources compile." if not compile_errors else "Lifecycle compile failed.", compile_errors)
 
 ok, evidence = writable_dir(APP_SUPPORT)
 add("app_support_writable", ok, "error", "App support directory is writable.", evidence)
@@ -544,12 +579,6 @@ try:
     )
 except Exception as exc:
     add("ptybroker_launchagent_plist", False, "error", f"Pairling PTY broker LaunchAgent plist unreadable: {type(exc).__name__}: {exc}", str(PTYBROKER_USER_PLIST))
-
-try:
-    payload = load_plist(SYSTEM_PLIST)
-    add("guardian_plist", payload.get("Label") == PAIRLING_GUARDIAN_LABEL, "warning", "Pairling guardian LaunchDaemon is rendered/installed.", {"label": payload.get("Label")})
-except Exception as exc:
-    add("guardian_plist", False, "warning", f"Pairling guardian LaunchDaemon is not installed: {type(exc).__name__}: {exc}", str(SYSTEM_PLIST))
 
 code, out, err = run(["launchctl", "print", f"gui/{os.getuid()}/{PAIRLING_LABEL}"])
 add("launchagent_loaded", code == 0 and "state = running" in out, "error", "Pairling LaunchAgent is running." if code == 0 else "Pairling LaunchAgent is not loaded.", (out or err)[:2000])
@@ -790,13 +819,13 @@ first_run = {
 result = {
     "ok": not errors,
     "product": "Pairling",
+    "safety_monitor": safety_monitor_status(),
     "schema_version": 1,
     "contract_version": "pairling-runtime-v1",
     "runtime": {
         "name": "pairlingd",
         "port": PAIRLING_PORT,
         "launchd_label": PAIRLING_LABEL,
-        "guardian_label": PAIRLING_GUARDIAN_LABEL,
     },
     "ptybroker": ptybroker_deployment,
     "paths": {

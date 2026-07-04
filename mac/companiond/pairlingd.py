@@ -481,9 +481,6 @@ TERMINAL_SURFACE_V2_NONCE_SALT = os.urandom(16).hex()
 LAST_HUMAN_ACTIVITY_AT = 0.0
 DAEMON_STARTED_AT = _time.time()
 BOUND_HOST = ""
-POWER_STATE_PATH = Path(os.environ.get("COMPANION_POWER_STATE_PATH", "/var/run/pairling-power-state.json"))
-POWER_STATE_FALLBACK_PATH = Path(os.environ.get("COMPANION_POWER_STATE_FALLBACK_PATH", "/tmp/pairling-power-state.json"))
-POWER_STATE_STALE_SECONDS = 90
 DAEMON_VERSION = "2026-05-07"
 
 _sessions_health_lock = threading.Lock()
@@ -565,6 +562,7 @@ def _clean_terminal_display_text(text: str) -> str:
 
 _HEALTH_PROBE_CACHE_SECONDS = 30.0
 _HEALTH_PAYLOAD_CACHE_SECONDS = 5.0
+REQUEST_READ_TIMEOUT_SECONDS = 15.0
 _health_probe_cache_lock = threading.Lock()
 _health_probe_cache: dict[str, tuple[float, object]] = {}
 _health_payload_cache_lock = threading.Lock()
@@ -606,7 +604,16 @@ _AUX_STREAM_ENDPOINTS = {
     "/invocations-stream",
     "/llm-route-stream",
 }
-_FAST_ENDPOINTS = {"/health", "/healthz", "/readyz", "/routez", "/power-state", "/manifest"}
+_FAST_ENDPOINTS = {"/health", "/healthz", "/readyz", "/routez", "/manifest"}
+
+
+def _is_orchestration_stream_path(path: str) -> bool:
+    prefix = f"{ORCHESTRATIONS_ROUTE}/"
+    suffix = "/stream"
+    if not path.startswith(prefix) or not path.endswith(suffix):
+        return False
+    inner = path[len(prefix):-len(suffix)]
+    return bool(inner) and "/" not in inner
 
 
 class _RuntimeAdmission:
@@ -936,12 +943,8 @@ def _pairdrop_gateway_provenance_ok(headers, client_address=None) -> bool:
     header_ok = str(getter("X-Pairling-Connect-Gateway", "") or "") == "pairling-connectd"
     if not header_ok:
         return False
-    # The gateway header alone is spoofable, so in the default loopback-only bind
-    # also require the loopback hop from connectd. Under PAIRLING_BIND_MODE=all a
-    # direct-LAN client is non-loopback, so waive the loopback requirement there
-    # to avoid breaking that path.
-    if os.environ.get("PAIRLING_BIND_MODE", "loopback").strip().lower() == "all":
-        return True
+    # The gateway header alone is spoofable. The trusted connectd hop is loopback,
+    # even when connectd received the original request over a tailnet route.
     return _loopback_client_address(client_address)
 
 
@@ -981,7 +984,7 @@ def _required_scopes_for_request(path: str, method: str) -> set[str]:
         return {"files:write"}
     if _is_pairdrop_upload_path(path):
         return {"files:write"}
-    if path in {"/health", "/healthz", "/readyz", "/routez", "/power-state", "/health-stream", "/provider-status", "/status", "/aperture-cli/status", "/aperture-cli/providers", "/aperture-cli/launch-contexts"}:
+    if path in {"/health", "/healthz", "/readyz", "/routez", "/health-stream", "/provider-status", "/status", "/aperture-cli/status", "/aperture-cli/providers", "/aperture-cli/launch-contexts"}:
         return {"health:read"}
     if path == "/manifest":
         return {"manifest:read"}
@@ -1065,6 +1068,10 @@ def _funnel_origin_request(headers, client_address) -> bool:
         return False
     getter = headers.get if hasattr(headers, "get") else lambda key, default=None: default
     return str(getter("X-Pairling-Funnel-Origin", "") or "").strip() == "1"
+
+
+def _pair_claim_requires_app_attest(headers, client_address) -> bool:
+    return _funnel_origin_request(headers, client_address) or not _loopback_client_address(client_address)
 
 
 def _connectd_peer_node_id(headers) -> str:
@@ -1723,6 +1730,24 @@ def _agent_registry_heartbeat_by_claude_uuid(provider: str, claude_uuid: str, *,
         return False
 
 
+def _agent_registry_heartbeat_by_native_id(provider: str, native_id: str, *,
+                                           terminal_tty: str = "", pid: int = 0) -> bool:
+    if not provider or not native_id:
+        return False
+    try:
+        with _agent_registry_conn() as conn:
+            cur = conn.execute(
+                "UPDATE agent_sessions SET last_heartbeat = ?, state = 'running', closed_at = NULL, "
+                "terminal_tty = COALESCE(NULLIF(?, ''), terminal_tty), "
+                "pid = COALESCE(NULLIF(?, 0), pid) "
+                "WHERE provider = ? AND native_id = ?",
+                (_time.time(), terminal_tty or "", int(pid or 0), provider, native_id),
+            )
+            return cur.rowcount > 0
+    except Exception:
+        return False
+
+
 def _agent_registry_mark_closed_by_claude_uuid(provider: str, claude_uuid: str) -> bool:
     """Tombstone keyed on claude_uuid (SessionEnd hook path). Idempotent —
     only rows without an existing closed_at are touched, like the PG
@@ -1735,6 +1760,21 @@ def _agent_registry_mark_closed_by_claude_uuid(provider: str, claude_uuid: str) 
                 "UPDATE agent_sessions SET closed_at = ?, state = 'terminated' "
                 "WHERE provider = ? AND claude_uuid = ? AND closed_at IS NULL",
                 (_time.time(), provider, claude_uuid),
+            )
+            return cur.rowcount > 0
+    except Exception:
+        return False
+
+
+def _agent_registry_mark_closed_by_native_id(provider: str, native_id: str) -> bool:
+    if not provider or not native_id:
+        return False
+    try:
+        with _agent_registry_conn() as conn:
+            cur = conn.execute(
+                "UPDATE agent_sessions SET closed_at = ?, state = 'terminated' "
+                "WHERE provider = ? AND native_id = ? AND closed_at IS NULL",
+                (_time.time(), provider, native_id),
             )
             return cur.rowcount > 0
     except Exception:
@@ -2007,7 +2047,7 @@ def _runtime_admission_for_path(path: str) -> _RuntimeAdmission:
         if _AUX_STREAM_ADMISSION_SEMAPHORE.acquire(blocking=False):
             return _RuntimeAdmission(_AUX_STREAM_ADMISSION_SEMAPHORE, True)
         return _RuntimeAdmission(None, False, "aux_stream_capacity_exceeded")
-    if path in _STREAM_ENDPOINTS:
+    if path in _STREAM_ENDPOINTS or _is_orchestration_stream_path(path):
         if _STREAM_ADMISSION_SEMAPHORE.acquire(blocking=False):
             return _RuntimeAdmission(_STREAM_ADMISSION_SEMAPHORE, True)
         return _RuntimeAdmission(None, False, "stream_capacity_exceeded")
@@ -2151,19 +2191,6 @@ def _codex_terminal_tty_candidates(reg: dict | None) -> list[str]:
     return candidates
 
 
-def _guardian_tailnet_ip(power_state: dict | None) -> str | None:
-    if not isinstance(power_state, dict):
-        return None
-    for section_name in ("network", "facts"):
-        section = power_state.get(section_name)
-        if not isinstance(section, dict):
-            continue
-        ip = str(section.get("tailscale_ip") or "").strip()
-        if ip.startswith("100."):
-            return ip
-    return None
-
-
 def _probe_tailnet_ip() -> str | None:
     ok, out, _ = _run_text(["tailscale", "ip", "-4"], timeout=3)
     if not ok:
@@ -2175,27 +2202,8 @@ def _probe_tailnet_ip() -> str | None:
     return None
 
 
-def _tailnet_ip(power_state: dict | None = None) -> str | None:
-    guardian_ip = _guardian_tailnet_ip(power_state)
-    if guardian_ip:
-        return guardian_ip
+def _tailnet_ip() -> str | None:
     return _cached_probe("tailnet_ip", _HEALTH_PROBE_CACHE_SECONDS, _probe_tailnet_ip)
-
-
-def _guardian_lan_ips(power_state: dict | None) -> list[str]:
-    if not isinstance(power_state, dict):
-        return []
-    network = power_state.get("network")
-    if not isinstance(network, dict):
-        return []
-    ips: list[str] = []
-    for item in network.get("lan_ips") or []:
-        ip = str(item or "").strip()
-        if not ip or ip.startswith(("127.", "169.254.", "100.")):
-            continue
-        if ip not in ips:
-            ips.append(ip)
-    return ips
 
 
 def _probe_lan_ips() -> list[str]:
@@ -2212,25 +2220,8 @@ def _probe_lan_ips() -> list[str]:
     return ips
 
 
-def _lan_ips(power_state: dict | None = None) -> list[str]:
-    guardian_ips = _guardian_lan_ips(power_state)
-    if guardian_ips:
-        return guardian_ips
+def _lan_ips() -> list[str]:
     return _cached_probe("lan_ips", _HEALTH_PROBE_CACHE_SECONDS, _probe_lan_ips)
-
-
-def _guardian_listener_entries(power_state: dict | None) -> list[str]:
-    if not isinstance(power_state, dict):
-        return []
-    daemon = power_state.get("daemon")
-    if not isinstance(daemon, dict):
-        return []
-    entries: list[str] = []
-    for item in daemon.get("listen") or []:
-        entry = str(item or "").strip()
-        if entry and entry not in entries:
-            entries.append(entry)
-    return entries
 
 
 def _probe_listener_entries() -> list[str]:
@@ -2249,151 +2240,8 @@ def _probe_listener_entries() -> list[str]:
     return entries
 
 
-def _listener_entries(power_state: dict | None = None) -> list[str]:
-    guardian_entries = _guardian_listener_entries(power_state)
-    if guardian_entries:
-        return guardian_entries
+def _listener_entries() -> list[str]:
     return _cached_probe("listener_entries", _HEALTH_PROBE_CACHE_SECONDS, _probe_listener_entries)
-
-
-def _read_guardian_state() -> tuple[dict | None, str | None, float | None, str | None]:
-    for path in (POWER_STATE_PATH, POWER_STATE_FALLBACK_PATH):
-        try:
-            if not path.exists():
-                continue
-            state = json.loads(path.read_text())
-            generated = float(state.get("generated_at") or state.get("ts") or 0)
-            age = max(0.0, _time.time() - generated) if generated else None
-            return state, str(path), age, None
-        except Exception as exc:
-            return None, str(path), None, f"{type(exc).__name__}: {exc}"
-    return None, None, None, "guardian state missing"
-
-
-def _coordinator_from_guardian(state: dict | None, age: float | None, error: str | None) -> dict:
-    if not state:
-        return {
-            "role": "primary_coordinator",
-            "posture": "unknown",
-            "severity": "unknown",
-            "summary": error or "Guardian state is unavailable",
-            "stale": True,
-        }
-    if isinstance(state.get("posture"), dict):
-        posture = state.get("posture") or {}
-        status = posture.get("status") or "unknown"
-        severity = posture.get("severity") or ("ok" if status == "ready" else status)
-        summary = posture.get("summary") or state.get("summary") or "Coordinator posture is unknown"
-    else:
-        status = state.get("posture") or "unknown"
-        severity = state.get("severity") or ("ok" if status == "ready" else status)
-        summary = state.get("summary") or "Coordinator posture is unknown"
-    stale = age is None or age > POWER_STATE_STALE_SECONDS
-    if stale:
-        status = "unknown"
-        severity = "unknown"
-        summary = f"Guardian sample is stale ({int(age or 0)}s old)"
-    return {
-        "role": (state.get("host") or {}).get("role") if isinstance(state.get("host"), dict) else "primary_coordinator",
-        "host": (state.get("host") or {}).get("name") if isinstance(state.get("host"), dict) else (state.get("host") or DEFAULT_COORDINATOR_HOST),
-        "posture": status,
-        "severity": severity,
-        "summary": summary,
-        "stale": stale,
-        "sample_age_seconds": age,
-    }
-
-
-def _normalize_guardian_state(state: dict | None) -> dict | None:
-    if not state:
-        return None
-    if isinstance(state.get("posture"), dict) and any(isinstance(state.get(key), dict) for key in ("host", "network", "daemon")):
-        normalized = dict(state)
-        host = normalized.get("host")
-        if not isinstance(host, dict):
-            normalized["host"] = {
-                "name": str(host or DEFAULT_COORDINATOR_HOST),
-                "role": "primary_coordinator",
-            }
-        return normalized
-
-    facts = state.get("facts") if isinstance(state.get("facts"), dict) else {}
-    checks_in = state.get("checks") if isinstance(state.get("checks"), list) else []
-    checks: dict[str, str] = {}
-    warnings: list[str] = []
-    for item in checks_in:
-        if not isinstance(item, dict):
-            continue
-        ident = str(item.get("id") or "check")
-        ok = bool(item.get("ok"))
-        message = str(item.get("message") or ("ok" if ok else "failed"))
-        checks[ident] = "ok" if ok else message
-        if not ok:
-            warnings.append(message)
-
-    sleep_minutes = facts.get("sleep_minutes")
-    disk_sleep = facts.get("disk_sleep_minutes")
-    thermal_speed = facts.get("thermal_cpu_speed_limit")
-    thermal_scheduler = facts.get("thermal_cpu_scheduler_limit")
-    thermal_state = "nominal"
-    if isinstance(thermal_speed, (int, float)) and thermal_speed < 80:
-        thermal_state = "warning"
-    if isinstance(thermal_scheduler, (int, float)) and thermal_scheduler < 80:
-        thermal_state = "warning"
-
-    host_name = state.get("host") if isinstance(state.get("host"), str) else DEFAULT_COORDINATOR_HOST
-    return {
-        "schema_version": state.get("schema_version") or 1,
-        "generated_at": state.get("generated_at") or state.get("ts") or _time.time(),
-        "host": {
-            "name": host_name or DEFAULT_COORDINATOR_HOST,
-            "role": "primary_coordinator",
-        },
-        "posture": {
-            "status": state.get("posture") or "unknown",
-            "severity": state.get("severity") or "unknown",
-            "summary": state.get("summary") or "Coordinator posture is unknown",
-        },
-        "power": {
-            "ac_power": facts.get("ac_power"),
-            "battery_percent": facts.get("battery_percent"),
-            "low_power_mode": facts.get("low_power_mode"),
-            "system_sleep_disabled": sleep_minutes == 0 if sleep_minutes is not None else None,
-            "display_sleep_minutes": facts.get("display_sleep_minutes"),
-            "disk_sleep_disabled": disk_sleep == 0 if disk_sleep is not None else None,
-            "caffeinate_pid": facts.get("caffeinate_pid"),
-            "prevent_system_sleep": facts.get("prevent_system_sleep"),
-            "prevent_idle_system_sleep": facts.get("prevent_user_idle_system_sleep"),
-            "prevent_display_sleep": facts.get("prevent_user_idle_display_sleep"),
-        },
-        "lid": {
-            "closed": facts.get("lid_closed"),
-            "apple_clamshell_causes_sleep": facts.get("clamshell_causes_sleep"),
-            "supported_posture": facts.get("lid_closed") is False,
-        },
-        "thermal": {
-            "state": thermal_state,
-            "cpu_speed_limit": thermal_speed,
-            "cpu_scheduler_limit": thermal_scheduler,
-        },
-        "network": {
-            "tailscale_installed": facts.get("tailscale_ip") is not None,
-            "tailscale_variant": "standalone",
-            "tailscale_ip": facts.get("tailscale_ip"),
-            "tailscale_status": "ok" if facts.get("tailscale_ip") else "missing",
-            "default_interface": None,
-            "lan_ips": [],
-        },
-        "daemon": {
-            "pairling_pid": os.getpid(),
-            "listen": (listener_entries := _listener_entries()),
-            "reachable_local": bool(listener_entries),
-            "reachable_tailnet": facts.get("daemon_reachable"),
-        },
-        "warnings": warnings,
-        "checks": checks,
-        "raw_schema": "legacy_flat_guardian",
-    }
 
 
 def _pairling_connect_health() -> dict:
@@ -2449,38 +2297,7 @@ def _coordinator_from_pairling_connect(connect: dict) -> dict:
     }
 
 
-# Guardian checks whose failure is fully compensated by a ready Pairling
-# Connect route: both only measure the standalone-Tailscale axis.
-_TAILNET_AXIS_CHECK_IDS = {"tailscale_ip", "daemon_reachable"}
-
-
-def _apply_pairling_connect_posture(coordinator: dict, power_state: dict | None, connect: dict) -> dict:
-    """Downgrade tailnet-axis criticality when the Pairling Connect route is
-    ready. The guardian historically measured only standalone Tailscale; a
-    healthy embedded connectd route serves phones regardless, so its absence
-    alone must not mark the coordinator unsafe. Any other failing check
-    keeps the original posture untouched."""
-    if not connect.get("ready"):
-        return coordinator
-    if coordinator.get("posture") != "unsafe":
-        return coordinator
-    checks = (power_state or {}).get("checks")
-    if not isinstance(checks, dict) or not checks:
-        return coordinator
-    failing = {cid for cid, msg in checks.items() if msg != "ok"}
-    if not failing or not failing.issubset(_TAILNET_AXIS_CHECK_IDS):
-        return coordinator
-    adjusted = dict(coordinator)
-    adjusted["posture"] = "warning"
-    adjusted["severity"] = "warning"
-    adjusted["summary"] = (
-        "Pairling Connect tailnet route is ready; standalone Tailscale is offline."
-    )
-    adjusted["tailnet_axis"] = "pairling_connect"
-    return adjusted
-
-
-def _health_routes(coordinator: dict, power_state: dict | None = None) -> list[dict]:
+def _health_routes(coordinator: dict) -> list[dict]:
     now = _time.time()
     routes: list[dict] = []
     connect = _pairling_connect_health()
@@ -2498,7 +2315,7 @@ def _health_routes(coordinator: dict, power_state: dict | None = None) -> list[d
             "source": str(route.get("source") or "pairling_connectd"),
             "id": route.get("id"),
         })
-    tailnet = _tailnet_ip(power_state)
+    tailnet = _tailnet_ip()
     if tailnet:
         ok = coordinator.get("posture") in ("ready", "warning")
         routes.append({
@@ -2508,7 +2325,7 @@ def _health_routes(coordinator: dict, power_state: dict | None = None) -> list[d
             "score": 100 if ok else 40,
             "last_ok_at": now if ok else None,
         })
-    for ip in _lan_ips(power_state)[:2]:
+    for ip in _lan_ips()[:2]:
         routes.append({
             "kind": "lan",
             "base_url": f"http://{ip}:{PORT}",
@@ -2529,8 +2346,8 @@ def _health_routes(coordinator: dict, power_state: dict | None = None) -> list[d
     return routes
 
 
-def _daemon_snapshot(power_state: dict | None = None) -> dict:
-    entries = _listener_entries(power_state)
+def _daemon_snapshot() -> dict:
+    entries = _listener_entries()
     return {
         "name": "pairlingd",
         "pid": os.getpid(),
@@ -2603,14 +2420,13 @@ def _routez_payload(auth_result=None) -> dict:
     }
 
 
-def _health_payload(full_power: bool = False, authenticated: bool = False, auth_result=None) -> dict:
+def _health_payload(authenticated: bool = False, auth_result=None) -> dict:
     connect = _pairling_connect_health()
-    power_state = None
     coordinator = _coordinator_from_pairling_connect(connect)
     if connect.get("summary") is not None:
         coordinator = dict(coordinator)
         coordinator["pairling_connect"] = connect["summary"]
-    routes = _health_routes(coordinator, power_state)
+    routes = _health_routes(coordinator)
     ok = coordinator.get("posture") in ("ready", "warning")
     runtime_info = _runtime_info_snapshot()
     public_runtime = _public_runtime_info(runtime_info) if _public_runtime_info else runtime_info
@@ -2625,7 +2441,7 @@ def _health_payload(full_power: bool = False, authenticated: bool = False, auth_
             "required": True,
             "legacy_global_token": False,
         },
-        "daemon": _daemon_snapshot(power_state),
+        "daemon": _daemon_snapshot(),
         "coordinator": coordinator,
     }
     if authenticated:
@@ -2649,16 +2465,16 @@ def _health_payload(full_power: bool = False, authenticated: bool = False, auth_
     return payload
 
 
-def _cached_health_payload(full_power: bool = False, authenticated: bool = False, auth_result=None) -> dict:
+def _cached_health_payload(authenticated: bool = False, auth_result=None) -> dict:
     device_id = str(getattr(auth_result, "device_id", "") or "")
     install_id = str(getattr(auth_result, "install_id", "") or "")
-    key = (bool(full_power), bool(authenticated), device_id, install_id)
+    key = (bool(authenticated), device_id, install_id)
     now = _time.time()
     with _health_payload_cache_lock:
         cached = _health_payload_cache.get(key)
         if cached is not None and now - cached[0] < _HEALTH_PAYLOAD_CACHE_SECONDS:
             return _copy_cache_value(cached[1])
-    payload = _health_payload(full_power=full_power, authenticated=authenticated, auth_result=auth_result)
+    payload = _health_payload(authenticated=authenticated, auth_result=auth_result)
     with _health_payload_cache_lock:
         _health_payload_cache[key] = (now, _copy_cache_value(payload))
     return _copy_cache_value(payload)
@@ -2694,38 +2510,24 @@ def _health_diff_digest(payload: dict) -> str:
     mirror = stable.get("mirror")
     if isinstance(mirror, dict):
         mirror.pop("updated_at", None)
-    stable.pop("guardian_sample_age_seconds", None)
     return hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()
 
 
 def _orchestration_preflight_from_health(health: dict) -> tuple[dict, dict]:
-    power_state = health.get("power_state") if isinstance(health.get("power_state"), dict) else None
-    if power_state is None:
-        power_state = {}
     coordinator = health.get("coordinator") or {}
     route = (health.get("routes") or [{}])[0]
     runtime_info = health.get("runtime") if isinstance(health.get("runtime"), dict) else {}
-    power = power_state.get("power") if isinstance(power_state.get("power"), dict) else {}
-    lid = power_state.get("lid") if isinstance(power_state.get("lid"), dict) else {}
-    network = power_state.get("network") if isinstance(power_state.get("network"), dict) else {}
-    thermal = power_state.get("thermal") if isinstance(power_state.get("thermal"), dict) else {}
-    facts = power_state.get("facts") if isinstance(power_state.get("facts"), dict) else {}
     preflight = {
         "posture": coordinator.get("posture") or "unknown",
-        "warnings": power_state.get("warnings") or [],
+        "warnings": [],
         "route": route.get("kind") or "unknown",
         "route_base": route.get("base_url"),
         "checked_at": health.get("ts"),
-        "tailscale_ip": network.get("tailscale_ip") or facts.get("tailscale_ip"),
-        "lid_closed": lid.get("closed") if "closed" in lid else facts.get("lid_closed"),
-        "ac_power": power.get("ac_power") if "ac_power" in power else facts.get("ac_power"),
-        "low_power_mode": power.get("low_power_mode") if "low_power_mode" in power else facts.get("low_power_mode"),
-        "thermal": thermal.get("state") or (
-            "throttled" if (
-                (facts.get("thermal_cpu_speed_limit") is not None and facts.get("thermal_cpu_speed_limit") < 80) or
-                (facts.get("thermal_cpu_scheduler_limit") is not None and facts.get("thermal_cpu_scheduler_limit") < 80)
-            ) else "normal"
-        ),
+        "tailscale_ip": None,
+        "lid_closed": None,
+        "ac_power": None,
+        "low_power_mode": None,
+        "thermal": "unknown",
         "runtime_version": runtime_info.get("runtime_version"),
         "runtime_source_revision": runtime_info.get("source_revision"),
         "runtime_contract_version": runtime_info.get("contract_version") or RUNTIME_CONTRACT_VERSION,
@@ -7542,28 +7344,37 @@ class ClientDisconnected(Exception):
 
 
 class Handler(BaseHTTPRequestHandler):
+    timeout = REQUEST_READ_TIMEOUT_SECONDS
 
     def do_GET(self):
         try:
             return self._dispatch()
+        except socket.timeout:
+            self._send_json({"ok": False, "error": {"code": "request_timeout"}}, status=408)
         except ClientDisconnected:
             return
 
     def do_POST(self):
         try:
             return self._dispatch()
+        except socket.timeout:
+            self._send_json({"ok": False, "error": {"code": "request_timeout"}}, status=408)
         except ClientDisconnected:
             return
 
     def do_PUT(self):
         try:
             return self._dispatch()
+        except socket.timeout:
+            self._send_json({"ok": False, "error": {"code": "request_timeout"}}, status=408)
         except ClientDisconnected:
             return
 
     def do_DELETE(self):
         try:
             return self._dispatch()
+        except socket.timeout:
+            self._send_json({"ok": False, "error": {"code": "request_timeout"}}, status=408)
         except ClientDisconnected:
             return
 
@@ -7817,7 +7628,9 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == "/manifest":
                 self._handle_manifest(q)
             elif u.path == "/pair/start":
-                if _funnel_origin_request(self.headers, self.client_address):
+                if not _loopback_client_address(self.client_address):
+                    self._send_json({"ok": False, "error": {"code": "pair_start_loopback_required", "message": "pair start is only available from loopback"}}, status=403)
+                elif _funnel_origin_request(self.headers, self.client_address):
                     # Belt-and-suspenders: /pair/start returns the 192-bit secret
                     # in plaintext and must never be served to a funnel-origin
                     # request, even if connectd's allowlist ever drifted.
@@ -7840,8 +7653,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_pair_bind_node(q)
             elif u.path == "/healthz":
                 self._handle_healthz(q)
-            elif u.path == "/power-state":
-                self._handle_power_state(q)
             elif u.path == "/health-stream":
                 self._handle_health_stream(q)
             elif u.path == "/open":
@@ -8075,16 +7886,23 @@ class Handler(BaseHTTPRequestHandler):
         uuid = str(payload.get("claude_uuid") or "").strip()
         return uuid if self._CLAUDE_UUID_RE.match(uuid) else ""
 
+    def _internal_provider(self, payload: dict) -> str:
+        provider = str(payload.get("provider") or "claude").strip().lower()
+        return provider if provider in {"claude", "codex"} else "claude"
+
     def _internal_terminal_tty(self, payload: dict) -> str:
         tty = str(payload.get("terminal_tty") or "").strip()
         return tty if self._INTERNAL_TTY_RE.match(tty) else ""
 
-    def _internal_claude_pid(self, payload: dict) -> int:
+    def _internal_pid(self, payload: dict) -> int:
         try:
-            pid = int(payload.get("claude_pid") or 0)
+            pid = int(payload.get("pid") or payload.get("claude_pid") or payload.get("codex_pid") or 0)
         except (TypeError, ValueError):
             return 0
         return pid if 0 < pid < 10 ** 8 else 0
+
+    def _internal_claude_pid(self, payload: dict) -> int:
+        return self._internal_pid(payload)
 
     def _read_internal_json(self) -> dict | None:
         if self.command != "POST":
@@ -8104,6 +7922,7 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._read_internal_json()
         if payload is None:
             return
+        provider = self._internal_provider(payload)
         session_id = str(payload.get("id") or "").strip()
         project = str(payload.get("project") or "").strip()
         if not _safe_session_id(session_id) or not project:
@@ -8114,23 +7933,41 @@ class Handler(BaseHTTPRequestHandler):
             return
         claude_uuid = self._internal_claude_uuid(payload)
         ok = _agent_registry_upsert(
-            "claude",
+            provider,
             session_id,
             project,
-            pid=self._internal_claude_pid(payload),
+            pid=self._internal_pid(payload),
             terminal_tty=self._internal_terminal_tty(payload),
-            claude_uuid=claude_uuid,
+            claude_uuid=claude_uuid if provider == "claude" else "",
             working_on=str(payload.get("working_on") or "")[:500],
+            metadata={"registered_by": "internal_session_register"},
         )
         # Mirrors the PG pg_notify('session_ready'): only fire once the row
         # carries a claude_uuid — that is what /turn-state-stream waits on.
-        if ok and claude_uuid:
+        if provider == "claude" and ok and claude_uuid:
             _signal_session_ready(session_id)
         self._send_json({"ok": bool(ok)})
 
     def _handle_internal_session_heartbeat(self, q):
         payload = self._read_internal_json()
         if payload is None:
+            return
+        provider = self._internal_provider(payload)
+        if provider == "codex":
+            session_id = str(payload.get("id") or "").strip()
+            if not _safe_session_id(session_id):
+                self._send_json({
+                    "ok": False,
+                    "error": {"code": "bad_request", "message": "id required"},
+                }, status=400)
+                return
+            ok = _agent_registry_heartbeat_by_native_id(
+                "codex",
+                session_id,
+                terminal_tty=self._internal_terminal_tty(payload),
+                pid=self._internal_pid(payload),
+            )
+            self._send_json({"ok": bool(ok)})
             return
         claude_uuid = self._internal_claude_uuid(payload)
         if not claude_uuid:
@@ -8143,7 +7980,7 @@ class Handler(BaseHTTPRequestHandler):
             "claude",
             claude_uuid,
             terminal_tty=self._internal_terminal_tty(payload),
-            pid=self._internal_claude_pid(payload),
+            pid=self._internal_pid(payload),
         )
         # ok=false simply means no row matched — same as the PG UPDATE no-op.
         self._send_json({"ok": bool(ok)})
@@ -8151,6 +7988,18 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_internal_session_close(self, q):
         payload = self._read_internal_json()
         if payload is None:
+            return
+        provider = self._internal_provider(payload)
+        if provider == "codex":
+            session_id = str(payload.get("id") or "").strip()
+            if not _safe_session_id(session_id):
+                self._send_json({
+                    "ok": False,
+                    "error": {"code": "bad_request", "message": "id required"},
+                }, status=400)
+                return
+            closed = _agent_registry_mark_closed_by_native_id("codex", session_id)
+            self._send_json({"ok": True, "closed": bool(closed)})
             return
         claude_uuid = self._internal_claude_uuid(payload)
         if not claude_uuid:
@@ -8164,20 +8013,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_internal_active_sessions(self, q):
         project = q.get("project", [""])[0].strip()
+        provider_filter = str(q.get("provider", ["claude"])[0] or "claude").strip().lower()
+        providers = ["claude", "codex"] if provider_filter == "all" else [provider_filter if provider_filter in {"claude", "codex"} else "claude"]
         cutoff = _time.time() - 300
         items = []
-        for row in _agent_registry_live("claude"):
-            if float(row.get("last_heartbeat") or 0) < cutoff:
-                continue
-            if project and row.get("project") != project:
-                continue
-            items.append({
-                "id": row.get("native_id"),
-                "project": row.get("project"),
-                "working_on": row.get("working_on") or None,
-                "started_at": float(row.get("started_at") or 0),
-                "last_heartbeat": float(row.get("last_heartbeat") or 0),
-            })
+        for provider in providers:
+            for row in _agent_registry_live(provider):
+                if float(row.get("last_heartbeat") or 0) < cutoff:
+                    continue
+                if project and row.get("project") != project:
+                    continue
+                items.append({
+                    "id": row.get("native_id"),
+                    "provider": provider,
+                    "project": row.get("project"),
+                    "working_on": row.get("working_on") or None,
+                    "started_at": float(row.get("started_at") or 0),
+                    "last_heartbeat": float(row.get("last_heartbeat") or 0),
+                })
         items.sort(key=lambda r: r["started_at"], reverse=True)
         self._send_json({"ok": True, "count": len(items), "sessions": items})
 
@@ -8233,17 +8086,15 @@ class Handler(BaseHTTPRequestHandler):
             subprocess.run(["open", "-a", SUBLIME_APP, path], check=False)
         self._send_text(200, b"ok\n")
 
-    # ----- /healthz + /power-state + /health-stream: coordinator health -----
+    # ----- /healthz + /health-stream: coordinator health -----
     def _handle_health(self, q):
         self._send_json(_cached_health_payload(
-            full_power=False,
             authenticated=self.pairling_auth is not None,
             auth_result=self.pairling_auth,
         ))
 
     def _handle_healthz(self, q):
         self._send_json(_cached_health_payload(
-            full_power=False,
             authenticated=self.pairling_auth is not None,
             auth_result=self.pairling_auth,
         ))
@@ -8563,6 +8414,7 @@ class Handler(BaseHTTPRequestHandler):
                 relay_device_id=payload.get("relay_device_id"),
                 relay_required=bool(relay_claims_required and relay_claims_required()),
                 relay_claim_verifier=RELAY_CLAIM_VERIFIER,
+                require_direct_attest=_pair_claim_requires_app_attest(self.headers, self.client_address),
             )
             if PAIRING_ADVERTISER is not None:
                 PAIRING_ADVERTISER.stop()
@@ -8620,6 +8472,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._read_json_object()
             host_chain = self._pairing_host_chain()
             funnel_origin = _funnel_origin_request(self.headers, self.client_address)
+            require_direct_attest = _pair_claim_requires_app_attest(self.headers, self.client_address)
             claim, k_token, aad, mac_confirm = PAIRING_STORE.psk_claim_pair(
                 pair_id=str(payload.get("pair_id") or ""),
                 b_pub_b64=str(payload.get("b_pub") or ""),
@@ -8635,6 +8488,7 @@ class Handler(BaseHTTPRequestHandler):
                 relay_required=bool(relay_claims_required and relay_claims_required()),
                 relay_claim_verifier=RELAY_CLAIM_VERIFIER,
                 funnel_origin=funnel_origin,
+                require_direct_attest=require_direct_attest,
             )
             nonce, enc_token = PAIRING_STORE.seal_psk_token(k_token, claim.device.token, aad)
             # Seal proof_secret (the request-proof HMAC key) under K_token for
@@ -8800,13 +8654,6 @@ class Handler(BaseHTTPRequestHandler):
         )
         self._send_json({"ok": True, "tailnet_node_id_bound": bound})
 
-    def _handle_power_state(self, q):
-        self._send_json(_cached_health_payload(
-            full_power=True,
-            authenticated=self.pairling_auth is not None,
-            auth_result=self.pairling_auth,
-        ))
-
     def _handle_mirror_status(self, q):
         project = q.get("project", [None])[0]
         args = ["status"]
@@ -8922,7 +8769,6 @@ class Handler(BaseHTTPRequestHandler):
         deadline = _time.time() + 600
         while _time.time() < deadline:
             payload = _cached_health_payload(
-                full_power=False,
                 authenticated=self.pairling_auth is not None,
                 auth_result=self.pairling_auth,
             )
@@ -11756,15 +11602,22 @@ class Handler(BaseHTTPRequestHandler):
         project_basename = os.path.basename(project.rstrip("/")) or project
         result = self._applescript_inject(project_basename, text)
 
+        status = 200
         if not result.get("ok"):
             # Fall back to the queue-file path so nothing is lost
             queue_file = QUEUE_DIR / f"{session_id}.txt"
             with open(queue_file, "a") as f:
                 f.write(text + "\n")
+            status = 202
             body = json.dumps({
-                "ok": True, "injected": False, "queued": True,
+                "ok": False, "injected": False, "queued": True,
+                "state": "queued_not_injected",
                 "fallback_reason": result.get("reason", "unknown"),
                 "window_match": project_basename,
+                "error": {
+                    "code": "terminal_injection_queued",
+                    "message": "Text was queued but was not typed into Terminal.",
+                },
             }).encode()
         else:
             body = json.dumps({
@@ -11772,7 +11625,7 @@ class Handler(BaseHTTPRequestHandler):
                 "window_match": project_basename,
             }).encode()
 
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -14152,7 +14005,7 @@ Worker instructions:
             self.send_error(409, "project has uncommitted changes; set allow_dirty_project to continue")
             return
 
-        health = _health_payload(full_power=True)
+        health = _health_payload()
         coordinator_meta, preflight_meta = _orchestration_preflight_from_health(health)
         if isinstance(payload.get("coordinator"), dict):
             coordinator_meta.update(payload["coordinator"])
@@ -18654,7 +18507,7 @@ Worker instructions:
     def _pairdrop_store(self):
         if PairDropStore is None:
             raise RuntimeError("PairDrop store unavailable")
-        return PairDropStore(HOME / "Pairling" / "PairDrop" / "v1")
+        return PairDropStore(HOME / "PairDrop")
 
     def _pairdrop_source(self) -> tuple[str, str]:
         auth = getattr(self, "pairling_auth", None)

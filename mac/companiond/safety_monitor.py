@@ -26,6 +26,10 @@ SAFETY_EVENTS_MAX_READ_BYTES = max(
     64 * 1024,
     int(os.environ.get("PAIRLING_SAFETY_EVENTS_MAX_READ_BYTES", str(1024 * 1024))),
 )
+SAFETY_EVENTS_DISK_WARNING_BYTES = max(
+    1024 * 1024,
+    int(os.environ.get("PAIRLING_SAFETY_EVENTS_DISK_WARNING_BYTES", str(256 * 1024 * 1024))),
+)
 DEFAULT_STATUS = {
     "contract_version": SAFETY_BRIDGE_CONTRACT_VERSION,
     "mode": "absent",
@@ -152,11 +156,28 @@ class SafetyMonitorBridge:
         status["contract_version"] = SAFETY_CONTRACT_VERSION
         if status_error:
             status["status_error"] = status_error
-        status["status_stale"] = self._status_stale(status, loaded is not None)
+        live_artifact = self._live_artifact_status()
+        if live_artifact:
+            status["live_artifact"] = live_artifact
+            if live_artifact.get("source") == "event_log":
+                status["mode"] = "system_extension"
+                status["installed"] = True
+                status["approved"] = True
+                status["running"] = True
+                if status.get("visibility") == "unavailable":
+                    status["visibility"] = "limited"
+                status["updated_at"] = max(
+                    float(status.get("updated_at") or 0),
+                    float(live_artifact.get("events_log_mtime") or 0),
+                )
+                if status.get("summary") == DEFAULT_STATUS["summary"]:
+                    status["summary"] = "Pairling Safety Monitor has live event-log evidence."
+        status["status_stale"] = self._status_stale(status, loaded is not None or bool(live_artifact))
         status["secure_mode_state"] = self._secure_mode_state(status)
         status["guarded_mode_state"] = "guarded_deferred"
         status["system_extension_status"] = self._system_extension_status(status)
         status["capabilities"] = self._capabilities(status)
+        status["disk_usage_warning"] = self._disk_usage_warning(live_artifact)
         status["evidence_test"] = self._read_evidence_test()
         events = self.events(limit=200)
         status["event_count"] = len(events)
@@ -361,6 +382,40 @@ class SafetyMonitorBridge:
         except OSError:
             return None, "status_unreadable"
         return (payload, None) if isinstance(payload, dict) else (None, "status_shape_invalid")
+
+    def _live_artifact_status(self) -> dict[str, Any] | None:
+        candidates: list[dict[str, Any]] = []
+        for path in self._event_paths():
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if not path.is_file() or stat.st_size <= 0:
+                continue
+            candidates.append({
+                "source": "event_log",
+                "events_log_path": _redact_path(str(path), self.home),
+                "events_log_bytes": int(stat.st_size),
+                "events_log_mtime": float(stat.st_mtime),
+                "path_scope": "system" if path == self.system_events_path else "user",
+            })
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (float(item["events_log_mtime"]), int(item["events_log_bytes"])), reverse=True)
+        return candidates[0]
+
+    def _disk_usage_warning(self, live_artifact: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not live_artifact:
+            return None
+        size = int(live_artifact.get("events_log_bytes") or 0)
+        if size < SAFETY_EVENTS_DISK_WARNING_BYTES:
+            return None
+        return {
+            "code": "safety_events_log_large",
+            "events_log_bytes": size,
+            "threshold_bytes": SAFETY_EVENTS_DISK_WARNING_BYTES,
+            "message": "Safety Monitor event log is large and should be rotated or rebuilt with the bounded writer.",
+        }
 
     def _normalize_event(self, raw: dict[str, Any]) -> dict[str, Any]:
         path_display = _redact_path(

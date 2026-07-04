@@ -78,7 +78,8 @@ if [[ ! "$VERSION" =~ $SEMVER_RE ]]; then
   fail "version '$VERSION' is not npm semver. Move mac/VERSION to semver for npm releases, or pass --version X.Y.Z."
 fi
 
-REVISION="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+BUILD_REVISION="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+REVISION="${PAIRLING_SOURCE_REVISION:-$BUILD_REVISION}"
 BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
 PACKAGED_SOURCE_PATHS=(
   "mac/VERSION"
@@ -87,7 +88,6 @@ PACKAGED_SOURCE_PATHS=(
   "mac/connectd/internal"
   "mac/connectd/go.mod"
   "mac/connectd/go.sum"
-  "mac/guardian"
   "mac/install"
   "mac/mcp"
   "mac/packaging/bin/pairling"
@@ -99,8 +99,46 @@ if git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 && \
   SOURCE_DIRTY="true"
 fi
 
+require_release_source_traceability() {
+  local tag="v$VERSION"
+  local tagged_commit remote_tag_commit
+  git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || fail "--release requires a git worktree"
+  [[ "$BUILD_REVISION" != "unknown" ]] || fail "--release could not read git build revision"
+  git -C "$REPO_ROOT" cat-file -e "$BUILD_REVISION^{commit}" 2>/dev/null \
+    || fail "--release build revision does not resolve to a commit: $BUILD_REVISION"
+  if [[ -n "${PAIRLING_SOURCE_REVISION:-}" ]]; then
+    [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] || fail "--release PAIRLING_SOURCE_REVISION must be a full git sha"
+  else
+    git -C "$REPO_ROOT" cat-file -e "$REVISION^{commit}" 2>/dev/null \
+      || fail "--release source revision does not resolve to a commit: $REVISION"
+  fi
+  git -C "$REPO_ROOT" rev-parse -q --verify "refs/tags/$tag^{tag}" >/dev/null \
+    || fail "--release requires annotated tag $tag"
+  tagged_commit="$(git -C "$REPO_ROOT" rev-list -n 1 "$tag" 2>/dev/null || true)"
+  [[ "$tagged_commit" == "$BUILD_REVISION" ]] || fail "--release tag $tag does not point at HEAD $BUILD_REVISION"
+  remote_tag_commit="$(git -C "$REPO_ROOT" ls-remote origin "refs/tags/$tag^{}" 2>/dev/null | awk '{ print $1; exit }')"
+  [[ "$remote_tag_commit" == "$BUILD_REVISION" ]] || fail "--release tag $tag is not pushed to origin at $BUILD_REVISION"
+}
+
+require_release_version_unpublished() {
+  local pkg out existing
+  for pkg in "pairling" "@pairling/runtime-darwin-arm64" "@pairling/runtime-darwin-x64"; do
+    if out="$(npm view "$pkg@$VERSION" version --json 2>&1)"; then
+      existing="$(printf '%s' "$out" | tr -d '"[:space:]')"
+      [[ "$existing" != "$VERSION" ]] \
+        || fail "--release version $VERSION is already published for $pkg; bump mac/VERSION first."
+    elif ! printf '%s' "$out" | grep -Eq 'E404|No match found'; then
+      fail "--release could not verify npm registry state for $pkg@$VERSION"
+    fi
+  done
+}
+
 if [[ "$RELEASE_MODE" == "1" ]]; then
-  [[ "$SOURCE_DIRTY" == "false" || "$ALLOW_DIRTY" == "1" ]] || fail "source tree is dirty; commit first (or --allow-dirty for non-release builds)."
+  [[ "$ALLOW_DIRTY" != "1" ]] || fail "--allow-dirty is only for non-release builds."
+  require_release_version_unpublished
+  require_release_source_traceability
+  [[ "$SOURCE_DIRTY" == "false" ]] || fail "source tree is dirty; commit first."
   [[ -n "$SIGN_IDENTITY" && "$SIGN_IDENTITY" != "-" ]] || [[ -n "$PREBUILT_ARM64" ]] || fail "--release requires PAIRLING_SIGN_IDENTITY (Developer ID) or prebuilt signed connectd binaries."
   # A release ships the vendored CPython (P3 custody) in the runtime packages.
   VENDOR_PYTHON="1"
@@ -130,7 +168,6 @@ mkdir -p \
   "$MACPAY/companiond/integrations/aperture_cli" \
   "$MACPAY/connectd/cmd" \
   "$MACPAY/connectd/internal" \
-  "$MACPAY/guardian" \
   "$MACPAY/install" \
   "$MACPAY/mcp" \
   "$MACPAY/packaging/bin"
@@ -143,7 +180,6 @@ cp "$REPO_ROOT/mac/companiond/"*.py "$MACPAY/companiond/"
 cp "$REPO_ROOT/mac/companiond/providers/"*.py "$MACPAY/companiond/providers/"
 cp "$REPO_ROOT/mac/companiond/integrations/__init__.py" "$MACPAY/companiond/integrations/"
 cp "$REPO_ROOT/mac/companiond/integrations/aperture_cli/"*.py "$MACPAY/companiond/integrations/aperture_cli/"
-cp "$REPO_ROOT/mac/guardian/"*.py "$MACPAY/guardian/"
 cp "$REPO_ROOT/mac/mcp/"*.py "$MACPAY/mcp/"
 cp "$REPO_ROOT/mac/install/"*.sh "$MACPAY/install/"
 cp "$REPO_ROOT/mac/install/"*.py "$MACPAY/install/"
@@ -153,7 +189,7 @@ cp -R "$REPO_ROOT/mac/connectd/internal" "$MACPAY/connectd/"
 cp "$REPO_ROOT/mac/packaging/bin/pairling" "$MACPAY/packaging/bin/"
 
 chmod 755 "$MACPAY/packaging/bin/pairling" "$MACPAY/install/"*.sh "$MACPAY/mcp/phone_tools.py" \
-  "$MACPAY/companiond/pairlingd.py" "$MACPAY/guardian/companion-power-guardian.py"
+  "$MACPAY/companiond/pairlingd.py"
 find "$MACPAY" -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
 
 PYCACHE="$(mktemp -d)"
@@ -162,9 +198,8 @@ PYTHONPYCACHEPREFIX="$PYCACHE" python3 -m py_compile \
   "$MACPAY/companiond/providers/"*.py \
   "$MACPAY/companiond/integrations/"*.py \
   "$MACPAY/companiond/integrations/aperture_cli/"*.py \
-  "$MACPAY/guardian/"*.py \
   "$MACPAY/mcp/"*.py \
-  "$MACPAY/install/render-launchd.py"
+  "$MACPAY/install/"*.py
 rm -rf "$PYCACHE"
 
 # --- connectd binaries ------------------------------------------------------

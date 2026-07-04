@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from runtime_contract import LEGACY_TOKEN_RELATIVE_PATH, POWER_STATE_PATH
+from runtime_contract import LEGACY_TOKEN_RELATIVE_PATH
 
 
 def home() -> Path:
@@ -69,10 +69,6 @@ def token_path() -> Path:
     return Path(os.environ.get("NOTIFY_TOKEN_FILE", str(home() / LEGACY_TOKEN_RELATIVE_PATH)))
 
 
-def guardian_state_path() -> Path:
-    return Path(os.environ.get("COMPANION_POWER_STATE_PATH", POWER_STATE_PATH))
-
-
 def legacy_scripts_root() -> Path:
     return home() / ".claude" / "scripts"
 
@@ -80,7 +76,7 @@ def legacy_scripts_root() -> Path:
 def release_root_for(script_path: str | Path) -> Path | None:
     path = Path(script_path).resolve()
     parent = path.parent
-    if parent.name in {"companiond", "guardian"}:
+    if parent.name == "companiond":
         root = parent.parent
         if (root / "manifest.json").is_file():
             return root

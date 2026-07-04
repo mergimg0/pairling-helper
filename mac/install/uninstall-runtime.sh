@@ -2,7 +2,6 @@
 set -euo pipefail
 
 PAIRLING_DAEMON_LABEL="dev.pairling.companiond"
-PAIRLING_GUARDIAN_LABEL="dev.pairling.power-guardian"
 PAIRLING_CONNECTD_LABEL="dev.pairling.connectd"
 PAIRLING_PTYBROKER_LABEL="dev.pairling.ptybroker"
 APP_SUPPORT="${PAIRLING_APP_SUPPORT_ROOT:-${COMPANION_APP_SUPPORT_ROOT:-$HOME/Library/Application Support/Pairling}}"
@@ -10,7 +9,6 @@ LOGS_ROOT="${PAIRLING_LOGS_ROOT:-${COMPANION_LOGS_ROOT:-$HOME/Library/Logs/Pairl
 USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_DAEMON_LABEL.plist"
 CONNECTD_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_CONNECTD_LABEL.plist"
 PTYBROKER_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_PTYBROKER_LABEL.plist"
-SYSTEM_PLIST="/Library/LaunchDaemons/$PAIRLING_GUARDIAN_LABEL.plist"
 # Legacy: the silent-join mint broker, removed from the product. Torn down below.
 MINTD_SYSTEM_LABEL="dev.pairling.mintd"
 MINTD_SYSTEM_PLIST="/Library/LaunchDaemons/$MINTD_SYSTEM_LABEL.plist"
@@ -137,7 +135,6 @@ bootout_user "$PAIRLING_PTYBROKER_LABEL" "$PTYBROKER_USER_PLIST"
 rm -f "$USER_PLIST"
 rm -f "$CONNECTD_USER_PLIST"
 rm -f "$PTYBROKER_USER_PLIST"
-bootout_system "$PAIRLING_GUARDIAN_LABEL" "$SYSTEM_PLIST"
 teardown_legacy_mintd
 
 rm -rf "$APP_SUPPORT/pair" 2>/dev/null || true

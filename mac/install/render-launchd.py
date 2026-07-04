@@ -8,7 +8,6 @@ import plistlib
 from pathlib import Path
 
 PAIRLING_DAEMON_LABEL = "dev.pairling.companiond"
-PAIRLING_GUARDIAN_LABEL = "dev.pairling.power-guardian"
 PAIRLING_CONNECTD_LABEL = "dev.pairling.connectd"
 PAIRLING_PTYBROKER_LABEL = "dev.pairling.ptybroker"
 PAIRLING_RUNTIME_PORT = "7773"
@@ -24,7 +23,7 @@ def daemon_plist(current: Path, logs: Path, python_bin: str) -> dict:
     env = {
         "PAIRLING_RUNTIME_PORT": PAIRLING_RUNTIME_PORT,
         "COMPANION_DAEMON_PORT": PAIRLING_RUNTIME_PORT,
-        "PAIRLING_BIND_MODE": "all",
+        "PAIRLING_BIND_MODE": "loopback",
         "PAIRLING_APP_SUPPORT_ROOT": str(current.parent.parent),
         "PAIRLING_LOGS_ROOT": str(logs),
         "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
@@ -41,30 +40,6 @@ def daemon_plist(current: Path, logs: Path, python_bin: str) -> dict:
         "ThrottleInterval": 10,
         "StandardOutPath": str(logs / "companiond.log"),
         "StandardErrorPath": str(logs / "companiond.err"),
-    }
-
-
-def guardian_plist(current: Path, logs: Path, python_bin: str) -> dict:
-    return {
-        "Label": PAIRLING_GUARDIAN_LABEL,
-        "ProgramArguments": [
-            python_bin,
-            str(current / "guardian" / "companion-power-guardian.py"),
-        ],
-        "EnvironmentVariables": {
-            "PAIRLING_RUNTIME_PORT": PAIRLING_RUNTIME_PORT,
-            "COMPANION_DAEMON_PORT": PAIRLING_RUNTIME_PORT,
-            "COMPANION_COORDINATOR_HOST": "pairling-mac",
-            "COMPANION_GUARDIAN_ENFORCE": "0",
-            "COMPANION_LOW_POWER_MODE_POLICY": "preserve",
-            "COMPANION_POWER_INTERVAL_SECONDS": "20",
-            "COMPANION_POWER_STATE_PATH": "/var/run/pairling-power-state.json",
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        },
-        "RunAtLoad": True,
-        "KeepAlive": True,
-        "StandardOutPath": str(logs / "power-guardian.log"),
-        "StandardErrorPath": str(logs / "power-guardian.err"),
     }
 
 
@@ -124,7 +99,6 @@ def main() -> int:
     parser.add_argument("--logs-root", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--daemon-python", default="/usr/local/bin/python3")
-    parser.add_argument("--guardian-python", default="/usr/bin/python3")
     parser.add_argument("--mirror-python", default="/usr/local/bin/python3", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -134,7 +108,6 @@ def main() -> int:
 
     write_plist(out / f"{PAIRLING_DAEMON_LABEL}.plist", daemon_plist(current, logs, args.daemon_python))
     write_plist(out / f"{PAIRLING_PTYBROKER_LABEL}.plist", ptybroker_plist(current, logs, args.daemon_python))
-    write_plist(out / f"{PAIRLING_GUARDIAN_LABEL}.plist", guardian_plist(current, logs, args.guardian_python))
     write_plist(out / f"{PAIRLING_CONNECTD_LABEL}.plist", connectd_plist(current, logs))
     return 0
 
