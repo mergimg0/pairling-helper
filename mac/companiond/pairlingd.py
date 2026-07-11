@@ -79,6 +79,7 @@ try:
         LEGACY_TOKEN_RELATIVE_PATH,
         PORT as RUNTIME_PORT,
         RUNTIME_NAME as RUNTIME_NAME,
+        TAILSCALE_VARIANT as RUNTIME_TAILSCALE_VARIANT,
     )
     from runtime_paths import app_support_root, devices_db_path
     from pairling_devices import DeviceAuthResult, DeviceRegistry
@@ -97,6 +98,7 @@ except Exception:
     LEGACY_TOKEN_RELATIVE_PATH = ".claude/scripts/.notify-token"
     RUNTIME_PORT = 7773
     RUNTIME_NAME = "pairling-mac-runtime"
+    RUNTIME_TAILSCALE_VARIANT = "embedded_tsnet"
     DeviceAuthResult = None
     DeviceRegistry = None
     advertised_pairling_connect_routes = None
@@ -2163,7 +2165,7 @@ def _runtime_info_snapshot() -> dict:
                 "compat_mode": "pairling-v1",
                 "launchd_label": RUNTIME_DAEMON_LABEL,
                 "port": PORT,
-                "tailscale_variant": "standalone",
+                "tailscale_variant": RUNTIME_TAILSCALE_VARIANT,
                 "verified": False,
                 "manifest_path": None,
                 "manifest_error": f"{type(exc).__name__}: {exc}",
@@ -2178,7 +2180,7 @@ def _runtime_info_snapshot() -> dict:
         "compat_mode": "pairling-v1",
         "launchd_label": RUNTIME_DAEMON_LABEL,
         "port": PORT,
-        "tailscale_variant": "standalone",
+        "tailscale_variant": RUNTIME_TAILSCALE_VARIANT,
         "verified": False,
         "manifest_path": None,
         "manifest_error": "runtime manifest helpers unavailable",

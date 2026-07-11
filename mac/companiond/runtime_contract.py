@@ -14,7 +14,9 @@ PORT = int(os.environ.get("PAIRLING_RUNTIME_PORT", "7773"))
 LEGACY_PORT = 7723
 DAEMON_LABEL = "dev.pairling.companiond"
 LEGACY_TOKEN_RELATIVE_PATH = ".claude/scripts/.notify-token"
-TAILSCALE_VARIANT = "standalone"
+# Pairling owns its route through pairling-connectd's embedded tsnet node. This
+# does not describe any unrelated Tailscale software installed on the Mac.
+TAILSCALE_VARIANT = "embedded_tsnet"
 AUTH_MODE = "scoped-device-bearer"
 PAIR_SERVICE_TYPE = "_pairling-pair._tcp"
 RUNTIME_BONJOUR_ADVERTISED = False

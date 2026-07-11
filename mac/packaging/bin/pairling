@@ -8,6 +8,25 @@ else
   REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 fi
 
+read_stamp() {
+  local path="$1"
+  if [[ -f "$path" ]]; then
+    tr -d '[:space:]' < "$path"
+  fi
+}
+
+if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
+  version="$(read_stamp "$REPO_ROOT/mac/VERSION")"
+  revision="$(read_stamp "$REPO_ROOT/mac/SOURCE_REVISION")"
+  version="${version:-unknown}"
+  if [[ -n "$revision" ]]; then
+    printf 'pairling %s (source %s)\n' "$version" "$revision"
+  else
+    printf 'pairling %s\n' "$version"
+  fi
+  exit 0
+fi
+
 export PYTHONDONTWRITEBYTECODE=1
 if [[ -z "${PYTHONPYCACHEPREFIX:-}" ]]; then
   PYTHONPYCACHEPREFIX="${TMPDIR:-/tmp}/pairling-pycache-$(id -u)"

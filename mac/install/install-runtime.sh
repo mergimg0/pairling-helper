@@ -663,8 +663,9 @@ poll_evidence_test() {
 # two rows only when it is non-empty, which is today's not-installed path. The
 # panel does not print the argument text itself, it uses fixed rows that spell the
 # same wording, so the box math is exact and the argument stays the canonical
-# sentence safety_step also prints plain. The Local Network both-sides copy is the
-# same sentence a machine path prints, wrapped to fixed rows that fit the box so
+# sentence safety_step also prints plain. The Local Network copy makes clear that
+# the permission and same-Wi-Fi requirement apply only to nearby pairing. It is
+# the same sentence a machine path prints, wrapped to fixed rows that fit the box so
 # the right border lines up. It gates on GUIDED_TTY, so a machine path draws
 # nothing.
 wizard_permissions_panel() {
@@ -679,9 +680,9 @@ wizard_permissions_panel() {
     wizard_box_row "$inner" "installed yet. Pairing works without it." "${WZ_GREY:-}installed yet. Pairing works without it.${r}"
     wizard_box_row "$inner" "" ""
   fi
-  wizard_box_row "$inner" "On first pair your iPhone asks for Local Network" "${WZ_PAPER:-}On first pair your iPhone asks for Local Network${r}"
-  wizard_box_row "$inner" "access, so allow it. This Mac and the iPhone must be" "${WZ_PAPER:-}access, so allow it. This Mac and the iPhone must be${r}"
-  wizard_box_row "$inner" "on the same Wi-Fi so the Mac can see the phone." "${WZ_PAPER:-}on the same Wi-Fi so the Mac can see the phone.${r}"
+  wizard_box_row "$inner" "Your iPhone may ask for Local Network access. Allow it" "${WZ_PAPER:-}Your iPhone may ask for Local Network access. Allow it${r}"
+  wizard_box_row "$inner" "for nearby pairing. Local Network and the same Wi-Fi are" "${WZ_PAPER:-}for nearby pairing. Local Network and the same Wi-Fi are${r}"
+  wizard_box_row "$inner" "not required for Pairling Connect." "${WZ_PAPER:-}not required for Pairling Connect.${r}"
   wizard_box_bot "$inner"
 }
 
@@ -714,7 +715,7 @@ safety_step() {
     if [ "${GUIDED_TTY:-0}" = 1 ]; then
       wizard_permissions_panel ""
     else
-      stage_note "On first pair your iPhone asks for Local Network access, so allow it. This Mac and the iPhone must be on the same Wi-Fi so the Mac can see the phone."
+      stage_note "Your iPhone may ask for Local Network access. Allow it for nearby pairing. Local Network and the same Wi-Fi are not required for Pairling Connect."
     fi
   else
     # The not-installed advisory. This is today's path. It states the truth: the
@@ -726,10 +727,10 @@ safety_step() {
       wizard_permissions_panel "Pairling Safety Monitor is a future feature and is not installed yet. Pairing works without it."
     else
       stage_note "Pairling Safety Monitor is a future feature and is not installed yet. Pairing works without it."
-      stage_note "On first pair your iPhone asks for Local Network access, so allow it. This Mac and the iPhone must be on the same Wi-Fi so the Mac can see the phone."
+      stage_note "Your iPhone may ask for Local Network access. Allow it for nearby pairing. Local Network and the same Wi-Fi are not required for Pairling Connect."
     fi
   fi
-  stage_note "If Local Network is allowed and pairing still stalls, the block is on the Mac or the network side, not the iPhone."
+  stage_note "If pairing stalls, run pairling doctor --json. Check Local Network access and the same Wi-Fi only when using nearby pairing."
   stage_note "Accessibility and Automation are only needed later if you enable typing into Terminal from the phone. Run pairling doctor --json to see the exact Mac grantee path before enabling it."
   return 0
 }
@@ -753,7 +754,7 @@ guided_on_exit() {
     fi
     printf '\nSetup did not finish (stage: %s, exit %s).\n' "${GUIDED_STAGE_CURRENT:-startup}" "$code" >&2
     printf 'Recovery: run `pairling doctor --json` to inspect, then re-run `pairling setup`.\n' >&2
-    printf 'Retry pairing only: `pairling pair --qr`. Sign in to Pairling Connect: `pairling connect-auth-open`.\n' >&2
+    printf 'Retry pairing only: `pairling pair --qr`. If doctor says Pairling Connect needs sign-in: `pairling connect-auth-open`.\n' >&2
   fi
 }
 
@@ -764,7 +765,7 @@ guided_on_exit() {
 # setting and never blocks setup.
 guided_permission_notice() {
   if [ "${GUIDED_TTY:-0}" = 1 ]; then
-    # The guided screen frames the no-permission line and the both-sides Local
+    # The guided screen frames the no-permission line and the route-aware Local
     # Network copy in a rounded panel, matching the safety_step panel. The copy is
     # wrapped to fixed rows so the right border lines up. The stall and
     # Accessibility lines stay plain notes below the box.
@@ -774,49 +775,75 @@ guided_permission_notice() {
     wizard_box_row "$inner" "macOS permissions" "${b}${WZ_PAPER:-}macOS permissions${r}"
     wizard_box_row "$inner" "" ""
     wizard_box_row "$inner" "This Mac needs no special privacy permission to pair." "${WZ_GREY:-}This Mac needs no special privacy permission to pair.${r}"
-    wizard_box_row "$inner" "On your iPhone allow Local Network access when Pairling" "${WZ_PAPER:-}On your iPhone allow Local Network access when Pairling${r}"
-    wizard_box_row "$inner" "asks. This Mac and the iPhone must be on the same Wi-Fi" "${WZ_PAPER:-}asks. This Mac and the iPhone must be on the same Wi-Fi${r}"
-    wizard_box_row "$inner" "so the Mac can see the phone." "${WZ_PAPER:-}so the Mac can see the phone.${r}"
+    wizard_box_row "$inner" "Your iPhone may ask for Local Network access. Allow it" "${WZ_PAPER:-}Your iPhone may ask for Local Network access. Allow it${r}"
+    wizard_box_row "$inner" "for nearby pairing. Local Network and the same Wi-Fi are" "${WZ_PAPER:-}for nearby pairing. Local Network and the same Wi-Fi are${r}"
+    wizard_box_row "$inner" "not required for Pairling Connect." "${WZ_PAPER:-}not required for Pairling Connect.${r}"
     wizard_box_bot "$inner"
-    stage_note "If you already allowed Local Network on the iPhone and pairing still stalls, the block is on the Mac or the network, not the iPhone. Check that both devices are on the same Wi-Fi."
+    stage_note "If pairing stalls, run pairling doctor --json. Check Local Network access and the same Wi-Fi only when using nearby pairing."
     stage_note "Accessibility and Automation are only needed if you later enable typing into Terminal from the phone, and macOS prompts then."
   else
     stage_note "This Mac needs no special privacy permission to pair."
-    stage_note "On your iPhone allow Local Network access when Pairling asks. This Mac and the iPhone must be on the same Wi-Fi so the Mac can see the phone."
-    stage_note "If you already allowed Local Network on the iPhone and pairing still stalls, the block is on the Mac or the network, not the iPhone. Check that both devices are on the same Wi-Fi."
+    stage_note "Your iPhone may ask for Local Network access. Allow it for nearby pairing. Local Network and the same Wi-Fi are not required for Pairling Connect."
+    stage_note "If pairing stalls, run pairling doctor --json. Check Local Network access and the same Wi-Fi only when using nearby pairing."
     stage_note "Accessibility and Automation are only needed if you later enable typing into Terminal from the phone, and macOS prompts then."
   fi
 }
 
-# guided_route_proof — one bounded, best-effort read of connectd /status that
-# tells the user whether the remote Pairling Connect route is live yet. Local and
-# LAN pairing already work regardless of the result. This never blocks or fails
-# setup (the whole probe is wrapped in `|| true`).
-guided_route_proof() {
-  python3 - "$REPO_ROOT" <<'PY' || true
+# guided_connect_route_state makes one bounded, best-effort read of connectd
+# /status and reduces it to the four states the setup copy can render. The
+# finish summary captures it once and passes the same value to both proofs, so
+# adjacent route and recovery messages cannot disagree.
+guided_connect_route_state() {
+  python3 - "$REPO_ROOT" 2>/dev/null <<'PY' || printf 'degraded\n'
 import os
 import sys
 
 repo_root = sys.argv[1]
 sys.path.insert(0, os.path.join(repo_root, "mac", "companiond"))
 try:
-    from pairling_connectd_status import fetch_connectd_status, advertised_pairling_connect_routes
+    from pairling_connectd_status import fetch_connectd_status, redacted_connectd_summary
 except Exception:
+    print("degraded")
     sys.exit(0)
 
-status = fetch_connectd_status(timeout_seconds=0.7) or {}
 try:
-    routes = advertised_pairling_connect_routes(status)
+    status = fetch_connectd_status(timeout_seconds=0.7) or {}
+    summary = redacted_connectd_summary(status)
 except Exception:
-    routes = []
+    print("degraded")
+    sys.exit(0)
 
-if routes:
-    print("     Route check: the Pairling Connect remote route is ready.")
-elif str(status.get("auth_state") or "") == "authenticated":
-    print("     Route check: Pairling Connect is signed in; the remote route will advertise shortly.")
+typed_status = str(summary.get("status") or "")
+if typed_status == "ready":
+    print("ready")
+elif typed_status == "route_missing":
+    print("starting")
+elif typed_status == "auth_pending":
+    print("needs_auth")
 else:
-    print("     Route check: local pairing is ready now; the remote route hardens after you sign in and the phone joins.")
+    print("degraded")
 PY
+}
+
+# guided_route_proof renders the captured Pairling Connect state. Nearby pairing
+# remains available when the remote route is not ready, but same Wi-Fi is never
+# presented as a requirement for a ready Pairling Connect route.
+guided_route_proof() {
+  local route_state="${1:-degraded}"
+  case "$route_state" in
+    ready)
+      printf '     Route check: Pairling Connect is ready. Same Wi-Fi is not required.\n'
+      ;;
+    starting)
+      printf '     Route check: Pairling Connect is signed in and the remote route is still starting.\n'
+      ;;
+    needs_auth)
+      printf '     Route check: Pairling Connect needs sign-in. Nearby pairing is available on the same Wi-Fi.\n'
+      ;;
+    degraded|*)
+      printf '     Route check: Pairling Connect needs attention. Run pairling doctor --json. Nearby pairing is available on the same Wi-Fi.\n'
+      ;;
+  esac
 }
 
 # guided_pairing_seen_proof is one bounded, best-effort, read-only check of the
@@ -831,9 +858,9 @@ PY
 # window. The whole probe is wrapped in `|| true`, so it never blocks or fails
 # setup.
 guided_pairing_seen_proof() {
-  local since="${1:-0}"
+  local since="${1:-0}" route_state="${2:-degraded}"
   PAIRLING_PAIRING_SEEN_POLL_STEPS="${PAIRLING_PAIRING_SEEN_POLL_STEPS:-6}" \
-    python3 - "$DEVICES_DB" "$since" <<'PY' || true
+    python3 - "$DEVICES_DB" "$since" "$route_state" <<'PY' || true
 import os
 import sqlite3
 import sys
@@ -844,6 +871,12 @@ try:
     since = float(sys.argv[2])
 except (IndexError, ValueError):
     since = 0.0
+try:
+    route_state = sys.argv[3]
+except IndexError:
+    route_state = "degraded"
+if route_state not in {"ready", "starting", "needs_auth", "degraded"}:
+    route_state = "degraded"
 try:
     steps = int(os.environ.get("PAIRLING_PAIRING_SEEN_POLL_STEPS") or "6")
 except ValueError:
@@ -882,7 +915,14 @@ try:
     else:
         print("     Pairing check: this Mac has not recorded your iPhone finishing pairing yet.")
         print("     If you just scanned the code, give it a moment and it should appear.")
-        print("     If it keeps stalling, confirm the iPhone allowed Local Network and both devices are on the same Wi-Fi.")
+        if route_state == "ready":
+            print("     Pairling Connect is ready, so same Wi-Fi is not required. Keep Pairling open on the iPhone and finish its sign-in if asked.")
+        elif route_state == "starting":
+            print("     Pairling Connect is still starting. Wait a moment, then scan a fresh code. Nearby pairing still needs Local Network access and the same Wi-Fi.")
+        elif route_state == "needs_auth":
+            print("     Pairling Connect needs sign-in. Run pairling connect-auth-open, then scan a fresh code. Nearby pairing still needs Local Network access and the same Wi-Fi.")
+        else:
+            print("     Pairling Connect needs attention. Run pairling doctor --json before scanning a fresh code, or use nearby pairing with Local Network access and the same Wi-Fi.")
 except Exception:
     # Any unexpected error means not seen. Never raise, so setup continues.
     pass
@@ -894,6 +934,15 @@ PY
 # device step, proves the route, and prints the exact re-run commands for any
 # step the operator may need to repeat.
 guided_finish_summary() {
+  local route_state="degraded" run_probes=0
+  if ! is_dry_run; then
+    route_state="$(guided_connect_route_state)"
+    case "$route_state" in
+      ready|starting|needs_auth|degraded) ;;
+      *) route_state="degraded" ;;
+    esac
+    run_probes=1
+  fi
   if [ "${GUIDED_TTY:-0}" = 1 ]; then
     # The guided screen frames the fixed guidance and the re-run command hints in a
     # rounded panel, with the commands in the brand accent. The route proof and the
@@ -910,21 +959,25 @@ guided_finish_summary() {
     wizard_box_row "$inner" "" ""
     wizard_box_row "$inner" "Inspect status anytime:        pairling doctor --json" "${WZ_GREY:-}Inspect status anytime:        ${r}${WZ_ACCENT:-}pairling doctor --json${r}"
     wizard_box_row "$inner" "Re-show the pairing code:       pairling pair --qr" "${WZ_GREY:-}Re-show the pairing code:       ${r}${WZ_ACCENT:-}pairling pair --qr${r}"
-    wizard_box_row "$inner" "Sign in for the remote route:   pairling connect-auth-open" "${WZ_GREY:-}Sign in for the remote route:   ${r}${WZ_ACCENT:-}pairling connect-auth-open${r}"
-    wizard_box_bot "$inner"
-    if ! is_dry_run; then
-      guided_route_proof || true
+    if [ "$run_probes" = 1 ] && [ "$route_state" = "needs_auth" ]; then
+      wizard_box_row "$inner" "Start Pairling Connect:        pairling connect-auth-open" "${WZ_GREY:-}Start Pairling Connect:        ${r}${WZ_ACCENT:-}pairling connect-auth-open${r}"
     fi
-    if ! is_dry_run; then guided_pairing_seen_proof "${PAIRLING_PAIRING_STARTED_AT:-0}" || true; fi
+    wizard_box_bot "$inner"
+    if [ "$run_probes" = 1 ]; then
+      guided_route_proof "$route_state" || true
+      guided_pairing_seen_proof "${PAIRLING_PAIRING_STARTED_AT:-0}" "$route_state" || true
+    fi
   else
     stage_note "The pairing code is shown above. Open Pairling on your iPhone, scan it, then approve this Mac."
-    if ! is_dry_run; then
-      guided_route_proof || true
+    if [ "$run_probes" = 1 ]; then
+      guided_route_proof "$route_state" || true
+      guided_pairing_seen_proof "${PAIRLING_PAIRING_STARTED_AT:-0}" "$route_state" || true
     fi
-    if ! is_dry_run; then guided_pairing_seen_proof "${PAIRLING_PAIRING_STARTED_AT:-0}" || true; fi
     stage_note "Inspect status anytime:        pairling doctor --json"
     stage_note "Re-show the pairing code:       pairling pair --qr"
-    stage_note "Sign in for the remote route:   pairling connect-auth-open"
+    if [ "$run_probes" = 1 ] && [ "$route_state" = "needs_auth" ]; then
+      stage_note "Start Pairling Connect:        pairling connect-auth-open"
+    fi
   fi
 }
 
@@ -2110,7 +2163,7 @@ install_runtime() {
       log "Pairling installed, but setup could not generate a pairing invitation. Run: pairling doctor --json; pairling pair --qr" >&2
       exit 1
     fi
-    stage_ok "pairing code displayed (local-first)"
+    stage_ok "pairing code displayed"
     log ""
     # Hold here on the guided screen so the pairing code stays in view until the
     # operator has scanned it, rather than being scrolled off by the stages
@@ -2122,9 +2175,9 @@ install_runtime() {
       read -r _ || true
       log ""
     fi
-    # Browser auth is useful, but it must not block or precede the first pairing
-    # code. First-pair bootstrap is local-first; Pairling Connect hardens after
-    # the phone has joined.
+    # Browser auth must not block or precede the first pairing code. The code may
+    # already carry a ready Pairling Connect route; this later handoff only opens
+    # approval when the Mac still needs it.
     stage_begin "Pairling Connect sign-in (Mac)"
     auto_open_connect_auth
     stage_ok "Pairling Connect sign-in handled"
@@ -2364,14 +2417,10 @@ def default_pair_route(port_number: int) -> dict:
         value = os.environ.get(key)
         if value:
             return {"base_url": value, "source": "explicit_override", "status": "override"}
-    # First-pair bootstrap: prefer LAN when the runtime actually serves it.
-    # iOS blocks plain HTTP to a tailnet IP before the embedded Pairling
-    # Connect route is ready, so a live LAN listener still wins. A LAN base
-    # nothing listens on loses to a ready Connect route, which the phone
-    # claims over its embedded tailnet (PrePairEmbeddedTailnetTransport).
-    lan_ip = detected_lan_ip()
-    if lan_ip and lan_base_serviceable(lan_ip, port_number):
-        return {"base_url": f"http://{lan_ip}:{port_number}", "source": "lan", "status": "fallback", "kind": "lan"}
+    # A ready embedded route is the preferred first-pair transport. Its route
+    # metadata lets iOS claim the QR through PrePairEmbeddedTailnetTransport,
+    # so the code remains usable away from the Mac's local network. Nearby LAN
+    # pairing is only the fallback while Pairling Connect is not ready.
     route = ready_connectd_route()
     if route:
         return {
@@ -2380,6 +2429,9 @@ def default_pair_route(port_number: int) -> dict:
             "status": route["status"],
             "kind": route["kind"],
         }
+    lan_ip = detected_lan_ip()
+    if lan_ip and lan_base_serviceable(lan_ip, port_number):
+        return {"base_url": f"http://{lan_ip}:{port_number}", "source": "lan", "status": "fallback", "kind": "lan"}
     if os.environ.get("PAIRLING_DISABLE_BONJOUR") != "1" and os.environ.get("PAIRLING_TEST_DISABLE_BONJOUR") != "1":
         return {"base_url": f"http://{socket.gethostname()}.local:{port_number}", "source": "bonjour", "status": "fallback", "kind": "bonjour"}
     tailnet_ip = detected_tailnet_ip()
@@ -2701,15 +2753,15 @@ def main() -> None:
         action = decision(status)
         if action[0] == "open":
             if post_auth_open():
-                print("Opened the Tailscale sign-in in your browser. Finish sign-in to bring Pairling Connect online; the pairing code follows.")
+                print("Opened the Tailscale sign-in in your browser. Finish sign-in to bring Pairling Connect online. The pairing code is already shown above.")
             else:
-                print("Pairling Connect sign-in is not ready yet; continuing with the pairing code. You can re-run sign-in later with: pairling connect-auth-open")
+                print("Pairling Connect sign-in is not ready yet. The pairing code above remains available for nearby pairing. Run pairling doctor --json for the next remote-access step.")
             return
         if action[0] == "skip":
             # Already authenticated or tagged — no browser step needed.
             return
         if wait_seconds <= 0 or time.monotonic() >= deadline:
-            print("Pairling Connect was not ready in time; continuing with the pairing code. You can sign in later with: pairling connect-auth-open")
+            print("Pairling Connect was not ready in time. The pairing code above remains available for nearby pairing. Run pairling doctor --json for the remote-route status.")
             return
         time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
 
