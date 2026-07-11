@@ -19,17 +19,24 @@ while [[ $# -gt 0 ]]; do
     --first-run)
       FIRST_RUN_MODE="true"
       ;;
+    --ssh-print-key)
+      # SPEC-p5 §6: re-display the SSH host fingerprint the phone pins,
+      # without re-running setup. The authorized_keys line for a generated
+      # client key is printed by `setup --ssh`.
+      exec python3 "$REPO_ROOT/mac/install/ssh_gateway_setup.py" host-fingerprint
+      ;;
     --help|-h)
       cat <<EOF
-usage: pairling doctor [--json] [--first-run]
+usage: pairling doctor [--json] [--first-run] [--ssh-print-key]
 
 Validates the Pairling Mac runtime. --first-run adds a machine-readable
-readiness contract for onboarding and pairing rehearsals.
+readiness contract for onboarding and pairing rehearsals. --ssh-print-key
+re-displays the SSH host-key fingerprint the phone pins (SPEC-p5).
 EOF
       exit 0
       ;;
     *)
-      echo "usage: pairling doctor [--json] [--first-run]" >&2
+      echo "usage: pairling doctor [--json] [--first-run] [--ssh-print-key]" >&2
       exit 2
       ;;
   esac
@@ -620,6 +627,38 @@ if health:
     add("health_contract", health.get("contract_version") == "pairling-runtime-v1", "error", "/health reports Pairling runtime contract.", health.get("contract_version"))
 else:
     add("health_contract", False, "error", "Cannot validate /health contract without response.")
+
+# Session keep-awake truth (SPEC-p7): the daemon holds a caffeinate -i child
+# only while supervised work runs. Informational — the honest limits are that
+# idle sleep is prevented, never a closed lid.
+keep_awake = None
+try:
+    req = urllib.request.Request(f"http://127.0.0.1:{PAIRLING_PORT}/power-state")
+    with urllib.request.urlopen(req, timeout=3) as resp:
+        keep_awake = (json.loads(resp.read().decode("utf-8")) or {}).get("keep_awake") or {}
+except Exception:
+    keep_awake = None
+if keep_awake is None:
+    add("keep_awake", False, "warning", "GET /power-state failed; keep-awake state unknown.")
+elif not keep_awake.get("enabled"):
+    add(
+        "keep_awake",
+        True,
+        "warning",
+        "Session keep-awake is disabled (PAIRLING_KEEP_AWAKE=0); the Mac follows its own sleep schedule even mid-run.",
+        {"enabled": False},
+    )
+else:
+    ka_reasons = keep_awake.get("reasons") or {}
+    ka_active = bool(keep_awake.get("active"))
+    ka_summary = "Keep-awake is holding the Mac awake" if ka_active else "Keep-awake is idle (no active work; the Mac may sleep)"
+    add(
+        "keep_awake",
+        True,
+        "warning",
+        f"{ka_summary}: streams={ka_reasons.get('streams', 0)} sessions={ka_reasons.get('sessions', 0)} workers={ka_reasons.get('workers', 0)}.",
+        {key: keep_awake.get(key) for key in ("enabled", "active", "reasons", "since", "caffeinate_pid")},
+    )
 
 connectd_status = fetch_connectd_status()
 connectd_summary = redacted_connectd_summary(connectd_status)

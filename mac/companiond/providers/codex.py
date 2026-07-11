@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+from . import registry_data
 from .base import (
     ProviderAdapter,
     ProviderAvailability,
@@ -17,20 +18,28 @@ from .base import (
 )
 
 
+# Identity comes from registry-data.json (SPEC-p1 §2.1); the literal is the
+# corrupt-data fallback, mirroring claude.py.
+_FALLBACK_DESCRIPTOR = ProviderDescriptor(
+    provider_id="codex",
+    display_name="Codex",
+    kind="terminal_cli",
+    builtin=True,
+    docs_url="https://developers.openai.com/codex",
+)
+_ENTRY = registry_data.entry_or_none("codex")
+
+
 class CodexProviderAdapter(ProviderAdapter):
-    descriptor = ProviderDescriptor(
-        provider_id="codex",
-        display_name="Codex",
-        kind="terminal_cli",
-        builtin=True,
-        docs_url="https://developers.openai.com/codex",
-    )
+    descriptor = registry_data.descriptor_for(_ENTRY) if _ENTRY else _FALLBACK_DESCRIPTOR
 
     def __init__(self, home: Path | None = None):
         self.home = home or Path.home()
 
     @property
     def candidates(self) -> list[Path]:
+        if _ENTRY is not None and _ENTRY.binary_candidates:
+            return registry_data.candidate_paths(_ENTRY, home=self.home)
         return [
             self.home / ".local" / "bin" / "codex",
             Path("/opt/homebrew/bin/codex"),
@@ -58,7 +67,8 @@ class CodexProviderAdapter(ProviderAdapter):
         }
 
     def probe(self) -> ProviderProbeResult:
-        resolved = resolve_executable("codex", self.candidates, env_var="PAIRLING_CODEX_BIN")
+        env_var = _ENTRY.env_override if _ENTRY is not None else "PAIRLING_CODEX_BIN"
+        resolved = resolve_executable("codex", self.candidates, env_var=env_var)
         config_path = self.home / ".codex" / "config.toml"
         hooks_path = self.home / ".codex" / "hooks.json"
         hook_count = json_hook_count(hooks_path)

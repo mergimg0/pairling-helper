@@ -126,15 +126,42 @@ class PTYBrokerClient:
     def snapshot(self, session_id: str, public_session_id: str | None = None) -> dict | None:
         return self._rpc("snapshot", session_id=session_id, public_session_id=public_session_id or "").get("snapshot")
 
-    def snapshot_v2(self, session_id: str, public_session_id: str | None = None) -> dict | None:
-        return self._rpc("snapshot_v2", session_id=session_id, public_session_id=public_session_id or "").get("surface")
+    def snapshot_v2(
+        self,
+        session_id: str,
+        public_session_id: str | None = None,
+        window_start: int | None = None,
+        window_size: int | None = None,
+    ) -> dict | None:
+        kwargs: dict = {"session_id": session_id, "public_session_id": public_session_id or ""}
+        if window_start is not None:
+            kwargs["window_start"] = int(window_start)
+        if window_size is not None:
+            kwargs["window_size"] = int(window_size)
+        return self._rpc("snapshot_v2", **kwargs).get("surface")
 
-    def raw_tail(self, session_id: str, since: int = 0) -> tuple[bytes, int, int, bool] | None:
+    def delta_v2(self, session_id: str, since_generation: int, public_session_id: str | None = None) -> dict | None:
+        return self._rpc(
+            "delta_v2",
+            session_id=session_id,
+            since_generation=max(0, int(since_generation or 0)),
+            public_session_id=public_session_id or "",
+        ).get("delta")
+
+    def raw_tail(self, session_id: str, since: int = 0) -> tuple[bytes, int, int, bool, int, float | None] | None:
         tail = self._rpc("raw_tail", session_id=session_id, since=max(0, int(since or 0))).get("tail")
         if not isinstance(tail, dict):
             return None
         data = base64.b64decode(str(tail.get("b64") or ""))
-        return data, int(tail.get("next_offset") or 0), int(tail.get("total") or 0), bool(tail.get("reset"))
+        raw_feed_at = tail.get("feed_at")
+        return (
+            data,
+            int(tail.get("next_offset") or 0),
+            int(tail.get("total") or 0),
+            bool(tail.get("reset")),
+            int(tail.get("gap_bytes") or 0),
+            float(raw_feed_at) if isinstance(raw_feed_at, (int, float)) else None,
+        )
 
     def control(self, session_id: str, action: dict) -> dict:
         return self._rpc("control", session_id=session_id, action=action).get("result") or {"ok": False, "reason": "empty broker result"}

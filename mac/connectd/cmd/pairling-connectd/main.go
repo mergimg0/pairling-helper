@@ -62,6 +62,8 @@ func run(args []string) int {
 		funnelDefault = true
 	}
 	funnelEnabled := fs.Bool("funnel", funnelDefault, "expose a public Tailscale Funnel listener for the pre-pair bootstrap claim (off by default)")
+	sshGatewayEnabled := fs.Bool("ssh-gateway", sshGatewayEnabledFromEnv(os.Getenv("PAIRLING_SSH_GATEWAY")), "open the loopback SSH-tunnel gateway listener (off by default)")
+	sshGatewayAddr := fs.String("ssh-gateway-addr", "127.0.0.1:7775", "loopback address the SSH-tunnel gateway listens on")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -199,6 +201,34 @@ func run(args []string) int {
 		}
 	}
 
+	// SPEC-p5 §2.1: the loopback SSH-tunnel gateway, off by default. A
+	// SEPARATE handler in ExposureModeSSH — post-pair surface only, no
+	// /pair/* lifecycle — so a user-supplied `ssh -L` targets the perimeter
+	// and never the daemon's loopback trust tier. A failure to open is
+	// logged but does not bring down the tailnet listener.
+	var sshServer *http.Server
+	if *sshGatewayEnabled {
+		sshHandler, serr := newSSHGatewayHandler(upstream, *maxBodyBytes, *sshGatewayAddr)
+		if serr != nil {
+			log.Printf("cannot create ssh gateway: %v", serr)
+			return 1
+		}
+		sshLn, serr := net.Listen("tcp", *sshGatewayAddr)
+		if serr != nil {
+			statusStore.SetLastError(serr.Error())
+			log.Printf("cannot start ssh gateway listener: %v", serr)
+		} else {
+			sshServer = &http.Server{Handler: sshHandler, ReadHeaderTimeout: 10 * time.Second}
+			log.Printf("pairling-connectd ssh gateway open addr=%s", *sshGatewayAddr)
+			go func() {
+				if serveErr := sshServer.Serve(sshLn); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+					statusStore.SetLastError(serveErr.Error())
+					log.Printf("ssh gateway server stopped: %v", serveErr)
+				}
+			}()
+		}
+	}
+
 	log.Printf("pairling-connectd hostname=%s state_dir=%s listen=%s upstream=%s status=%s", *hostname, *stateDir, *listenAddr, upstream.String(), *statusAddr)
 	server := &http.Server{
 		Handler:           handler,
@@ -214,6 +244,7 @@ func run(args []string) int {
 	case <-ctx.Done():
 		shutdownHTTPServer(server)
 		shutdownHTTPServer(funnelServer)
+		shutdownHTTPServer(sshServer)
 		return 0
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {

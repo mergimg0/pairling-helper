@@ -52,6 +52,13 @@ DEFAULT_TEAM_ID = "965AVD34A3"
 APNS_ENVIRONMENTS = {"development", "sandbox", "production"}
 APNS_KEY_ENVIRONMENTS = {"development", "sandbox", "production", "both"}
 
+# The /health push axis (health_axis). OK means Apple accepted the delivery;
+# neutral outcomes are the device's own choice and prove nothing about the
+# plane, so they count neither for nor against it.
+PUSH_HEALTH_CONTRACT_VERSION = "pairling-push-health-v1"
+PUSH_HEALTH_OK_OUTCOMES = {"sent", "ok"}
+PUSH_HEALTH_NEUTRAL_OUTCOMES = {"disabled", "snoozed"}
+
 KIND_CATEGORY = {
     "session_attention": "PAIRLING_SESSION_ATTENTION",
     "turn_done": "PAIRLING_TURN_DONE",
@@ -580,6 +587,129 @@ class PairlingPushDispatcher:
             "events": payload.get("events", [])[-20:],
             "updated_at": payload.get("updated_at"),
         }
+
+    def health_axis(self) -> dict[str, Any]:
+        """The push-plane axis for /health: can this Mac deliver pushes, and
+        how did the recent deliveries go?
+
+        Exists because the APNs provider died silently for weeks (credentials
+        stripped from re-rendered launchd env, then an FD-exhausted daemon)
+        and no surface anywhere could say so. The phone renders a banner from
+        this axis, which is the dead-man's switch for the whole class: any
+        future cause of dead push delivery becomes visible at the next
+        health read instead of never."""
+        try:
+            provider = self._provider_status()
+        except Exception as exc:  # noqa: BLE001 - a broken provider read IS the finding
+            return {
+                "contract_version": PUSH_HEALTH_CONTRACT_VERSION,
+                "provider_configured": False,
+                "provider_mode": "unknown",
+                "degraded": True,
+                "reason": f"provider_status_failed:{type(exc).__name__}",
+                "last_delivery_outcome": None,
+                "last_delivery_at": None,
+                "registered_devices": 0,
+            }
+        configured = bool(provider.get("configured"))
+        data = self._read()
+        attempts = [
+            event
+            for event in data.get("events", [])
+            if isinstance(event, dict)
+            and event.get("outcome")
+            and not str(event.get("event") or "").endswith(".registered")
+            and event.get("outcome") not in PUSH_HEALTH_NEUTRAL_OUTCOMES
+        ][-10:]
+        last = attempts[-1] if attempts else None
+        any_ok = any(event.get("outcome") in PUSH_HEALTH_OK_OUTCOMES for event in attempts)
+        degraded = False
+        reason = None
+        if not configured:
+            degraded = True
+            reason = "provider_not_configured"
+        elif attempts and not any_ok:
+            degraded = True
+            reason = "deliveries_failing"
+        registered = [
+            device
+            for device in data.get("devices", [])
+            if isinstance(device, dict) and device.get("apns_token_hash")
+        ]
+        return {
+            "contract_version": PUSH_HEALTH_CONTRACT_VERSION,
+            "provider_configured": configured,
+            "provider_mode": str(provider.get("mode") or "not_configured"),
+            "degraded": degraded,
+            "reason": reason,
+            "last_delivery_outcome": (last or {}).get("outcome"),
+            "last_delivery_at": (last or {}).get("ts"),
+            "registered_devices": len(registered),
+        }
+
+    def drop_device(self, *, device_id: str, reason: str = "revoked") -> dict[str, Any]:
+        """Remove a device's push registration and secrets entirely.
+
+        Pairing revocation makes the tokens permanently undeliverable, but
+        the records used to linger: every emit iterated them, stale tokens
+        drew apns_410 noise into the audit, and the registry only healed one
+        token at a time. Revocation now cascades here, and the boot sweep
+        (gc_revoked) heals history."""
+        device_id = _nonempty(device_id, "device_id")
+        dropped = False
+        with self._lock:
+            data = self._read()
+            devices = data.get("devices", [])
+            keep = [item for item in devices if item.get("device_id") != device_id]
+            if len(keep) != len(devices):
+                dropped = True
+                data["devices"] = keep
+                self._append_event(data, {
+                    "event": "push.device.gc",
+                    "device_id": device_id,
+                    "outcome": "dropped",
+                    "reason": reason,
+                })
+                self._write(data)
+            secrets = self._read_secrets()
+            secret_devices = secrets.get("devices")
+            if isinstance(secret_devices, dict) and device_id in secret_devices:
+                del secret_devices[device_id]
+                self._write_secrets(secrets)
+                dropped = True
+        return {"ok": True, "device_id": device_id, "dropped": dropped}
+
+    def gc_revoked(self, *, revoked_device_ids: list[str], reason: str = "revoked_sweep") -> dict[str, Any]:
+        """Boot-time sweep: drop every push registration whose pairing was
+        revoked, including revocations that never passed through the revoke
+        endpoint (supersede-on-re-pair)."""
+        revoked = {str(item).strip() for item in revoked_device_ids if str(item).strip()}
+        if not revoked:
+            return {"ok": True, "dropped": []}
+        with self._lock:
+            registered = {
+                str(item.get("device_id") or "")
+                for item in self._read().get("devices", [])
+                if isinstance(item, dict)
+            }
+        dropped = []
+        for device_id in sorted(revoked & registered):
+            result = self.drop_device(device_id=device_id, reason=reason)
+            if result.get("dropped"):
+                dropped.append(device_id)
+        # Secrets can outlive registry records; sweep them independently.
+        with self._lock:
+            secrets = self._read_secrets()
+            secret_devices = secrets.get("devices")
+            if isinstance(secret_devices, dict):
+                stale = sorted(revoked & set(secret_devices.keys()))
+                for device_id in stale:
+                    del secret_devices[device_id]
+                    if device_id not in dropped:
+                        dropped.append(device_id)
+                if stale:
+                    self._write_secrets(secrets)
+        return {"ok": True, "dropped": dropped}
 
     def update_preferences(self, *, device_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         device_id = _nonempty(device_id, "device_id")

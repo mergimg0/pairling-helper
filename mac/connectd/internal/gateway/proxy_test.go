@@ -250,6 +250,16 @@ func TestHandlerEnforcesRequestBodyLimitBeforeUpstream(t *testing.T) {
 	}
 }
 
+func TestComposeSyncHasTheSameTwoMiBBodyLimitAsThePhoneAndDaemon(t *testing.T) {
+	handler := &Handler{maxBodyBytes: defaultMaxBodyBytes}
+	if got := handler.requestBodyLimit(http.MethodPost, "/compose/recordings/sync"); got != composeSyncMaxBodyBytes {
+		t.Fatalf("Compose body limit = %d, want %d", got, composeSyncMaxBodyBytes)
+	}
+	if got := handler.requestBodyLimit(http.MethodGet, "/compose/recordings/sync"); got != defaultMaxBodyBytes {
+		t.Fatalf("Compose GET body limit = %d, want default %d", got, defaultMaxBodyBytes)
+	}
+}
+
 func TestHandlerLogsMetadataWithoutSensitiveBodies(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
@@ -697,6 +707,7 @@ type endpointContractRowForTesting struct {
 	Method                  string `json:"method"`
 	SamplePath              string `json:"sample_path"`
 	ConnectdPairlingConnect bool   `json:"connectd_pairling_connect"`
+	ConnectdSSHGateway      bool   `json:"connectd_ssh_gateway"`
 	BearerRequired          bool   `json:"bearer_required"`
 	AssertConnectdParity    bool   `json:"assert_connectd_parity"`
 }

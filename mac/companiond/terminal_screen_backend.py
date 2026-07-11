@@ -5,7 +5,8 @@ import importlib.util
 import json
 import os
 import re
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 
@@ -42,7 +43,7 @@ class TerminalCursor:
 
 
 def detect_terminal_pending_input(rows: list[str]) -> dict[str, Any] | None:
-    choice_re = re.compile(r"^\s*(?P<selected>[>›]?)\s*(?P<id>\d+)[.)]\s+(?P<body>.+?)\s*$")
+    choice_re = re.compile(r"^\s*(?P<selected>[>›❯]?)\s*(?P<id>\d+)[.)]\s+(?P<body>.+?)\s*$")
     choices: list[dict[str, Any]] = []
     prompt = ""
     for idx, row in enumerate(rows):
@@ -79,15 +80,25 @@ def detect_terminal_pending_input(rows: list[str]) -> dict[str, Any] | None:
             "choices": choices,
         }
 
+    # A real selector, not a coincidence of numbered text: code listings,
+    # line-numbered output, and ordered prose all match the per-line choice
+    # shape. Require the ids to be the consecutive run 1..n and either an
+    # explicit selection cursor or a question-shaped prompt line before
+    # treating the screen as awaiting a selection.
     if len(choices) >= 2:
-        return {
-            "state": "awaiting_selection",
-            "confidence": "high",
-            "prompt": prompt,
-            "choices": choices,
-        }
+        ids = [int(choice["id"]) for choice in choices]
+        consecutive_from_one = ids == list(range(1, len(ids) + 1))
+        has_cursor = any(choice["selected"] for choice in choices)
+        question_prompt = prompt.rstrip().endswith("?")
+        if consecutive_from_one and (has_cursor or question_prompt):
+            return {
+                "state": "awaiting_selection",
+                "confidence": "high",
+                "prompt": prompt,
+                "choices": choices,
+            }
 
-    if "press enter" in lowered or "confirm" in lowered:
+    if "press enter" in lowered or "confirm to continue" in lowered:
         return {
             "state": "awaiting_confirmation",
             "confidence": "medium",
@@ -154,6 +165,10 @@ class TerminalScreenBackend(Protocol):
 
 
 class VTScreenBackend:
+    # Generations of dirty-row history retained for delta requests; a client
+    # further behind than this receives a full delta (all rows) instead.
+    DIRTY_HISTORY_GENERATIONS = 1024
+
     def __init__(self, screen: Any, *, source: str = "broker_vt", backend: str = "pty_broker") -> None:
         self.screen = screen
         self.source = source
@@ -161,19 +176,28 @@ class VTScreenBackend:
         self.generation = 0
         self.raw_offset = 0
         self._dirty_row_indexes: tuple[int, ...] = tuple(range(int(getattr(screen, "rows", 0) or 0)))
+        self._dirty_history: deque[tuple[int, tuple[int, ...]]] = deque(maxlen=self.DIRTY_HISTORY_GENERATIONS)
+
+    def _consume_screen_dirty(self) -> tuple[int, ...]:
+        consume = getattr(self.screen, "consume_dirty", None)
+        if callable(consume):
+            return tuple(consume())
+        return tuple(range(int(getattr(self.screen, "rows", 0) or 0)))
 
     def feed(self, data: bytes, *, raw_offset: int) -> TerminalScreenState:
         self.screen.feed(data)
         self.generation += 1
         self.raw_offset = max(self.raw_offset, int(raw_offset or 0))
-        self._dirty_row_indexes = tuple(range(int(getattr(self.screen, "rows", 0) or 0)))
+        self._dirty_row_indexes = self._consume_screen_dirty()
+        self._dirty_history.append((self.generation, self._dirty_row_indexes))
         return self.snapshot()
 
     def resize(self, rows: int, columns: int) -> TerminalScreenState:
         if hasattr(self.screen, "resize"):
             self.screen.resize(rows, columns)
         self.generation += 1
-        self._dirty_row_indexes = tuple(range(int(getattr(self.screen, "rows", rows) or rows)))
+        self._dirty_row_indexes = self._consume_screen_dirty()
+        self._dirty_history.append((self.generation, self._dirty_row_indexes))
         return self.snapshot()
 
     def snapshot(self) -> TerminalScreenState:
@@ -242,9 +266,24 @@ class VTScreenBackend:
         )
 
     def dirty_delta(self, *, since_generation: int) -> TerminalScreenState | None:
-        if self.generation <= int(since_generation or 0):
+        """State whose dirty_row_indexes is exactly the union of rows changed
+        after since_generation. None when nothing changed. When the request
+        predates retained history, every row reports dirty, which is a
+        correct (full) delta rather than a silent gap."""
+        since = int(since_generation or 0)
+        if self.generation <= since:
             return None
-        return self.snapshot()
+        history = list(self._dirty_history)
+        rows = int(getattr(self.screen, "rows", 0) or 0)
+        if not history or history[0][0] > since + 1:
+            union: set[int] = set(range(rows))
+        else:
+            union = set()
+            for generation, dirty in history:
+                if generation > since:
+                    union.update(dirty)
+        state = self.snapshot()
+        return replace(state, dirty_row_indexes=tuple(sorted(index for index in union if index < rows)))
 
 
 class DegradedTerminalScreenBackend:

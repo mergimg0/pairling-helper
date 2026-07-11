@@ -20,6 +20,9 @@ class ProviderDescriptor:
     kind: str
     builtin: bool = True
     docs_url: str | None = None
+    # Internal, automatic integration tier (deep | standard | recognized).
+    # Never a permission, never a gate on the raw-PTY floor (SPEC-p1 §2.2).
+    adapter_depth: str = "deep"
 
 
 @dataclass(frozen=True)

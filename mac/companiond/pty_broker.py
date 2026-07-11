@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import fcntl
 import base64
+import codecs
+from collections import deque
 import hashlib
 import json
 import os
@@ -14,6 +16,7 @@ import socket
 import secrets
 import struct
 import subprocess
+import sys
 import termios
 import threading
 import time
@@ -45,6 +48,73 @@ _ABSOLUTE_PATH_ROOT_TOKENS = {
 }
 _ANSI_COLOR_NAMES = ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white")
 _RPC_MAX_FRAME_BYTES = 8 * 1024 * 1024
+
+# Capture retention (Wave A): recordings are the replay corpus and the
+# forensic record, but they must not grow without bound or keep old
+# sessions' bytes at rest forever. On session close each file truncates
+# from the head to the tail cap, recording the dropped byte count in a
+# .pruned sidecar so nothing vanishes silently; the directory prunes
+# oldest-first to the budget at broker startup and on spawn.
+CAPTURE_TAIL_BYTES = max(64 * 1024, int(os.environ.get("PAIRLING_CAPTURE_TAIL_BYTES", str(4 * 1024 * 1024))))
+CAPTURE_DIR_BUDGET_BYTES = max(16 * 1024 * 1024, int(os.environ.get("PAIRLING_CAPTURE_DIR_BUDGET_BYTES", str(512 * 1024 * 1024))))
+
+
+def truncate_capture_tail(path, tail_bytes: int = CAPTURE_TAIL_BYTES) -> int:
+    """Keeps the newest tail_bytes of a recording, writes a .pruned sidecar
+    naming the dropped byte count, and returns it. 0 means untouched."""
+    try:
+        if path is None:
+            return 0
+        path = Path(path)
+        size = path.stat().st_size
+        if size <= tail_bytes:
+            return 0
+        with open(path, "rb") as handle:
+            handle.seek(size - tail_bytes)
+            tail = handle.read()
+        tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+        tmp.write_bytes(tail)
+        tmp.replace(path)
+        dropped = size - tail_bytes
+        sidecar = path.with_name(path.name + ".pruned")
+        sidecar.write_text(json.dumps({
+            "dropped_bytes": dropped,
+            "pruned_at": time.time(),
+        }, sort_keys=True) + "\n", encoding="utf-8")
+        return dropped
+    except OSError:
+        return 0
+
+
+def prune_capture_dir(log_dir, budget_bytes: int = CAPTURE_DIR_BUDGET_BYTES) -> list[str]:
+    """Removes oldest recordings (and their sidecars) until the directory
+    fits the budget. Returns the removed file names, oldest first."""
+    removed: list[str] = []
+    try:
+        log_dir = Path(log_dir)
+        entries = []
+        total = 0
+        for entry in log_dir.glob("broker-*.log"):
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            entries.append((stat.st_mtime, stat.st_size, entry))
+            total += stat.st_size
+        entries.sort()
+        for _mtime, size, entry in entries:
+            if total <= budget_bytes:
+                break
+            try:
+                entry.unlink()
+                entry.with_name(entry.name + ".pruned").unlink(missing_ok=True)
+                removed.append(entry.name)
+                total -= size
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return removed
 _TERMINAL_SURFACE_V2_NONCE_SALT = os.urandom(16).hex()
 BROKER_PROTOCOL_VERSION = 1
 BROKER_CODE_VERSION = "pty-broker-v1"
@@ -153,7 +223,13 @@ def _terminal_surface_v2_cell_payload(cell) -> dict:
     return payload
 
 
-def terminal_surface_v2_payload_from_state(session_id: str, state) -> dict:
+def terminal_surface_v2_payload_from_state(
+    session_id: str,
+    state,
+    scrollback_rows: list[list[dict]] | None = None,
+    scrollback_total: int = 0,
+    window_start: int | None = None,
+) -> dict:
     provider, native_id = _parse_session_ref(session_id)
     row_payloads: list[dict] = []
     links_payload: dict[str, dict] = {}
@@ -168,20 +244,38 @@ def terminal_surface_v2_payload_from_state(session_id: str, state) -> dict:
             "url": str(url) if url is not None else None,
             "label": str(label) if label is not None else None,
         }
-    for row in getattr(state, "visible_rows", ()):
-        cells = [_terminal_surface_v2_cell_payload(cell) for cell in getattr(row, "cells", ())]
-        row_material = {
-            "index": int(getattr(row, "index", 0)),
-            "wrapped": bool(getattr(row, "wrapped", False)),
-            "cells": cells,
-        }
-        row_payloads.append({
-            "index": row_material["index"],
-            "wrapped": row_material["wrapped"],
-            "dirty_generation": int(getattr(row, "dirty_generation", 0) or 0),
-            "cells_hash": _sha256_prefixed(row_material),
-            "cells": cells,
-        })
+    if scrollback_rows is not None and window_start is not None:
+        # History window (SPEC-p4 §2.3): serve the requested slice with
+        # ABSOLUTE indexes so the phone can stitch pages above the live view.
+        for offset, history_cells in enumerate(scrollback_rows):
+            cells = [dict(cell) for cell in history_cells]
+            row_material = {
+                "index": int(window_start) + offset,
+                "wrapped": False,
+                "cells": cells,
+            }
+            row_payloads.append({
+                "index": row_material["index"],
+                "wrapped": False,
+                "dirty_generation": 0,
+                "cells_hash": _sha256_prefixed(row_material),
+                "cells": cells,
+            })
+    else:
+        for row in getattr(state, "visible_rows", ()):
+            cells = [_terminal_surface_v2_cell_payload(cell) for cell in getattr(row, "cells", ())]
+            row_material = {
+                "index": int(getattr(row, "index", 0)),
+                "wrapped": bool(getattr(row, "wrapped", False)),
+                "cells": cells,
+            }
+            row_payloads.append({
+                "index": row_material["index"],
+                "wrapped": row_material["wrapped"],
+                "dirty_generation": int(getattr(row, "dirty_generation", 0) or 0),
+                "cells_hash": _sha256_prefixed(row_material),
+                "cells": cells,
+            })
     cursor = getattr(state, "cursor", None)
     cursor_payload = {
         "row": getattr(cursor, "row", None),
@@ -194,12 +288,23 @@ def terminal_surface_v2_payload_from_state(session_id: str, state) -> dict:
         "columns": int(getattr(state, "columns", 0) or 0),
     }
     capabilities = list(getattr(state, "capabilities", ()) or ())
-    scrollback = {
-        "window_start": 0,
-        "window_size": len(row_payloads),
-        "total_rows": len(row_payloads),
-        "truncated_before": False,
-    }
+    history_total = max(0, int(scrollback_total or 0))
+    if scrollback_rows is not None and window_start is not None:
+        scrollback = {
+            "window_start": int(window_start),
+            "window_size": len(row_payloads),
+            "total_rows": history_total + len(getattr(state, "visible_rows", ()) or ()),
+            "truncated_before": int(window_start) > 0,
+        }
+    else:
+        # Live view: the visible screen sits AFTER the retained history, and
+        # truncated_before discloses that older rows exist to page back to.
+        scrollback = {
+            "window_start": history_total,
+            "window_size": len(row_payloads),
+            "total_rows": history_total + len(row_payloads),
+            "truncated_before": history_total > 0,
+        }
     pending_input = getattr(state, "pending_input", None)
     pending_input_detection = getattr(state, "pending_input_detection", None)
     if pending_input_detection is None:
@@ -312,6 +417,7 @@ class VTScreen:
         self._state = "normal"
         self._csi = ""
         self._osc = ""
+        self._utf8_decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.title: str | None = None
         self.alternate_screen = False
         self.scroll_top = 0
@@ -320,6 +426,15 @@ class VTScreen:
         self.current_link_id: str | None = None
         self.links: dict[str, str] = {}
         self._primary_state: dict | None = None
+        # SPEC-p4 §2.3: rows that scroll off the top of the PRIMARY screen are
+        # real scrollback, retained bounded so the phone can page history.
+        # Alt-screen output and scroll-region tricks never land here — a real
+        # emulator's semantics.
+        self._scrollback: deque = deque(maxlen=5000)
+        # Rows touched since the last consume_dirty(). Every mutation path
+        # marks here; the replay conformance corpus proves completeness by
+        # reconstructing screens from dirty rows alone.
+        self._dirty: set[int] = set(range(self.rows))
 
     @staticmethod
     def _default_attr() -> dict:
@@ -340,7 +455,10 @@ class VTScreen:
         return [self._default_attr().copy() for _ in range(self.columns)]
 
     def feed(self, data: bytes) -> None:
-        text = data.decode("utf-8", errors="replace")
+        # PTY reads split UTF-8 sequences at arbitrary byte boundaries; a
+        # per-chunk decode turns the split character into replacement glyphs.
+        # The incremental decoder buffers the partial tail until it completes.
+        text = self._utf8_decoder.decode(data)
         for ch in text:
             self._feed_char(ch)
 
@@ -396,6 +514,21 @@ class VTScreen:
         if pending is not None:
             payload["pending_input"] = pending
         return payload
+
+    def _touch(self, row: int) -> None:
+        if 0 <= row < self.rows:
+            self._dirty.add(row)
+
+    def _touch_span(self, top: int, bottom: int) -> None:
+        self._dirty.update(range(max(0, top), min(self.rows - 1, bottom) + 1))
+
+    def _touch_all(self) -> None:
+        self._dirty.update(range(self.rows))
+
+    def consume_dirty(self) -> tuple[int, ...]:
+        dirty = tuple(sorted(self._dirty))
+        self._dirty.clear()
+        return dirty
 
     def _feed_char(self, ch: str) -> None:
         if self._state == "osc":
@@ -468,6 +601,7 @@ class VTScreen:
         if width == 2 and self.cursor_col + 1 < self.columns:
             self.grid[self.cursor_row][self.cursor_col + 1] = ""
             self.attrs[self.cursor_row][self.cursor_col + 1] = attr.copy()
+        self._touch(self.cursor_row)
         self.cursor_col += width
 
     def _linefeed(self) -> None:
@@ -507,6 +641,7 @@ class VTScreen:
                 self.wrapped = [False for _ in range(self.rows)]
                 self.cursor_row = 0
                 self.cursor_col = 0
+                self._touch_all()
             elif mode == 0:
                 for c in range(self.cursor_col, self.columns):
                     self.grid[self.cursor_row][c] = " "
@@ -515,20 +650,24 @@ class VTScreen:
                     self.grid[r] = self._blank_text_row()
                     self.attrs[r] = self._blank_attr_row()
                     self.wrapped[r] = False
+                self._touch_span(self.cursor_row, self.rows - 1)
         elif final == "K":
             mode = value(0, 0)
             if mode == 2:
                 self.grid[self.cursor_row] = self._blank_text_row()
                 self.attrs[self.cursor_row] = self._blank_attr_row()
                 self.wrapped[self.cursor_row] = False
+                self._touch(self.cursor_row)
             elif mode == 1:
                 for c in range(0, self.cursor_col + 1):
                     self.grid[self.cursor_row][c] = " "
                     self.attrs[self.cursor_row][c] = self._default_attr().copy()
+                self._touch(self.cursor_row)
             else:
                 for c in range(self.cursor_col, self.columns):
                     self.grid[self.cursor_row][c] = " "
                     self.attrs[self.cursor_row][c] = self._default_attr().copy()
+                self._touch(self.cursor_row)
         elif final == "m":
             self._handle_sgr([int(p) if p.isdigit() else 0 for p in parts] or [0])
         elif final == "@":
@@ -572,6 +711,7 @@ class VTScreen:
         for row, col in positions:
             if 0 <= row < self.rows and 0 <= col < self.columns and self.grid[row][col] not in {"", " "}:
                 self.grid[row][col] = unicodedata.normalize("NFC", self.grid[row][col] + ch)
+                self._touch(row)
                 return
 
     def _handle_sgr(self, params: list[int]) -> None:
@@ -628,6 +768,7 @@ class VTScreen:
             attrs.insert(self.cursor_col, self._default_attr().copy())
             row.pop()
             attrs.pop()
+        self._touch(self.cursor_row)
 
     def _delete_characters(self, count: int) -> None:
         count = max(1, min(count, self.columns - self.cursor_col))
@@ -638,6 +779,7 @@ class VTScreen:
             attrs.pop(self.cursor_col)
             row.append(" ")
             attrs.append(self._default_attr().copy())
+        self._touch(self.cursor_row)
 
     def _insert_lines(self, count: int) -> None:
         if not (self.scroll_top <= self.cursor_row <= self.scroll_bottom):
@@ -650,6 +792,7 @@ class VTScreen:
             del self.grid[self.scroll_bottom + 1]
             del self.attrs[self.scroll_bottom + 1]
             del self.wrapped[self.scroll_bottom + 1]
+        self._touch_span(self.cursor_row, self.scroll_bottom)
 
     def _delete_lines(self, count: int) -> None:
         if not (self.scroll_top <= self.cursor_row <= self.scroll_bottom):
@@ -662,15 +805,50 @@ class VTScreen:
             self.grid.insert(self.scroll_bottom, self._blank_text_row())
             self.attrs.insert(self.scroll_bottom, self._blank_attr_row())
             self.wrapped.insert(self.scroll_bottom, False)
+        self._touch_span(self.cursor_row, self.scroll_bottom)
 
     def _scroll_up(self, top: int, bottom: int, count: int) -> None:
         for _ in range(max(1, count)):
+            if top == 0 and not self.alternate_screen:
+                self._scrollback.append(self._capture_cell_row(0))
             del self.grid[top]
             del self.attrs[top]
             del self.wrapped[top]
             self.grid.insert(bottom, self._blank_text_row())
             self.attrs.insert(bottom, self._blank_attr_row())
             self.wrapped.insert(bottom, False)
+        self._touch_span(top, bottom)
+
+    def _capture_cell_row(self, index: int) -> list[dict]:
+        row = self.grid[index]
+        attr_row = self.attrs[index]
+        last = -1
+        for idx, ch in enumerate(row):
+            if ch not in {" ", ""}:
+                last = idx
+        cells: list[dict] = []
+        for idx in range(last + 1):
+            ch = row[idx]
+            if ch == "":
+                continue
+            cells.append({
+                "text": ch,
+                "width": max(1, self._char_width(ch)),
+                **attr_row[idx],
+            })
+        return cells
+
+    @property
+    def scrollback_total(self) -> int:
+        return len(self._scrollback)
+
+    def scrollback_window(self, start: int, size: int) -> list[list[dict]]:
+        total = len(self._scrollback)
+        start = max(0, min(int(start or 0), total))
+        size = max(0, min(int(size or 0), total - start))
+        if size == 0:
+            return []
+        return [list(self._scrollback[i]) for i in range(start, start + size)]
 
     def _scroll_down(self, top: int, bottom: int, count: int) -> None:
         for _ in range(max(1, count)):
@@ -680,6 +858,7 @@ class VTScreen:
             self.grid.insert(top, self._blank_text_row())
             self.attrs.insert(top, self._blank_attr_row())
             self.wrapped.insert(top, False)
+        self._touch_span(top, bottom)
 
     def _handle_osc(self, payload: str) -> None:
         if payload.startswith(("0;", "2;")):
@@ -704,6 +883,7 @@ class VTScreen:
         self.scroll_bottom = self.rows - 1
         self.current_attr = self._default_attr()
         self.current_link_id = None
+        self._touch_all()
 
     def _enter_alternate_screen(self) -> None:
         if self.alternate_screen:
@@ -729,6 +909,7 @@ class VTScreen:
             self.cursor_col = self._primary_state["cursor_col"]
         self.alternate_screen = False
         self._primary_state = None
+        self._touch_all()
 
     def resize(self, rows: int, columns: int) -> None:
         old_text = self.text_rows()
@@ -745,6 +926,7 @@ class VTScreen:
         self.cursor_col = min(self.cursor_col, self.columns - 1)
         self.scroll_top = 0
         self.scroll_bottom = self.rows - 1
+        self._dirty = set(range(self.rows))
 
 
 @dataclass
@@ -772,8 +954,24 @@ class PTYBrokerSession:
         self._closed = False
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
+        # Guards the master_fd check-close-null so the two close sites (the
+        # read loop's finally and the terminate/signal path) cannot both close
+        # the same descriptor. Without it, one thread could close the fd and,
+        # before nulling it, another thread reads it as still-open and closes
+        # it a second time — closing an unrelated descriptor if the number was
+        # already reused by a new open. A dedicated lock, not self._lock, so a
+        # close never contends with the RLock the read/write paths hold.
+        self._fd_lock = threading.Lock()
         self._raw = bytearray()
         self._raw_offset = 0
+        # Changes on every PTY input, before the child has time to repaint.
+        # Folding this into the snapshot nonce closes the local-Enter race
+        # where the rendered approval still looks current for a few ms.
+        self._input_epoch = 0
+        self._feed_marks: deque[tuple[int, float]] = deque(maxlen=4096)
+        # Installed by the manager; invoked after each ingest so subscribers
+        # learn about output at write time instead of polling raw_tail.
+        self.on_output = None
 
     def start(self) -> None:
         master_fd, slave_fd = pty.openpty()
@@ -798,8 +996,27 @@ class PTYBrokerSession:
     def is_alive(self) -> bool:
         return bool(self.process and self.process.poll() is None)
 
+    def _close_master_fd(self) -> None:
+        """Close the PTY master exactly once, atomically. The read loop's
+        finally and the terminate/signal path both end a session and both must
+        release the master; this serializes the check-close-null so they never
+        close the same descriptor twice (which, after fd-number reuse, would
+        close an unrelated open file)."""
+        with self._fd_lock:
+            fd = self.master_fd
+            if fd < 0:
+                return
+            self.master_fd = -1
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
     def close(self) -> None:
         self.terminate(signal.SIGTERM)
+        dropped = truncate_capture_tail(self.raw_log_path)
+        if dropped:
+            print(f"pairling pty broker pruned {dropped} bytes from {getattr(self.raw_log_path, 'name', self.raw_log_path)}", file=sys.stderr, flush=True)
 
     def terminate(self, sig: int = signal.SIGTERM, wait_timeout: float = 2.0) -> dict:
         self._closed = True
@@ -825,36 +1042,116 @@ class PTYBrokerSession:
         except Exception as exc:
             ok = False
             error = f"{type(exc).__name__}: {exc}"
-        try:
-            if self.master_fd >= 0:
-                os.close(self.master_fd)
-                self.master_fd = -1
-        except Exception:
-            pass
+        self._close_master_fd()
         with self._condition:
             self._condition.notify_all()
         return {"ok": ok, "pid": self.pid, "signal": signal.Signals(sig).name, "error": error}
 
     def snapshot(self, public_session_id: str | None = None) -> dict:
         with self._lock:
-            return self.screen.snapshot(public_session_id or self.session_id, self.generation)
+            return self._snapshot_locked(public_session_id or self.session_id)
+
+    def _snapshot_locked(self, public_session_id: str) -> dict:
+        snapshot = self.screen.snapshot(public_session_id, self.generation)
+        snapshot["nonce"] = hashlib.sha256(json.dumps({
+            "screen_hash": snapshot.get("screen_hash"),
+            "generation": snapshot.get("generation"),
+            "input_epoch": self._input_epoch,
+            "session_id": public_session_id,
+        }, sort_keys=True).encode()).hexdigest()
+        return snapshot
 
     def snapshot_v2(self):
         with self._lock:
             return self.screen_backend.snapshot()
 
-    def raw_tail(self, since: int = 0) -> tuple[bytes, int, int, bool]:
+    def dirty_delta_v2(self, since_generation: int):
         with self._lock:
-            total = len(self._raw)
-            reset = since > total
-            start = 0 if reset else max(0, since)
-            return bytes(self._raw[start:]), total, total, reset
+            return self.screen_backend.dirty_delta(since_generation=since_generation)
 
-    def write(self, data: bytes) -> None:
+    def scrollback_slice(self, window_start: int, window_size: int) -> tuple[list[list[dict]], int]:
+        with self._lock:
+            return (
+                self.screen.scrollback_window(window_start, window_size),
+                self.screen.scrollback_total,
+            )
+
+    def scrollback_total(self) -> int:
+        with self._lock:
+            return self.screen.scrollback_total
+
+    def _ingest_output(self, data: bytes) -> None:
+        arrived_at = time.time()
+        with self._condition:
+            self._raw_offset += len(data)
+            self._raw.extend(data)
+            if len(self._raw) > 2_000_000:
+                del self._raw[:1_000_000]
+            # (end offset, arrival time) marks let raw_tail report when the
+            # oldest unserved byte actually arrived, which is the honest start
+            # of the delivery-latency clock.
+            self._feed_marks.append((self._raw_offset, arrived_at))
+            self.screen_backend.feed(data, raw_offset=self._raw_offset)
+            self.generation = self.screen_backend.generation
+            self.last_activity = time.time()
+            offset_after = self._raw_offset
+            self._condition.notify_all()
+        hook = self.on_output
+        if hook is not None:
+            try:
+                hook(self.session_id, offset_after, arrived_at)
+            except Exception:
+                pass
+
+    def raw_tail(self, since: int = 0) -> tuple[bytes, int, int, bool, int, float | None]:
+        # Offsets are stream-absolute (total bytes ever produced), not
+        # ring-relative: a ring trim must surface as an explicit gap for a
+        # lagging consumer, never as a silent skip or a spurious reset.
+        with self._lock:
+            total = self._raw_offset
+            earliest = total - len(self._raw)
+            since_abs = max(0, int(since or 0))
+            reset = since_abs > total
+            if reset:
+                start_abs = earliest
+                gap = 0
+            else:
+                start_abs = max(since_abs, earliest)
+                gap = start_abs - since_abs
+            feed_at = None
+            if start_abs < total:
+                for end_offset, arrived_at in self._feed_marks:
+                    if end_offset > start_abs:
+                        feed_at = arrived_at
+                        break
+            return bytes(self._raw[start_abs - earliest:]), total, total, reset, gap, feed_at
+
+    def _write_locked(self, data: bytes) -> None:
         if self.master_fd < 0:
             raise RuntimeError("session is not started")
-        os.write(self.master_fd, data)
+        self._input_epoch += 1
+        # The master fd is non-blocking; a type-mode burst (or a paste) can
+        # hit EAGAIN when the slave side is momentarily full. Apply bounded
+        # backpressure instead of failing the keystroke: wait for
+        # writability up to 1s total, then surface the error honestly.
+        view = memoryview(data)
+        deadline = time.time() + 1.0
+        while view:
+            try:
+                written = os.write(self.master_fd, view)
+                view = view[written:]
+            except BlockingIOError:
+                if time.time() >= deadline:
+                    raise
+                select.select([], [self.master_fd], [], 0.02)
         self.last_activity = time.time()
+
+    def write(self, data: bytes) -> None:
+        # Serialize every PTY input with proofed controls. A local attached
+        # terminal must not slip a key between a permission screen check and
+        # Pairling's Enter/Escape write.
+        with self._lock:
+            self._write_locked(data)
 
     def control(self, action: dict) -> dict:
         kind = action.get("type")
@@ -872,6 +1169,39 @@ class PTYBrokerSession:
             data = mapping.get(str(key))
             if data is None:
                 return {"ok": False, "reason": "unsupported key"}
+            if action.get("require_screen_proof") is True:
+                expected_hash = str(action.get("expected_screen_hash") or "")
+                expected_nonce = str(action.get("expected_nonce") or "")
+                try:
+                    expected_generation = int(action.get("expected_generation"))
+                except (TypeError, ValueError):
+                    return {"ok": False, "reason": "screen_proof_missing", "pty_written": False}
+                if not expected_hash or not expected_nonce:
+                    return {"ok": False, "reason": "screen_proof_missing", "pty_written": False}
+                with self._lock:
+                    current = self._snapshot_locked(self.session_id)
+                    if (
+                        str(current.get("screen_hash") or "") != expected_hash
+                        or str(current.get("nonce") or "") != expected_nonce
+                        or int(current.get("generation") or 0) != expected_generation
+                    ):
+                        return {
+                            "ok": False,
+                            "reason": "stale_screen",
+                            "pty_written": False,
+                            "screen_hash": current.get("screen_hash"),
+                            "nonce": current.get("nonce"),
+                            "generation": current.get("generation"),
+                        }
+                    self._write_locked(data)
+                    return {
+                        "ok": True,
+                        "pty_written": True,
+                        "screen_proof_verified": True,
+                        "screen_hash": current.get("screen_hash"),
+                        "nonce": current.get("nonce"),
+                        "generation": current.get("generation"),
+                    }
             self.write(data)
             return {"ok": True}
         if kind == "choice":
@@ -890,6 +1220,31 @@ class PTYBrokerSession:
             key_code = int(action.get("key_code") or 0)
             self.write(bytes([key_code]))
             return {"ok": True}
+        if kind == "input":
+            # Type mode (SPEC-p4 §2.2): small raw byte chunks straight to the
+            # PTY, no per-keystroke confirm. The generation guard lives HERE
+            # because this session owns the per-frame generation counter. The
+            # check is epoch-shaped: a client ahead of us saw a screen that
+            # has since been reset/replaced (reject), and a client more than
+            # 1000 frames behind is typing blind (reject). Both surface as
+            # stale_generation for the daemon's receipt.
+            expected = action.get("expected_generation")
+            if expected is not None:
+                try:
+                    expected = int(expected)
+                except (TypeError, ValueError):
+                    return {"ok": False, "reason": "bad_generation"}
+                current = int(self.generation)
+                if expected > current or (current - expected) > 1000:
+                    return {"ok": False, "reason": "stale_generation", "generation": current}
+            try:
+                data = base64.b64decode(str(action.get("b64") or ""), validate=True)
+            except Exception:
+                return {"ok": False, "reason": "bad_input_encoding"}
+            if not data or len(data) > 1024:
+                return {"ok": False, "reason": "input_size"}
+            self.write(data)
+            return {"ok": True, "generation": int(self.generation)}
         return {"ok": False, "reason": "unsupported action"}
 
     def send_text(self, text: str) -> dict:
@@ -968,15 +1323,7 @@ class PTYBrokerSession:
                 if log_f:
                     log_f.write(data)
                     log_f.flush()
-                with self._condition:
-                    self._raw_offset += len(data)
-                    self._raw.extend(data)
-                    if len(self._raw) > 2_000_000:
-                        del self._raw[:1_000_000]
-                    self.screen_backend.feed(data, raw_offset=self._raw_offset)
-                    self.generation = self.screen_backend.generation
-                    self.last_activity = time.time()
-                    self._condition.notify_all()
+                self._ingest_output(data)
         finally:
             if log_f:
                 log_f.close()
@@ -987,6 +1334,14 @@ class PTYBrokerSession:
                     pass
                 except Exception:
                     pass
+            # Close the PTY master here, not only in the signal path. A child
+            # that exits on its own (a finished agent, a `sleep` that returns)
+            # ends this loop at EOF; without this close the /dev/ptmx master
+            # leaked one descriptor per naturally-ended session, which is the
+            # workload-triggered FD leak that drove the daemon to EMFILE on
+            # 2026-07-06/07. The close is serialized with the signal path via
+            # _close_master_fd so the two sites cannot double-close.
+            self._close_master_fd()
             self._closed = True
             with self._condition:
                 self._condition.notify_all()
@@ -1015,6 +1370,67 @@ class PTYBrokerManager:
         self._by_tty: dict[str, str] = {}
         self._lock = threading.RLock()
         self._server_started = False
+        self._output_lock = threading.Lock()
+        self._output_cond = threading.Condition(self._output_lock)
+        self._output_subscribers: list[dict] = []
+
+    # ----- output push: subscribers learn about PTY output at write time ---
+
+    def notify_output(self, session_id: str, raw_offset: int, feed_at: float) -> None:
+        with self._output_cond:
+            for entry in self._output_subscribers:
+                queue = entry["queue"]
+                if len(queue) >= 4096:
+                    queue.popleft()
+                    entry["dropped"] += 1
+                queue.append((session_id, raw_offset, feed_at))
+            self._output_cond.notify_all()
+
+    def _serve_output_subscriber(self, conn: socket.socket) -> None:
+        entry = {"queue": deque(), "dropped": 0}
+        with self._output_cond:
+            self._output_subscribers.append(entry)
+        try:
+            _write_rpc_frame(conn, {"ok": True, "subscribed": True})
+            while True:
+                with self._output_cond:
+                    if not entry["queue"] and not entry["dropped"]:
+                        self._output_cond.wait(timeout=20.0)
+                    items = list(entry["queue"])
+                    entry["queue"].clear()
+                    dropped = entry["dropped"]
+                    entry["dropped"] = 0
+                if dropped:
+                    _write_rpc_frame(conn, {"event": "output_gap", "dropped": dropped})
+                if not items:
+                    # Heartbeat doubles as dead-peer detection: the write
+                    # raises once the subscriber went away.
+                    _write_rpc_frame(conn, {"event": "heartbeat"})
+                    continue
+                # Coalesce bursts per session; the consumer drains the full
+                # range from its cursor, so only the latest offset matters.
+                latest: dict[str, tuple[int, float]] = {}
+                for session_id, raw_offset, feed_at in items:
+                    known = latest.get(session_id)
+                    if known is None or raw_offset > known[0]:
+                        earliest_feed = known[1] if known is not None else feed_at
+                        latest[session_id] = (raw_offset, min(feed_at, earliest_feed))
+                for session_id, (raw_offset, feed_at) in latest.items():
+                    _write_rpc_frame(conn, {
+                        "event": "output",
+                        "session_id": session_id,
+                        "raw_offset": raw_offset,
+                        "feed_at": feed_at,
+                    })
+        except OSError:
+            pass
+        finally:
+            with self._output_cond:
+                self._output_subscribers = [e for e in self._output_subscribers if e is not entry]
+            try:
+                conn.close()
+            except OSError:
+                pass
 
     def start_attach_server(self) -> None:
         with self._lock:
@@ -1039,6 +1455,7 @@ class PTYBrokerManager:
         self.start_attach_server()
         safe_command = command
         argv = ["/bin/zsh", "-ic", safe_command]
+        prune_capture_dir(self.log_dir)
         raw_log = self.log_dir / f"broker-{provider}-{native_id}.log"
         merged_env = dict(os.environ)
         if env:
@@ -1054,6 +1471,7 @@ class PTYBrokerManager:
             columns=columns,
             raw_log_path=raw_log,
         )
+        session.on_output = self.notify_output
         session.start()
         with self._lock:
             self._sessions[session_id] = session
@@ -1146,11 +1564,73 @@ class PTYBrokerManager:
             return None
         return session.snapshot(public_session_id=public_session_id or session_id)
 
-    def snapshot_v2(self, session_id: str, public_session_id: str | None = None) -> dict | None:
+    def snapshot_v2(
+        self,
+        session_id: str,
+        public_session_id: str | None = None,
+        window_start: int | None = None,
+        window_size: int | None = None,
+    ) -> dict | None:
         session = self.get(session_id)
         if not session:
             return None
-        return terminal_surface_v2_payload_from_state(public_session_id or session_id, session.snapshot_v2())
+        if window_start is not None and window_size is not None:
+            rows, total = session.scrollback_slice(int(window_start), int(window_size))
+            return terminal_surface_v2_payload_from_state(
+                public_session_id or session_id,
+                session.snapshot_v2(),
+                scrollback_rows=rows,
+                scrollback_total=total,
+                window_start=int(window_start),
+            )
+        return terminal_surface_v2_payload_from_state(
+            public_session_id or session_id,
+            session.snapshot_v2(),
+            scrollback_total=session.scrollback_total(),
+        )
+
+    def delta_v2(self, session_id: str, since_generation: int, public_session_id: str | None = None) -> dict | None:
+        """A TerminalSurfaceV2Delta wire payload: only the rows changed after
+        since_generation, on the exact contract the phone's applying(delta:)
+        already implements. None when nothing changed."""
+        session = self.get(session_id)
+        if not session:
+            return None
+        state = session.dirty_delta_v2(int(since_generation or 0))
+        if state is None:
+            return None
+        snapshot = terminal_surface_v2_payload_from_state(
+            public_session_id or session_id,
+            state,
+            scrollback_total=session.scrollback_total(),
+        )
+        dirty = set(state.dirty_row_indexes)
+        # Dirty indexes are visible-row positions; the payload rows list is
+        # in visible order, so filter by position and keep each row's own
+        # index value for the phone's merge-by-index.
+        dirty_rows = [
+            row for offset, row in enumerate(snapshot["rows"])
+            if offset in dirty
+        ]
+        return {
+            "schema_version": snapshot["schema_version"],
+            "event": "delta",
+            "session_id": snapshot["session_id"],
+            "generation": snapshot["generation"],
+            "base_generation": int(since_generation or 0),
+            "raw_offset": snapshot["raw_offset"],
+            "screen_hash": snapshot["screen_hash"],
+            "nonce": snapshot["nonce"],
+            "dirty_rows": dirty_rows,
+            "cursor": snapshot.get("cursor"),
+            "scrollback": snapshot.get("scrollback"),
+            "alternate_screen": snapshot.get("alternate_screen"),
+            "title": snapshot.get("title"),
+            "pending_input": snapshot.get("pending_input"),
+            "pending_input_state": snapshot.get("pending_input_state"),
+            "pending_input_detection": snapshot.get("pending_input_detection"),
+            "event_limits": snapshot.get("event_limits"),
+        }
 
     def control(self, session_id: str, action: dict) -> dict:
         session = self.get(session_id)
@@ -1179,7 +1659,7 @@ class PTYBrokerManager:
             return {"ok": False, "reason": "broker session not found", "status": 404}
         return session.send_text(text)
 
-    def raw_tail(self, session_id: str, since: int = 0) -> tuple[bytes, int, int, bool] | None:
+    def raw_tail(self, session_id: str, since: int = 0) -> tuple[bytes, int, int, bool, int, float | None] | None:
         session = self.get(session_id)
         if not session:
             return None
@@ -1231,6 +1711,10 @@ class PTYBrokerManager:
                 if not self._validate_token(request.get("token")):
                     _write_rpc_frame(conn, {"ok": False, "error": {"code": "unauthorized", "message": "pty broker token required"}})
                     return
+                if str(request.get("op") or "") == "subscribe_output":
+                    # Long-lived push connection; the serve loop owns it now.
+                    self._serve_output_subscriber(conn)
+                    return
                 response = self._dispatch_rpc(request)
             except Exception as exc:
                 response = {"ok": False, "error": {"code": type(exc).__name__, "message": str(exc)[:300]}}
@@ -1265,15 +1749,26 @@ class PTYBrokerManager:
                 public_session_id=str(request.get("public_session_id") or "") or None,
             )}
         if op == "snapshot_v2":
+            raw_window_start = request.get("window_start")
+            raw_window_size = request.get("window_size")
             return {"ok": True, "surface": self.snapshot_v2(
                 str(request.get("session_id") or ""),
+                public_session_id=str(request.get("public_session_id") or "") or None,
+                window_start=int(raw_window_start) if raw_window_start is not None else None,
+                window_size=int(raw_window_size) if raw_window_size is not None else None,
+            )}
+        if op == "delta_v2":
+            raw_since = request.get("since_generation")
+            return {"ok": True, "delta": self.delta_v2(
+                str(request.get("session_id") or ""),
+                int(raw_since or 0),
                 public_session_id=str(request.get("public_session_id") or "") or None,
             )}
         if op == "raw_tail":
             tail = self.raw_tail(str(request.get("session_id") or ""), since=int(request.get("since") or 0))
             if tail is None:
                 return {"ok": True, "tail": None}
-            data, next_offset, total, reset = tail
+            data, next_offset, total, reset, gap_bytes, feed_at = tail
             return {
                 "ok": True,
                 "tail": {
@@ -1281,6 +1776,8 @@ class PTYBrokerManager:
                     "next_offset": next_offset,
                     "total": total,
                     "reset": reset,
+                    "gap_bytes": gap_bytes,
+                    "feed_at": feed_at,
                 },
             }
         if op == "control":

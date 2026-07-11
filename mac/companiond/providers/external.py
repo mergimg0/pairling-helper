@@ -1,32 +1,56 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
-from .base import ProviderAdapter, ProviderAvailability, ProviderDescriptor, ProviderDiagnostics, ProviderProbeResult
+from . import registry_data
+from .base import (
+    ProviderAdapter,
+    ProviderAvailability,
+    ProviderDiagnostics,
+    ProviderProbeResult,
+    cli_version,
+    resolve_executable,
+)
 
 
-EXTERNAL_DESCRIPTORS = [
-    ProviderDescriptor("aider", "Aider", "terminal_cli", builtin=False, docs_url="https://aider.chat/docs/"),
-    ProviderDescriptor("opencode", "OpenCode", "terminal_cli", builtin=False, docs_url="https://opencode.ai/docs"),
-    ProviderDescriptor("hermes_agent", "Hermes Agent", "terminal_cli", builtin=False, docs_url="https://hermes-agent.nousresearch.com/docs/user-guide/cli"),
-    ProviderDescriptor("grok_build", "Grok Build", "terminal_cli", builtin=False, docs_url="https://x.ai/cli"),
-    ProviderDescriptor("antigravity", "Antigravity", "agent_platform", builtin=False, docs_url="https://developers.googleblog.com/en/build-with-google-antigravity-our-new-agentic-development-platform/"),
-]
+class RecognizedProviderAdapter(ProviderAdapter):
+    """Recognized tier: detection only — name, version, path (SPEC-p1 §2.2).
 
+    Detection is honest and free, so it is always on: no experimental env
+    flag. The adapter never enumerates sessions and never claims control;
+    setup prints these entries as "recognized, not yet controllable".
+    """
 
-class DisabledExternalProviderAdapter(ProviderAdapter):
-    def __init__(self, descriptor: ProviderDescriptor):
-        self.descriptor = descriptor
+    def __init__(self, entry: registry_data.RegistryEntry, home: Path | None = None):
+        self.entry = entry
+        self.home = home or Path.home()
+        self.descriptor = registry_data.descriptor_for(entry)
 
     def supports(self, capability: str) -> bool:
         return capability == "detect"
 
     def probe(self) -> ProviderProbeResult:
+        resolved = resolve_executable(
+            self.entry.binary_name,
+            registry_data.candidate_paths(self.entry, home=self.home),
+            env_var=self.entry.env_override,
+        )
+        installed = resolved is not None
+        version = cli_version(resolved.path, list(self.entry.version_command)) if resolved else None
+        config_candidates = registry_data.config_file_paths(self.entry, home=self.home)
+        primary_config = config_candidates[0] if config_candidates else None
+        if installed:
+            notes = ("Recognized, not yet controllable.",)
+        else:
+            notes = (
+                f"{self.entry.display_name} CLI not found in configured, known, or daemon PATH locations",
+            )
         availability = ProviderAvailability(
             provider_id=self.descriptor.provider_id,
             display_name=self.descriptor.display_name,
             kind=self.descriptor.kind,
-            installed=False,
+            installed=installed,
             usable=False,
             launchable=False,
             auth_state="unsupported",
@@ -36,11 +60,18 @@ class DisabledExternalProviderAdapter(ProviderAdapter):
             controllable_sessions=0,
             capabilities=("detect",),
             setup_actions=("provider_sprint_required",),
-            notes=("Provider descriptor is present for future integration; adapter is disabled.",),
+            notes=notes,
+        )
+        diagnostics = ProviderDiagnostics(
+            cli_path=str(resolved.path) if resolved else None,
+            cli_path_source=resolved.source if resolved else None,
+            version=version,
+            config_path=str(primary_config) if primary_config else None,
+            config_exists=primary_config.is_file() if primary_config else None,
         )
         return ProviderProbeResult(
             descriptor=self.descriptor,
             availability=availability,
-            diagnostics=ProviderDiagnostics(),
+            diagnostics=diagnostics,
             observed_at=time.time(),
         )

@@ -90,7 +90,7 @@ def preferred_pairling_connect_base_url(status: dict[str, Any]) -> str | None:
     return str(routes[0]["base_url"])
 
 
-def redacted_connectd_summary(status: dict[str, Any]) -> dict[str, Any]:
+def redacted_connectd_summary(status: dict[str, Any], *, paired_recently: bool | None = None) -> dict[str, Any]:
     routes = advertised_pairling_connect_routes(status)
     return {
         "schema_version": int(status.get("schema_version") or 0) if isinstance(status, dict) else 0,
@@ -106,7 +106,7 @@ def redacted_connectd_summary(status: dict[str, Any]) -> dict[str, Any]:
         "listener_running": bool(status.get("listener_running")) if isinstance(status, dict) else False,
         "upstream_reachable": bool(status.get("upstream_reachable")) if isinstance(status, dict) else False,
         "local_pairing_available": True,
-        "next_action": _next_action(status, bool(routes)),
+        "next_action": _next_action(status, bool(routes), paired_recently=paired_recently),
     }
 
 
@@ -124,8 +124,18 @@ def _degraded_status(status: dict[str, Any]) -> str:
     return "route_missing"
 
 
-def _next_action(status: dict[str, Any], route_ready: bool) -> dict[str, str]:
+def _next_action(status: dict[str, Any], route_ready: bool, *, paired_recently: bool | None = None) -> dict[str, str]:
     if route_ready:
+        # Evidence beats assumption: when the daemon can attest a paired
+        # device authenticated recently, the next action is nothing, not a
+        # pairing prompt. None means the caller has no registry (the
+        # installer CLI), which keeps the historical prompt.
+        if paired_recently:
+            return {
+                "id": "none",
+                "label": "Paired",
+                "message": "This Mac is paired with your iPhone.",
+            }
         return {
             "id": "pair_iphone",
             "label": "Pair iPhone",

@@ -17,6 +17,7 @@ import (
 
 const defaultMaxBodyBytes int64 = 1_000_000
 const prePairMaxBodyBytes int64 = 16 * 1024
+const composeSyncMaxBodyBytes int64 = 2 * 1024 * 1024
 const pairDropSmallFileMaxBodyBytes int64 = 10 * 1024 * 1024
 const pairDropUploadChunkMaxBodyBytes int64 = 1024 * 1024
 const peerNodeHeader = "X-Pairling-Peer-Node"
@@ -49,6 +50,11 @@ const (
 	ExposureModePostPair        ExposureMode = "post_pair"
 	ExposureModePrePair         ExposureMode = "pre_pair"
 	ExposureModePairlingConnect ExposureMode = "pairling_connect"
+	// ExposureModeSSH is the loopback listener a user-supplied SSH tunnel
+	// targets (SPEC-p5 §2.1). Post-pair surface only, bearer required, and
+	// the /pair/* lifecycle does not exist here: SSH is an additional pipe
+	// to a paired Mac, never a pairing channel.
+	ExposureModeSSH ExposureMode = "ssh"
 	// ExposureModeFunnelBootstrap is the public Funnel surface. It is the most
 	// restrictive mode: only the minimal bootstrap claim plus health probes, with
 	// no bearer post-pair fallthrough. Used only by the separate ListenFunnel
@@ -126,7 +132,7 @@ func NewHandler(opts Options) (*Handler, error) {
 	if mode == "" {
 		mode = ExposureModePostPair
 	}
-	if mode != ExposureModePostPair && mode != ExposureModePrePair && mode != ExposureModePairlingConnect && mode != ExposureModeFunnelBootstrap {
+	if mode != ExposureModePostPair && mode != ExposureModePrePair && mode != ExposureModePairlingConnect && mode != ExposureModeFunnelBootstrap && mode != ExposureModeSSH {
 		return nil, errors.New("unknown exposure mode")
 	}
 	upstream := *opts.Upstream
@@ -240,6 +246,12 @@ func (h *Handler) rewrite(r *httputil.ProxyRequest) {
 	r.Out.Header.Del(funnelOriginHeader)
 	if h.mode == ExposureModeFunnelBootstrap {
 		r.Out.Header.Set(funnelOriginHeader, "1")
+	}
+	if h.mode == ExposureModeSSH {
+		// SPEC-p5 §2.1: the daemon sees an honest non-loopback-tier client.
+		// There is no tailnet peer identity over SSH; provenance is the
+		// gateway's own attestation of the pipe.
+		r.Out.Header.Set(peerProvenanceHeader, "ssh_gateway")
 	}
 	if h.peerNodeResolver != nil {
 		if nodeID, provenance, ok := h.peerNodeResolver.PeerNodeID(in.Context(), in.RemoteAddr); ok {
@@ -413,9 +425,21 @@ func (h *Handler) allowed(method, path string, header http.Header) bool {
 			return true
 		}
 		return hasBearer(header) && Allowed(method, path)
+	case ExposureModeSSH:
+		if pairLifecyclePath(path) {
+			return false
+		}
+		return hasBearer(header) && Allowed(method, path)
 	default:
 		return Allowed(method, path)
 	}
+}
+
+// pairLifecyclePath matches every /pair/* endpoint. Pairing over SSH does
+// not exist (SPEC-p5 §2.3): the route can only be added to an already
+// paired Mac, which keeps /pair/start and the App Attest gate intact.
+func pairLifecyclePath(path string) bool {
+	return strings.HasPrefix(path, "/pair/")
 }
 
 func (h *Handler) allowedForAnyMethod(path string, header http.Header) bool {
@@ -432,6 +456,11 @@ func (h *Handler) allowedForAnyMethod(path string, header http.Header) bool {
 			return true
 		}
 		return hasBearer(header) && allowedForAnyMethod(path)
+	case ExposureModeSSH:
+		if pairLifecyclePath(path) {
+			return false
+		}
+		return hasBearer(header) && allowedForAnyMethod(path)
 	default:
 		return allowedForAnyMethod(path)
 	}
@@ -446,6 +475,11 @@ func (h *Handler) requestBodyLimit(method, path string) int64 {
 	if method == http.MethodPost && path == "/pairdrop/files" {
 		if h.maxBodyBytes <= 0 || pairDropSmallFileMaxBodyBytes < h.maxBodyBytes {
 			return pairDropSmallFileMaxBodyBytes
+		}
+	}
+	if method == http.MethodPost && path == "/compose/recordings/sync" {
+		if h.maxBodyBytes <= 0 || h.maxBodyBytes < composeSyncMaxBodyBytes {
+			return composeSyncMaxBodyBytes
 		}
 	}
 	if method == http.MethodPost && path == "/upload" {
@@ -554,11 +588,11 @@ func localUpstream(upstream *url.URL) bool {
 }
 
 func dynamicGETPath(path string) bool {
-	return sessionExportPath(path) || orchestrationItemPath(path) || orchestrationStreamPath(path) || pairDropFileContentPath(path) || pairDropFileItemPath(path) || pairDropUploadItemPath(path)
+	return sessionExportPath(path) || orchestrationItemPath(path) || orchestrationStreamPath(path) || pairDropFileContentPath(path) || pairDropFileItemPath(path) || pairDropUploadItemPath(path) || postureItemPath(path) || raceItemPath(path)
 }
 
 func dynamicPOSTPath(path string) bool {
-	return pickerMCPRestartPath(path) || orchestrationStopPath(path) || pairDropAttachPath(path) || pairDropUploadCompletePath(path)
+	return pickerMCPRestartPath(path) || orchestrationStopPath(path) || pairDropAttachPath(path) || pairDropUploadCompletePath(path) || raceFinishPath(path)
 }
 
 func dynamicPUTPath(path string) bool {
@@ -566,7 +600,36 @@ func dynamicPUTPath(path string) bool {
 }
 
 func dynamicDELETEPath(path string) bool {
-	return pairDropFileItemPath(path) || pairDropUploadItemPath(path)
+	return pairDropFileItemPath(path) || pairDropUploadItemPath(path) || postureItemPath(path)
+}
+
+// raceItemPath matches /sessions/race/{id}: one segment, no nesting.
+func raceItemPath(path string) bool {
+	if !strings.HasPrefix(path, "/sessions/race/") {
+		return false
+	}
+	suffix := strings.TrimPrefix(path, "/sessions/race/")
+	return suffix != "" && !strings.Contains(suffix, "/")
+}
+
+// raceFinishPath matches /sessions/race/{id}/finish.
+func raceFinishPath(path string) bool {
+	if !strings.HasPrefix(path, "/sessions/race/") || !strings.HasSuffix(path, "/finish") {
+		return false
+	}
+	inner := strings.TrimSuffix(strings.TrimPrefix(path, "/sessions/race/"), "/finish")
+	inner = strings.Trim(inner, "/")
+	return inner != "" && !strings.Contains(inner, "/")
+}
+
+// postureItemPath matches /postures/{slug} (SPEC-p6 §2.2): one segment,
+// no nesting.
+func postureItemPath(path string) bool {
+	if !strings.HasPrefix(path, "/postures/") {
+		return false
+	}
+	suffix := strings.TrimPrefix(path, "/postures/")
+	return suffix != "" && !strings.Contains(suffix, "/")
 }
 
 func sessionExportPath(path string) bool {
@@ -653,118 +716,9 @@ func orchestrationStreamPath(path string) bool {
 	return len(parts) == 2 && parts[0] != "" && parts[1] == "stream"
 }
 
-var getPaths = map[string]bool{
-	"/activity":                     true,
-	"/activity-stream":              true,
-	"/aperture-cli/launch-contexts": true,
-	"/aperture-cli/providers":       true,
-	"/aperture-cli/status":          true,
-	"/commands":                     true,
-	"/commands-stream":              true,
-	"/corpus":                       true,
-	"/filesystem/directories":       true,
-	"/health":                       true,
-	"/health-stream":                true,
-	"/healthz":                      true,
-	"/readyz":                       true,
-	"/routez":                       true,
-	"/invocations":                  true,
-	"/invocations-stream":           true,
-	"/manifest":                     true,
-	"/mirror/conflicts":             true,
-	"/mirror/projects":              true,
-	"/mirror/status":                true,
-	"/model-status":                 true,
-	"/orchestrations":               true,
-	"/personal-context":             true,
-	"/pairdrop/events":              true,
-	"/pairdrop/files":               true,
-	"/pickers/hooks":                true,
-	"/pickers/mcp":                  true,
-	"/pickers/memory":               true,
-	"/pickers/permissions":          true,
-	"/pickers/resume":               true,
-	"/pickers/resume/preview":       true,
-	"/provider-status":              true,
-	"/push/status":                  true,
-	"/recent-projects":              true,
-	"/safety/events":                true,
-	"/safety/status":                true,
-	"/search":                       true,
-	"/sentinel/events":              true,
-	"/sentinel/preferences":         true,
-	"/sentinel/status":              true,
-	"/session-meta":                 true,
-	"/session-live-events":          true,
-	"/session-source-diagnostics":   true,
-	"/sessions":                     true,
-	"/sessions-stream":              true,
-	"/sessions-visible":             true,
-	"/session-runtime-truth":        true,
-	"/session-runtime-truth-stream": true,
-	"/status":                       true,
-	"/substrate-feed":               true,
-	"/substrate-status":             true,
-	"/terminal-stream":              true,
-	"/terminal-stream-diagnostics":  true,
-	"/terminal-surface":             true,
-	"/terminal-surface-stream":      true,
-	"/terminal-surface-v2":          true,
-	"/terminal-surface-stream-v2":   true,
-	"/terminal-workspace":           true,
-	"/terminal-workspace-stream":    true,
-	"/tokens":                       true,
-	"/transcript":                   true,
-	"/transcript-stream":            true,
-	"/turn-state-stream":            true,
-	"/worker-stats":                 true,
-	"/workers":                      true,
-	"/workstate-feed":               true,
-}
+// getPaths moved to routes_generated.go (source: mac/companiond/route_registry.py).
 
-var postPaths = map[string]bool{
-	"/aperture-cli/open":                     true,
-	"/cross-provider-action":                 true,
-	"/inject":                                true,
-	"/inject-now":                            true,
-	"/interrupt":                             true,
-	"/llm-route":                             true,
-	"/llm-route-stream":                      true,
-	"/mirror/flush":                          true,
-	"/mirror/resume":                         true,
-	"/open":                                  true,
-	"/orchestrations":                        true,
-	"/pair/claim":                            true,
-	"/pair/bind-node":                        true,
-	"/pair/psk-claim":                        true,
-	"/pair/revoke":                           true,
-	"/pair/rotate-token":                     true,
-	"/pair/start":                            true,
-	"/pairling-tools/run":                    true,
-	"/pairdrop/files":                        true,
-	"/pairdrop/maintenance/cleanup-partials": true,
-	"/pairdrop/uploads":                      true,
-	"/phone-tools/availability":              true,
-	"/phone-tools/next":                      true,
-	"/phone-tools/result":                    true,
-	"/push/live-activity-test":               true,
-	"/push/live-activity-token":              true,
-	"/push/permission/allow":                 true,
-	"/push/preferences":                      true,
-	"/push/test":                             true,
-	"/resume-session":                        true,
-	"/safety/ack":                            true,
-	"/send-text":                             true,
-	"/sentinel/evaluate-now":                 true,
-	"/sentinel/preferences":                  true,
-	"/sentinel/snooze":                       true,
-	"/sigint":                                true,
-	"/sigterm":                               true,
-	"/spawn-session":                         true,
-	"/terminal-control":                      true,
-	"/upload":                                true,
-	"/worker-kill":                           true,
-}
+// postPaths moved to routes_generated.go (source: mac/companiond/route_registry.py).
 
 var prePairGetPaths = map[string]bool{
 	"/health":   true,

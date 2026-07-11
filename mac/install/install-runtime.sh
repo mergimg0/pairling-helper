@@ -358,6 +358,17 @@ wizard_box_row() {
   printf '  %s│\033[0m %s%s %s│\033[0m\n' "${WZ_EINK:-}" "$styled" "$(wizard_line_h "$pad" " ")" "${WZ_EINK:-}"
 }
 
+# wizard_qr_open: head the pairing QR on the guided screen with a bold header only.
+# A fixed-width e-ink rule cannot frame a variable-width QR and reads as
+# disproportionate, so the header is the whole frame. It gates on GUIDED_TTY, so a
+# machine path keeps GUIDED_TTY 0 and it prints nothing, and the QR and the pair URL
+# render exactly as before. render_pair_qr itself is untouched.
+wizard_qr_open() {
+  [ "${GUIDED_TTY:-0}" = 1 ] || return 0
+  wizard_palette_init
+  printf '\n  \033[1m%sScan this in Pairling on your iPhone\033[0m\n' "${WZ_PAPER:-}"
+}
+
 wizard_splash() {
   [ "${GUIDED_TTY:-0}" = 1 ] || return 0
   wizard_palette_init
@@ -469,6 +480,63 @@ stage_skip() {
 
 stage_note() {
   printf '     %s\n' "$1"
+}
+
+# provider_setup_stage: print the detected coding agents (provider · version ·
+# depth wording) from registry-data.json and record include/exclude choices in
+# ~/.pairling/providers.json (SPEC-p1). Detection is read-only. Exclusion
+# hides a provider from Pairling surfaces and never touches the provider's
+# own config or processes. Machine paths never prompt: dry runs and non-TTY
+# runs leave the visibility file untouched unless PAIRLING_PROVIDERS_EXCLUDE
+# is set, so a re-run cannot silently reset a choice made earlier.
+provider_setup_stage() {
+  local setup_py="$REPO_ROOT/mac/companiond/provider_setup.py"
+  if [ -f "$CURRENT_LINK/companiond/provider_setup.py" ]; then
+    setup_py="$CURRENT_LINK/companiond/provider_setup.py"
+  fi
+  if ! "$PYTHON3_BIN" "$setup_py" table; then
+    stage_skip "provider detection unavailable; setup continues"
+    return 0
+  fi
+  if [ -n "${PAIRLING_PROVIDERS_EXCLUDE+x}" ]; then
+    if "$PYTHON3_BIN" "$setup_py" apply --exclude "$PAIRLING_PROVIDERS_EXCLUDE"; then
+      stage_ok "provider visibility recorded from PAIRLING_PROVIDERS_EXCLUDE"
+    else
+      stage_skip "PAIRLING_PROVIDERS_EXCLUDE was invalid; visibility unchanged"
+    fi
+    return 0
+  fi
+  local current_excluded=""
+  current_excluded="$("$PYTHON3_BIN" "$setup_py" current 2>/dev/null || true)"
+  if is_dry_run || [ "${WIZARD_TUI:-0}" != 1 ]; then
+    if [ -n "$current_excluded" ]; then
+      stage_ok "provider visibility unchanged (excluded: $current_excluded)"
+    else
+      stage_ok "every detected provider is included (change later in Settings on the iPhone)"
+    fi
+    return 0
+  fi
+  local answer=""
+  if [ -n "$current_excluded" ]; then
+    printf 'Providers to exclude (ids, comma-separated; Enter keeps %s excluded): ' "$current_excluded" >/dev/tty
+  else
+    printf 'Providers to exclude (ids, comma-separated; Enter includes all): ' >/dev/tty
+  fi
+  IFS= read -r answer </dev/tty || answer=""
+  if [ -z "$answer" ]; then
+    if [ -n "$current_excluded" ]; then
+      stage_ok "provider visibility unchanged (excluded: $current_excluded)"
+    else
+      stage_ok "every detected provider is included"
+    fi
+    return 0
+  fi
+  if "$PYTHON3_BIN" "$setup_py" apply --exclude "$answer"; then
+    stage_ok "provider visibility recorded (excluded: $answer)"
+  else
+    stage_skip "exclusions not recognized; visibility unchanged"
+  fi
+  return 0
 }
 
 # wizard_recovery_menu: a plain bash recovery menu. It uses a plain blocking
@@ -590,6 +658,33 @@ poll_evidence_test() {
   return 124
 }
 
+# wizard_permissions_panel: draw the macOS-permissions advisory as a rounded e-ink
+# box on the guided screen. $1 carries the Safety Monitor status line and shows its
+# two rows only when it is non-empty, which is today's not-installed path. The
+# panel does not print the argument text itself, it uses fixed rows that spell the
+# same wording, so the box math is exact and the argument stays the canonical
+# sentence safety_step also prints plain. The Local Network both-sides copy is the
+# same sentence a machine path prints, wrapped to fixed rows that fit the box so
+# the right border lines up. It gates on GUIDED_TTY, so a machine path draws
+# nothing.
+wizard_permissions_panel() {
+  [ "${GUIDED_TTY:-0}" = 1 ] || return 0
+  wizard_palette_init
+  local safety="$1" inner=60 b=$'\033[1m' r=$'\033[0m'
+  wizard_box_top "$inner"
+  wizard_box_row "$inner" "macOS permissions" "${b}${WZ_PAPER:-}macOS permissions${r}"
+  wizard_box_row "$inner" "" ""
+  if [ -n "$safety" ]; then
+    wizard_box_row "$inner" "Pairling Safety Monitor is a future feature and is not" "${WZ_GREY:-}Pairling Safety Monitor is a future feature and is not${r}"
+    wizard_box_row "$inner" "installed yet. Pairing works without it." "${WZ_GREY:-}installed yet. Pairing works without it.${r}"
+    wizard_box_row "$inner" "" ""
+  fi
+  wizard_box_row "$inner" "On first pair your iPhone asks for Local Network" "${WZ_PAPER:-}On first pair your iPhone asks for Local Network${r}"
+  wizard_box_row "$inner" "access, so allow it. This Mac and the iPhone must be" "${WZ_PAPER:-}access, so allow it. This Mac and the iPhone must be${r}"
+  wizard_box_row "$inner" "on the same Wi-Fi so the Mac can see the phone." "${WZ_PAPER:-}on the same Wi-Fi so the Mac can see the phone.${r}"
+  wizard_box_bot "$inner"
+}
+
 # safety_step: the one safety gate in v1. It reads the live SafetyMonitorBridge
 # status. Today the app is not installed, so the bridge reports installed false,
 # and this prints one plain advisory line that the Safety Monitor is a future
@@ -614,13 +709,26 @@ safety_step() {
       # until Full Disk Access is granted.
       wizard_recovery_menu recoverable "macOS permissions" || true
     fi
+    # The Local Network advisory. On the guided screen it renders as a rounded
+    # panel. A machine path keeps the plain stage_note, byte identical.
+    if [ "${GUIDED_TTY:-0}" = 1 ]; then
+      wizard_permissions_panel ""
+    else
+      stage_note "On first pair your iPhone asks for Local Network access, so allow it. This Mac and the iPhone must be on the same Wi-Fi so the Mac can see the phone."
+    fi
   else
     # The not-installed advisory. This is today's path. It states the truth: the
     # Safety Monitor is a future feature, it is not installed, and pairing works
-    # without it. It never claims setup installed anything.
-    stage_note "Pairling Safety Monitor is a future feature and is not installed yet. Pairing works without it."
+    # without it. It never claims setup installed anything. On the guided screen the
+    # advisory and the Local Network copy render as one rounded panel. A machine
+    # path keeps the two plain stage_note lines, byte identical.
+    if [ "${GUIDED_TTY:-0}" = 1 ]; then
+      wizard_permissions_panel "Pairling Safety Monitor is a future feature and is not installed yet. Pairing works without it."
+    else
+      stage_note "Pairling Safety Monitor is a future feature and is not installed yet. Pairing works without it."
+      stage_note "On first pair your iPhone asks for Local Network access, so allow it. This Mac and the iPhone must be on the same Wi-Fi so the Mac can see the phone."
+    fi
   fi
-  stage_note "On first pair your iPhone asks for Local Network access, so allow it. This Mac and the iPhone must be on the same Wi-Fi so the Mac can see the phone."
   stage_note "If Local Network is allowed and pairing still stalls, the block is on the Mac or the network side, not the iPhone."
   stage_note "Accessibility and Automation are only needed later if you enable typing into Terminal from the phone. Run pairling doctor --json to see the exact Mac grantee path before enabling it."
   return 0
@@ -655,10 +763,29 @@ guided_on_exit() {
 # privacy permission for basic pairing. It never reads or modifies any privacy
 # setting and never blocks setup.
 guided_permission_notice() {
-  stage_note "This Mac needs no special privacy permission to pair."
-  stage_note "On your iPhone allow Local Network access when Pairling asks. This Mac and the iPhone must be on the same Wi-Fi so the Mac can see the phone."
-  stage_note "If you already allowed Local Network on the iPhone and pairing still stalls, the block is on the Mac or the network, not the iPhone. Check that both devices are on the same Wi-Fi."
-  stage_note "Accessibility and Automation are only needed if you later enable typing into Terminal from the phone. Run pairling doctor --json to see the exact Mac grantee path before enabling it."
+  if [ "${GUIDED_TTY:-0}" = 1 ]; then
+    # The guided screen frames the no-permission line and the both-sides Local
+    # Network copy in a rounded panel, matching the safety_step panel. The copy is
+    # wrapped to fixed rows so the right border lines up. The stall and
+    # Accessibility lines stay plain notes below the box.
+    wizard_palette_init
+    local inner=60 b=$'\033[1m' r=$'\033[0m'
+    wizard_box_top "$inner"
+    wizard_box_row "$inner" "macOS permissions" "${b}${WZ_PAPER:-}macOS permissions${r}"
+    wizard_box_row "$inner" "" ""
+    wizard_box_row "$inner" "This Mac needs no special privacy permission to pair." "${WZ_GREY:-}This Mac needs no special privacy permission to pair.${r}"
+    wizard_box_row "$inner" "On your iPhone allow Local Network access when Pairling" "${WZ_PAPER:-}On your iPhone allow Local Network access when Pairling${r}"
+    wizard_box_row "$inner" "asks. This Mac and the iPhone must be on the same Wi-Fi" "${WZ_PAPER:-}asks. This Mac and the iPhone must be on the same Wi-Fi${r}"
+    wizard_box_row "$inner" "so the Mac can see the phone." "${WZ_PAPER:-}so the Mac can see the phone.${r}"
+    wizard_box_bot "$inner"
+    stage_note "If you already allowed Local Network on the iPhone and pairing still stalls, the block is on the Mac or the network, not the iPhone. Check that both devices are on the same Wi-Fi."
+    stage_note "Accessibility and Automation are only needed if you later enable typing into Terminal from the phone, and macOS prompts then."
+  else
+    stage_note "This Mac needs no special privacy permission to pair."
+    stage_note "On your iPhone allow Local Network access when Pairling asks. This Mac and the iPhone must be on the same Wi-Fi so the Mac can see the phone."
+    stage_note "If you already allowed Local Network on the iPhone and pairing still stalls, the block is on the Mac or the network, not the iPhone. Check that both devices are on the same Wi-Fi."
+    stage_note "Accessibility and Automation are only needed if you later enable typing into Terminal from the phone, and macOS prompts then."
+  fi
 }
 
 # guided_route_proof — one bounded, best-effort read of connectd /status that
@@ -767,14 +894,38 @@ PY
 # device step, proves the route, and prints the exact re-run commands for any
 # step the operator may need to repeat.
 guided_finish_summary() {
-  stage_note "The pairing code is shown above. Open Pairling on your iPhone, scan it, then approve this Mac."
-  if ! is_dry_run; then
-    guided_route_proof || true
+  if [ "${GUIDED_TTY:-0}" = 1 ]; then
+    # The guided screen frames the fixed guidance and the re-run command hints in a
+    # rounded panel, with the commands in the brand accent. The route proof and the
+    # seen probe stay below the box because their text is dynamic and could run
+    # wider than the box. The guidance sentence is wrapped to fixed rows so the
+    # right border lines up.
+    wizard_palette_init
+    local inner=60 b=$'\033[1m' r=$'\033[0m'
+    wizard_box_top "$inner"
+    wizard_box_row "$inner" "Setup complete" "${b}${WZ_OK:-}Setup complete${r}"
+    wizard_box_row "$inner" "" ""
+    wizard_box_row "$inner" "The pairing code is shown above. Open Pairling on your" "${WZ_PAPER:-}The pairing code is shown above. Open Pairling on your${r}"
+    wizard_box_row "$inner" "iPhone, scan it, then approve this Mac." "${WZ_PAPER:-}iPhone, scan it, then approve this Mac.${r}"
+    wizard_box_row "$inner" "" ""
+    wizard_box_row "$inner" "Inspect status anytime:        pairling doctor --json" "${WZ_GREY:-}Inspect status anytime:        ${r}${WZ_ACCENT:-}pairling doctor --json${r}"
+    wizard_box_row "$inner" "Re-show the pairing code:       pairling pair --qr" "${WZ_GREY:-}Re-show the pairing code:       ${r}${WZ_ACCENT:-}pairling pair --qr${r}"
+    wizard_box_row "$inner" "Sign in for the remote route:   pairling connect-auth-open" "${WZ_GREY:-}Sign in for the remote route:   ${r}${WZ_ACCENT:-}pairling connect-auth-open${r}"
+    wizard_box_bot "$inner"
+    if ! is_dry_run; then
+      guided_route_proof || true
+    fi
+    if ! is_dry_run; then guided_pairing_seen_proof "${PAIRLING_PAIRING_STARTED_AT:-0}" || true; fi
+  else
+    stage_note "The pairing code is shown above. Open Pairling on your iPhone, scan it, then approve this Mac."
+    if ! is_dry_run; then
+      guided_route_proof || true
+    fi
+    if ! is_dry_run; then guided_pairing_seen_proof "${PAIRLING_PAIRING_STARTED_AT:-0}" || true; fi
+    stage_note "Inspect status anytime:        pairling doctor --json"
+    stage_note "Re-show the pairing code:       pairling pair --qr"
+    stage_note "Sign in for the remote route:   pairling connect-auth-open"
   fi
-  if ! is_dry_run; then guided_pairing_seen_proof "${PAIRLING_PAIRING_STARTED_AT:-0}" || true; fi
-  stage_note "Inspect status anytime:        pairling doctor --json"
-  stage_note "Re-show the pairing code:       pairling pair --qr"
-  stage_note "Sign in for the remote route:   pairling connect-auth-open"
 }
 
 append_history() {
@@ -807,6 +958,7 @@ run_compile_checks() {
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/runtime_manifest.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/runtime_paths.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pairdrop_store.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/compose_recording_store.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pairling_connectd_status.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pairling_devices.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/local_mcp_bridge.py"
@@ -821,11 +973,17 @@ run_compile_checks() {
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pty_broker_client.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pty_broker_service.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/terminal_screen_backend.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/session_events.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/session_event_log.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/session_event_ingest.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/terminal_text_sanitizer.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/push_dispatcher.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/push_event_catalog.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/live_activity_publisher.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/standard_push_publisher.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/fleet_tier.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/fleet_activity_publisher.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/fd_watchdog.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/safety_monitor.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/sentinel_notifications.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/workstate_feed_contract.py"
@@ -844,6 +1002,7 @@ run_compile_checks() {
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/mcp/phone_tools.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/install/render-launchd.py"
   PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/install/psk_dependency_check.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/install/ssh_gateway_setup.py"
   rm -rf "$pycache_root"
 }
 
@@ -983,6 +1142,7 @@ copy_release() {
   cp "$REPO_ROOT/mac/companiond/runtime_manifest.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/runtime_paths.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairdrop_store.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/compose_recording_store.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairling_connectd_status.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairling_devices.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/local_mcp_bridge.py" "$tmp/companiond/"
@@ -997,19 +1157,32 @@ copy_release() {
   cp "$REPO_ROOT/mac/companiond/pty_broker_client.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pty_broker_service.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/terminal_screen_backend.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/session_events.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/session_event_log.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/session_event_ingest.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/route_registry.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/terminal_text_sanitizer.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/push_dispatcher.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/push_event_catalog.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/live_activity_publisher.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/standard_push_publisher.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/fleet_tier.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/fleet_activity_publisher.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/fd_watchdog.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/safety_monitor.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/sentinel_notifications.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/workstate_feed_contract.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/model_status_contract.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/substrate_status_contract.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/provider_setup.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/keep_awake.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/postures.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/integrations/__init__.py" "$tmp/companiond/integrations/"
   cp "$REPO_ROOT/mac/companiond/integrations/aperture_cli/"*.py "$tmp/companiond/integrations/aperture_cli/"
   cp "$REPO_ROOT/mac/companiond/providers/"*.py "$tmp/companiond/providers/"
+  # registry-data.json is the provider source of truth (SPEC-p1); a release
+  # without it silently degrades to the builtin fallbacks.
+  cp "$REPO_ROOT/mac/companiond/providers/"*.json "$tmp/companiond/providers/"
   cp "$REPO_ROOT/mac/mcp/phone_tools.py" "$tmp/mcp/"
   build_connectd_binary "$tmp/connectd/pairling-connectd"
   stage_vendored_python "$tmp/python"
@@ -1019,7 +1192,7 @@ copy_release() {
   chmod 755 "$tmp/bin/pairling" "$tmp/companiond/pairlingd.py" "$tmp/mcp/phone_tools.py"
   chmod 755 "$tmp/connectd/pairling-connectd"
   chmod 644 "$tmp/companiond/"*.py "$tmp/mcp/"*.py
-  chmod 644 "$tmp/companiond/providers/"*.py
+  chmod 644 "$tmp/companiond/providers/"*.py "$tmp/companiond/providers/"*.json
   chmod 644 "$tmp/companiond/integrations/"*.py "$tmp/companiond/integrations/aperture_cli/"*.py
   chmod 755 "$tmp/companiond/pairlingd.py" "$tmp/mcp/phone_tools.py"
   clear_release_quarantine "$tmp"
@@ -1049,6 +1222,7 @@ copy_runtime_source_tree() {
   # source of truth in relay/). Non-fatal if absent — the gate fails closed.
   cp "$REPO_ROOT/relay/app_attest_validator.py" "$mac_root/companiond/" 2>/dev/null || true
   cp "$REPO_ROOT/mac/companiond/providers/"*.py "$mac_root/companiond/providers/"
+  cp "$REPO_ROOT/mac/companiond/providers/"*.json "$mac_root/companiond/providers/"
   cp "$REPO_ROOT/mac/companiond/integrations/__init__.py" "$mac_root/companiond/integrations/"
   cp "$REPO_ROOT/mac/companiond/integrations/aperture_cli/"*.py "$mac_root/companiond/integrations/aperture_cli/"
   cp "$REPO_ROOT/mac/connectd/go.mod" "$mac_root/connectd/"
@@ -1209,6 +1383,7 @@ for rel in [
     "companiond/runtime_manifest.py",
     "companiond/runtime_paths.py",
     "companiond/pairdrop_store.py",
+    "companiond/compose_recording_store.py",
     "companiond/pairling_connectd_status.py",
     "companiond/pairling_devices.py",
     "companiond/local_mcp_bridge.py",
@@ -1223,6 +1398,10 @@ for rel in [
     "companiond/pty_broker_client.py",
     "companiond/pty_broker_service.py",
     "companiond/terminal_screen_backend.py",
+    "companiond/session_events.py",
+    "companiond/session_event_log.py",
+    "companiond/session_event_ingest.py",
+    "companiond/route_registry.py",
     "companiond/terminal_text_sanitizer.py",
     "companiond/push_dispatcher.py",
     "companiond/push_event_catalog.py",
@@ -1408,6 +1587,13 @@ render_plists() {
     --output-dir "$PLIST_BUILD_DIR"
     --daemon-python "$daemon_python"
   )
+  # SPEC-p5 §2.1: `pairling setup --ssh` (or a prior enable) renders connectd
+  # with the loopback SSH-tunnel gateway on. The flag persists in the
+  # LaunchAgent env, so a plain `setup` re-run keeps a previously enabled
+  # gateway unless the operator passes --no-ssh.
+  if [ "${SSH_GATEWAY_ENABLED:-0}" = "1" ]; then
+    render_args+=(--ssh-gateway)
+  fi
   python3 "$REPO_ROOT/mac/install/render-launchd.py" "${render_args[@]}"
 }
 
@@ -1804,6 +1990,22 @@ rollback() {
 
 install_runtime() {
   local setup_args=("$@")
+  # SPEC-p5 §2.1: --ssh enables the SSH-tunnel gateway, --no-ssh disables it.
+  # Absent either flag, keep whatever the currently rendered connectd plist
+  # already carries, so a plain re-run never silently turns the gateway off.
+  for _ssh_arg in "${setup_args[@]:-}"; do
+    case "$_ssh_arg" in
+      --ssh) SSH_GATEWAY_ENABLED=1 ;;
+      --no-ssh) SSH_GATEWAY_ENABLED=0 ;;
+    esac
+  done
+  if [ -z "${SSH_GATEWAY_ENABLED:-}" ]; then
+    if grep -q "PAIRLING_SSH_GATEWAY" "$CONNECTD_USER_PLIST" 2>/dev/null; then
+      SSH_GATEWAY_ENABLED=1
+    else
+      SSH_GATEWAY_ENABLED=0
+    fi
+  fi
   # Guard the empty-array expansion: install_runtime is called with no args
   # today, and under bash 3.2 with set -u "${setup_args[@]}" raises an unbound
   # variable error when the array is empty. The length check avoids that.
@@ -1832,7 +2034,7 @@ install_runtime() {
   # by its literal one-line form. The call is idempotent, so the later defensive
   # calls in wizard_splash and the stage markers cost only one string test.
   if [ "$GUIDED_TTY" = 1 ]; then wizard_palette_init; fi
-  if is_dry_run; then GUIDED_STAGE_TOTAL=5; else GUIDED_STAGE_TOTAL=8; fi
+  if is_dry_run; then GUIDED_STAGE_TOTAL=6; else GUIDED_STAGE_TOTAL=9; fi
   trap guided_on_exit EXIT
   # When WIZARD_TUI is 1 the guided stages add the splash, the live safety step,
   # and the bash recovery menu, all behind a WIZARD_TUI check and the dry-run
@@ -1891,6 +2093,9 @@ install_runtime() {
   fi
   stage_ok "no Mac privacy permission is required to pair"
 
+  stage_begin "Providers"
+  provider_setup_stage
+
   if ! is_dry_run; then
     stage_begin "Pairing code for the iPhone"
     if [ "${WIZARD_TUI:-0}" = 1 ]; then
@@ -1905,6 +2110,16 @@ install_runtime() {
     fi
     stage_ok "pairing code displayed (local-first)"
     log ""
+    # Hold here on the guided screen so the pairing code stays in view until the
+    # operator has scanned it, rather than being scrolled off by the stages
+    # below. Gated on a terminal stdin like the recovery menu, so a piped, CI, or
+    # captured run never blocks, and skipped in a dry run. The read tolerates EOF.
+    if [ "${GUIDED_TTY:-0}" = 1 ] && [ -t 0 ] && ! is_dry_run; then
+      wizard_palette_init
+      printf '     %sScan the code above in Pairling on your iPhone, then press Enter to finish setup.\033[0m ' "${WZ_PAPER:-}"
+      read -r _ || true
+      log ""
+    fi
     # Browser auth is useful, but it must not block or precede the first pairing
     # code. First-pair bootstrap is local-first; Pairling Connect hardens after
     # the phone has joined.
@@ -2123,15 +2338,37 @@ def ready_connectd_route():
             return None
         time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
 
+def lan_base_serviceable(ip: str, port_number: int) -> bool:
+    """Only advertise a LAN pairing base that something actually serves.
+
+    A loopback-bound daemon leaves lan_ip:port with no listener, so a QR
+    built on it sends the phone to a dead socket while a ready Pairling
+    Connect route sits unused. Probe the exact address the phone would
+    hit. Tests fabricate LAN IPs that can never be bound, so the test
+    seam pins serviceability instead of probing."""
+    flag = os.environ.get("PAIRLING_TEST_LAN_LISTENING")
+    if flag is not None:
+        return flag.strip() != "0"
+    if os.environ.get("PAIRLING_TEST_LAN_IP") is not None:
+        return True
+    try:
+        with socket.create_connection((ip, port_number), timeout=0.35):
+            return True
+    except OSError:
+        return False
+
 def default_pair_route(port_number: int) -> dict:
     for key in ("PAIRLING_PAIR_BASE_URL", "PAIRLING_PUBLIC_BASE_URL"):
         value = os.environ.get(key)
         if value:
             return {"base_url": value, "source": "explicit_override", "status": "override"}
-    # First-pair bootstrap: prefer LAN when it exists. iOS blocks plain HTTP to
-    # a tailnet IP before the embedded Pairling Connect route is ready.
+    # First-pair bootstrap: prefer LAN when the runtime actually serves it.
+    # iOS blocks plain HTTP to a tailnet IP before the embedded Pairling
+    # Connect route is ready, so a live LAN listener still wins. A LAN base
+    # nothing listens on loses to a ready Connect route, which the phone
+    # claims over its embedded tailnet (PrePairEmbeddedTailnetTransport).
     lan_ip = detected_lan_ip()
-    if lan_ip:
+    if lan_ip and lan_base_serviceable(lan_ip, port_number):
         return {"base_url": f"http://{lan_ip}:{port_number}", "source": "lan", "status": "fallback", "kind": "lan"}
     route = ready_connectd_route()
     if route:
@@ -2234,6 +2471,10 @@ if manual:
     print("")
 PY
   if [[ -n "$pair_url" ]]; then
+    # The guided screen heads the QR with a bold header only. A machine path keeps
+    # GUIDED_TTY 0, so the helper is silent and the QR renders exactly as before.
+    # render_pair_qr itself is untouched.
+    wizard_qr_open
     if ! render_pair_qr "$pair_url"; then
       log "QR rendering unavailable because Swift/CoreImage is not available. Use the pair URL above."
     fi
@@ -2492,7 +2733,7 @@ guard CommandLine.arguments.count > 1,
 }
 
 filter.setValue(message, forKey: "inputMessage")
-filter.setValue("M", forKey: "inputCorrectionLevel")
+filter.setValue("L", forKey: "inputCorrectionLevel")
 
 guard let output = filter.outputImage else {
     exit(2)
@@ -2532,18 +2773,35 @@ func isDark(_ x: Int, _ y: Int) -> Bool {
     return raw[index] < 128 && raw[index + 1] < 128 && raw[index + 2] < 128
 }
 
-let quietZone = 4
+// Half-block rendering: one column per module, and the upper half block packs two
+// module rows into one terminal row, so a long pairing URL fits an 80-column
+// terminal instead of overflowing at about 180 columns. The foreground colors the
+// top module and the background colors the bottom module. A dark module is black
+// (foreground 30, background 40) and a light module is white (foreground 37,
+// background 47). This is the standard scannable qrencode ANSIUTF8 format. The quiet
+// zone is 2 modules and the error correction is "L", the smaller settings that keep
+// the QR under 80 columns.
+let quietZone = 2
 let reset = "\u{001B}[0m"
-let black = "\u{001B}[40m  "
-let white = "\u{001B}[47m  "
 
-for y in (-quietZone)..<(height + quietZone) {
+func moduleDark(_ x: Int, _ y: Int) -> Bool {
+    return x >= 0 && y >= 0 && x < width && y < height && isDark(x, y)
+}
+
+func cell(_ topDark: Bool, _ bottomDark: Bool) -> String {
+    let foreground = topDark ? "30" : "37"
+    let background = bottomDark ? "40" : "47"
+    return "\u{001B}[\(foreground);\(background)m\u{2580}"
+}
+
+var y = -quietZone
+while y < height + quietZone {
     var line = ""
     for x in (-quietZone)..<(width + quietZone) {
-        let dark = x >= 0 && y >= 0 && x < width && y < height && isDark(x, y)
-        line += dark ? black : white
+        line += cell(moduleDark(x, y), moduleDark(x, y + 1))
     }
     print(line + reset)
+    y += 2
 }
 SWIFT
 }

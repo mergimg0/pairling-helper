@@ -43,8 +43,18 @@ def daemon_plist(current: Path, logs: Path, python_bin: str) -> dict:
     }
 
 
-def connectd_plist(current: Path, logs: Path) -> dict:
+def connectd_plist(current: Path, logs: Path, ssh_gateway: bool = False) -> dict:
     app_support = current.parent.parent
+    connectd_env = {
+        "PAIRLING_RUNTIME_PORT": PAIRLING_RUNTIME_PORT,
+        "PAIRLING_APP_SUPPORT_ROOT": str(app_support),
+        "PAIRLING_LOGS_ROOT": str(logs),
+        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    }
+    if ssh_gateway:
+        # SPEC-p5 §2.1: `pairling setup --ssh` flips this on. connectd opens
+        # the loopback SSH-tunnel gateway on 7775; default stays off.
+        connectd_env["PAIRLING_SSH_GATEWAY"] = "1"
     return {
         "Label": PAIRLING_CONNECTD_LABEL,
         "ProgramArguments": [
@@ -58,12 +68,7 @@ def connectd_plist(current: Path, logs: Path) -> dict:
             "--state-dir",
             str(app_support / "connectd" / "tsnet-state"),
         ],
-        "EnvironmentVariables": {
-            "PAIRLING_RUNTIME_PORT": PAIRLING_RUNTIME_PORT,
-            "PAIRLING_APP_SUPPORT_ROOT": str(app_support),
-            "PAIRLING_LOGS_ROOT": str(logs),
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        },
+        "EnvironmentVariables": connectd_env,
         "RunAtLoad": True,
         "KeepAlive": True,
         "ThrottleInterval": 10,
@@ -100,6 +105,8 @@ def main() -> int:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--daemon-python", default="/usr/local/bin/python3")
     parser.add_argument("--mirror-python", default="/usr/local/bin/python3", help=argparse.SUPPRESS)
+    parser.add_argument("--ssh-gateway", action="store_true",
+                        help="render connectd with the loopback SSH-tunnel gateway enabled (SPEC-p5)")
     args = parser.parse_args()
 
     current = Path(args.current_root)
@@ -108,7 +115,7 @@ def main() -> int:
 
     write_plist(out / f"{PAIRLING_DAEMON_LABEL}.plist", daemon_plist(current, logs, args.daemon_python))
     write_plist(out / f"{PAIRLING_PTYBROKER_LABEL}.plist", ptybroker_plist(current, logs, args.daemon_python))
-    write_plist(out / f"{PAIRLING_CONNECTD_LABEL}.plist", connectd_plist(current, logs))
+    write_plist(out / f"{PAIRLING_CONNECTD_LABEL}.plist", connectd_plist(current, logs, ssh_gateway=args.ssh_gateway))
     return 0
 
 

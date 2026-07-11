@@ -23,6 +23,7 @@ const (
 	RouteKindFunnel        = "funnel"
 	RouteStatusReady       = "ready"
 	RouteIDFunnel          = "pairling-connect-funnel"
+	gatewayRecoveryProofs  = 2
 )
 
 type AdvertisedRoute struct {
@@ -199,10 +200,12 @@ func (s *Store) RecordGatewayEvent(method, path string, status int, outcome stri
 			return
 		}
 		if gatewayEventIsRecoveryProbe(path, status, outcome) {
-			s.gatewaySuccessStreak = 1
-			snapshot.GatewayHealthy = true
-			snapshot.LastGatewayFailure = ""
-			snapshot.LastGatewayFailureAt = ""
+			s.gatewaySuccessStreak++
+			if s.gatewaySuccessStreak >= gatewayRecoveryProofs {
+				snapshot.GatewayHealthy = true
+				snapshot.LastGatewayFailure = ""
+				snapshot.LastGatewayFailureAt = ""
+			}
 			return
 		}
 	})

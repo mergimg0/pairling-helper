@@ -237,8 +237,23 @@ func TestStoreSuppressesAdvertisedRouteAfterRecentGatewayValidationFailure(t *te
 
 	store.RecordGatewayEvent("GET", "/routez", 200, "forwarded")
 	snapshot = store.Snapshot()
+	if snapshot.GatewayHealthy {
+		t.Fatalf("single routez success should not recover gateway health: %+v", snapshot)
+	}
+	if snapshot.LastGatewayFailure == "" || snapshot.LastGatewayFailureAt == "" {
+		t.Fatalf("unresolved gateway failure should remain visible after one success: %+v", snapshot)
+	}
+	if len(snapshot.AdvertisedRoutes) != 0 {
+		t.Fatalf("single routez success advertised a route: %+v", snapshot.AdvertisedRoutes)
+	}
+
+	store.RecordGatewayEvent("GET", "/routez", 200, "forwarded")
+	snapshot = store.Snapshot()
 	if !snapshot.GatewayHealthy {
-		t.Fatalf("gateway should recover after fresh successful routez proof: %+v", snapshot)
+		t.Fatalf("gateway should recover after consecutive successful routez proofs: %+v", snapshot)
+	}
+	if snapshot.LastGatewayFailure != "" || snapshot.LastGatewayFailureAt != "" {
+		t.Fatalf("recovered gateway should clear failure markers: %+v", snapshot)
 	}
 	if len(snapshot.AdvertisedRoutes) != 1 {
 		t.Fatalf("recovered gateway did not advertise route: %+v", snapshot.AdvertisedRoutes)
@@ -265,7 +280,7 @@ func TestStoreDoesNotPoisonRouteHealthForProductEndpointFailures(t *testing.T) {
 	}
 }
 
-func TestStoreRecoversRouteHealthAfterFreshSuccessfulRouteProof(t *testing.T) {
+func TestStoreGatewayFailureResetsRecoveryProofStreak(t *testing.T) {
 	store := NewStore("pairling-inst-abcdef")
 	store.SetAuthenticated()
 	store.SetTailnetIP("100.64.0.10")
@@ -278,12 +293,20 @@ func TestStoreRecoversRouteHealthAfterFreshSuccessfulRouteProof(t *testing.T) {
 	}
 
 	store.RecordGatewayEvent("GET", "/routez", 200, "forwarded")
+	store.RecordGatewayEvent("GET", "/routez", 502, "upstream_error")
+	store.RecordGatewayEvent("GET", "/routez", 200, "forwarded")
 	snapshot := store.Snapshot()
+	if snapshot.GatewayHealthy {
+		t.Fatalf("failure between routez successes should reset recovery streak: %+v", snapshot)
+	}
+
+	store.RecordGatewayEvent("GET", "/routez", 200, "forwarded")
+	snapshot = store.Snapshot()
 	if !snapshot.GatewayHealthy {
-		t.Fatalf("fresh routez proof should recover route health: %+v", snapshot)
+		t.Fatalf("two routez successes after latest failure should recover route health: %+v", snapshot)
 	}
 	if len(snapshot.AdvertisedRoutes) != 1 {
-		t.Fatalf("fresh routez proof should restore advertised route: %+v", snapshot.AdvertisedRoutes)
+		t.Fatalf("consecutive routez proofs should restore advertised route: %+v", snapshot.AdvertisedRoutes)
 	}
 }
 

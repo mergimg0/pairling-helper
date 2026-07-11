@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+from . import registry_data
 from .base import (
     ProviderAdapter,
     ProviderAvailability,
@@ -17,20 +18,29 @@ from .base import (
 )
 
 
+# Identity comes from registry-data.json (SPEC-p1 §2.1). The literal below is
+# a fallback so a corrupt data file degrades to today's behavior instead of a
+# dead adapter; the registry-data contract test guards the file itself.
+_FALLBACK_DESCRIPTOR = ProviderDescriptor(
+    provider_id="claude",
+    display_name="Claude",
+    kind="terminal_cli",
+    builtin=True,
+    docs_url="https://docs.anthropic.com/en/docs/claude-code",
+)
+_ENTRY = registry_data.entry_or_none("claude")
+
+
 class ClaudeProviderAdapter(ProviderAdapter):
-    descriptor = ProviderDescriptor(
-        provider_id="claude",
-        display_name="Claude",
-        kind="terminal_cli",
-        builtin=True,
-        docs_url="https://docs.anthropic.com/en/docs/claude-code",
-    )
+    descriptor = registry_data.descriptor_for(_ENTRY) if _ENTRY else _FALLBACK_DESCRIPTOR
 
     def __init__(self, home: Path | None = None):
         self.home = home or Path.home()
 
     @property
     def candidates(self) -> list[Path]:
+        if _ENTRY is not None and _ENTRY.binary_candidates:
+            return registry_data.candidate_paths(_ENTRY, home=self.home)
         return [
             self.home / ".local" / "bin" / "claude",
             Path("/opt/homebrew/bin/claude"),
@@ -60,7 +70,8 @@ class ClaudeProviderAdapter(ProviderAdapter):
         }
 
     def probe(self) -> ProviderProbeResult:
-        resolved = resolve_executable("claude", self.candidates, env_var="PAIRLING_CLAUDE_BIN")
+        env_var = _ENTRY.env_override if _ENTRY is not None else "PAIRLING_CLAUDE_BIN"
+        resolved = resolve_executable("claude", self.candidates, env_var=env_var)
         config_path = self.home / ".claude" / "settings.json"
         hook_count = json_hook_count(config_path)
         installed = resolved is not None

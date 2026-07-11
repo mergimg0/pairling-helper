@@ -352,6 +352,16 @@ class DeviceRegistry:
                     proof_secret=row["proof_secret"],
                     scopes=scopes,
                 )
+            # Record the sighting in memory only. The auth hot path is pinned
+            # write-free (test_device_registry_uses_wal_and_no_successful_auth
+            # _write): every request authenticates, and a write per request
+            # would churn WAL for nothing. flush_last_seen() persists the
+            # newest sighting lazily, off this path.
+            marks = getattr(self, "_last_seen_marks", None)
+            if marks is None:
+                marks = {}
+                self._last_seen_marks = marks
+            marks[row["device_id"]] = time.time()
             return DeviceAuthResult(
                 True,
                 200,
@@ -395,6 +405,64 @@ class DeviceRegistry:
                     conn=conn,
                 )
             return changed
+
+    def flush_last_seen(self) -> int:
+        """Persist in-memory auth sightings, newest-wins, skipping anything
+        already persisted. The auth path itself never writes; this runs on
+        the evidence read and costs nothing when there is nothing new."""
+        marks = dict(getattr(self, "_last_seen_marks", {}) or {})
+        flushed_marks = getattr(self, "_flushed_marks", None)
+        if flushed_marks is None:
+            flushed_marks = {}
+            self._flushed_marks = flushed_marks
+        pending = {
+            device_id: seen_at
+            for device_id, seen_at in marks.items()
+            if seen_at > flushed_marks.get(device_id, 0.0)
+        }
+        if not pending:
+            return 0
+        flushed = 0
+        with self.connect() as conn:
+            for device_id, seen_at in pending.items():
+                try:
+                    conn.execute(
+                        "UPDATE devices SET last_seen_at = ? "
+                        "WHERE device_id = ? AND COALESCE(last_seen_at, 0) < ?",
+                        (seen_at, device_id, seen_at),
+                    )
+                    flushed_marks[device_id] = seen_at
+                    flushed += 1
+                except sqlite3.Error:
+                    continue
+        return flushed
+
+    def any_device_seen_within(self, seconds: float) -> bool:
+        """Human-pairing evidence: an unrevoked device authenticated (or was
+        created) within the window. Drives next_action so a paired, active
+        Mac stops telling its user to scan a pairing code. Flushes pending
+        sightings first so fresh evidence counts immediately."""
+        self.flush_last_seen()
+        cutoff = time.time() - max(0.0, float(seconds))
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM devices "
+                "WHERE revoked_at IS NULL "
+                "AND (COALESCE(last_seen_at, 0) >= ? OR COALESCE(created_at, 0) >= ?)",
+                (cutoff, cutoff),
+            ).fetchone()
+            return bool(row["n"])
+
+    def revoked_device_ids(self) -> list[str]:
+        """Every device id that has ever been revoked. Feeds the push
+        dispatcher's boot-time GC so revoked pairings cannot keep push
+        registrations (stale tokens burned APNs calls and cluttered the
+        delivery audit for weeks before the 2026-07-09 cleanup)."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT device_id FROM devices WHERE revoked_at IS NOT NULL"
+            ).fetchall()
+            return [str(row["device_id"]) for row in rows]
 
     def revoke_device(self, device_id: str, *, reason: str = "revoked") -> bool:
         with self.connect() as conn:
