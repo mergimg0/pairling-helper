@@ -1,0 +1,145 @@
+{
+  "schema_version": 1,
+  "providers": [
+    {
+      "id": "claude",
+      "display_name": "Claude",
+      "kind": "terminal_cli",
+      "adapter_depth": "deep",
+      "builtin": true,
+      "binary_name": "claude",
+      "binary_candidates": [
+        "~/.local/bin/claude",
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude"
+      ],
+      "env_override": "PAIRLING_CLAUDE_BIN",
+      "config_paths": [
+        "~/.claude/settings.json"
+      ],
+      "version_command": ["--version"],
+      "docs_url": "https://docs.anthropic.com/en/docs/claude-code"
+    },
+    {
+      "id": "codex",
+      "display_name": "Codex",
+      "kind": "terminal_cli",
+      "adapter_depth": "deep",
+      "builtin": true,
+      "binary_name": "codex",
+      "binary_candidates": [
+        "~/.local/bin/codex",
+        "/opt/homebrew/bin/codex",
+        "/usr/local/bin/codex"
+      ],
+      "env_override": "PAIRLING_CODEX_BIN",
+      "config_paths": [
+        "~/.codex/config.toml"
+      ],
+      "version_command": ["--version"],
+      "docs_url": "https://developers.openai.com/codex"
+    },
+    {
+      "id": "aider",
+      "display_name": "Aider",
+      "kind": "terminal_cli",
+      "adapter_depth": "recognized",
+      "binary_name": "aider",
+      "binary_candidates": [
+        "~/.local/bin/aider",
+        "/opt/homebrew/bin/aider",
+        "/usr/local/bin/aider"
+      ],
+      "env_override": "PAIRLING_AIDER_BIN",
+      "config_paths": [
+        "~/.aider.conf.yml"
+      ],
+      "version_command": ["--version"],
+      "docs_url": "https://aider.chat/docs/"
+    },
+    {
+      "id": "opencode",
+      "display_name": "OpenCode",
+      "kind": "terminal_cli",
+      "adapter_depth": "recognized",
+      "binary_name": "opencode",
+      "binary_candidates": [
+        "~/.local/bin/opencode",
+        "/opt/homebrew/bin/opencode",
+        "/usr/local/bin/opencode"
+      ],
+      "env_override": "PAIRLING_OPENCODE_BIN",
+      "config_paths": [
+        "~/.config/opencode/opencode.json"
+      ],
+      "version_command": ["--version"],
+      "docs_url": "https://opencode.ai/docs"
+    },
+    {
+      "id": "hermes_agent",
+      "display_name": "Hermes Agent",
+      "kind": "terminal_cli",
+      "adapter_depth": "recognized",
+      "binary_name": "hermes",
+      "binary_candidates": [
+        "~/.local/bin/hermes",
+        "/opt/homebrew/bin/hermes",
+        "/usr/local/bin/hermes"
+      ],
+      "env_override": "PAIRLING_HERMES_AGENT_BIN",
+      "config_paths": [],
+      "version_command": ["--version"],
+      "docs_url": "https://hermes-agent.nousresearch.com/docs/user-guide/cli"
+    },
+    {
+      "id": "grok_build",
+      "display_name": "Grok Build",
+      "kind": "terminal_cli",
+      "adapter_depth": "recognized",
+      "binary_name": "grok",
+      "binary_candidates": [
+        "~/.local/bin/grok",
+        "/opt/homebrew/bin/grok",
+        "/usr/local/bin/grok"
+      ],
+      "env_override": "PAIRLING_GROK_BUILD_BIN",
+      "config_paths": [],
+      "version_command": ["--version"],
+      "docs_url": "https://x.ai/cli"
+    },
+    {
+      "id": "antigravity",
+      "display_name": "Antigravity",
+      "kind": "agent_platform",
+      "adapter_depth": "recognized",
+      "binary_name": "antigravity",
+      "binary_candidates": [
+        "~/.local/bin/antigravity",
+        "/opt/homebrew/bin/antigravity",
+        "/usr/local/bin/antigravity"
+      ],
+      "env_override": "PAIRLING_ANTIGRAVITY_BIN",
+      "config_paths": [],
+      "version_command": ["--version"],
+      "docs_url": "https://developers.googleblog.com/en/build-with-google-antigravity-our-new-agentic-development-platform/"
+    },
+    {
+      "id": "gemini",
+      "display_name": "Gemini CLI",
+      "kind": "terminal_cli",
+      "adapter_depth": "recognized",
+      "binary_name": "gemini",
+      "binary_candidates": [
+        "~/.local/bin/gemini",
+        "/opt/homebrew/bin/gemini",
+        "/usr/local/bin/gemini"
+      ],
+      "env_override": "PAIRLING_GEMINI_BIN",
+      "config_paths": [
+        "~/.gemini/settings.json"
+      ],
+      "version_command": ["--version"],
+      "docs_url": "https://github.com/google-gemini/gemini-cli"
+    }
+  ]
+}

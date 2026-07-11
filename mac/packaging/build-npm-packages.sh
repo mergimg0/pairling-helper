@@ -134,9 +134,44 @@ require_release_version_unpublished() {
   done
 }
 
+require_release_version_sources() {
+  local source_version
+  source_version="$(tr -d '[:space:]' < "$REPO_ROOT/mac/VERSION")"
+  [[ "$VERSION" == "$source_version" ]] \
+    || fail "--release version $VERSION does not match mac/VERSION $source_version."
+
+  python3 - "$REPO_ROOT" "$VERSION" <<'PY' || fail "--release npm source package versions must all match $VERSION."
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+expected = sys.argv[2]
+paths = (
+    Path("npm/pairling/package.json"),
+    Path("npm/runtime-darwin-arm64/package.json"),
+    Path("npm/runtime-darwin-x64/package.json"),
+)
+errors = []
+for relative in paths:
+    try:
+        actual = str(json.loads((root / relative).read_text())["version"])
+    except Exception as exc:
+        errors.append(f"{relative}: {type(exc).__name__}: {exc}")
+        continue
+    if actual != expected:
+        errors.append(f"{relative}: version {actual!r} does not match release {expected!r}")
+if errors:
+    for error in errors:
+        print(f"error: {error}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
 if [[ "$RELEASE_MODE" == "1" ]]; then
   [[ "$ALLOW_DIRTY" != "1" ]] || fail "--allow-dirty is only for non-release builds."
   require_release_version_unpublished
+  require_release_version_sources
   require_release_source_traceability
   [[ "$SOURCE_DIRTY" == "false" ]] || fail "source tree is dirty; commit first."
   [[ -n "$SIGN_IDENTITY" && "$SIGN_IDENTITY" != "-" ]] || [[ -n "$PREBUILT_ARM64" ]] || fail "--release requires PAIRLING_SIGN_IDENTITY (Developer ID) or prebuilt signed connectd binaries."
@@ -178,6 +213,7 @@ printf '%s\n' "$BRANCH" > "$MACPAY/SOURCE_BRANCH"
 printf '%s\n' "$SOURCE_DIRTY" > "$MACPAY/SOURCE_DIRTY"
 cp "$REPO_ROOT/mac/companiond/"*.py "$MACPAY/companiond/"
 cp "$REPO_ROOT/mac/companiond/providers/"*.py "$MACPAY/companiond/providers/"
+cp "$REPO_ROOT/mac/companiond/providers/"*.json "$MACPAY/companiond/providers/"
 cp "$REPO_ROOT/mac/companiond/integrations/__init__.py" "$MACPAY/companiond/integrations/"
 cp "$REPO_ROOT/mac/companiond/integrations/aperture_cli/"*.py "$MACPAY/companiond/integrations/aperture_cli/"
 cp "$REPO_ROOT/mac/mcp/"*.py "$MACPAY/mcp/"
@@ -190,6 +226,7 @@ cp "$REPO_ROOT/mac/packaging/bin/pairling" "$MACPAY/packaging/bin/"
 
 chmod 755 "$MACPAY/packaging/bin/pairling" "$MACPAY/install/"*.sh "$MACPAY/mcp/phone_tools.py" \
   "$MACPAY/companiond/pairlingd.py"
+chmod 644 "$MACPAY/companiond/providers/"*.py "$MACPAY/companiond/providers/"*.json
 find "$MACPAY" -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
 
 PYCACHE="$(mktemp -d)"

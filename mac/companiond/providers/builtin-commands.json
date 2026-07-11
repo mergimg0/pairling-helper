@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "providers": {
+    "claude": {
+      "verified_version": "2.1.201",
+      "commands": [
+        {"name": "/help",      "description": "Get help with using Claude Code", "args": null},
+        {"name": "/clear",     "description": "Clear conversation history", "args": null},
+        {"name": "/compact",   "description": "Compact the conversation context", "args": null},
+        {"name": "/resume",    "description": "Resume a previous session", "args": null},
+        {"name": "/continue",  "description": "Continue the most recent session", "args": null},
+        {"name": "/exit",      "description": "Exit Claude Code", "args": null},
+        {"name": "/quit",      "description": "Quit Claude Code", "args": null},
+        {"name": "/effort",    "description": "Set thinking effort level", "args": "<level>"},
+        {"name": "/model",     "description": "Set the model", "args": "<model>"},
+        {"name": "/status",    "description": "Show session status", "args": null},
+        {"name": "/init",      "description": "Initialize CLAUDE.md", "args": null},
+        {"name": "/config",    "description": "Edit Claude Code config", "args": null},
+        {"name": "/login",     "description": "Authenticate with Anthropic", "args": null},
+        {"name": "/logout",    "description": "Sign out", "args": null},
+        {"name": "/mcp",       "description": "Manage MCP servers", "args": null},
+        {"name": "/agents",    "description": "List or run agents", "args": null},
+        {"name": "/tools",     "description": "List available tools", "args": null},
+        {"name": "/skills",    "description": "List available skills", "args": null},
+        {"name": "/cost",      "description": "Show session token cost", "args": null},
+        {"name": "/review",    "description": "Run a code review on the current diff", "args": null},
+        {"name": "/release-notes", "description": "Show what's new", "args": null},
+        {"name": "/feedback",  "description": "Send feedback to Anthropic", "args": null}
+      ]
+    },
+    "codex": {
+      "verified_version": "0.142.5",
+      "commands": [
+        {"name": "/help", "description": "Show Codex interactive help", "args": null},
+        {"name": "/status", "description": "Show Codex session status when available", "args": null},
+        {"name": "/model", "description": "Change model if supported by the current Codex build", "args": "<model>"},
+        {"name": "/resume", "description": "Resume a previous Codex session in this project", "args": "<session_id>"},
+        {"name": "/mcp", "description": "Inspect or manage Codex MCP servers", "args": null},
+        {"name": "/quit", "description": "Exit the Codex session", "args": null},
+        {"name": "/exit", "description": "Exit the Codex session", "args": null}
+      ]
+    }
+  }
+}

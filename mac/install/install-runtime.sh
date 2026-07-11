@@ -1422,6 +1422,8 @@ for rel in [
     "companiond/providers/codex.py",
     "companiond/providers/external.py",
     "companiond/providers/registry.py",
+    "companiond/providers/builtin-commands.json",
+    "companiond/providers/registry-data.json",
     "connectd/pairling-connectd",
     "mcp/phone_tools.py",
 ]:
