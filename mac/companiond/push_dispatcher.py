@@ -723,6 +723,10 @@ class PairlingPushDispatcher:
         if isinstance(relay_device_id, str):
             device["relay_device_id"] = relay_device_id.strip() or None
 
+        mac_install_id = str(payload.get("mac_install_id") or "").strip()
+        if mac_install_id:
+            device["mac_install_id"] = mac_install_id
+
         apns_environment = _normalize_apns_environment(payload.get("apns_environment") or device.get("apns_environment"))
         if apns_environment:
             device["apns_environment"] = apns_environment
@@ -744,7 +748,7 @@ class PairlingPushDispatcher:
         relay_pair_secret = str(payload.get("relay_pair_secret") or "").strip()
         if relay_pair_secret:
             relay_secret_ref = str(payload.get("relay_pair_secret_ref") or _sha256_hex(relay_pair_secret)).strip()
-            mac_install_id = str(payload.get("mac_install_id") or os.environ.get("PAIRLING_MAC_INSTALL_ID") or "").strip()
+            mac_install_id = str(payload.get("mac_install_id") or device.get("mac_install_id") or os.environ.get("PAIRLING_MAC_INSTALL_ID") or "").strip()
             secrets_payload = self._read_secrets()
             secret_device = secrets_payload.setdefault("devices", {}).setdefault(device_id, {})
             secret_device["relay_pair_secret"] = relay_pair_secret
@@ -803,6 +807,17 @@ class PairlingPushDispatcher:
         device_id = _nonempty(device_id, "device_id")
         data = self._read()
         device = self._device_record(data, device_id, create=True)
+        secret = self._secret_for_device(device_id)
+        source_mac_install_id = str(
+            payload.get("mac_install_id")
+            or secret.get("mac_install_id")
+            or device.get("mac_install_id")
+            or os.environ.get("PAIRLING_MAC_INSTALL_ID")
+            or ""
+        ).strip()
+        if source_mac_install_id:
+            payload = dict(payload)
+            payload["mac_install_id"] = source_mac_install_id
         kind = str(payload.get("kind") or "push_diagnostic")[:80]
         route = str(payload.get("route") or "pairling://settings/push")[:300]
         title = str(payload.get("title") or "")[:90] or None
@@ -1927,6 +1942,7 @@ def _alert_pairling_extra(payload: dict[str, Any]) -> dict[str, Any]:
         "health_posture",
         "health_severity",
         "health_summary",
+        "mac_install_id",
     }
     out: dict[str, Any] = {}
     for key in allowed:

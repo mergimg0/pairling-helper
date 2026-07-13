@@ -107,6 +107,8 @@ type Handler struct {
 	proxy            *httputil.ReverseProxy
 }
 
+type routeProbeTokenKey struct{}
+
 type RateLimiter interface {
 	Allow(remoteAddr, method, path string) bool
 }
@@ -152,6 +154,29 @@ func NewHandler(opts Options) (*Handler, error) {
 		FlushInterval: -1,
 	}
 	return h, nil
+}
+
+// ProbeRoute runs the semantic route check through the same allowlist,
+// rewrite, reverse proxy, response validation, and event logger as a tailnet
+// request. The internal token is carried only in an in-process context value;
+// inbound headers are still deleted before the upstream hop.
+func (h *Handler) ProbeRoute(ctx context.Context, internalToken string) bool {
+	if h == nil || strings.TrimSpace(internalToken) == "" {
+		return false
+	}
+	request, err := http.NewRequestWithContext(
+		context.WithValue(ctx, routeProbeTokenKey{}, internalToken),
+		http.MethodGet,
+		"http://pairling.internal/routez",
+		nil,
+	)
+	if err != nil {
+		return false
+	}
+	request.RemoteAddr = "127.0.0.1:0"
+	response := &probeResponseWriter{header: make(http.Header), status: http.StatusOK}
+	h.ServeHTTP(response, request)
+	return response.status >= 200 && response.status < 400 && routeResponseIsValid(response.body.Bytes())
 }
 
 // isFunnelSynthesizedPath reports the funnel-mode GET paths connectd answers
@@ -223,9 +248,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, bodyLimit)
 	}
 
-	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	rec := &statusRecorder{
+		ResponseWriter: w,
+		status:         http.StatusOK,
+		captureBody:    path == "/routez",
+	}
 	h.proxy.ServeHTTP(rec, r)
-	h.log(r, rec.status, "forwarded")
+	outcome := "forwarded"
+	if path == "/routez" && rec.status >= 200 && rec.status < 400 {
+		if routeResponseIsValid(rec.body.Bytes()) {
+			outcome = "route_verified"
+		} else {
+			outcome = "validation_failed"
+		}
+	}
+	h.log(r, rec.status, outcome)
 }
 
 func (h *Handler) rewrite(r *httputil.ProxyRequest) {
@@ -244,6 +281,9 @@ func (h *Handler) rewrite(r *httputil.ProxyRequest) {
 	r.Out.Header.Del(peerNodeHeader)
 	r.Out.Header.Del(peerProvenanceHeader)
 	r.Out.Header.Del(funnelOriginHeader)
+	if token, ok := in.Context().Value(routeProbeTokenKey{}).(string); ok && strings.TrimSpace(token) != "" {
+		r.Out.Header.Set(internalTokenHeader, token)
+	}
 	if h.mode == ExposureModeFunnelBootstrap {
 		r.Out.Header.Set(funnelOriginHeader, "1")
 	}
@@ -399,12 +439,60 @@ func (h *Handler) log(r *http.Request, status int, outcome string) {
 
 type statusRecorder struct {
 	http.ResponseWriter
+	status      int
+	captureBody bool
+	body        bytes.Buffer
+}
+
+type probeResponseWriter struct {
+	header http.Header
 	status int
+	body   bytes.Buffer
+}
+
+func (r *probeResponseWriter) Header() http.Header { return r.header }
+
+func (r *probeResponseWriter) WriteHeader(status int) { r.status = status }
+
+func (r *probeResponseWriter) Write(payload []byte) (int, error) {
+	return r.body.Write(payload)
 }
 
 func (r *statusRecorder) WriteHeader(status int) {
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Write(payload []byte) (int, error) {
+	if r.captureBody && r.body.Len() < 64<<10 {
+		remaining := (64 << 10) - r.body.Len()
+		captured := payload
+		if len(captured) > remaining {
+			captured = captured[:remaining]
+		}
+		_, _ = r.body.Write(captured)
+	}
+	return r.ResponseWriter.Write(payload)
+}
+
+func routeResponseIsValid(payload []byte) bool {
+	var response struct {
+		OK              bool   `json:"ok"`
+		SchemaVersion   int    `json:"schema_version"`
+		ContractVersion string `json:"contract_version"`
+		Runtime         struct {
+			Verified        bool   `json:"verified"`
+			ContractVersion string `json:"contract_version"`
+		} `json:"runtime"`
+	}
+	if json.Unmarshal(payload, &response) != nil {
+		return false
+	}
+	return response.OK &&
+		response.SchemaVersion == 1 &&
+		response.ContractVersion == "pairling-runtime-v1" &&
+		response.Runtime.Verified &&
+		response.Runtime.ContractVersion == "pairling-runtime-v1"
 }
 
 func supportedMethod(method string) bool {
@@ -420,6 +508,9 @@ func (h *Handler) allowed(method, path string, header http.Header) bool {
 	case ExposureModePairlingConnect:
 		if path == "/pair/start" {
 			return false
+		}
+		if method == http.MethodPost && isReauthPath(path) {
+			return true
 		}
 		if prePairAllowed(method, path) {
 			return true
@@ -452,6 +543,9 @@ func (h *Handler) allowedForAnyMethod(path string, header http.Header) bool {
 		if path == "/pair/start" {
 			return true
 		}
+		if isReauthPath(path) {
+			return true
+		}
 		if prePairAllowed(http.MethodGet, path) || prePairAllowed(http.MethodPost, path) {
 			return true
 		}
@@ -468,6 +562,11 @@ func (h *Handler) allowedForAnyMethod(path string, header http.Header) bool {
 
 func (h *Handler) requestBodyLimit(method, path string) int64 {
 	if method == http.MethodPost && isPrePairClaimPath(path) && (h.mode == ExposureModePrePair || h.mode == ExposureModePairlingConnect || h.mode == ExposureModeFunnelBootstrap) {
+		if h.maxBodyBytes <= 0 || prePairMaxBodyBytes < h.maxBodyBytes {
+			return prePairMaxBodyBytes
+		}
+	}
+	if method == http.MethodPost && isReauthPath(path) && h.mode == ExposureModePairlingConnect {
 		if h.maxBodyBytes <= 0 || prePairMaxBodyBytes < h.maxBodyBytes {
 			return prePairMaxBodyBytes
 		}
@@ -539,6 +638,10 @@ var funnelBootstrapPostPaths = map[string]bool{
 
 func isPrePairClaimPath(path string) bool {
 	return path == "/pair/claim" || path == "/pair/psk-claim"
+}
+
+func isReauthPath(path string) bool {
+	return path == "/pair/reauth-challenge" || path == "/pair/reauth-claim"
 }
 
 func hasBearer(header http.Header) bool {

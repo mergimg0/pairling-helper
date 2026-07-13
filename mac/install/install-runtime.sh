@@ -35,6 +35,7 @@ PACKAGED_SOURCE_PATHS=(
   "mac/connectd/go.sum"
   "mac/install"
   "mac/mcp"
+  "relay/app_attest_validator.py"
 )
 SOURCE_DIRTY="${PAIRLING_SOURCE_DIRTY:-$(read_source_stamp "$REPO_ROOT/mac/SOURCE_DIRTY")}"
 if [[ -z "$SOURCE_DIRTY" ]]; then
@@ -1070,6 +1071,56 @@ run_psk_dependency_checks() {
   run_psk_dependency_import_check "$PYTHON3_BIN" "$REPO_ROOT/mac/companiond" "source-tree preflight"
 }
 
+app_attest_validator_source() {
+  local candidate
+  for candidate in \
+    "$REPO_ROOT/relay/app_attest_validator.py" \
+    "$REPO_ROOT/mac/companiond/app_attest_validator.py"; do
+    if [[ -f "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  log "ERROR: App Attest validator source is missing; refusing to stage an incomplete runtime." >&2
+  return 1
+}
+
+stage_app_attest_assets() {
+  local destination="$1"
+  local validator
+  validator="$(app_attest_validator_source)" || {
+    WIZARD_FATAL=1
+    exit 1
+  }
+  if [[ ! -f "$REPO_ROOT/mac/companiond/apple-app-attest-root-ca.pem" ]]; then
+    log "ERROR: Apple App Attest root certificate is missing; refusing to stage an incomplete runtime." >&2
+    WIZARD_FATAL=1
+    exit 1
+  fi
+  cp "$validator" "$destination/app_attest_validator.py"
+  cp "$REPO_ROOT/mac/companiond/apple-app-attest-root-ca.pem" "$destination/"
+}
+
+run_app_attest_import_check() {
+  local python_bin="$1"
+  local companiond_path="$2"
+  local label="$3"
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$companiond_path" "$python_bin" - "$companiond_path" "$label" <<'PY'
+import sys
+from pathlib import Path
+
+companiond_path, label = sys.argv[1:]
+root = Path(companiond_path)
+for name in ("app_attest_lan.py", "app_attest_validator.py", "apple-app-attest-root-ca.pem"):
+    if not (root / name).is_file():
+        raise SystemExit(f"{label}: missing {name}")
+import app_attest_lan
+validator = app_attest_lan._load_validator()
+if validator is None:
+    raise SystemExit(f"{label}: App Attest validator import failed: {app_attest_lan._validator_error}")
+PY
+}
+
 run_staged_psk_dependency_checks() {
   local tmp="$1"
   local staged_python="$PYTHON3_BIN"
@@ -1077,6 +1128,7 @@ run_staged_psk_dependency_checks() {
     staged_python="$tmp/python/bin/python3"
   fi
   run_psk_dependency_import_check "$staged_python" "$tmp/companiond" "staged runtime copy"
+  run_app_attest_import_check "$staged_python" "$tmp/companiond" "staged runtime copy"
 }
 
 ensure_state() {
@@ -1150,6 +1202,31 @@ clear_release_quarantine() {
   local target="$1"
   if command -v xattr >/dev/null 2>&1; then
     xattr -dr com.apple.quarantine "$target" >/dev/null 2>&1 || true
+  fi
+}
+
+remove_python_bytecode() {
+  local root="$1"
+  local residue
+  if ! find "$root" -name '__pycache__' -prune -exec rm -rf {} +; then
+    log "ERROR: unable to remove Python cache directories from the staged runtime." >&2
+    WIZARD_FATAL=1
+    exit 1
+  fi
+  if ! find "$root" -name '*.pyc' -delete; then
+    log "ERROR: unable to remove Python bytecode files from the staged runtime." >&2
+    WIZARD_FATAL=1
+    exit 1
+  fi
+  if ! residue="$(find "$root" \( -name '__pycache__' -o -name '*.pyc' \) -print -quit)"; then
+    log "ERROR: unable to verify Python bytecode cleanup in the staged runtime." >&2
+    WIZARD_FATAL=1
+    exit 1
+  fi
+  if [[ -n "$residue" ]]; then
+    log "ERROR: Python bytecode remains in the staged runtime: $residue" >&2
+    WIZARD_FATAL=1
+    exit 1
   fi
 }
 
@@ -1230,6 +1307,8 @@ copy_release() {
   cp "$REPO_ROOT/mac/companiond/provider_setup.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/keep_awake.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/postures.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/app_attest_lan.py" "$tmp/companiond/"
+  stage_app_attest_assets "$tmp/companiond"
   cp "$REPO_ROOT/mac/companiond/integrations/__init__.py" "$tmp/companiond/integrations/"
   cp "$REPO_ROOT/mac/companiond/integrations/aperture_cli/"*.py "$tmp/companiond/integrations/aperture_cli/"
   cp "$REPO_ROOT/mac/companiond/providers/"*.py "$tmp/companiond/providers/"
@@ -1249,6 +1328,7 @@ copy_release() {
   chmod 644 "$tmp/companiond/integrations/"*.py "$tmp/companiond/integrations/aperture_cli/"*.py
   chmod 755 "$tmp/companiond/pairlingd.py" "$tmp/mcp/phone_tools.py"
   clear_release_quarantine "$tmp"
+  remove_python_bytecode "$tmp"
   rm -rf "$RELEASE_ROOT"
   mv "$tmp" "$RELEASE_ROOT"
   write_manifest "$RELEASE_ROOT"
@@ -1270,10 +1350,9 @@ copy_runtime_source_tree() {
   printf '%s\n' "$BRANCH" > "$mac_root/SOURCE_BRANCH"
   printf '%s\n' "$SOURCE_DIRTY" > "$mac_root/SOURCE_DIRTY"
   cp "$REPO_ROOT/mac/companiond/"*.py "$mac_root/companiond/"
-  # WS2: co-locate the canonical App Attest validator with the daemon so
-  # app_attest_lan can import it in the staged runtime (the repo keeps the one
-  # source of truth in relay/). Non-fatal if absent — the gate fails closed.
-  cp "$REPO_ROOT/relay/app_attest_validator.py" "$mac_root/companiond/" 2>/dev/null || true
+  # WS2: keep the validator and its trust anchor inside every runtime copy.
+  # Staging fails closed when either asset is absent or cannot import.
+  stage_app_attest_assets "$mac_root/companiond"
   cp "$REPO_ROOT/mac/companiond/providers/"*.py "$mac_root/companiond/providers/"
   cp "$REPO_ROOT/mac/companiond/providers/"*.json "$mac_root/companiond/providers/"
   cp "$REPO_ROOT/mac/companiond/integrations/__init__.py" "$mac_root/companiond/integrations/"
@@ -1429,60 +1508,32 @@ from pathlib import Path
 repo_root, install_root, version, revision, branch, dirty, app_support, logs_root, devices_db, port = sys.argv[1:]
 root = Path(install_root)
 files = []
-for rel in [
-    "bin/pairling",
-    "companiond/pairlingd.py",
-    "companiond/runtime_contract.py",
-    "companiond/runtime_manifest.py",
-    "companiond/runtime_paths.py",
-    "companiond/pairdrop_store.py",
-    "companiond/compose_recording_store.py",
-    "companiond/pairling_connectd_status.py",
-    "companiond/pairling_devices.py",
-    "companiond/local_mcp_bridge.py",
-    "companiond/llm_route.py",
-    "companiond/pairling_tools.py",
-    "companiond/pairling_pairing.py",
-    "companiond/pairling_psk.py",
-    "companiond/pairling_relay_claims.py",
-    "companiond/request_proof.py",
-    "companiond/codex_approval.py",
-    "companiond/pty_broker.py",
-    "companiond/pty_broker_client.py",
-    "companiond/pty_broker_service.py",
-    "companiond/terminal_screen_backend.py",
-    "companiond/session_events.py",
-    "companiond/session_event_log.py",
-    "companiond/session_event_ingest.py",
-    "companiond/route_registry.py",
-    "companiond/terminal_text_sanitizer.py",
-    "companiond/push_dispatcher.py",
-    "companiond/push_event_catalog.py",
-    "companiond/live_activity_publisher.py",
-    "companiond/standard_push_publisher.py",
-    "companiond/safety_monitor.py",
-    "companiond/sentinel_notifications.py",
-    "companiond/workstate_feed_contract.py",
-    "companiond/model_status_contract.py",
-    "companiond/substrate_status_contract.py",
-    "companiond/integrations/__init__.py",
-    "companiond/integrations/aperture_cli/__init__.py",
-    "companiond/integrations/aperture_cli/launch.py",
-    "companiond/integrations/aperture_cli/status.py",
-    "companiond/providers/__init__.py",
-    "companiond/providers/base.py",
-    "companiond/providers/claude.py",
-    "companiond/providers/codex.py",
-    "companiond/providers/external.py",
-    "companiond/providers/registry.py",
-    "companiond/providers/builtin-commands.json",
-    "companiond/providers/registry-data.json",
-    "connectd/pairling-connectd",
-    "mcp/phone_tools.py",
-]:
-    path = root / rel
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    files.append({"path": rel, "sha256": digest})
+
+def visit(directory: Path) -> None:
+    for path in sorted(directory.iterdir(), key=lambda item: item.name):
+        rel = path.relative_to(root).as_posix()
+        if rel == "manifest.json":
+            continue
+        if path.name == "__pycache__" or path.suffix == ".pyc":
+            raise RuntimeError(f"forbidden Python bytecode in staged runtime: {rel}")
+        if path.is_symlink():
+            target = path.readlink().as_posix()
+            files.append({
+                "path": rel,
+                "kind": "symlink",
+                "target": target,
+                "sha256": hashlib.sha256(target.encode("utf-8")).hexdigest(),
+            })
+        elif path.is_dir():
+            visit(path)
+        elif path.is_file():
+            files.append({
+                "path": rel,
+                "kind": "file",
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            })
+
+visit(root)
 
 now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 manifest = {

@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import errno
 import hashlib
 import html
 import json
@@ -64,11 +65,12 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import traceback
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, quote, unquote
 
 try:
     from runtime_contract import (
@@ -77,6 +79,7 @@ try:
         DAEMON_LABEL as RUNTIME_DAEMON_LABEL,
         DEFAULT_DEVICE_SCOPES as RUNTIME_DEFAULT_DEVICE_SCOPES,
         LEGACY_TOKEN_RELATIVE_PATH,
+        LOCAL_MCP_DISPATCH_SCOPE,
         PORT as RUNTIME_PORT,
         RUNTIME_NAME as RUNTIME_NAME,
         TAILSCALE_VARIANT as RUNTIME_TAILSCALE_VARIANT,
@@ -96,6 +99,7 @@ except Exception:
     RUNTIME_DAEMON_LABEL = "dev.pairling.companiond"
     RUNTIME_DEFAULT_DEVICE_SCOPES = frozenset()
     LEGACY_TOKEN_RELATIVE_PATH = ".claude/scripts/.notify-token"
+    LOCAL_MCP_DISPATCH_SCOPE = "pairling-tools:dispatch"
     RUNTIME_PORT = 7773
     RUNTIME_NAME = "pairling-mac-runtime"
     RUNTIME_TAILSCALE_VARIANT = "embedded_tsnet"
@@ -812,6 +816,8 @@ PAIRING_STORE = (
 )
 PAIRING_ADVERTISER = PairingAdvertiser() if PairingAdvertiser else None
 REAUTH_STORE = ReauthStore(DEVICE_REGISTRY) if ReauthStore and DEVICE_REGISTRY else None
+_PAIRDROP_STORE_SINGLETON = None
+_PAIRDROP_STORE_SINGLETON_LOCK = threading.Lock()
 RELAY_CLAIM_VERIFIER = (
     RelayClaimVerifier.from_environment(mac_install_id=PAIRING_STORE.install_id)
     if RelayClaimVerifier and PAIRING_STORE
@@ -1129,6 +1135,7 @@ _inject_rate_lock = threading.Lock()
 _inject_rate_state: dict[str, list[float]] = {}  # session_id -> [timestamps]
 _request_rate_lock = threading.Lock()
 _request_rate_state: dict[str, list[float]] = {}
+_REQUEST_RATE_MAX_KEYS = 4096
 _proof_replay_cache = ReplayCache() if ReplayCache is not None else None
 SSE_MAX_EVENT_BYTES = 64 * 1024
 SSE_TRANSCRIPT_MAX_EVENT_BYTES = 256 * 1024
@@ -1353,6 +1360,13 @@ _runtime_snapshot_cache: dict[tuple, tuple[float, object]] = {}
 _runtime_snapshot_key_locks: dict[tuple, threading.Lock] = {}
 _auth_result_cache_lock = threading.Lock()
 _auth_result_cache: dict[tuple, tuple[float, object]] = {}
+_client_workflow_audit_lock = threading.Lock()
+_client_workflow_audit_last: dict[tuple[str, ...], float] = {}
+_CLIENT_WORKFLOW_AUDIT_INTERVAL_SECONDS = 300.0
+_CLIENT_WORKFLOW_AUDIT_MAX_KEYS = 2048
+_CLIENT_APP_BUILD_HEADER = "X-Pairling-App-Build"
+_CLIENT_SOURCE_REVISION_HEADER = "X-Pairling-App-Source-Revision"
+_LAST_LEGACY_POSTURE_APP_BUILD = 210
 _FAST_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_FAST_REQUESTS)
 _REQUEST_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_REQUESTS)
 _DASHBOARD_STREAM_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_DASHBOARD_STREAMS)
@@ -1898,6 +1912,37 @@ def _required_scopes_for_request(path: str, method: str) -> set[str]:
     return {"sessions:read"} if method == "GET" else {"pair:admin"}
 
 
+def _self_device_target(auth_result, requested_device_id) -> tuple[str | None, dict | None]:
+    authenticated_device_id = str(getattr(auth_result, "device_id", "") or "").strip()
+    if not authenticated_device_id:
+        return None, {
+            "status": 401,
+            "code": "device_identity_required",
+            "message": "An authenticated device identity is required.",
+        }
+    requested = str(requested_device_id or "").strip()
+    if requested and requested != authenticated_device_id:
+        return None, {
+            "status": 403,
+            "code": "device_target_mismatch",
+            "message": "A paired device can only manage its own device record.",
+        }
+    return authenticated_device_id, None
+
+
+def _pairling_tools_payload_for_auth(auth_result, payload: dict) -> tuple[dict | None, dict | None]:
+    requested = str(payload.get("iphone_device_id") or "").strip()
+    scopes = set(getattr(auth_result, "scopes", []) or [])
+    if LOCAL_MCP_DISPATCH_SCOPE in scopes:
+        return dict(payload), None
+    device_id, error = _self_device_target(auth_result, requested)
+    if error is not None:
+        return None, error
+    scoped_payload = dict(payload)
+    scoped_payload["iphone_device_id"] = device_id
+    return scoped_payload, None
+
+
 def _bearer_token(headers) -> str | None:
     auth = headers.get("Authorization", "")
     if auth.startswith("Bearer "):
@@ -1910,6 +1955,13 @@ def _loopback_client_address(client_address) -> bool:
     if not client_address:
         return False
     return str(client_address[0]) in ("127.0.0.1", "::1")
+
+
+def _internal_route_probe_request(path: str, headers, client_address) -> bool:
+    if path != "/routez" or not _loopback_client_address(client_address) or not INTERNAL_HOOK_TOKEN:
+        return False
+    presented = str(headers.get("X-Pairling-Internal-Token") or "").strip()
+    return bool(presented) and secrets.compare_digest(presented, INTERNAL_HOOK_TOKEN)
 
 
 def _funnel_origin_request(headers, client_address) -> bool:
@@ -2042,6 +2094,172 @@ def _authenticate_device(token: str, *, required_scopes: set[str], path: str, me
     return auth_result
 
 
+def _validated_client_release_headers(headers) -> dict[str, str] | None:
+    getter = headers.get if hasattr(headers, "get") else lambda key, default=None: default
+    app_build = str(getter(_CLIENT_APP_BUILD_HEADER, "") or "").strip()
+    source_revision = str(getter(_CLIENT_SOURCE_REVISION_HEADER, "") or "").strip().lower()
+    if not re.fullmatch(r"[0-9]{1,12}", app_build):
+        return None
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source_revision):
+        return None
+    return {
+        "app_build": app_build,
+        "app_source_revision": source_revision,
+    }
+
+
+def _legacy_posture_request_allowed(headers) -> bool:
+    getter = headers.get if hasattr(headers, "get") else lambda key, default=None: default
+    raw_build = str(getter(_CLIENT_APP_BUILD_HEADER, "") or "").strip()
+    if not re.fullmatch(r"[0-9]{1,12}", raw_build):
+        return False
+    return int(raw_build) <= _LAST_LEGACY_POSTURE_APP_BUILD
+
+
+def _client_workflow_route_family(path: str) -> str | None:
+    clean_path = str(path or "").split("?", 1)[0]
+    if clean_path in _FAST_ENDPOINTS or clean_path in {"/health-stream", "/power-state"}:
+        return None
+    first_segment = next((part for part in clean_path.split("/") if part), "")
+    if not first_segment or not re.fullmatch(r"[a-z0-9-]{1,48}", first_segment):
+        return "/other"
+    if first_segment.startswith("session") or first_segment in {
+        "activity",
+        "commands-stream",
+        "corpus",
+        "device-events",
+        "recent-projects",
+        "terminal-stream",
+        "terminal-surface",
+        "terminal-surface-v2",
+        "terminal-surface-stream",
+        "terminal-surface-stream-v2",
+        "terminal-workspace",
+        "terminal-workspace-stream",
+        "transcript",
+        "transcript-stream",
+        "turn-state-stream",
+    }:
+        return "/sessions"
+    if first_segment == "pairdrop":
+        return "/pairdrop"
+    if first_segment in {
+        "aperture-cli",
+        "compose",
+        "cross-provider-action",
+        "deepfield",
+        "filesystem",
+        "fleet",
+        "invocations",
+        "keep-awake",
+        "llm-route",
+        "model-status",
+        "onestream-handoff",
+        "open",
+        "orchestrations",
+        "pair",
+        "pairling-tools",
+        "personal-context",
+        "phone-tools",
+        "pickers",
+        "postures",
+        "providers",
+        "push",
+        "safety",
+        "send-text",
+        "sentinel",
+        "sigint",
+        "sigterm",
+        "spawn-session",
+        "status",
+        "substrate-feed",
+        "substrate-status",
+        "tokens",
+        "upload",
+        "worker-kill",
+        "workers",
+    }:
+        return f"/{first_segment}"
+    return "/other"
+
+
+def _maybe_audit_authenticated_client_workflow(
+    *,
+    auth_result,
+    headers,
+    client_address,
+    path: str,
+    method: str,
+    proof_verified: bool,
+) -> bool:
+    if DEVICE_REGISTRY is None or auth_result is None or not getattr(auth_result, "ok", False):
+        return False
+    device_id = str(getattr(auth_result, "device_id", "") or "").strip()
+    release = _validated_client_release_headers(headers)
+    route_family = _client_workflow_route_family(path)
+    if not device_id or release is None or route_family is None:
+        return False
+
+    transport = (
+        "pairling_connectd"
+        if _pairdrop_gateway_provenance_ok(headers, client_address)
+        else "direct"
+    )
+    method_value = str(method or "GET").upper()
+    key = (
+        device_id,
+        release["app_build"],
+        release["app_source_revision"],
+        route_family,
+        method_value,
+        transport,
+    )
+    now = _time.time()
+    with _client_workflow_audit_lock:
+        last_at = _client_workflow_audit_last.get(key)
+        if last_at is not None and now - last_at < _CLIENT_WORKFLOW_AUDIT_INTERVAL_SECONDS:
+            return False
+        _client_workflow_audit_last[key] = now
+        if len(_client_workflow_audit_last) > _CLIENT_WORKFLOW_AUDIT_MAX_KEYS:
+            oldest_keys = sorted(
+                _client_workflow_audit_last,
+                key=_client_workflow_audit_last.get,
+            )[: max(1, _CLIENT_WORKFLOW_AUDIT_MAX_KEYS // 4)]
+            for old_key in oldest_keys:
+                _client_workflow_audit_last.pop(old_key, None)
+
+    detail = {
+        **release,
+        "method": method_value,
+        "transport": transport,
+        "proof_verified": bool(proof_verified),
+        "device_identity_source": "bearer_auth",
+        "release_identity_source": "client_reported",
+    }
+    provenance = _connectd_peer_provenance(headers) if transport == "pairling_connectd" else None
+    if provenance:
+        detail["peer_provenance"] = provenance
+    try:
+        DEVICE_REGISTRY.record_audit(
+            "client.workflow.request",
+            device_id=device_id,
+            outcome="authenticated",
+            path=route_family,
+            detail=detail,
+        )
+    except Exception:
+        with _client_workflow_audit_lock:
+            if _client_workflow_audit_last.get(key) == now:
+                _client_workflow_audit_last.pop(key, None)
+        return False
+    return True
+
+
+def _clear_client_workflow_audit_for_tests() -> None:
+    with _client_workflow_audit_lock:
+        _client_workflow_audit_last.clear()
+
+
 def _path_and_query(parsed) -> str:
     return parsed.path + (f"?{parsed.query}" if parsed.query else "")
 
@@ -2094,7 +2312,31 @@ def _rate_limit_for_high_risk_endpoint(path: str) -> int:
         # at two keys a second. The client coalesces (~50ms flush) so real
         # rates sit far below this ceiling — it exists to stay a ceiling.
         return 2400
+    if _pairdrop_upload_bytes_id(path) is not None:
+        # The iOS resumable uploader sends 512 KiB proof-bound chunks. A 4 GiB
+        # object needs 8,192 requests, so the generic mutation ceiling would
+        # stop a valid upload near 60 MiB. The rate key collapses all chunk paths
+        # into one authenticated-device bucket so random upload IDs cannot mint
+        # fresh limits. The store separately enforces ownership, serialization,
+        # total bytes, and reserved disk capacity.
+        return 20_000
     return 120
+
+
+def _rate_limit_key_path(path: str) -> str:
+    if _pairdrop_upload_bytes_id(path) is not None:
+        return "/pairdrop/uploads/*/bytes"
+    if _pairdrop_upload_complete_id(path) is not None:
+        return "/pairdrop/uploads/*/complete"
+    if _pairdrop_upload_id_from_path(path) is not None:
+        return "/pairdrop/uploads/*"
+    if _pairdrop_attach_file_id(path) is not None:
+        return "/pairdrop/files/*/attach"
+    if _pairdrop_file_content_id(path) is not None:
+        return "/pairdrop/files/*/content"
+    if _pairdrop_file_id_from_path(path) is not None:
+        return "/pairdrop/files/*"
+    return path
 
 
 def _parse_single_byte_range(raw: str, total: int) -> tuple[int, int, bool]:
@@ -2106,15 +2348,20 @@ def _parse_single_byte_range(raw: str, total: int) -> tuple[int, int, bool]:
     first, last = match.group(1), match.group(2)
     if first == "" and last == "":
         raise PairDropStoreError("bad_range")
-    if first == "":
-        suffix_len = int(last)
-        if suffix_len <= 0:
-            raise PairDropStoreError("range_not_satisfiable")
-        start = max(total - suffix_len, 0)
-        end = total - 1
-    else:
-        start = int(first)
-        end = int(last) if last else total - 1
+    if len(first) > 20 or len(last) > 20:
+        raise PairDropStoreError("bad_range")
+    try:
+        if first == "":
+            suffix_len = int(last)
+            if suffix_len <= 0:
+                raise PairDropStoreError("range_not_satisfiable")
+            start = max(total - suffix_len, 0)
+            end = total - 1
+        else:
+            start = int(first)
+            end = int(last) if last else total - 1
+    except ValueError as exc:
+        raise PairDropStoreError("bad_range") from exc
     if total <= 0 or start >= total or end < start:
         raise PairDropStoreError("range_not_satisfiable")
     end = min(end, total - 1)
@@ -2129,6 +2376,13 @@ def _pairdrop_attachment_filename(raw: str) -> str:
     return safe[:120].replace("\\", "_").replace('"', "_")
 
 
+def _pairdrop_content_disposition(raw: str) -> str:
+    display_name = str(raw or "pairdrop-file")[:120]
+    fallback = _pairdrop_attachment_filename(display_name)
+    encoded = quote(display_name, safe="")
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+
+
 def _pairdrop_safe_content_type(raw: str) -> str:
     value = str(raw or "").strip()
     if re.fullmatch(r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+", value):
@@ -2140,6 +2394,15 @@ def _request_rate_check(key: str, max_per_min: int = 120) -> tuple[bool, int]:
     now = _time.time()
     window_start = now - 60
     with _request_rate_lock:
+        if key not in _request_rate_state and len(_request_rate_state) >= _REQUEST_RATE_MAX_KEYS:
+            for existing_key, existing_timestamps in list(_request_rate_state.items()):
+                fresh = [stamp for stamp in existing_timestamps if stamp >= window_start]
+                if fresh:
+                    _request_rate_state[existing_key] = fresh
+                else:
+                    _request_rate_state.pop(existing_key, None)
+            if len(_request_rate_state) >= _REQUEST_RATE_MAX_KEYS:
+                return False, 60
         timestamps = [t for t in _request_rate_state.get(key, []) if t >= window_start]
         if len(timestamps) >= max_per_min:
             oldest = min(timestamps)
@@ -2148,6 +2411,37 @@ def _request_rate_check(key: str, max_per_min: int = 120) -> tuple[bool, int]:
         timestamps.append(now)
         _request_rate_state[key] = timestamps
     return True, 0
+
+
+def _reauth_rate_check(device_id: str, headers, client_address) -> tuple[bool, int]:
+    """Bound unauthenticated recovery work by both caller and target.
+
+    connectd is the trusted source of the tailnet node header. Hash both values
+    before using them as in-memory keys so attacker-controlled identifiers have
+    fixed storage cost and never appear in diagnostics.
+    """
+    origin = ""
+    if _pairdrop_gateway_provenance_ok(headers, client_address):
+        origin = _connectd_peer_node_id(headers)
+    if not origin:
+        origin = str(client_address[0] if client_address else "unknown")
+    origin_key = hashlib.sha256(origin.encode("utf-8")).hexdigest()
+    target_key = hashlib.sha256(str(device_id or "").encode("utf-8")).hexdigest()
+    allowed, retry_after = _request_rate_check(
+        f"pair_reauth:origin:{origin_key}",
+        max_per_min=20,
+    )
+    if not allowed:
+        return False, retry_after
+    return _request_rate_check(
+        f"pair_reauth:target:{target_key}",
+        max_per_min=10,
+    )
+
+
+def _clear_auth_result_cache() -> None:
+    with _auth_result_cache_lock:
+        _auth_result_cache.clear()
 
 
 def _runtime_info_snapshot() -> dict:
@@ -3890,25 +4184,30 @@ def _health_routes(coordinator: dict) -> list[dict]:
         if not isinstance(base_url, str) or not base_url:
             continue
         ready = route.get("status") == "ready"
+        kind = str(route.get("kind") or "tailnet")
+        is_funnel = kind == "funnel"
         routes.append({
-            "kind": str(route.get("kind") or "tailnet"),
+            "kind": kind,
             "base_url": base_url,
             "status": "ok" if ready else "degraded",
-            "score": 90 if ready else 30,
+            "score": (10 if ready else 5) if is_funnel else (110 if ready else 30),
             "last_ok_at": now if ready else None,
             "source": str(route.get("source") or "pairling_connectd"),
-            "id": route.get("id"),
+            "id": route.get("id") or ("pairling-connect-funnel" if is_funnel else "pairling-connect-tailnet"),
         })
     tailnet = _tailnet_ip()
     if tailnet:
-        ok = coordinator.get("posture") in ("ready", "warning")
-        routes.append({
-            "kind": "tailnet",
-            "base_url": f"http://{tailnet}:{PORT}",
-            "status": "ok" if ok else "degraded",
-            "score": 100 if ok else 40,
-            "last_ok_at": now if ok else None,
-        })
+        tailnet_base_url = f"http://{tailnet}:{PORT}"
+        if not any(route["base_url"] == tailnet_base_url for route in routes):
+            routes.append({
+                "kind": "tailnet",
+                "base_url": tailnet_base_url,
+                "status": "candidate",
+                "score": 40,
+                "last_ok_at": None,
+                "source": "standalone_tailnet",
+                "id": "standalone-tailnet",
+            })
     for ip in _lan_ips()[:2]:
         routes.append({
             "kind": "lan",
@@ -3916,6 +4215,8 @@ def _health_routes(coordinator: dict) -> list[dict]:
             "status": "candidate",
             "score": 20,
             "last_ok_at": None,
+            "source": "lan",
+            "id": f"lan-{ip}",
         })
     if not routes:
         host = os.environ.get("PAIRLING_BOUND_HOST", f"0.0.0.0")
@@ -3926,7 +4227,10 @@ def _health_routes(coordinator: dict) -> list[dict]:
             "status": "unknown",
             "score": 0,
             "last_ok_at": None,
+            "source": "manual",
+            "id": "manual-bound-host",
         })
+    routes.sort(key=lambda route: int(route["score"]), reverse=True)
     return routes
 
 
@@ -6746,6 +7050,7 @@ def _start_standard_turn_push_publisher():
         turn_state_dir=TURN_STATE_DIR,
         push_dispatcher=PUSH_DISPATCHER,
         claude_session_resolver=_lookup_claude_session_for_uuid,
+        mac_install_id=getattr(PAIRING_STORE, "install_id", "") if PAIRING_STORE else "",
         logger=lambda msg: print(f"[standard-turn-publisher] {msg}", file=sys.stderr, flush=True),
     )
     publisher.start()
@@ -11016,6 +11321,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         required_scopes = _required_scopes_for_request(u.path, self.command)
+        internal_route_probe = _internal_route_probe_request(u.path, self.headers, self.client_address)
         token = _bearer_token(self.headers)
         if token:
             if DEVICE_REGISTRY is None:
@@ -11066,7 +11372,7 @@ class Handler(BaseHTTPRequestHandler):
                 }, status=auth_result.status)
                 return
             self.pairling_auth = auth_result
-        elif u.path not in PUBLIC_ENDPOINTS:
+        elif u.path not in PUBLIC_ENDPOINTS and not internal_route_probe:
             admission.release()
             self._send_json({
                 "ok": False,
@@ -11145,7 +11451,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.pairling_auth is not None and _is_high_risk_endpoint(u.path) and DEVICE_REGISTRY is not None:
             max_per_min = _rate_limit_for_high_risk_endpoint(u.path)
-            allowed, retry = _request_rate_check(f"{self.pairling_auth.device_id}:{u.path}", max_per_min=max_per_min)
+            rate_path = _rate_limit_key_path(u.path)
+            allowed, retry = _request_rate_check(
+                f"{self.pairling_auth.device_id}:{rate_path}",
+                max_per_min=max_per_min,
+            )
             if not allowed:
                 admission.release()
                 self._send_json({
@@ -11155,7 +11465,7 @@ class Handler(BaseHTTPRequestHandler):
                         "message": "too many mutating requests",
                     },
                     "retry_after": retry,
-                }, status=429)
+                }, status=429, headers={"Retry-After": str(retry)})
                 return
             try:
                 DEVICE_REGISTRY.record_audit(
@@ -11164,6 +11474,19 @@ class Handler(BaseHTTPRequestHandler):
                     outcome="ok",
                     path=u.path,
                     detail={"method": self.command, "scopes": sorted(required_scopes)},
+                )
+            except Exception:
+                pass
+
+        if self.pairling_auth is not None:
+            try:
+                _maybe_audit_authenticated_client_workflow(
+                    auth_result=self.pairling_auth,
+                    headers=self.headers,
+                    client_address=self.client_address,
+                    path=u.path,
+                    method=self.command,
+                    proof_verified=proof_verified,
                 )
             except Exception:
                 pass
@@ -11737,6 +12060,19 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("body must be a JSON object")
         return payload
 
+    def _resolve_self_device_target(self, requested_device_id) -> str | None:
+        device_id, error = _self_device_target(self.pairling_auth, requested_device_id)
+        if error is not None:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": error["code"],
+                    "message": error["message"],
+                },
+            }, status=int(error["status"]))
+            return None
+        return device_id
+
     def _handle_pairling_tools_run(self, q):
         if run_pairling_tool is None:
             self._send_json({
@@ -11753,6 +12089,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
             return
 
+        payload, target_error = _pairling_tools_payload_for_auth(self.pairling_auth, payload)
+        if target_error is not None:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": target_error["code"],
+                    "message": target_error["message"],
+                },
+            }, status=int(target_error["status"]))
+            return
         result = run_pairling_tool(payload)
         if DEVICE_REGISTRY is not None and audit_detail_for_tool_run is not None:
             error_payload = result.get("error") if isinstance(result.get("error"), dict) else {}
@@ -11784,7 +12130,41 @@ class Handler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, ValueError) as exc:
             self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
             return
-        state = PHONE_TOOL_AVAILABILITY.update(payload)
+        device_id = getattr(self.pairling_auth, "device_id", None)
+        worker_id = str(payload.get("worker_id") or "legacy")[:100]
+        supersedes_worker_id = str(payload.get("supersedes_worker_id") or "").strip()[:100] or None
+        if not isinstance(payload.get("listener_running"), bool):
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "invalid_boolean",
+                    "message": "listener_running must be a JSON boolean",
+                },
+            }, status=400)
+            return
+        listener_running = payload["listener_running"]
+        if PHONE_TOOL_WORK_QUEUE is not None:
+            if listener_running:
+                if not PHONE_TOOL_WORK_QUEUE.activate_worker(
+                    device_id=device_id,
+                    worker_id=worker_id,
+                    supersedes_worker_id=supersedes_worker_id,
+                ):
+                    self._send_json({
+                        "ok": False,
+                        "error": {
+                            "code": "phone_tools_worker_stale",
+                            "message": "This Phone Tools worker lifecycle has already stopped.",
+                        },
+                    }, status=409)
+                    return
+            else:
+                PHONE_TOOL_WORK_QUEUE.deactivate_worker(device_id=device_id, worker_id=worker_id)
+        state = PHONE_TOOL_AVAILABILITY.update(
+            payload,
+            device_id=device_id,
+            reactivate=worker_id == "legacy",
+        )
         self._send_json({
             "ok": True,
             "schema_version": 1,
@@ -11807,25 +12187,55 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
             return
         tools = payload.get("tools") if isinstance(payload.get("tools"), list) else []
-        wait_seconds = payload.get("wait_seconds") or 10
-        request = PHONE_TOOL_WORK_QUEUE.next_request(
-            device_id=getattr(self.pairling_auth, "device_id", None),
-            tools=tools,
-            wait_seconds=wait_seconds,
-        )
+        raw_wait_seconds = payload.get("wait_seconds", 10)
+        if isinstance(raw_wait_seconds, bool):
+            wait_seconds = None
+        else:
+            try:
+                wait_seconds = int(raw_wait_seconds)
+            except (TypeError, ValueError):
+                wait_seconds = None
+        if wait_seconds is None:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "invalid_wait_seconds",
+                    "message": "wait_seconds must be an integer",
+                },
+            }, status=400)
+            return
+        wait_seconds = max(1, min(wait_seconds, 25))
+        worker_id = str(payload.get("worker_id") or "legacy")[:100]
+        device_id = getattr(self.pairling_auth, "device_id", None)
+        if not PHONE_TOOL_WORK_QUEUE.worker_is_active(device_id=device_id, worker_id=worker_id):
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "phone_tools_worker_stale",
+                    "message": "This Phone Tools worker is no longer active.",
+                },
+            }, status=409)
+            return
         if PHONE_TOOL_AVAILABILITY is not None:
             PHONE_TOOL_AVAILABILITY.update({
                 "listener_running": True,
                 "port": 0,
                 "tools": tools,
                 "app_state": "foreground-worker",
-                "expires_in_seconds": 30,
-            })
+                "expires_in_seconds": max(20, min(int(wait_seconds or 10) + 20, 120)),
+                "worker_id": worker_id,
+            }, device_id=device_id, reactivate=False)
+        request = PHONE_TOOL_WORK_QUEUE.next_request(
+            device_id=device_id,
+            tools=tools,
+            wait_seconds=wait_seconds,
+            worker_id=worker_id,
+        )
         self._send_json({
             "ok": True,
             "schema_version": 1,
             "request": request,
-            "worker": PHONE_TOOL_WORK_QUEUE.snapshot(),
+            "worker": PHONE_TOOL_WORK_QUEUE.snapshot(device_id=device_id),
         })
 
     def _handle_phone_tools_result(self, q):
@@ -11843,16 +12253,35 @@ class Handler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, ValueError) as exc:
             self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
             return
-        ok = PHONE_TOOL_WORK_QUEUE.complete(
+        if not isinstance(payload.get("ok"), bool):
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "invalid_boolean",
+                    "message": "ok must be a JSON boolean",
+                },
+            }, status=400)
+            return
+        completion = PHONE_TOOL_WORK_QUEUE.complete(
             request_id=str(payload.get("request_id") or ""),
-            ok=bool(payload.get("ok")),
+            ok=payload["ok"],
             result=str(payload.get("result") or ""),
             error=str(payload.get("error") or ""),
+            device_id=getattr(self.pairling_auth, "device_id", None),
+            worker_id=str(payload.get("worker_id") or "legacy")[:100],
         )
-        self._send_json({
-            "ok": ok,
-            "schema_version": 1,
-        }, status=200 if ok else 404)
+        if completion != "accepted":
+            self._send_json({
+                "ok": False,
+                "schema_version": 1,
+                "error": {
+                    "code": "phone_tools_result_stale",
+                    "message": "This Phone Tools result no longer belongs to an active request.",
+                    "state": completion,
+                },
+            }, status=409)
+            return
+        self._send_json({"ok": True, "schema_version": 1})
 
     def _pairing_host_chain(self) -> list[str]:
         hosts: list[str] = []
@@ -12149,14 +12578,6 @@ class Handler(BaseHTTPRequestHandler):
         if REAUTH_STORE is None:
             self._send_json({"ok": False, "error": {"code": "pairing_unavailable", "message": "reauth unavailable"}}, status=503)
             return
-        allowed, retry_after = _request_rate_check(f"pair_reauth:{self.client_address[0]}", max_per_min=10)
-        if not allowed:
-            self.send_response(429)
-            self.send_header("Retry-After", str(retry_after))
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"ok": False, "error": {"code": "rate_limited", "message": "too many reauth attempts"}}).encode("utf-8"))
-            return
         try:
             payload = self._read_json_object()
         except ValueError as exc:
@@ -12165,6 +12586,14 @@ class Handler(BaseHTTPRequestHandler):
         device_id = str(payload.get("device_id") or "")
         if not device_id:
             self._send_json({"ok": False, "error": {"code": "device_id_required", "message": "device_id required"}}, status=400)
+            return
+        allowed, retry_after = _reauth_rate_check(device_id, self.headers, self.client_address)
+        if not allowed:
+            self._send_json(
+                {"ok": False, "error": {"code": "rate_limited", "message": "too many reauth attempts"}},
+                status=429,
+                headers={"Retry-After": str(retry_after)},
+            )
             return
         # A challenge is issued for ANY device_id (even unknown / revoked) so
         # this endpoint never reveals whether a device exists.
@@ -12183,8 +12612,19 @@ class Handler(BaseHTTPRequestHandler):
         device_id = str(payload.get("device_id") or "")
         challenge = str(payload.get("challenge") or "")
         signature_b64 = str(payload.get("signature") or "")
+        if not device_id:
+            self._send_json({"ok": False, "error": {"code": "reauth_failed", "message": "reauth failed"}}, status=401)
+            return
+        allowed, retry_after = _reauth_rate_check(device_id, self.headers, self.client_address)
+        if not allowed:
+            self._send_json(
+                {"ok": False, "error": {"code": "rate_limited", "message": "too many reauth attempts"}},
+                status=429,
+                headers={"Retry-After": str(retry_after)},
+            )
+            return
         try:
-            signature = base64.b64decode(signature_b64) if signature_b64 else b""
+            signature = base64.b64decode(signature_b64, validate=True) if signature_b64 else b""
         except Exception:
             signature = b""
         verified = REAUTH_STORE.verify_and_consume(device_id, challenge, signature)
@@ -12194,7 +12634,15 @@ class Handler(BaseHTTPRequestHandler):
             # bad signature / expired-or-used challenge. No enumeration oracle.
             self._send_json({"ok": False, "error": {"code": "reauth_failed", "message": "reauth failed"}}, status=401)
             return
+        _clear_auth_result_cache()
+        self._invalidate_phone_tools_device(device_id, reason="iphone_credential_changed")
         self._send_json({"ok": True, "device": {"id": device_id, "token": new_token}})
+
+    def _invalidate_phone_tools_device(self, device_id: str, *, reason: str) -> None:
+        if PHONE_TOOL_WORK_QUEUE is not None:
+            PHONE_TOOL_WORK_QUEUE.deactivate_device(device_id, reason=reason)
+        if PHONE_TOOL_AVAILABILITY is not None:
+            PHONE_TOOL_AVAILABILITY.remove_device(device_id)
 
     def _handle_pair_revoke(self, q):
         if DEVICE_REGISTRY is None:
@@ -12205,11 +12653,13 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
             return
-        device_id = str(payload.get("device_id") or "")
-        if not device_id:
-            self._send_json({"ok": False, "error": {"code": "device_id_required"}}, status=400)
+        device_id = self._resolve_self_device_target(payload.get("device_id"))
+        if device_id is None:
             return
         revoked = DEVICE_REGISTRY.revoke_device(device_id, reason="api")
+        if revoked:
+            _clear_auth_result_cache()
+            self._invalidate_phone_tools_device(device_id, reason="iphone_pairing_revoked")
         if revoked and PUSH_DISPATCHER is not None:
             # A revoked pairing's push tokens are permanently undeliverable;
             # cascade the revocation into the push registry so nothing keeps
@@ -12229,14 +12679,15 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
             return
-        device_id = str(payload.get("device_id") or "")
-        if not device_id:
-            self._send_json({"ok": False, "error": {"code": "device_id_required"}}, status=400)
+        device_id = self._resolve_self_device_target(payload.get("device_id"))
+        if device_id is None:
             return
         token = DEVICE_REGISTRY.rotate_token(device_id)
         if token is None:
             self._send_json({"ok": False, "error": {"code": "device_not_found"}}, status=404)
             return
+        _clear_auth_result_cache()
+        self._invalidate_phone_tools_device(device_id, reason="iphone_credential_changed")
         self._send_json({"ok": True, "device_id": device_id, "token": token})
 
     def _handle_pair_bind_node(self, q):
@@ -16770,10 +17221,31 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({"ok": True, "file": path.name})
 
     def _handle_postures_list(self, q):
-        self._send_json({"ok": True, "postures": postures.list_postures(self._postures_root())})
+        try:
+            rows = postures.list_postures(self._postures_root())
+        except (postures.PostureIOError, OSError) as exc:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": getattr(exc, "code", "posture_io_failed"),
+                    "message": "The posture files on this Mac could not be read.",
+                },
+            }, status=500)
+            return
+        self._send_json({"ok": True, "postures": rows})
 
     def _handle_posture_read(self, q, slug: str):
-        row = postures.read_posture(self._postures_root(), slug)
+        try:
+            row = postures.read_posture(self._postures_root(), slug)
+        except (postures.PostureIOError, OSError) as exc:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": getattr(exc, "code", "posture_io_failed"),
+                    "message": "This posture could not be read from the Mac.",
+                },
+            }, status=500)
+            return
         if row is None:
             self._send_json({"ok": False, "error": {"code": "not_found", "message": "no such posture"}}, status=404)
             return
@@ -16792,15 +17264,53 @@ class Handler(BaseHTTPRequestHandler):
         name = str(payload.get("name") or "").strip()
         description = str(payload.get("description") or "")
         body = str(payload.get("body") or "")
+        mode = str(payload.get("mode") or "").strip().lower()
+        original_slug = str(payload.get("original_slug") or "").strip() or None
+        expected_revision = str(payload.get("expected_revision") or "").strip() or None
         client_action_id = str(payload.get("client_action_id") or "").strip() or None
         body_hash = hashlib.sha256(raw).hexdigest()
         device_id = getattr(getattr(self, "pairling_auth", None), "device_id", None)
-        audit_action = {"type": "posture_write", "name": name[:80]}
+        audit_action = {
+            "type": "posture_write",
+            "name": name[:80],
+            "mode": mode or "legacy_upsert",
+            "original_slug": original_slug,
+        }
         if not name or not body.strip():
             self._send_json({"ok": False, "error": {"code": "invalid_request", "message": "name and body are required"}}, status=400)
             return
+        if mode not in {"", "create", "edit"}:
+            self._send_json({"ok": False, "error": {"code": "invalid_request", "message": "mode must be create or edit"}}, status=400)
+            return
+        if mode == "" and not _legacy_posture_request_allowed(self.headers):
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "posture_mode_required",
+                    "message": "Current clients must choose create or edit explicitly.",
+                },
+            }, status=400)
+            return
+        if mode == "create" and (original_slug is not None or expected_revision is not None):
+            self._send_json({"ok": False, "error": {"code": "invalid_request", "message": "create cannot include an original slug or expected revision"}}, status=400)
+            return
+        if mode == "edit" and (original_slug is None or expected_revision is None):
+            self._send_json({"ok": False, "error": {"code": "invalid_request", "message": "edit requires original_slug and expected_revision"}}, status=400)
+            return
         try:
-            written = postures.write_posture(self._postures_root(), name=name, description=description, body=body)
+            written = postures.mutate_posture(
+                self._postures_root(),
+                name=name,
+                description=description,
+                body=body,
+                original_slug=original_slug if mode == "edit" else None,
+                expected_revision=expected_revision if mode == "edit" else None,
+                create_only=mode == "create",
+                # Builds before the versioned edit contract used POST as an
+                # upsert. Keep that wire behavior for those clients, but mark
+                # it in both the response and audit receipt.
+                legacy_upsert=mode == "",
+            )
         except postures.PostureTooLarge:
             receipt = _make_action_receipt(
                 client_action_id=client_action_id,
@@ -16820,7 +17330,7 @@ class Handler(BaseHTTPRequestHandler):
                 "receipt": receipt,
             }, status=413)
             return
-        except (ValueError, OSError) as exc:
+        except postures.PostureConflict as exc:
             receipt = _make_action_receipt(
                 client_action_id=client_action_id,
                 state="rejected",
@@ -16830,12 +17340,52 @@ class Handler(BaseHTTPRequestHandler):
             _store_action_receipt(
                 device_id, "", client_action_id, body_hash, receipt,
                 action_kind="posture_write",
-                audit_action={**audit_action, "error": str(exc)[:120]},
+                audit_action={**audit_action, "error": "posture_conflict"},
+                persist=False,
+            )
+            current = exc.current if isinstance(exc.current, dict) else None
+            current_summary = None
+            if current is not None:
+                current_summary = {
+                    key: current.get(key)
+                    for key in ("slug", "name", "description", "mtime", "revision")
+                }
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "posture_conflict",
+                    "message": str(exc)[:200],
+                    "current": current_summary,
+                    "conflict_copies": exc.conflict_copies,
+                },
+                "receipt": receipt,
+            }, status=409)
+            return
+        except ValueError as exc:
+            self._send_json({
+                "ok": False,
+                "error": {"code": "invalid_request", "message": str(exc)[:200]},
+            }, status=400)
+            return
+        except (postures.PostureIOError, OSError) as exc:
+            receipt = _make_action_receipt(
+                client_action_id=client_action_id,
+                state="rejected",
+                idempotent=False,
+                phases=_receipt_phases(validated=True, applied=False, pty_written=False),
+            )
+            _store_action_receipt(
+                device_id, "", client_action_id, body_hash, receipt,
+                action_kind="posture_write",
+                audit_action={**audit_action, "error": type(exc).__name__},
                 persist=False,
             )
             self._send_json({
                 "ok": False,
-                "error": {"code": "posture_write_failed", "message": str(exc)[:200]},
+                "error": {
+                    "code": getattr(exc, "code", "posture_io_failed"),
+                    "message": "The posture could not be saved on this Mac.",
+                },
                 "receipt": receipt,
             }, status=500)
             return
@@ -16848,18 +17398,76 @@ class Handler(BaseHTTPRequestHandler):
         _store_action_receipt(
             device_id, "", client_action_id, body_hash, receipt,
             action_kind="posture_write",
-            # Overwrite is allowed but never silent (SPEC-p6 §4): the receipt
-            # records that this write replaced an existing posture.
-            audit_action={**audit_action, "slug": written["slug"], "overwrote": written["overwrote"]},
+            audit_action={
+                **audit_action,
+                "slug": written["slug"],
+                "overwrote": written["overwrote"],
+                "renamed_from": written.get("renamed_from"),
+                "revision": written.get("revision"),
+                "legacy_upsert": written.get("legacy_upsert", False),
+            },
             persist=False,
         )
         self._send_json({"ok": True, "posture": written, "receipt": receipt})
 
     def _handle_posture_delete(self, q, slug: str):
         client_action_id = (q.get("client_action_id", [None]) or [None])[0]
+        expected_revision = str((q.get("expected_revision", [""]) or [""])[0] or "").strip() or None
         device_id = getattr(getattr(self, "pairling_auth", None), "device_id", None)
         audit_action = {"type": "posture_delete", "slug": slug[:80]}
-        removed = postures.delete_posture(self._postures_root(), slug)
+        legacy_delete = expected_revision is None and _legacy_posture_request_allowed(self.headers)
+        if expected_revision is None and not legacy_delete:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "posture_revision_required",
+                    "message": "Current clients must provide the posture revision when deleting.",
+                },
+            }, status=400)
+            return
+        try:
+            removed = postures.delete_posture(
+                self._postures_root(),
+                slug,
+                expected_revision=expected_revision,
+                # An omitted revision is the intentional compatibility path
+                # for already-shipped clients. Current clients always send it.
+                require_revision=not legacy_delete,
+            )
+        except postures.PostureConflict as exc:
+            receipt = _make_action_receipt(
+                client_action_id=client_action_id,
+                state="rejected",
+                idempotent=False,
+                phases=_receipt_phases(validated=True, applied=False, pty_written=False),
+            )
+            _store_action_receipt(
+                device_id, "", client_action_id, "", receipt,
+                action_kind="posture_delete",
+                audit_action={**audit_action, "error": "posture_conflict"},
+                persist=False,
+            )
+            self._send_json({
+                "ok": False,
+                "error": {"code": "posture_conflict", "message": str(exc)[:200]},
+                "receipt": receipt,
+            }, status=409)
+            return
+        except ValueError as exc:
+            self._send_json({
+                "ok": False,
+                "error": {"code": "invalid_request", "message": str(exc)[:200]},
+            }, status=400)
+            return
+        except (postures.PostureIOError, OSError) as exc:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": getattr(exc, "code", "posture_io_failed"),
+                    "message": "The posture could not be deleted from this Mac.",
+                },
+            }, status=500)
+            return
         receipt = _make_action_receipt(
             client_action_id=client_action_id,
             state="applied" if removed else "rejected",
@@ -16976,12 +17584,19 @@ class Handler(BaseHTTPRequestHandler):
         "biotech-research-",
     )
 
-    def _send_json(self, payload: dict, status: int = 200):
+    def _send_json(
+        self,
+        payload: dict,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+    ):
         body = json.dumps(payload).encode()
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError) as exc:
@@ -17859,7 +18474,9 @@ class Handler(BaseHTTPRequestHandler):
                 },
             }, status=503)
             return
-        device_id = q.get("device_id", [getattr(self.pairling_auth, "device_id", None)])[0]
+        device_id = self._resolve_self_device_target(q.get("device_id", [None])[0])
+        if device_id is None:
+            return
         self._send_json(PUSH_DISPATCHER.status(device_id=device_id))
 
     def _handle_push_preferences(self, q):
@@ -17874,7 +18491,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             payload = self._read_json_object()
-            device_id = str(payload.get("device_id") or getattr(self.pairling_auth, "device_id", "") or "")
+            device_id = self._resolve_self_device_target(payload.get("device_id"))
+            if device_id is None:
+                return
             result = PUSH_DISPATCHER.update_preferences(device_id=device_id, payload=payload)
         except (ValueError, json.JSONDecodeError) as exc:
             self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
@@ -18085,7 +18704,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             payload = self._read_json_object()
-            device_id = str(payload.get("device_id") or getattr(self.pairling_auth, "device_id", "") or "")
+            device_id = self._resolve_self_device_target(payload.get("device_id"))
+            if device_id is None:
+                return
             result = PUSH_DISPATCHER.record_test(device_id=device_id, payload=payload)
         except (ValueError, json.JSONDecodeError) as exc:
             self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
@@ -18107,7 +18728,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             payload = self._read_json_object()
-            device_id = str(payload.get("device_id") or getattr(self.pairling_auth, "device_id", "") or "")
+            device_id = self._resolve_self_device_target(payload.get("device_id"))
+            if device_id is None:
+                return
             result = PUSH_DISPATCHER.record_live_activity_token(device_id=device_id, payload=payload)
         except (ValueError, json.JSONDecodeError) as exc:
             self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
@@ -18129,7 +18752,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             payload = self._read_json_object()
-            device_id = str(payload.get("device_id") or getattr(self.pairling_auth, "device_id", "") or "")
+            device_id = self._resolve_self_device_target(payload.get("device_id"))
+            if device_id is None:
+                return
             result = PUSH_DISPATCHER.record_live_activity_test(device_id=device_id, payload=payload)
         except (ValueError, json.JSONDecodeError) as exc:
             self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
@@ -18234,7 +18859,9 @@ class Handler(BaseHTTPRequestHandler):
                 token_sessions = []
             human_idle = payload.get("human_idle_minutes")
             human_idle_minutes = float(human_idle) if human_idle not in (None, "") else None
-            device_id = str(payload.get("device_id") or getattr(self.pairling_auth, "device_id", "") or "")
+            device_id = self._resolve_self_device_target(payload.get("device_id"))
+            if device_id is None:
+                return
             result = SENTINEL_NOTIFICATIONS.evaluate_now(
                 worker_stats=worker_stats,
                 token_sessions=token_sessions,
@@ -23366,7 +23993,7 @@ Worker instructions:
 
     # ----- /search: Spotlight-style cross-session text search -----
     def _handle_search(self, q):
-        """Walk every JSONL in ~/.claude/projects/*/ and return the top
+        """Walk every Claude and Codex transcript and return the top
         matches for `q`. Substring + token match, scored by:
           - term frequency in the matching turn (×1)
           - recency boost (× decay over 30 days)
@@ -23394,9 +24021,14 @@ Worker instructions:
         tokens = [t for t in re.split(r"\s+", q_lower) if len(t) >= 2]
 
         results: list[dict] = []
+        def keep_result(row: dict) -> None:
+            results.append(row)
+            if len(results) > limit * 2:
+                results.sort(key=lambda item: item["score"], reverse=True)
+                del results[limit:]
         projects_root = HOME / ".claude" / "projects"
 
-        # Walk newest-modified first so we bail early on huge backlogs.
+        # Newest-first improves locality, but the search remains exhaustive.
         all_jsonl: list[tuple[float, "Path", str]] = []
         if provider_filter in ("all", "claude") and projects_root.exists():
             for project_dir in projects_root.iterdir():
@@ -23415,8 +24047,7 @@ Worker instructions:
         import time as _time
         now_ts = _time.time()
 
-        # Hard cap on examined files to keep the endpoint snappy at scale.
-        for mtime, jp, project_name in all_jsonl[:200]:
+        for mtime, jp, project_name in all_jsonl:
             try:
                 with open(jp, "rb") as f:
                     line_idx = 0
@@ -23511,7 +24142,7 @@ Worker instructions:
                         if end < len(body):
                             snippet = snippet + "…"
 
-                        results.append({
+                        keep_result({
                             "session_id": _qualified_session_id("claude", jp.stem),
                             "provider": "claude",
                             "native_id": jp.stem,
@@ -23525,14 +24156,9 @@ Worker instructions:
                         })
             except OSError:
                 continue
-            # Stop scanning once we've gathered comfortably more than `limit`
-            # so high-relevance early files dominate without scanning the
-            # whole archive.
-            if len(results) >= limit * 4:
-                break
 
         if provider_filter in ("all", "codex"):
-            for jp in _codex_rollout_paths()[:200]:
+            for jp in _codex_rollout_paths():
                 try:
                     st = jp.stat()
                 except OSError:
@@ -23620,7 +24246,7 @@ Worker instructions:
                                     snippet = "…" + snippet
                                 if end < len(body):
                                     snippet = snippet + "…"
-                                results.append({
+                                keep_result({
                                     "session_id": _qualified_session_id("codex", native_id),
                                     "provider": "codex",
                                     "native_id": native_id,
@@ -23634,14 +24260,13 @@ Worker instructions:
                                 })
                 except OSError:
                     continue
-                if len(results) >= limit * 4:
-                    break
 
         results.sort(key=lambda r: r["score"], reverse=True)
         self._json_response(200, {
             "ok": True,
             "count": min(len(results), limit),
             "results": results[:limit],
+            "exhaustive": True,
         })
 
     def _json_response(self, code: int, payload: dict) -> None:
@@ -24301,9 +24926,14 @@ Worker instructions:
 
     # ----- /pairdrop/*: private Mac-backed Pairling Connect file vault -----
     def _pairdrop_store(self):
+        global _PAIRDROP_STORE_SINGLETON
         if PairDropStore is None:
             raise RuntimeError("PairDrop store unavailable")
-        return PairDropStore(HOME / "PairDrop")
+        if _PAIRDROP_STORE_SINGLETON is None:
+            with _PAIRDROP_STORE_SINGLETON_LOCK:
+                if _PAIRDROP_STORE_SINGLETON is None:
+                    _PAIRDROP_STORE_SINGLETON = PairDropStore(HOME / "PairDrop")
+        return _PAIRDROP_STORE_SINGLETON
 
     def _pairdrop_source(self) -> tuple[str, str]:
         auth = getattr(self, "pairling_auth", None)
@@ -24317,11 +24947,22 @@ Worker instructions:
 
     def _send_pairdrop_error(self, err, *, status: int = 400):
         code = getattr(err, "code", None) or str(err) or "pairdrop_error"
+        if code == "transfer_too_large":
+            status = 413
+        elif code == "insufficient_storage":
+            status = 507
+        elif code == "free_space_unavailable":
+            status = 503
+        messages = {
+            "transfer_too_large": "PairDrop file exceeds the configured transfer limit",
+            "insufficient_storage": "PairDrop does not have enough reserved free space",
+            "free_space_unavailable": "PairDrop could not verify free disk space",
+        }
         self._send_json({
             "ok": False,
             "error": {
                 "code": code,
-                "message": code.replace("_", " "),
+                "message": messages.get(code, code.replace("_", " ")),
             },
         }, status=status)
 
@@ -24404,9 +25045,60 @@ Worker instructions:
                 return
             self.send_error(404, "PairDrop route not found")
         except PairDropStoreError as e:
-            self._send_pairdrop_error(e, status=404 if getattr(e, "code", "") in {"not_found", "deleted", "missing_object"} else 400)
-        except Exception as e:
-            self._send_json({"ok": False, "error": {"code": "pairdrop_failed", "message": str(e)}}, status=500)
+            self._send_pairdrop_error(
+                e,
+                status=(
+                    404
+                    if getattr(e, "code", "")
+                    in {"not_found", "deleted", "missing_object", "upload_not_found"}
+                    else 400
+                ),
+            )
+        except OSError as exc:
+            if exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}:
+                self._send_pairdrop_error(
+                    PairDropStoreError("insufficient_storage"),
+                    status=507,
+                )
+                return
+            Handler._send_unexpected_pairdrop_error(self, path, exc)
+        except sqlite3.OperationalError as exc:
+            if "full" in str(exc).lower():
+                self._send_pairdrop_error(
+                    PairDropStoreError("insufficient_storage"),
+                    status=507,
+                )
+                return
+            Handler._send_unexpected_pairdrop_error(self, path, exc)
+        except Exception as exc:
+            Handler._send_unexpected_pairdrop_error(self, path, exc)
+
+    def _send_unexpected_pairdrop_error(self, path: str, exc: Exception) -> None:
+        correlation_id = "pd_err_" + secrets.token_hex(8)
+        diagnostic = {
+            "event": "pairdrop.request_failed",
+            "correlation_id": correlation_id,
+            "route_family": _rate_limit_key_path(path),
+            "exception_type": type(exc).__name__,
+            "device_id": str(
+                getattr(getattr(self, "pairling_auth", None), "device_id", "")
+                or ""
+            ),
+        }
+        print(
+            "[pairdrop-error] " + json.dumps(diagnostic, sort_keys=True),
+            file=sys.stderr,
+            flush=True,
+        )
+        traceback.print_exc(file=sys.stderr)
+        self._send_json({
+            "ok": False,
+            "error": {
+                "code": "pairdrop_failed",
+                "message": "PairDrop could not complete the request",
+                "correlation_id": correlation_id,
+            },
+        }, status=500)
 
     def _handle_pairdrop_upload(self, q):
         filename = q.get("filename", [""])[0]
@@ -24427,7 +25119,7 @@ Worker instructions:
             session_hint=session_hint,
             expected_sha256=expected_sha256,
         )
-        item = {k: v for k, v in item.items() if k != "storage_relpath"}
+        item = self._public_pairdrop_file(item)
         self._send_json({"ok": True, "file": item}, status=201)
 
     def _read_json_object(self) -> dict:
@@ -24448,23 +25140,48 @@ Worker instructions:
             if key not in {"source_device_id", "source_install_id"}
         }
 
+    def _public_pairdrop_file(self, item: dict) -> dict:
+        return {
+            key: value for key, value in item.items()
+            if key
+            not in {
+                "storage_relpath",
+                "source_device_id",
+                "source_install_id",
+                "session_hint",
+            }
+        }
+
     def _handle_pairdrop_upload_session_create(self):
         payload = self._read_json_object()
-        filename = str(payload.get("filename") or "").strip()
+        filename_value = payload.get("filename")
+        if not isinstance(filename_value, str):
+            raise PairDropStoreError("bad_filename")
+        filename = filename_value.strip()
         if not filename:
             raise PairDropStoreError("filename_required")
         total = payload.get("total_byte_count", payload.get("byte_size", 0))
-        expected_sha256 = str(payload.get("sha256") or payload.get("expected_sha256") or "").strip()
-        content_type = str(payload.get("content_type") or "application/octet-stream")
+        expected_sha256_value = payload.get(
+            "sha256",
+            payload.get("expected_sha256"),
+        )
+        if not isinstance(expected_sha256_value, str):
+            raise PairDropStoreError("bad_expected_sha256")
+        expected_sha256 = expected_sha256_value.strip()
+        content_type = payload.get("content_type", "application/octet-stream")
+        if not isinstance(content_type, str):
+            raise PairDropStoreError("bad_content_type")
+        create_idempotency_key = payload.get("create_idempotency_key")
         device_id, install_id = self._pairdrop_source()
         session = self._pairdrop_store().create_upload_session(
             filename=filename,
             content_type=content_type,
-            total_byte_count=int(total or 0),
+            total_byte_count=total,
             expected_sha256=expected_sha256,
             source_device_id=device_id,
             source_install_id=install_id,
             source_route=self._pairdrop_source_route(),
+            create_idempotency_key=create_idempotency_key,
         )
         self._send_json({"ok": True, "upload": self._public_upload_session(session)}, status=201)
 
@@ -24477,33 +25194,48 @@ Worker instructions:
         )
         self._send_json({"ok": True, "upload": self._public_upload_session(session)})
 
-    def _pairdrop_chunk_offset(self, body_len: int) -> int:
+    def _pairdrop_chunk_offset(self, body_len: int) -> tuple[int, int | None]:
         content_range = str(self.headers.get("Content-Range") or "").strip()
         if content_range:
             match = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", content_range)
             if not match:
                 raise PairDropStoreError("bad_content_range")
-            start = int(match.group(1))
-            end = int(match.group(2))
+            numeric_parts = [match.group(1), match.group(2)]
+            if match.group(3) != "*":
+                numeric_parts.append(match.group(3))
+            if any(len(part) > 20 for part in numeric_parts):
+                raise PairDropStoreError("bad_content_range")
+            try:
+                start = int(match.group(1))
+                end = int(match.group(2))
+                declared_total = (
+                    None if match.group(3) == "*" else int(match.group(3))
+                )
+            except ValueError as exc:
+                raise PairDropStoreError("bad_content_range") from exc
             if end < start or (end - start + 1) != body_len:
                 raise PairDropStoreError("content_range_mismatch")
-            return start
+            return start, declared_total
         offset = str(self.headers.get("X-PairDrop-Offset") or "").strip()
         if offset:
-            if not re.fullmatch(r"\d+", offset):
+            if len(offset) > 20 or not re.fullmatch(r"\d+", offset):
                 raise PairDropStoreError("bad_offset")
-            return int(offset)
+            try:
+                return int(offset), None
+            except ValueError as exc:
+                raise PairDropStoreError("bad_offset") from exc
         raise PairDropStoreError("offset_required")
 
     def _handle_pairdrop_upload_session_bytes(self, upload_id: str):
         body = self._read_body()
         chunk_sha256 = str(self.headers.get("X-PairDrop-Chunk-SHA256") or "").strip()
         idempotency_key = str(self.headers.get("Idempotency-Key") or "").strip()
-        offset = self._pairdrop_chunk_offset(len(body))
+        offset, declared_total = self._pairdrop_chunk_offset(len(body))
         device_id, install_id = self._pairdrop_source()
         session = self._pairdrop_store().write_upload_chunk(
             upload_id,
             offset=offset,
+            declared_total_byte_count=declared_total,
             data=body,
             chunk_sha256=chunk_sha256,
             idempotency_key=idempotency_key,
@@ -24519,7 +25251,7 @@ Worker instructions:
             source_device_id=device_id,
             source_install_id=install_id,
         )
-        file = {k: v for k, v in result["file"].items() if k != "storage_relpath"}
+        file = self._public_pairdrop_file(result["file"])
         self._send_json({"ok": True, "state": result["state"], "upload_id": upload_id, "file": file}, status=201)
 
     def _handle_pairdrop_upload_session_cancel(self, upload_id: str):
@@ -24532,16 +25264,27 @@ Worker instructions:
         self._send_json({"ok": True, "upload": self._public_upload_session(session)})
 
     def _handle_pairdrop_list(self, q):
-        include_deleted = q.get("include_deleted", ["false"])[0].lower() == "true"
-        files = [
-            {k: v for k, v in item.items() if k != "storage_relpath"}
-            for item in self._pairdrop_store().list_files(include_deleted=include_deleted)
-        ]
+        if q.get("include_deleted", ["false"])[0].lower() == "true":
+            raise PairDropStoreError("include_deleted_not_supported")
+        raw_limit = q.get("limit", ["100"])[0]
+        if not re.fullmatch(r"\d+", raw_limit):
+            raise PairDropStoreError("bad_limit")
+        cursor = q.get("cursor", [None])[0]
+        page = self._pairdrop_store().list_files_page(
+            limit=int(raw_limit),
+            cursor=cursor,
+        )
+        files = [self._public_pairdrop_file(item) for item in page["files"]]
         self._send_json({
             "ok": True,
-            "schema_version": 1,
+            "schema_version": 2,
             "mac_location": "~/PairDrop",
             "files": files,
+            "page": {
+                "limit": page["limit"],
+                "has_more": page["has_more"],
+                "next_cursor": page["next_cursor"],
+            },
         })
 
     def _handle_pairdrop_get(self, file_id: str, q):
@@ -24549,20 +25292,20 @@ Worker instructions:
             self._handle_pairdrop_download(file_id)
             return
         item = self._pairdrop_store().get_file(file_id)
-        item = {k: v for k, v in item.items() if k != "storage_relpath"}
+        item = self._public_pairdrop_file(item)
         self._send_json({"ok": True, "file": item})
 
     def _handle_pairdrop_download(self, file_id: str):
         descriptor = self._pairdrop_store().download_descriptor(file_id)
         item = descriptor["item"]
         path = descriptor["path"]
-        display_name = _pairdrop_attachment_filename(str(item.get("display_name") or "pairdrop-file"))
+        display_name = str(item.get("display_name") or "pairdrop-file")
         content_type = _pairdrop_safe_content_type(str(item.get("content_type") or "application/octet-stream"))
         byte_size = int(item.get("byte_size") or path.stat().st_size)
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(byte_size))
-        self.send_header("Content-Disposition", f'attachment; filename="{display_name}"')
+        self.send_header("Content-Disposition", _pairdrop_content_disposition(display_name))
         self.send_header("X-PairDrop-File-ID", str(item.get("id") or file_id))
         self.end_headers()
         with path.open("rb") as handle:
@@ -24600,7 +25343,7 @@ Worker instructions:
                 return
             raise
 
-        display_name = _pairdrop_attachment_filename(str(item.get("display_name") or "pairdrop-file"))
+        display_name = str(item.get("display_name") or "pairdrop-file")
         content_type = _pairdrop_safe_content_type(str(item.get("content_type") or "application/octet-stream"))
         length = end - start + 1
         self.send_response(206 if partial else 200)
@@ -24608,7 +25351,7 @@ Worker instructions:
         self.send_header("ETag", f'"{digest}"')
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(length))
-        self.send_header("Content-Disposition", f'attachment; filename="{display_name}"')
+        self.send_header("Content-Disposition", _pairdrop_content_disposition(display_name))
         self.send_header("X-PairDrop-File-ID", str(item.get("id") or file_id))
         self.send_header("X-PairDrop-SHA256", digest)
         if partial:
@@ -25232,7 +25975,7 @@ Worker instructions:
         '''
         return _run_osascript(script)
 
-    # ----- /corpus: walk EVERY project dir under ~/.claude/projects/ -----
+    # ----- /corpus: deterministic Claude + Codex transcript inventory -----
     def _handle_corpus(self, q):
         try:
             since = float(q.get("since", ["0"])[0])
@@ -25242,30 +25985,82 @@ Worker instructions:
         try:
             limit = int(q.get("limit", ["500"])[0])
         except ValueError:
-            limit = 500
+            self.send_error(400, "limit must be int")
+            return
+        limit = max(1, min(limit, 2000))
+
+        after_mtime_raw = q.get("after_mtime", [None])[0]
+        after_session_id = q.get("after_session_id", [None])[0]
+        if (after_mtime_raw is None) != (after_session_id is None):
+            self.send_error(400, "after_mtime and after_session_id must be supplied together")
+            return
+        after_key = None
+        if after_mtime_raw is not None:
+            try:
+                after_key = (float(after_mtime_raw), str(after_session_id))
+            except ValueError:
+                self.send_error(400, "after_mtime must be unix timestamp")
+                return
 
         projects_root = HOME / ".claude" / "projects"
         items = []
-        for project_dir in projects_root.iterdir():
-            if not project_dir.is_dir():
-                continue
-            if _is_excluded_project_dir_name(project_dir.name):
-                continue
-            for p in project_dir.glob("*.jsonl"):
-                try:
-                    st = p.stat()
-                except OSError:
+        if projects_root.is_dir():
+            for project_dir in projects_root.iterdir():
+                if not project_dir.is_dir():
                     continue
-                if st.st_mtime >= since:
-                    items.append({
-                        "session_id": p.stem,
-                        "project_dir": project_dir.name,
-                        "size": st.st_size,
-                        "mtime": st.st_mtime,
-                    })
-        items.sort(key=lambda x: x["mtime"], reverse=True)
-        items = items[:limit]
-        body = json.dumps({"count": len(items), "items": items}).encode()
+                if _is_excluded_project_dir_name(project_dir.name):
+                    continue
+                for p in project_dir.glob("*.jsonl"):
+                    try:
+                        st = p.stat()
+                    except OSError:
+                        continue
+                    if st.st_mtime >= since:
+                        items.append({
+                            "session_id": p.stem,
+                            "provider": "claude",
+                            "project_dir": project_dir.name,
+                            "size": st.st_size,
+                            "mtime": st.st_mtime,
+                        })
+
+        seen_codex = set()
+        for p in _codex_rollout_paths():
+            meta = _codex_rollout_meta(p)
+            native_id = str((meta or {}).get("id") or "")
+            if not native_id or native_id in seen_codex:
+                continue
+            seen_codex.add(native_id)
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            if st.st_mtime >= since:
+                items.append({
+                    "session_id": _qualified_session_id("codex", native_id),
+                    "provider": "codex",
+                    "project_dir": str((meta or {}).get("cwd") or ""),
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                })
+
+        items.sort(key=lambda x: (x["mtime"], x["session_id"]))
+        if after_key is not None:
+            items = [item for item in items if (item["mtime"], item["session_id"]) > after_key]
+        page = items[:limit]
+        has_more = len(items) > len(page)
+        next_cursor = None
+        if has_more and page:
+            next_cursor = {
+                "mtime": page[-1]["mtime"],
+                "session_id": page[-1]["session_id"],
+            }
+        body = json.dumps({
+            "count": len(page),
+            "items": page,
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+        }).encode()
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

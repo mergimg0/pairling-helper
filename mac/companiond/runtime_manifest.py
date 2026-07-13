@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,186 @@ def _manifest_file_hash(manifest: dict[str, Any], relative_path: str) -> str | N
     return None
 
 
+_VERIFY_CACHE_LOCK = threading.Lock()
+_VERIFY_CACHE: dict[str, tuple[tuple[int, int, str, str], bool, str | None]] = {}
+_VERIFY_CACHE_MAX_ENTRIES = 64
+
+
+def _runtime_payload_entries(root: Path) -> dict[str, tuple[Path, str, str | None]]:
+    entries: dict[str, tuple[Path, str, str | None]] = {}
+
+    def visit(directory: Path) -> None:
+        for path in sorted(directory.iterdir(), key=lambda item: item.name):
+            rel = path.relative_to(root).as_posix()
+            if rel == "manifest.json":
+                continue
+            if path.is_symlink():
+                kind = "symlink"
+                target = os.readlink(path)
+                entries[rel] = (path, kind, target)
+            elif path.is_dir():
+                visit(path)
+                continue
+            elif path.is_file():
+                kind = "file"
+                target = None
+                entries[rel] = (path, kind, target)
+            else:
+                kind = "unsupported"
+                target = None
+                entries[rel] = (path, kind, target)
+
+    visit(root)
+    return entries
+
+
+def _payload_inventory_marker(
+    entries: dict[str, tuple[Path, str, str | None]],
+) -> str:
+    """Fingerprint payload identity and mutation metadata without reading bodies."""
+
+    digest = hashlib.sha256()
+    for rel in sorted(entries):
+        path, kind, target = entries[rel]
+        stat = path.lstat()
+        row = (
+            rel,
+            kind,
+            target or "",
+            stat.st_mode,
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+            stat.st_ino,
+        )
+        digest.update(json.dumps(row, separators=(",", ":")).encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _verify_runtime_payload(
+    root: Path,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+) -> tuple[bool, str | None]:
+    try:
+        manifest_stat = manifest_path.stat()
+        manifest_marker = hashlib.sha256(
+            json.dumps(
+                manifest,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        actual = _runtime_payload_entries(root)
+        inventory_marker = _payload_inventory_marker(actual)
+    except Exception as exc:
+        return False, f"runtime inventory failed: {type(exc).__name__}: {exc}"
+
+    verification_marker = (
+        manifest_stat.st_mtime_ns,
+        manifest_stat.st_size,
+        manifest_marker,
+        inventory_marker,
+    )
+    cache_key = str(manifest_path.resolve())
+    with _VERIFY_CACHE_LOCK:
+        cached = _VERIFY_CACHE.get(cache_key)
+        if cached and cached[0] == verification_marker:
+            return cached[1], cached[2]
+
+    expected: dict[str, dict[str, Any]] = {}
+    error: str | None = None
+    raw_entries = manifest.get("files")
+    if not isinstance(raw_entries, list):
+        error = "manifest files is not an array"
+    else:
+        for item in raw_entries:
+            if not isinstance(item, dict):
+                error = "manifest contains a non-object file entry"
+                break
+            rel = item.get("path")
+            if (
+                not isinstance(rel, str)
+                or not rel
+                or rel.startswith("/")
+                or "\\" in rel
+                or any(part in ("", ".", "..") for part in rel.split("/"))
+            ):
+                error = f"manifest contains unsafe path {rel!r}"
+                break
+            if rel in expected:
+                error = f"manifest contains duplicate path {rel}"
+                break
+            expected[rel] = item
+
+    if error is None:
+        bytecode = sorted(
+            rel
+            for rel in actual
+            if rel.endswith(".pyc") or "__pycache__" in rel.split("/")
+        )
+        if bytecode:
+            error = "runtime contains forbidden Python bytecode: " + ", ".join(bytecode[:5])
+
+    if error is None:
+        missing = sorted(set(expected) - set(actual))
+        unexpected = sorted(set(actual) - set(expected))
+        if missing:
+            error = "runtime files missing from disk: " + ", ".join(missing[:5])
+        elif unexpected:
+            error = "runtime files absent from manifest: " + ", ".join(unexpected[:5])
+
+    if error is None:
+        for rel in sorted(expected):
+            item = expected[rel]
+            path, actual_kind, actual_target = actual[rel]
+            expected_kind = item.get("kind") or "file"
+            if expected_kind != actual_kind:
+                error = f"kind mismatch for {rel}: expected {expected_kind}, got {actual_kind}"
+                break
+            expected_hash = item.get("sha256")
+            if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+                error = f"manifest has invalid hash for {rel}"
+                break
+            if actual_kind == "symlink":
+                if item.get("target") != actual_target:
+                    error = f"symlink target mismatch for {rel}"
+                    break
+                actual_hash = hashlib.sha256((actual_target or "").encode("utf-8")).hexdigest()
+            elif actual_kind == "file":
+                actual_hash = sha256_file(path)
+            else:
+                error = f"unsupported runtime entry kind for {rel}"
+                break
+            if actual_hash != expected_hash:
+                error = f"hash mismatch for {rel}"
+                break
+
+    if error is None:
+        try:
+            final_inventory_marker = _payload_inventory_marker(
+                _runtime_payload_entries(root)
+            )
+        except Exception as exc:
+            error = f"runtime inventory failed: {type(exc).__name__}: {exc}"
+        else:
+            if final_inventory_marker != inventory_marker:
+                error = "runtime payload changed during verification"
+
+    verified = error is None
+    with _VERIFY_CACHE_LOCK:
+        _VERIFY_CACHE[cache_key] = (
+            verification_marker,
+            verified,
+            error,
+        )
+        while len(_VERIFY_CACHE) > _VERIFY_CACHE_MAX_ENTRIES:
+            _VERIFY_CACHE.pop(next(iter(_VERIFY_CACHE)))
+    return verified, error
+
+
 def build_runtime_info(
     script_path: str | Path,
     *,
@@ -81,7 +262,7 @@ def build_runtime_info(
     except Exception as exc:
         verification_error = f"{type(exc).__name__}: {exc}"
 
-    if manifest:
+    if manifest is not None:
         runtime_version = str(manifest.get("runtime_version") or runtime_version)
         source_revision = str(manifest.get("source_revision") or source_revision)
         source_branch = str(manifest.get("source_branch") or source_branch)
@@ -90,12 +271,16 @@ def build_runtime_info(
         installed_at = str(manifest.get("installed_at") or installed_at or "")
         install_root = str(manifest.get("install_root") or install_root)
         expected_hash = _manifest_file_hash(manifest, relative_path)
-        if expected_hash and source_hash:
-            verified = expected_hash == source_hash
-            if not verified:
-                verification_error = f"hash mismatch for {relative_path}"
-        else:
+        if not expected_hash:
             verification_error = f"manifest missing hash for {relative_path}"
+        elif not source_hash or expected_hash != source_hash:
+            verification_error = f"hash mismatch for {relative_path}"
+        elif manifest_path is not None:
+            verified, verification_error = _verify_runtime_payload(
+                manifest_path.parent,
+                manifest,
+                manifest_path,
+            )
 
     return {
         "name": RUNTIME_NAME,

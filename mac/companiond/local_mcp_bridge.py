@@ -10,11 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from pairling_devices import DeviceRegistry, load_or_create_install_id, utc_epoch
+from runtime_contract import LOCAL_MCP_DISPATCH_SCOPE
 from runtime_paths import app_support_root
 
 
 LOCAL_MCP_DEVICE_NAME = "Pairling MCP Bridge"
 LOCAL_MCP_SCOPE = "pairling-tools:run"
+LOCAL_MCP_SCOPES = frozenset({LOCAL_MCP_SCOPE, LOCAL_MCP_DISPATCH_SCOPE})
 
 
 def mcp_bridge_credential_path() -> Path:
@@ -53,7 +55,7 @@ def ensure_local_mcp_bridge_device(
         token = str(existing.get("token") or "")
         auth = device_registry.authenticate(
             token,
-            required_scopes=[LOCAL_MCP_SCOPE],
+            required_scopes=LOCAL_MCP_SCOPES,
             path="/pairling-tools/run",
         )
         if auth.ok and str(auth.install_id or "") == install_id_value:
@@ -62,7 +64,7 @@ def ensure_local_mcp_bridge_device(
                 "install_id": install_id_value,
                 "token": token,
                 "proof_secret": auth.proof_secret or str(existing.get("proof_secret") or ""),
-                "scopes": sorted(auth.scopes or {LOCAL_MCP_SCOPE}),
+                "scopes": sorted(auth.scopes or LOCAL_MCP_SCOPES),
                 "created_at": float(existing.get("created_at") or utc_epoch()),
             }
             _write_private_json(target, normalized)
@@ -76,7 +78,7 @@ def ensure_local_mcp_bridge_device(
 
     created = device_registry.create_device(
         device_name=LOCAL_MCP_DEVICE_NAME,
-        scopes=[LOCAL_MCP_SCOPE],
+        scopes=LOCAL_MCP_SCOPES,
         install_id=install_id_value,
         device_id="dev_local_mcp_" + secrets.token_hex(12),
     )
@@ -114,7 +116,7 @@ def validate_local_mcp_bridge_credential(
     token = str(credential.get("token") or "")
     auth = (registry or DeviceRegistry()).authenticate(
         token,
-        required_scopes=[LOCAL_MCP_SCOPE],
+        required_scopes=LOCAL_MCP_SCOPES,
         path="/pairling-tools/run",
     )
     if not auth.ok:

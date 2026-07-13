@@ -106,6 +106,8 @@ POST_ROUTES = [
     "/pair/bind-node",
     "/pair/claim",
     "/pair/psk-claim",
+    "/pair/reauth-challenge",
+    "/pair/reauth-claim",
     "/pair/revoke",
     "/pair/rotate-token",
     "/pair/start",

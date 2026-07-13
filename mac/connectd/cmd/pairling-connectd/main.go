@@ -95,8 +95,6 @@ func run(args []string) int {
 	statusServer := startStatusServer(*statusAddr, statusStore)
 	defer shutdownHTTPServer(statusServer)
 
-	go monitorUpstream(ctx, upstream, statusStore)
-
 	srv := &tsnet.Server{
 		Dir:        *stateDir,
 		Hostname:   *hostname,
@@ -135,6 +133,9 @@ func run(args []string) int {
 		log.Printf("cannot create gateway: %v", err)
 		return 1
 	}
+	go monitorUpstream(ctx, upstream, statusStore, func(probeContext context.Context) bool {
+		return handler.ProbeRoute(probeContext, loadInternalHookToken(home))
+	})
 
 	ln, err := srv.Listen("tcp", *listenAddr)
 	if err != nil {
@@ -428,11 +429,16 @@ func shutdownHTTPServer(server *http.Server) {
 	_ = server.Shutdown(ctx)
 }
 
-func monitorUpstream(ctx context.Context, upstream *url.URL, store *status.Store) {
+func monitorUpstream(
+	ctx context.Context,
+	upstream *url.URL,
+	store *status.Store,
+	routeProbe func(context.Context) bool,
+) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	check := func() {
-		store.SetUpstreamReachable(checkUpstream(upstream))
+		refreshUpstreamStatus(ctx, upstream, store, routeProbe)
 	}
 	check()
 	for {
@@ -443,6 +449,55 @@ func monitorUpstream(ctx context.Context, upstream *url.URL, store *status.Store
 			check()
 		}
 	}
+}
+
+func refreshUpstreamStatus(
+	ctx context.Context,
+	upstream *url.URL,
+	store *status.Store,
+	routeProbe func(context.Context) bool,
+) {
+	reachable := checkUpstream(upstream)
+	store.SetUpstreamReachable(reachable)
+	if !reachable || routeProbe == nil {
+		return
+	}
+	proofs := status.GatewayRecoveryProofs
+	if store.Snapshot().GatewayHealthy {
+		proofs = 1
+	}
+	for range proofs {
+		probeContext, cancel := context.WithTimeout(ctx, 3*time.Second)
+		verified := routeProbe(probeContext)
+		cancel()
+		if !verified {
+			// ProbeRoute normally records the exact gateway result through its
+			// logger. Record a fail-closed result here as well for failures that
+			// occur before the request can enter the handler, such as a missing
+			// internal route token.
+			store.RecordGatewayEvent(http.MethodGet, "/routez", 0, "validation_failed")
+			return
+		}
+	}
+}
+
+func loadInternalHookToken(home string) string {
+	path := strings.TrimSpace(os.Getenv("PAIRLING_INTERNAL_HOOK_TOKEN_FILE"))
+	if path == "" {
+		path = filepath.Join(home, ".claude", "companion", "internal-hook-token")
+	}
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	token := strings.TrimSpace(string(payload))
+	if len(token) != 64 {
+		return ""
+	}
+	if _, err := hex.DecodeString(token); err != nil {
+		return ""
+	}
+	return token
 }
 
 func checkUpstream(upstream *url.URL) bool {
@@ -457,9 +512,19 @@ func checkUpstream(upstream *url.URL) bool {
 	if err != nil {
 		return false
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	_ = resp.Body.Close()
-	return resp.StatusCode < 500
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		return false
+	}
+	var payload struct {
+		OK              bool   `json:"ok"`
+		ContractVersion string `json:"contract_version"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&payload); err != nil {
+		return false
+	}
+	return payload.OK && payload.ContractVersion == "pairling-runtime-v1"
 }
 
 func monitorTailnetIPs(ctx context.Context, srv *tsnet.Server, store *status.Store) {

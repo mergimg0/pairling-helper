@@ -39,6 +39,15 @@ func (l *recordingLogger) joined() string {
 	return fmt.Sprintf("%+v", l.events)
 }
 
+func (l *recordingLogger) last() Event {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.events) == 0 {
+		return Event{}
+	}
+	return l.events[len(l.events)-1]
+}
+
 func TestHandlerForwardsAllowedRequestAndPreservesAuthProofHeaders(t *testing.T) {
 	var sawRequest bool
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -480,6 +489,64 @@ func TestPairlingConnectStripsInternalTokenHeader(t *testing.T) {
 	}
 	if forwardedHeader != "" {
 		t.Fatalf("internal token header forwarded to upstream: %q", forwardedHeader)
+	}
+}
+
+func TestProbeRouteInjectsInternalTokenAndRequiresSemanticPayload(t *testing.T) {
+	const token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	var forwardedToken string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwardedToken = r.Header.Get("X-Pairling-Internal-Token")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"schema_version":1,"contract_version":"pairling-runtime-v1","runtime":{"verified":true,"contract_version":"pairling-runtime-v1"}}`))
+	}))
+	defer upstream.Close()
+	logger := &recordingLogger{}
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewHandler(Options{
+		Upstream: upstreamURL,
+		Mode:     ExposureModePairlingConnect,
+		Logger:   logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !handler.ProbeRoute(context.Background(), token) {
+		t.Fatal("semantic route probe failed")
+	}
+	if forwardedToken != token {
+		t.Fatalf("internal token = %q, want probe token", forwardedToken)
+	}
+	if event := logger.last(); event.Outcome != "route_verified" || event.Status != http.StatusOK {
+		t.Fatalf("last event = %+v, want route_verified 200", event)
+	}
+}
+
+func TestProbeRouteRejectsNonSemanticSuccess(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+	logger := &recordingLogger{}
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewHandler(Options{Upstream: upstreamURL, Mode: ExposureModePairlingConnect, Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if handler.ProbeRoute(context.Background(), "internal-token") {
+		t.Fatal("non-semantic HTTP success recovered the route")
+	}
+	if event := logger.last(); event.Outcome != "validation_failed" || event.Status != http.StatusOK {
+		t.Fatalf("last event = %+v, want validation_failed 200", event)
 	}
 }
 

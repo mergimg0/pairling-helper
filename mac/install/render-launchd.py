@@ -26,6 +26,7 @@ def daemon_plist(current: Path, logs: Path, python_bin: str) -> dict:
         "PAIRLING_BIND_MODE": "loopback",
         "PAIRLING_APP_SUPPORT_ROOT": str(current.parent.parent),
         "PAIRLING_LOGS_ROOT": str(logs),
+        "PYTHONDONTWRITEBYTECODE": "1",
         "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
     }
     return {
@@ -88,6 +89,7 @@ def ptybroker_plist(current: Path, logs: Path, python_bin: str) -> dict:
         "EnvironmentVariables": {
             "PAIRLING_APP_SUPPORT_ROOT": str(app_support),
             "PAIRLING_LOGS_ROOT": str(logs),
+            "PYTHONDONTWRITEBYTECODE": "1",
             "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         },
         "RunAtLoad": True,

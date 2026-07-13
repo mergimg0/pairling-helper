@@ -8,6 +8,7 @@ HTTP dependency so daemon tests can exercise the storage contract directly.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import errno
 import fcntl
@@ -20,7 +21,8 @@ import sqlite3
 import stat
 import tempfile
 import time
-from collections.abc import Iterator
+import unicodedata
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -32,13 +34,56 @@ class PairDropStoreError(ValueError):
         self.code = code
 
 
+GIB = 1024 * 1024 * 1024
+DEFAULT_MAX_TRANSFER_BYTES = 4 * GIB
+MIN_MAX_TRANSFER_BYTES = 1 * GIB
+MAX_MAX_TRANSFER_BYTES = 16 * GIB
+MAX_INLINE_UPLOAD_BYTES = 10 * 1024 * 1024
+DEFAULT_FREE_SPACE_RESERVE_BYTES = 256 * 1024 * 1024
+MAX_FREE_SPACE_RESERVE_BYTES = 4 * GIB
+MAX_ORIGINAL_NAME_LENGTH = 255
+MAX_CONTENT_TYPE_LENGTH = 127
+DEFAULT_LIST_PAGE_SIZE = 100
+MAX_LIST_PAGE_SIZE = 200
+MAX_CREATE_IDEMPOTENCY_KEY_LENGTH = 200
+UPLOAD_LEASE_SECONDS = 24 * 60 * 60
+UPLOAD_PROGRESS_EVENT_BYTES = 64 * 1024 * 1024
+
+
+def _bounded_environment_bytes(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        configured = int(str(os.environ.get(name, default)).strip())
+    except (TypeError, ValueError):
+        configured = default
+    return max(minimum, min(configured, maximum))
+
+
+PAIRLING_PAIRDROP_MAX_TRANSFER_BYTES = _bounded_environment_bytes(
+    "PAIRLING_PAIRDROP_MAX_TRANSFER_BYTES",
+    DEFAULT_MAX_TRANSFER_BYTES,
+    MIN_MAX_TRANSFER_BYTES,
+    MAX_MAX_TRANSFER_BYTES,
+)
+PAIRLING_PAIRDROP_FREE_SPACE_RESERVE_BYTES = _bounded_environment_bytes(
+    "PAIRLING_PAIRDROP_FREE_SPACE_RESERVE_BYTES",
+    DEFAULT_FREE_SPACE_RESERVE_BYTES,
+    0,
+    MAX_FREE_SPACE_RESERVE_BYTES,
+)
+
+
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def _safe_display_name(filename: str) -> str:
-    base = os.path.basename(str(filename or "").strip())
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", base).strip("._")
+    normalized = unicodedata.normalize("NFC", str(filename or "").strip())
+    base = re.split(r"[/\\]", normalized)[-1]
+    safe = "".join(
+        character
+        for character in base
+        if unicodedata.category(character) not in {"Cc", "Cf"}
+    ).strip()
     if not safe:
         return "upload.bin"
     if len(safe) <= 120:
@@ -49,6 +94,84 @@ def _safe_display_name(filename: str) -> str:
     return safe[:120]
 
 
+def _validated_original_name(filename: Any) -> str:
+    if not isinstance(filename, str):
+        raise PairDropStoreError("bad_filename")
+    value = filename.strip()
+    if not value:
+        raise PairDropStoreError("filename_required")
+    if len(value) > MAX_ORIGINAL_NAME_LENGTH:
+        raise PairDropStoreError("filename_too_long")
+    return value
+
+
+def _normalized_content_type(content_type: Any) -> str:
+    if content_type is None or content_type == "":
+        return "application/octet-stream"
+    if not isinstance(content_type, str):
+        raise PairDropStoreError("bad_content_type")
+    value = content_type.strip().lower()
+    if (
+        not value
+        or len(value) > MAX_CONTENT_TYPE_LENGTH
+        or not re.fullmatch(r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+", value)
+    ):
+        raise PairDropStoreError("bad_content_type")
+    return value
+
+
+def _normalized_create_idempotency_key(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise PairDropStoreError("bad_create_idempotency_key")
+    key = value.strip()
+    if (
+        not key
+        or len(key) > MAX_CREATE_IDEMPOTENCY_KEY_LENGTH
+        or not re.fullmatch(r"[A-Za-z0-9._:-]+", key)
+    ):
+        raise PairDropStoreError("bad_create_idempotency_key")
+    return key
+
+
+def _encode_file_cursor(created_at: str, file_id: str) -> str:
+    payload = json.dumps(
+        {"created_at": created_at, "id": file_id},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_file_cursor(cursor: Any) -> tuple[str, str]:
+    if not isinstance(cursor, str) or not cursor or len(cursor) > 512:
+        raise PairDropStoreError("bad_cursor")
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        payload = base64.b64decode(
+            cursor + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise PairDropStoreError("bad_cursor") from exc
+    if not isinstance(value, dict):
+        raise PairDropStoreError("bad_cursor")
+    created_at = value.get("created_at")
+    file_id = value.get("id")
+    if (
+        not isinstance(created_at, str)
+        or not created_at
+        or len(created_at) > 40
+        or not isinstance(file_id, str)
+        or not re.fullmatch(r"pd_[a-f0-9]{32}", file_id)
+    ):
+        raise PairDropStoreError("bad_cursor")
+    return created_at, file_id
+
+
 def _json_list(value: Any) -> str:
     return json.dumps(value if isinstance(value, list) else [])
 
@@ -57,8 +180,29 @@ class PairDropStore:
     schema_version = 1
     sqlite_busy_timeout_ms = 10_000
 
-    def __init__(self, root: Path, *, legacy_root: Path | None = None, migrate_legacy: bool = True):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        legacy_root: Path | None = None,
+        migrate_legacy: bool = True,
+        max_transfer_bytes: int = PAIRLING_PAIRDROP_MAX_TRANSFER_BYTES,
+        free_space_reserve_bytes: int = PAIRLING_PAIRDROP_FREE_SPACE_RESERVE_BYTES,
+        free_space_provider: Callable[[Path], int] | None = None,
+    ):
+        self._schema_ready = False
         self.root = Path(root).expanduser()
+        self.max_transfer_bytes = max(
+            MIN_MAX_TRANSFER_BYTES,
+            min(int(max_transfer_bytes), MAX_MAX_TRANSFER_BYTES),
+        )
+        self.free_space_reserve_bytes = max(
+            0,
+            min(int(free_space_reserve_bytes), MAX_FREE_SPACE_RESERVE_BYTES),
+        )
+        self._free_space_provider = free_space_provider or (
+            lambda path: int(shutil.disk_usage(path).free)
+        )
         self.objects_dir = self.root / "objects"
         self.partials_dir = self.root / "partials"
         self.thumbnails_dir = self.root / "thumbnails"
@@ -162,6 +306,8 @@ class PairDropStore:
             conn.close()
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
+        if self._schema_ready:
+            return
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS files (
@@ -211,6 +357,7 @@ class PairDropStore:
                 source_device_id TEXT,
                 source_install_id TEXT,
                 source_route TEXT,
+                create_idempotency_key TEXT,
                 state TEXT NOT NULL,
                 last_error TEXT,
                 created_at TEXT NOT NULL,
@@ -236,6 +383,25 @@ class PairDropStore:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pairdrop_files_created ON files(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pairdrop_upload_sessions_state ON upload_sessions(state)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pairdrop_upload_sessions_expires ON upload_sessions(expires_at)")
+        upload_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(upload_sessions)").fetchall()
+        }
+        if "create_idempotency_key" not in upload_columns:
+            conn.execute(
+                "ALTER TABLE upload_sessions ADD COLUMN create_idempotency_key TEXT"
+            )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pairdrop_upload_create_idempotency
+                ON upload_sessions(
+                    source_device_id,
+                    source_install_id,
+                    create_idempotency_key
+                )
+             WHERE create_idempotency_key IS NOT NULL
+            """
+        )
+        self._schema_ready = True
 
     def _migrate_legacy_vault(self) -> None:
         legacy_root = self.legacy_root
@@ -773,7 +939,11 @@ class PairDropStore:
     ) -> dict[str, Any]:
         if not data:
             raise PairDropStoreError("empty_body")
-        display_name = _safe_display_name(filename)
+        if len(data) > MAX_INLINE_UPLOAD_BYTES:
+            raise PairDropStoreError("transfer_too_large")
+        original_name = _validated_original_name(filename)
+        normalized_content_type = _normalized_content_type(content_type)
+        display_name = _safe_display_name(original_name)
         digest = hashlib.sha256(data).hexdigest()
         if expected_sha256 and expected_sha256.lower() != digest:
             raise PairDropStoreError("sha256_mismatch")
@@ -786,50 +956,69 @@ class PairDropStore:
         relpath = Path("objects") / digest[:2] / f"{file_id}.blob"
         partial = self.partials_dir / f"{file_id}.partial"
         target = self.root / relpath
-        target.parent.mkdir(parents=True, exist_ok=True)
-        partial.write_bytes(data)
-        os.replace(partial, target)
         now = _now_iso()
-        with self._connect() as conn:
-            self._ensure_schema(conn)
-            conn.execute(
-                """
-                INSERT INTO files (
-                    id, parent_id, kind, display_name, original_name, content_type,
-                    byte_size, sha256, storage_relpath, source_device_id,
-                    source_install_id, source_route, created_at, updated_at,
-                    deleted_at, last_opened_at, session_hint, tags_json
-                ) VALUES (?, ?, 'file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
-                """,
-                (
-                    file_id,
-                    parent_id,
-                    display_name,
-                    str(filename or ""),
-                    content_type or "application/octet-stream",
-                    len(data),
-                    digest,
-                    str(relpath),
-                    source_device_id,
-                    source_install_id,
-                    source_route,
-                    now,
-                    now,
-                    session_hint,
-                    _json_list([]),
-                ),
-            )
-            self._record_event(conn, "created", file_id, {
-                "byte_size": len(data),
-                "content_type": content_type or "application/octet-stream",
-                "sha256": digest,
-            })
-            conn.commit()
+        target_written = False
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with self._connect() as conn:
+                self._ensure_schema(conn)
+                conn.execute("BEGIN IMMEDIATE")
+                self._expire_upload_reservations(conn, now)
+                self._require_reserved_capacity(conn, additional_bytes=len(data))
+                partial.write_bytes(data)
+                os.replace(partial, target)
+                target_written = True
+                conn.execute(
+                    """
+                    INSERT INTO files (
+                        id, parent_id, kind, display_name, original_name, content_type,
+                        byte_size, sha256, storage_relpath, source_device_id,
+                        source_install_id, source_route, created_at, updated_at,
+                        deleted_at, last_opened_at, session_hint, tags_json
+                    ) VALUES (?, ?, 'file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                    """,
+                    (
+                        file_id,
+                        parent_id,
+                        display_name,
+                        original_name,
+                        normalized_content_type,
+                        len(data),
+                        digest,
+                        str(relpath),
+                        source_device_id,
+                        source_install_id,
+                        source_route,
+                        now,
+                        now,
+                        session_hint,
+                        _json_list([]),
+                    ),
+                )
+                self._record_event(conn, "created", file_id, {
+                    "byte_size": len(data),
+                    "content_type": normalized_content_type,
+                    "sha256": digest,
+                })
+        except Exception as exc:
+            for candidate in (partial, target if target_written else None):
+                if candidate is None:
+                    continue
+                try:
+                    candidate.unlink()
+                except OSError:
+                    pass
+            if isinstance(exc, OSError) and exc.errno in {
+                errno.ENOSPC,
+                getattr(errno, "EDQUOT", -1),
+            }:
+                raise PairDropStoreError("insufficient_storage") from exc
+            raise
         item = self.get_file(file_id)
         self._audit("file.created", {
             "file_id": file_id,
             "byte_size": len(data),
-            "content_type": content_type or "application/octet-stream",
+            "content_type": normalized_content_type,
             "sha256": digest,
         })
         return item
@@ -844,54 +1033,114 @@ class PairDropStore:
         source_device_id: str,
         source_install_id: str,
         source_route: str = "pairling-connectd",
+        create_idempotency_key: str | None = None,
         expires_in_seconds: int = 24 * 60 * 60,
     ) -> dict[str, Any]:
-        total = int(total_byte_count)
+        if type(total_byte_count) is not int:
+            raise PairDropStoreError("bad_total_byte_count")
+        total = total_byte_count
         digest = str(expected_sha256 or "").strip().lower()
         if total <= 0:
             raise PairDropStoreError("bad_total_byte_count")
+        if total > self.max_transfer_bytes:
+            raise PairDropStoreError("transfer_too_large")
         if not re.fullmatch(r"[a-f0-9]{64}", digest):
             raise PairDropStoreError("bad_expected_sha256")
+        original_name = _validated_original_name(filename)
+        normalized_content_type = _normalized_content_type(content_type)
+        idempotency_key = _normalized_create_idempotency_key(
+            create_idempotency_key
+        )
+        if idempotency_key and (not source_device_id or not source_install_id):
+            raise PairDropStoreError("create_idempotency_source_required")
+        # Reap terminal partials before evaluating current free space. Active
+        # sessions stay protected by cleanup_partials.
+        self.cleanup_partials(older_than_seconds=0)
         upload_id = "pu_" + secrets.token_hex(16)
-        display_name = _safe_display_name(filename)
+        display_name = _safe_display_name(original_name)
         now = _now_iso()
         expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + max(60, int(expires_in_seconds))))
+        reused_upload_id: str | None = None
         with self._connect() as conn:
             self._ensure_schema(conn)
-            conn.execute(
-                """
-                INSERT INTO upload_sessions (
-                    upload_id, file_id, display_name, original_name, content_type,
-                    total_byte_count, expected_sha256, verified_offset,
-                    source_device_id, source_install_id, source_route, state,
-                    last_error, created_at, updated_at, expires_at
-                ) VALUES (?, NULL, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'created', NULL, ?, ?, ?)
-                """,
-                (
-                    upload_id,
-                    display_name,
-                    str(filename or ""),
-                    content_type or "application/octet-stream",
-                    total,
-                    digest,
-                    source_device_id,
-                    source_install_id,
-                    source_route,
-                    now,
-                    now,
-                    expires_at,
-                ),
-            )
-            self._record_event(conn, "upload_session_created", None, {
-                "upload_id": upload_id,
-                "byte_size": total,
-                "content_type": content_type or "application/octet-stream",
-            })
+            conn.execute("BEGIN IMMEDIATE")
+            self._expire_upload_reservations(conn, now)
+            existing = None
+            if idempotency_key:
+                existing = conn.execute(
+                    """
+                    SELECT * FROM upload_sessions
+                     WHERE source_device_id = ?
+                       AND source_install_id = ?
+                       AND create_idempotency_key = ?
+                    """,
+                    (source_device_id, source_install_id, idempotency_key),
+                ).fetchone()
+            if existing is not None:
+                same_request = (
+                    existing["original_name"] == original_name
+                    and existing["content_type"] == normalized_content_type
+                    and existing["total_byte_count"] == total
+                    and existing["expected_sha256"] == digest
+                )
+                if not same_request:
+                    raise PairDropStoreError("create_idempotency_conflict")
+                if existing["state"] in {"cancelled", "expired", "failed_terminal"}:
+                    conn.execute(
+                        """
+                        UPDATE upload_sessions
+                           SET create_idempotency_key = NULL
+                         WHERE upload_id = ?
+                        """,
+                        (existing["upload_id"],),
+                    )
+                else:
+                    reused_upload_id = existing["upload_id"]
+
+            if reused_upload_id is None:
+                self._require_reserved_capacity(conn, additional_bytes=total)
+                conn.execute(
+                    """
+                    INSERT INTO upload_sessions (
+                        upload_id, file_id, display_name, original_name, content_type,
+                        total_byte_count, expected_sha256, verified_offset,
+                        source_device_id, source_install_id, source_route,
+                        create_idempotency_key, state, last_error, created_at,
+                        updated_at, expires_at
+                    ) VALUES (?, NULL, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 'created', NULL, ?, ?, ?)
+                    """,
+                    (
+                        upload_id,
+                        display_name,
+                        original_name,
+                        normalized_content_type,
+                        total,
+                        digest,
+                        source_device_id,
+                        source_install_id,
+                        source_route,
+                        idempotency_key,
+                        now,
+                        now,
+                        expires_at,
+                    ),
+                )
+                self._record_event(conn, "upload_session_created", None, {
+                    "upload_id": upload_id,
+                    "byte_size": total,
+                    "content_type": normalized_content_type,
+                })
             conn.commit()
+        if reused_upload_id is not None:
+            return self.get_upload_session(
+                reused_upload_id,
+                source_device_id=source_device_id,
+                source_install_id=source_install_id,
+            )
         self._audit("upload_session.created", {
             "upload_id": upload_id,
             "byte_size": total,
-            "content_type": content_type or "application/octet-stream",
+            "content_type": normalized_content_type,
         })
         return self.get_upload_session(upload_id)
 
@@ -923,16 +1172,26 @@ class PairDropStore:
         upload_id: str,
         *,
         offset: int,
+        declared_total_byte_count: int | None = None,
         data: bytes,
         chunk_sha256: str,
         idempotency_key: str,
         source_device_id: str,
         source_install_id: str,
     ) -> dict[str, Any]:
+        # Reject invented or foreign IDs before creating the durable
+        # cross-process lock file. Real sessions are bounded by capacity;
+        # attacker-chosen IDs are not.
+        self.get_upload_session(
+            upload_id,
+            source_device_id=source_device_id,
+            source_install_id=source_install_id,
+        )
         with self._upload_operation_lock(upload_id):
             return self._write_upload_chunk_locked(
                 upload_id,
                 offset=offset,
+                declared_total_byte_count=declared_total_byte_count,
                 data=data,
                 chunk_sha256=chunk_sha256,
                 idempotency_key=idempotency_key,
@@ -945,6 +1204,7 @@ class PairDropStore:
         upload_id: str,
         *,
         offset: int,
+        declared_total_byte_count: int | None,
         data: bytes,
         chunk_sha256: str,
         idempotency_key: str,
@@ -971,13 +1231,53 @@ class PairDropStore:
         with self._connect() as conn:
             self._ensure_schema(conn)
             conn.execute("BEGIN IMMEDIATE")
+            self._expire_upload_reservations(conn, _now_iso())
             row = conn.execute("SELECT * FROM upload_sessions WHERE upload_id = ?", (upload_id,)).fetchone()
             if row is None:
                 raise PairDropStoreError("upload_not_found")
             session = self._public_upload_row(row)
             self._assert_upload_source(session, source_device_id, source_install_id)
             if session["state"] in {"completing", "committed", "cancelled", "expired", "failed_terminal"}:
+                conn.commit()
                 raise PairDropStoreError("upload_not_writable")
+            if (
+                declared_total_byte_count is not None
+                and int(declared_total_byte_count) != int(session["total_byte_count"])
+            ):
+                raise PairDropStoreError("content_range_total_mismatch")
+
+            verified_offset = int(session["verified_offset"] or 0)
+            partial = self._partial_path(upload_id)
+            if partial.is_symlink() or (partial.exists() and not partial.is_file()):
+                raise PairDropStoreError("unsafe_partial_path")
+            partial_size = partial.stat().st_size if partial.exists() else None
+            if partial_size is None and verified_offset > 0 or (
+                partial_size is not None and partial_size < verified_offset
+            ):
+                partial.unlink(missing_ok=True)
+                conn.execute(
+                    """
+                    UPDATE upload_sessions
+                       SET verified_offset = 0, state = 'failed_retryable',
+                           last_error = 'upload_restart_required', updated_at = ?
+                     WHERE upload_id = ?
+                    """,
+                    (_now_iso(), upload_id),
+                )
+                conn.execute(
+                    "DELETE FROM upload_chunks WHERE upload_id = ?",
+                    (upload_id,),
+                )
+                self._record_event(
+                    conn,
+                    "upload_session_restart_required",
+                    None,
+                    {"upload_id": upload_id},
+                )
+                conn.commit()
+                raise PairDropStoreError("upload_restart_required")
+            if partial_size is not None and partial_size > verified_offset:
+                self._truncate_partial(upload_id, verified_offset)
 
             previous = conn.execute(
                 "SELECT * FROM upload_chunks WHERE upload_id = ? AND idempotency_key = ?",
@@ -994,7 +1294,6 @@ class PairDropStore:
                     "verified_offset": max(session["verified_offset"], offset + len(data)),
                 }
 
-            verified_offset = int(session["verified_offset"] or 0)
             if offset < verified_offset:
                 if self._partial_range_hash(upload_id, offset, len(data)) == chunk_hash:
                     return {**session, "idempotent": True}
@@ -1004,9 +1303,14 @@ class PairDropStore:
             if offset + len(data) > int(session["total_byte_count"]):
                 raise PairDropStoreError("chunk_exceeds_total")
 
+            self._require_reserved_capacity(conn)
             self._write_partial_range(upload_id, offset, data)
             new_offset = offset + len(data)
             now = _now_iso()
+            expires_at = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ",
+                time.gmtime(time.time() + UPLOAD_LEASE_SECONDS),
+            )
             conn.execute(
                 """
                 INSERT INTO upload_chunks (
@@ -1018,24 +1322,83 @@ class PairDropStore:
             conn.execute(
                 """
                 UPDATE upload_sessions
-                   SET verified_offset = ?, state = 'receiving', updated_at = ?, last_error = NULL
+                   SET verified_offset = ?, state = 'receiving', updated_at = ?,
+                       expires_at = ?, last_error = NULL
                  WHERE upload_id = ?
                 """,
-                (new_offset, now, upload_id),
+                (new_offset, now, expires_at, upload_id),
             )
-            self._record_event(conn, "upload_session_progress", None, {
-                "upload_id": upload_id,
-                "verified_offset": new_offset,
-            })
+            records_progress = (
+                new_offset == int(session["total_byte_count"])
+                or new_offset // UPLOAD_PROGRESS_EVENT_BYTES
+                > verified_offset // UPLOAD_PROGRESS_EVENT_BYTES
+            )
+            if records_progress:
+                self._record_event(conn, "upload_session_progress", None, {
+                    "upload_id": upload_id,
+                    "verified_offset": new_offset,
+                })
             conn.commit()
 
-        self._audit("upload_session.chunk", {
-            "upload_id": upload_id,
-            "offset": offset,
-            "byte_count": len(data),
-        })
+        if records_progress:
+            self._audit("upload_session.progress", {
+                "upload_id": upload_id,
+                "verified_offset": new_offset,
+                "total_byte_count": session["total_byte_count"],
+            })
         updated = self.get_upload_session(upload_id)
         return {**updated, "idempotent": False}
+
+    def _expire_upload_reservations(self, conn: sqlite3.Connection, now: str) -> None:
+        conn.execute(
+            """
+            UPDATE upload_sessions
+               SET state = 'expired', updated_at = ?
+             WHERE state NOT IN ('completing', 'committed', 'cancelled', 'expired', 'failed_terminal')
+               AND expires_at <= ?
+            """,
+            (now, now),
+        )
+        conn.execute(
+            """
+            DELETE FROM upload_chunks
+             WHERE upload_id IN (
+                SELECT upload_id FROM upload_sessions
+                 WHERE state IN ('committed', 'cancelled', 'expired', 'failed_terminal')
+             )
+            """
+        )
+
+    def _reserved_upload_bytes(self, conn: sqlite3.Connection) -> int:
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(
+                CASE
+                    WHEN total_byte_count > verified_offset
+                    THEN total_byte_count - verified_offset
+                    ELSE 0
+                END
+            ), 0)
+              FROM upload_sessions
+             WHERE state NOT IN ('committed', 'cancelled', 'expired', 'failed_terminal')
+            """
+        ).fetchone()
+        return max(0, int(row[0] if row is not None else 0))
+
+    def _require_reserved_capacity(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        additional_bytes: int = 0,
+    ) -> None:
+        reserved = self._reserved_upload_bytes(conn) + max(0, int(additional_bytes))
+        required = reserved + self.free_space_reserve_bytes
+        try:
+            available = max(0, int(self._free_space_provider(self.root)))
+        except (OSError, TypeError, ValueError) as exc:
+            raise PairDropStoreError("free_space_unavailable") from exc
+        if available < required:
+            raise PairDropStoreError("insufficient_storage")
 
     def complete_upload_session(
         self,
@@ -1044,6 +1407,11 @@ class PairDropStore:
         source_device_id: str,
         source_install_id: str,
     ) -> dict[str, Any]:
+        self.get_upload_session(
+            upload_id,
+            source_device_id=source_device_id,
+            source_install_id=source_install_id,
+        )
         with self._upload_operation_lock(upload_id):
             return self._complete_upload_session_locked(
                 upload_id,
@@ -1058,11 +1426,19 @@ class PairDropStore:
         source_device_id: str,
         source_install_id: str,
     ) -> dict[str, Any]:
-        session = self.get_upload_session(
-            upload_id,
-            source_device_id=source_device_id,
-            source_install_id=source_install_id,
-        )
+        with self._connect() as conn:
+            self._ensure_schema(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            self._expire_upload_reservations(conn, _now_iso())
+            row = conn.execute(
+                "SELECT * FROM upload_sessions WHERE upload_id = ?",
+                (upload_id,),
+            ).fetchone()
+            if row is None:
+                raise PairDropStoreError("upload_not_found")
+            session = self._public_upload_row(row)
+            self._assert_upload_source(session, source_device_id, source_install_id)
+            conn.commit()
         if session["state"] == "committed" and session.get("file_id"):
             return {
                 "ok": True,
@@ -1073,6 +1449,7 @@ class PairDropStore:
         if session["state"] in {"cancelled", "expired", "failed_terminal"}:
             raise PairDropStoreError("upload_not_completable")
 
+        verified_partial_identity: tuple[int, ...] | None = None
         if session["state"] == "completing":
             recovered = self._recover_completed_upload_session(session)
             if recovered is not None:
@@ -1089,7 +1466,11 @@ class PairDropStore:
             if int(session["verified_offset"] or 0) != byte_size:
                 self._mark_upload_error(upload_id, "failed_retryable", "verified_offset_mismatch")
                 raise PairDropStoreError("verified_offset_mismatch")
+            verified_partial_identity = self._file_identity(partial)
             digest = self._sha256_file(partial)
+            if self._file_identity(partial) != verified_partial_identity:
+                self._mark_upload_error(upload_id, "failed_retryable", "partial_changed")
+                raise PairDropStoreError("partial_changed")
             if digest != session["expected_sha256"]:
                 self._mark_upload_error(upload_id, "failed_terminal", "sha256_mismatch")
                 raise PairDropStoreError("sha256_mismatch")
@@ -1116,15 +1497,27 @@ class PairDropStore:
             raise PairDropStoreError("missing_partial")
         if partial.stat().st_size != int(session["total_byte_count"]):
             raise PairDropStoreError("byte_count_mismatch")
-        if self._sha256_file(partial) != digest:
-            raise PairDropStoreError("sha256_mismatch")
+        current_identity = self._file_identity(partial)
+        if verified_partial_identity is None:
+            verified_partial_identity = current_identity
+            if self._sha256_file(partial) != digest:
+                raise PairDropStoreError("sha256_mismatch")
+            if self._file_identity(partial) != verified_partial_identity:
+                raise PairDropStoreError("partial_changed")
+        elif current_identity != verified_partial_identity:
+            raise PairDropStoreError("partial_changed")
 
         os.replace(partial, target)
+        # Rename updates ctime on macOS even though it moves the same inode and
+        # content. Compare every stable content-identity field except ctime.
+        if self._file_identity(target)[:-1] != verified_partial_identity[:-1]:
+            raise PairDropStoreError("completion_file_conflict")
         return self._commit_recovered_upload_session(
             session,
             file_id,
             target,
             event_type="upload_session_committed",
+            object_verified=True,
         )
 
     def _claim_upload_completion(self, session: dict[str, Any]) -> dict[str, Any]:
@@ -1179,9 +1572,17 @@ class PairDropStore:
                 return None
             if candidate.stat().st_size != total_byte_count:
                 return None
+            candidate_identity = self._file_identity(candidate)
             if self._sha256_file(candidate) != expected_sha256:
                 return None
-            return self._commit_recovered_upload_session(session, file_id, candidate)
+            if self._file_identity(candidate) != candidate_identity:
+                return None
+            return self._commit_recovered_upload_session(
+                session,
+                file_id,
+                candidate,
+                object_verified=True,
+            )
         except FileNotFoundError:
             return None
         return None
@@ -1193,6 +1594,7 @@ class PairDropStore:
         object_path: Path,
         *,
         event_type: str = "upload_session_recovered",
+        object_verified: bool = False,
     ) -> dict[str, Any]:
         upload_id = str(session["upload_id"])
         byte_size = int(session["total_byte_count"])
@@ -1201,7 +1603,9 @@ class PairDropStore:
             raise PairDropStoreError("upload_completion_ownership_lost")
         if object_path.is_symlink() or not object_path.is_file():
             raise PairDropStoreError("missing_object")
-        if object_path.stat().st_size != byte_size or self._sha256_file(object_path) != digest:
+        if object_path.stat().st_size != byte_size:
+            raise PairDropStoreError("completion_file_conflict")
+        if not object_verified and self._sha256_file(object_path) != digest:
             raise PairDropStoreError("completion_file_conflict")
         relpath = object_path.relative_to(self.root)
         now = _now_iso()
@@ -1275,6 +1679,10 @@ class PairDropStore:
             ).rowcount
             if changed != 1:
                 raise PairDropStoreError("upload_completion_ownership_lost")
+            conn.execute(
+                "DELETE FROM upload_chunks WHERE upload_id = ?",
+                (upload_id,),
+            )
             self._record_event(conn, event_type, file_id, {"upload_id": upload_id})
             conn.commit()
         item = self.get_file(file_id)
@@ -1327,6 +1735,10 @@ class PairDropStore:
             ).rowcount
             if changed != 1:
                 raise PairDropStoreError("upload_not_cancellable")
+            conn.execute(
+                "DELETE FROM upload_chunks WHERE upload_id = ?",
+                (upload_id,),
+            )
             self._record_event(conn, "upload_session_cancelled", None, {"upload_id": upload_id})
             conn.commit()
         self._audit("upload_session.cancelled", {"upload_id": upload_id})
@@ -1346,6 +1758,46 @@ class PairDropStore:
             self._ensure_schema(conn)
             rows = conn.execute(query).fetchall()
         return [self._public_row(row) for row in rows]
+
+    def list_files_page(
+        self,
+        *,
+        limit: int = DEFAULT_LIST_PAGE_SIZE,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        if type(limit) is not int or limit < 1 or limit > MAX_LIST_PAGE_SIZE:
+            raise PairDropStoreError("bad_limit")
+        cursor_values = _decode_file_cursor(cursor) if cursor is not None else None
+        where = "deleted_at IS NULL"
+        parameters: list[Any] = []
+        if cursor_values is not None:
+            created_at, file_id = cursor_values
+            where += " AND (created_at < ? OR (created_at = ? AND id < ?))"
+            parameters.extend((created_at, created_at, file_id))
+        parameters.append(limit + 1)
+        with self._connect() as conn:
+            self._ensure_schema(conn)
+            rows = conn.execute(
+                f"""
+                SELECT * FROM files
+                 WHERE {where}
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        next_cursor = None
+        if has_more and page_rows:
+            last = page_rows[-1]
+            next_cursor = _encode_file_cursor(last["created_at"], last["id"])
+        return {
+            "files": [self._public_row(row) for row in page_rows],
+            "limit": limit,
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+        }
 
     def get_file(self, file_id: str, *, include_deleted: bool = False) -> dict[str, Any]:
         if not self._valid_id(file_id):
@@ -1374,10 +1826,9 @@ class PairDropStore:
         return {"ok": True, "id": file_id, "deleted_at": now}
 
     def attach_descriptor(self, file_id: str, *, session_id: str = "") -> dict[str, Any]:
-        item = self.get_file(file_id)
-        path = self._object_path(item)
-        if not path.is_file():
-            raise PairDropStoreError("missing_object")
+        descriptor = self.verified_read_descriptor(file_id)
+        item = descriptor["item"]
+        path = descriptor["path"]
         now = _now_iso()
         with self._connect() as conn:
             self._ensure_schema(conn)
@@ -1479,7 +1930,95 @@ class PairDropStore:
             for row in rows
         ]
 
+    def recover_stale_completions(
+        self,
+        *,
+        older_than_seconds: int = 300,
+    ) -> dict[str, int]:
+        cutoff = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(time.time() - max(0, older_than_seconds)),
+        )
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM upload_sessions
+                 WHERE state = 'completing' AND updated_at <= ?
+                 ORDER BY updated_at ASC
+                 LIMIT 100
+                """,
+                (cutoff,),
+            ).fetchall()
+
+        recovered = 0
+        restarted = 0
+        deferred = 0
+        restart_errors = {
+            "missing_partial",
+            "byte_count_mismatch",
+            "verified_offset_mismatch",
+            "sha256_mismatch",
+            "partial_changed",
+        }
+        for row in rows:
+            session = self._public_upload_row(row)
+            upload_id = str(session["upload_id"])
+            with self._upload_operation_lock(upload_id):
+                try:
+                    self._complete_upload_session_locked(
+                        upload_id,
+                        source_device_id=str(session["source_device_id"] or ""),
+                        source_install_id=str(session["source_install_id"] or ""),
+                    )
+                    recovered += 1
+                    continue
+                except PairDropStoreError as exc:
+                    if exc.code not in restart_errors:
+                        deferred += 1
+                        continue
+
+                partial = self._partial_path(upload_id)
+                if partial.is_symlink() or partial.is_file():
+                    partial.unlink(missing_ok=True)
+                now = _now_iso()
+                expires_at = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ",
+                    time.gmtime(time.time() + UPLOAD_LEASE_SECONDS),
+                )
+                with self._connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    changed = conn.execute(
+                        """
+                        UPDATE upload_sessions
+                           SET file_id = NULL, verified_offset = 0,
+                               state = 'failed_retryable',
+                               last_error = 'upload_restart_required',
+                               updated_at = ?, expires_at = ?
+                         WHERE upload_id = ? AND state = 'completing'
+                        """,
+                        (now, expires_at, upload_id),
+                    ).rowcount
+                    if changed:
+                        conn.execute(
+                            "DELETE FROM upload_chunks WHERE upload_id = ?",
+                            (upload_id,),
+                        )
+                        self._record_event(
+                            conn,
+                            "upload_session_restart_required",
+                            None,
+                            {"upload_id": upload_id, "reason": "stale_completion"},
+                        )
+                    conn.commit()
+                restarted += int(bool(changed))
+        return {
+            "recovered": recovered,
+            "restarted": restarted,
+            "deferred": deferred,
+        }
+
     def cleanup_partials(self, *, older_than_seconds: int = 3600) -> dict[str, Any]:
+        completion_recovery = self.recover_stale_completions()
         cutoff = time.time() - max(0, older_than_seconds)
         now = _now_iso()
         expired = 0
@@ -1544,6 +2083,7 @@ class PairDropStore:
             "preserved_active": preserved_active,
             "skipped_symlinks": skipped_symlinks,
             "expired_sessions": expired,
+            "completion_recovery": completion_recovery,
         })
         return {
             "ok": True,
@@ -1551,6 +2091,7 @@ class PairDropStore:
             "preserved_active": preserved_active,
             "skipped_symlinks": skipped_symlinks,
             "expired_sessions": expired,
+            "completion_recovery": completion_recovery,
         }
 
     def _object_path(self, item: dict[str, Any]) -> Path:
@@ -1596,6 +2137,26 @@ class PairDropStore:
         except OSError as exc:
             if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR}:
                 raise PairDropStoreError("unsafe_partial_path") from exc
+            if exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}:
+                raise PairDropStoreError("insufficient_storage") from exc
+            raise
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+    def _truncate_partial(self, upload_id: str, byte_count: int) -> None:
+        path = self._partial_path(upload_id)
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        fd = -1
+        try:
+            fd = os.open(str(path), flags)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise PairDropStoreError("unsafe_partial_path")
+            os.ftruncate(fd, byte_count)
+            os.fsync(fd)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR}:
+                raise PairDropStoreError("unsafe_partial_path") from exc
             raise
         finally:
             if fd >= 0:
@@ -1622,6 +2183,18 @@ class PairDropStore:
                 hasher.update(chunk)
         return hasher.hexdigest()
 
+    @staticmethod
+    def _file_identity(path: Path) -> tuple[int, ...]:
+        stat_result = path.lstat()
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_mode,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            stat_result.st_ctime_ns,
+        )
+
     def _assert_upload_source(self, session: dict[str, Any], device_id: str, install_id: str) -> None:
         if session.get("source_device_id") != device_id or session.get("source_install_id") != install_id:
             raise PairDropStoreError("wrong_source")
@@ -1641,6 +2214,11 @@ class PairDropStore:
                 """,
                 (state, error, now, upload_id),
             )
+            if state == "failed_terminal":
+                conn.execute(
+                    "DELETE FROM upload_chunks WHERE upload_id = ?",
+                    (upload_id,),
+                )
             conn.commit()
 
     def _public_row(self, row: sqlite3.Row) -> dict[str, Any]:
@@ -1690,19 +2268,28 @@ class PairDropStore:
             (event_type, file_id, _now_iso(), json.dumps(summary, sort_keys=True)),
         )
 
-    def _audit(self, event: str, detail: dict[str, Any]) -> None:
-        self.audit_path.parent.mkdir(parents=True, exist_ok=True)
-        safe_detail = {
-            key: value for key, value in detail.items()
-            if key not in {"path", "body", "request_body", "contents"}
-        }
-        record = {
-            "ts": _now_iso(),
-            "event": event,
-            "detail": safe_detail,
-        }
-        with self.audit_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
+    def _audit(self, event: str, detail: dict[str, Any]) -> bool:
+        """Write the secondary JSONL audit without changing primary operation truth."""
+
+        try:
+            self.audit_path.parent.mkdir(parents=True, exist_ok=True)
+            safe_detail = {
+                key: value for key, value in detail.items()
+                if key not in {"path", "body", "request_body", "contents"}
+            }
+            record = {
+                "ts": _now_iso(),
+                "event": event,
+                "detail": safe_detail,
+            }
+            with self.audit_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+            return True
+        except (OSError, TypeError, ValueError):
+            # Every state-changing operation also records its durable event in
+            # SQLite. A failed secondary sink must not turn an already-committed
+            # operation into a 500 that the client will retry.
+            return False
 
     @staticmethod
     def _valid_id(file_id: str) -> bool:

@@ -23,7 +23,7 @@ const (
 	RouteKindFunnel        = "funnel"
 	RouteStatusReady       = "ready"
 	RouteIDFunnel          = "pairling-connect-funnel"
-	gatewayRecoveryProofs  = 2
+	GatewayRecoveryProofs  = 2
 )
 
 type AdvertisedRoute struct {
@@ -61,6 +61,7 @@ type Snapshot struct {
 	LastError            string            `json:"last_error,omitempty"`
 	LastGatewayFailure   string            `json:"last_gateway_failure,omitempty"`
 	LastGatewayFailureAt string            `json:"last_gateway_failure_at,omitempty"`
+	LastRouteProofAt     string            `json:"last_route_proof_at,omitempty"`
 	UpdatedAt            string            `json:"updated_at"`
 }
 
@@ -69,6 +70,7 @@ type Store struct {
 	snapshot             Snapshot
 	authURL              string
 	gatewaySuccessStreak int
+	upstreamEverReady    bool
 }
 
 func NewStore(hostname string) *Store {
@@ -79,7 +81,7 @@ func NewStore(hostname string) *Store {
 			AuthState:        "starting",
 			Hostname:         hostname,
 			ControlURLMode:   DefaultControlURLMode,
-			GatewayHealthy:   true,
+			GatewayHealthy:   false,
 			ListenPort:       DefaultListenPort,
 			ConnectdVersion:  DefaultConnectdVersion,
 			AdvertisedRoutes: []AdvertisedRoute{},
@@ -178,6 +180,15 @@ func (s *Store) SetTailnetLockEnabled(enabled bool) {
 func (s *Store) SetUpstreamReachable(reachable bool) {
 	s.update(func(snapshot *Snapshot) {
 		snapshot.UpstreamReachable = reachable
+		if !reachable {
+			s.gatewaySuccessStreak = 0
+			snapshot.GatewayHealthy = false
+			if s.upstreamEverReady {
+				snapshot.LastGatewayFailure = "upstream semantic readiness failed"
+				snapshot.LastGatewayFailureAt = nowString()
+			}
+			return
+		}
 	})
 }
 
@@ -192,7 +203,7 @@ func (s *Store) RecordGatewayEvent(method, path string, status int, outcome stri
 		method = strings.ToUpper(strings.TrimSpace(method))
 		path = strings.TrimSpace(path)
 		outcome = strings.TrimSpace(outcome)
-		if gatewayEventIsFailure(path, status, outcome) {
+		if gatewayEventIsFailure(status, outcome) {
 			s.gatewaySuccessStreak = 0
 			snapshot.GatewayHealthy = false
 			snapshot.LastGatewayFailure = redact(fmt.Sprintf("%s %s status=%d outcome=%s", method, path, status, outcome))
@@ -200,13 +211,23 @@ func (s *Store) RecordGatewayEvent(method, path string, status int, outcome stri
 			return
 		}
 		if gatewayEventIsRecoveryProbe(path, status, outcome) {
-			s.gatewaySuccessStreak++
-			if s.gatewaySuccessStreak >= gatewayRecoveryProofs {
+			if s.gatewaySuccessStreak < GatewayRecoveryProofs {
+				s.gatewaySuccessStreak++
+			}
+			snapshot.LastRouteProofAt = nowString()
+			if s.gatewaySuccessStreak >= GatewayRecoveryProofs {
+				s.upstreamEverReady = true
 				snapshot.GatewayHealthy = true
 				snapshot.LastGatewayFailure = ""
 				snapshot.LastGatewayFailureAt = ""
 			}
 			return
+		}
+		if path == "/routez" {
+			s.gatewaySuccessStreak = 0
+			snapshot.GatewayHealthy = false
+			snapshot.LastGatewayFailure = redact(fmt.Sprintf("%s %s status=%d outcome=%s", method, path, status, outcome))
+			snapshot.LastGatewayFailureAt = nowString()
 		}
 	})
 }
@@ -290,16 +311,15 @@ func advertisedRoutes(snapshot Snapshot) []AdvertisedRoute {
 	return routes
 }
 
-func gatewayEventIsFailure(path string, status int, outcome string) bool {
-	path = strings.TrimSpace(path)
-	if path != "/routez" {
-		return false
-	}
+func gatewayEventIsFailure(status int, outcome string) bool {
 	outcome = strings.ToLower(strings.TrimSpace(outcome))
-	if outcome == "upstream_error" || outcome == "validation_failed" || outcome == "timeout" {
+	if outcome == "upstream_error" || outcome == "validation_failed" || outcome == "timeout" || outcome == "connection_refused" {
 		return true
 	}
-	if status >= 500 {
+	// Only gateway-class HTTP responses prove that the advertised route is
+	// broken. A forwarded 500 is an application failure, and a forwarded 503
+	// can be normal runtime load shedding; neither should hide a healthy route.
+	if status == 502 || status == 504 {
 		return true
 	}
 	return false
@@ -307,7 +327,7 @@ func gatewayEventIsFailure(path string, status int, outcome string) bool {
 
 func gatewayEventIsRecoveryProbe(path string, status int, outcome string) bool {
 	outcome = strings.ToLower(strings.TrimSpace(outcome))
-	return path == "/routez" && outcome == "forwarded" && status >= 200 && status < 400
+	return path == "/routez" && outcome == "route_verified" && status >= 200 && status < 400
 }
 
 func nowString() string {

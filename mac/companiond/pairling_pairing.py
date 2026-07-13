@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import secrets
@@ -13,6 +14,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from collections import OrderedDict
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -108,29 +110,71 @@ class ReauthStore:
     is unknown, revoked, has no SE key, or the signature does not check out.
     """
 
-    def __init__(self, registry: DeviceRegistry, *, ttl_seconds: int = 120):
+    def __init__(
+        self,
+        registry: DeviceRegistry,
+        *,
+        ttl_seconds: int = 120,
+        max_entries: int = 512,
+    ):
         self.registry = registry
-        self.ttl_seconds = ttl_seconds
+        self.ttl_seconds = max(1, min(int(ttl_seconds), 300))
+        self.max_entries = max(1, min(int(max_entries), 4096))
         self._lock = threading.Lock()
-        self._challenges: dict[str, tuple[str, float]] = {}
+        # Key by the random challenge instead of device id. Concurrent recovery
+        # attempts for one phone must not invalidate each other. Store only a
+        # fixed-size digest of the untrusted device id so arbitrary input cannot
+        # turn this short-lived table into an unbounded memory sink.
+        self._challenges: OrderedDict[str, tuple[bytes, float]] = OrderedDict()
+
+    @staticmethod
+    def _device_key(device_id: str) -> bytes:
+        return hashlib.sha256(str(device_id or "").encode("utf-8")).digest()
+
+    def _prune_expired_locked(self, now: float) -> None:
+        expired = [
+            challenge
+            for challenge, (_, expires_at) in self._challenges.items()
+            if expires_at <= now
+        ]
+        for challenge in expired:
+            self._challenges.pop(challenge, None)
 
     def issue_challenge(self, device_id: str) -> str:
         challenge = secrets.token_hex(32)
+        now = time.time()
         with self._lock:
-            self._challenges[device_id] = (challenge, time.time() + self.ttl_seconds)
+            self._prune_expired_locked(now)
+            while len(self._challenges) >= self.max_entries:
+                self._challenges.popitem(last=False)
+            self._challenges[challenge] = (
+                self._device_key(device_id),
+                now + self.ttl_seconds,
+            )
         return challenge
 
     def verify_and_consume(self, device_id: str, challenge: str, signature_der: bytes) -> bool:
+        challenge = str(challenge or "")
+        if len(challenge) != 64:
+            return False
+        try:
+            bytes.fromhex(challenge)
+        except ValueError:
+            return False
+        if not signature_der or len(signature_der) > 256:
+            return False
         # Single-use: pop regardless of outcome so a captured challenge cannot
         # be replayed even if the first signature was wrong.
+        now = time.time()
         with self._lock:
-            entry = self._challenges.pop(device_id, None)
+            self._prune_expired_locked(now)
+            entry = self._challenges.pop(challenge, None)
         if entry is None:
             return False
-        stored_challenge, expires_at = entry
-        if time.time() > expires_at:
+        stored_device_key, expires_at = entry
+        if now > expires_at:
             return False
-        if not secrets.compare_digest(stored_challenge, challenge or ""):
+        if not secrets.compare_digest(stored_device_key, self._device_key(device_id)):
             return False
         point_b64 = self.registry.get_se_pubkey(device_id)
         if not point_b64:

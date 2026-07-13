@@ -92,6 +92,7 @@ PACKAGED_SOURCE_PATHS=(
   "mac/mcp"
   "mac/packaging/bin/pairling"
   "npm"
+  "relay/app_attest_validator.py"
 )
 SOURCE_DIRTY="false"
 if git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 && \
@@ -212,6 +213,16 @@ printf '%s\n' "$REVISION" > "$MACPAY/SOURCE_REVISION"
 printf '%s\n' "$BRANCH" > "$MACPAY/SOURCE_BRANCH"
 printf '%s\n' "$SOURCE_DIRTY" > "$MACPAY/SOURCE_DIRTY"
 cp "$REPO_ROOT/mac/companiond/"*.py "$MACPAY/companiond/"
+APP_ATTEST_VALIDATOR="$REPO_ROOT/relay/app_attest_validator.py"
+if [[ ! -f "$APP_ATTEST_VALIDATOR" ]]; then
+  APP_ATTEST_VALIDATOR="$REPO_ROOT/mac/companiond/app_attest_validator.py"
+fi
+if [[ ! -f "$APP_ATTEST_VALIDATOR" || ! -f "$REPO_ROOT/mac/companiond/apple-app-attest-root-ca.pem" ]]; then
+  echo "ERROR: App Attest validator or Apple root certificate is missing" >&2
+  exit 1
+fi
+cp "$APP_ATTEST_VALIDATOR" "$MACPAY/companiond/app_attest_validator.py"
+cp "$REPO_ROOT/mac/companiond/apple-app-attest-root-ca.pem" "$MACPAY/companiond/"
 cp "$REPO_ROOT/mac/companiond/providers/"*.py "$MACPAY/companiond/providers/"
 cp "$REPO_ROOT/mac/companiond/providers/"*.json "$MACPAY/companiond/providers/"
 cp "$REPO_ROOT/mac/companiond/integrations/__init__.py" "$MACPAY/companiond/integrations/"

@@ -17,10 +17,17 @@ func hasRouteKind(routes []AdvertisedRoute, kind string) bool {
 	return false
 }
 
+func proveGatewayReady(store *Store) {
+	for range GatewayRecoveryProofs {
+		store.RecordGatewayEvent(http.MethodGet, "/routez", http.StatusOK, "route_verified")
+	}
+}
+
 func TestFunnelRouteIsAdditiveAndGated(t *testing.T) {
 	s := NewStore("pairling-test")
 	s.SetListenerRunning(true)
 	s.SetUpstreamReachable(true)
+	proveGatewayReady(s)
 	s.SetTailnetIP("100.64.0.1")
 	s.SetAuthenticated()
 
@@ -191,6 +198,7 @@ func TestStoreAdvertisesRouteOnlyWhenReady(t *testing.T) {
 	store.SetTailnetIP("100.64.0.10")
 	store.SetListenerRunning(true)
 	store.SetUpstreamReachable(true)
+	proveGatewayReady(store)
 
 	if got := store.Snapshot().AdvertisedRoutes; len(got) != 0 {
 		t.Fatalf("unauthenticated status advertised routes: %+v", got)
@@ -216,12 +224,73 @@ func TestStoreAdvertisesRouteOnlyWhenReady(t *testing.T) {
 	}
 }
 
+func TestStoreStartsFailClosedUntilSemanticUpstreamReadiness(t *testing.T) {
+	store := NewStore("pairling-inst-abcdef")
+	store.SetAuthenticated()
+	store.SetTailnetIP("100.64.0.10")
+	store.SetListenerRunning(true)
+
+	snapshot := store.Snapshot()
+	if snapshot.GatewayHealthy {
+		t.Fatalf("fresh store must not assume gateway health: %+v", snapshot)
+	}
+	if len(snapshot.AdvertisedRoutes) != 0 {
+		t.Fatalf("fresh store advertised a route before semantic readiness: %+v", snapshot.AdvertisedRoutes)
+	}
+
+	store.SetUpstreamReachable(true)
+	snapshot = store.Snapshot()
+	if snapshot.GatewayHealthy || len(snapshot.AdvertisedRoutes) != 0 {
+		t.Fatalf("readyz reachability must not open the route without /routez proof: %+v", snapshot)
+	}
+
+	store.RecordGatewayEvent(http.MethodGet, "/routez", http.StatusOK, "route_verified")
+	snapshot = store.Snapshot()
+	if snapshot.GatewayHealthy || len(snapshot.AdvertisedRoutes) != 0 {
+		t.Fatalf("one /routez proof must not open the route: %+v", snapshot)
+	}
+	store.RecordGatewayEvent(http.MethodGet, "/routez", http.StatusOK, "route_verified")
+	snapshot = store.Snapshot()
+	if !snapshot.GatewayHealthy || len(snapshot.AdvertisedRoutes) != 1 || snapshot.LastRouteProofAt == "" {
+		t.Fatalf("two exact /routez proofs should open clean startup: %+v", snapshot)
+	}
+}
+
+func TestUpstreamOutageResetsRecoveryProofsAndNeedsTwoRoutezSuccesses(t *testing.T) {
+	store := NewStore("pairling-inst-abcdef")
+	store.SetAuthenticated()
+	store.SetTailnetIP("100.64.0.10")
+	store.SetListenerRunning(true)
+	store.SetUpstreamReachable(true)
+	proveGatewayReady(store)
+
+	store.SetUpstreamReachable(false)
+	store.SetUpstreamReachable(true)
+	snapshot := store.Snapshot()
+	if snapshot.GatewayHealthy || len(snapshot.AdvertisedRoutes) != 0 {
+		t.Fatalf("an upstream outage must close the route until fresh route proofs arrive: %+v", snapshot)
+	}
+
+	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
+	snapshot = store.Snapshot()
+	if snapshot.GatewayHealthy || len(snapshot.AdvertisedRoutes) != 0 {
+		t.Fatalf("one post-outage routez success must not recover the route: %+v", snapshot)
+	}
+
+	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
+	snapshot = store.Snapshot()
+	if !snapshot.GatewayHealthy || len(snapshot.AdvertisedRoutes) != 1 {
+		t.Fatalf("two consecutive post-outage proofs should recover the route: %+v", snapshot)
+	}
+}
+
 func TestStoreSuppressesAdvertisedRouteAfterRecentGatewayValidationFailure(t *testing.T) {
 	store := NewStore("pairling-inst-abcdef")
 	store.SetAuthenticated()
 	store.SetTailnetIP("100.64.0.10")
 	store.SetListenerRunning(true)
 	store.SetUpstreamReachable(true)
+	proveGatewayReady(store)
 
 	store.RecordGatewayEvent("GET", "/routez", 502, "upstream_error")
 	snapshot := store.Snapshot()
@@ -235,7 +304,7 @@ func TestStoreSuppressesAdvertisedRouteAfterRecentGatewayValidationFailure(t *te
 		t.Fatalf("gateway failure advertised routes: %+v", got)
 	}
 
-	store.RecordGatewayEvent("GET", "/routez", 200, "forwarded")
+	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
 	snapshot = store.Snapshot()
 	if snapshot.GatewayHealthy {
 		t.Fatalf("single routez success should not recover gateway health: %+v", snapshot)
@@ -247,7 +316,7 @@ func TestStoreSuppressesAdvertisedRouteAfterRecentGatewayValidationFailure(t *te
 		t.Fatalf("single routez success advertised a route: %+v", snapshot.AdvertisedRoutes)
 	}
 
-	store.RecordGatewayEvent("GET", "/routez", 200, "forwarded")
+	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
 	snapshot = store.Snapshot()
 	if !snapshot.GatewayHealthy {
 		t.Fatalf("gateway should recover after consecutive successful routez proofs: %+v", snapshot)
@@ -260,23 +329,97 @@ func TestStoreSuppressesAdvertisedRouteAfterRecentGatewayValidationFailure(t *te
 	}
 }
 
-func TestStoreDoesNotPoisonRouteHealthForProductEndpointFailures(t *testing.T) {
+func TestStoreSuppressesAdvertisedRouteAfterProductEndpointFailure(t *testing.T) {
 	store := NewStore("pairling-inst-abcdef")
 	store.SetAuthenticated()
 	store.SetTailnetIP("100.64.0.10")
 	store.SetListenerRunning(true)
 	store.SetUpstreamReachable(true)
+	proveGatewayReady(store)
 
-	store.RecordGatewayEvent("POST", "/push/test", 500, "upstream_error")
+	store.RecordGatewayEvent("GET", "/sessions-visible", 502, "upstream_error")
 	snapshot := store.Snapshot()
-	if !snapshot.GatewayHealthy {
-		t.Fatalf("product endpoint 5xx should not poison route health: %+v", snapshot)
+	if snapshot.GatewayHealthy {
+		t.Fatalf("product endpoint upstream failure should mark gateway unhealthy: %+v", snapshot)
 	}
-	if snapshot.LastGatewayFailure != "" {
-		t.Fatalf("product endpoint failure should not be stored as route failure: %+v", snapshot)
+	if snapshot.LastGatewayFailure == "" {
+		t.Fatalf("product endpoint failure should be stored as gateway failure: %+v", snapshot)
+	}
+	if len(snapshot.AdvertisedRoutes) != 0 {
+		t.Fatalf("product endpoint failure should suppress advertised routes: %+v", snapshot.AdvertisedRoutes)
+	}
+
+	store.RecordGatewayEvent("GET", "/sessions-visible", 200, "forwarded")
+	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
+	snapshot = store.Snapshot()
+	if snapshot.GatewayHealthy {
+		t.Fatalf("app success plus one routez proof should not recover gateway health: %+v", snapshot)
+	}
+
+	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
+	snapshot = store.Snapshot()
+	if !snapshot.GatewayHealthy {
+		t.Fatalf("two consecutive routez proofs should recover gateway health: %+v", snapshot)
 	}
 	if len(snapshot.AdvertisedRoutes) != 1 {
-		t.Fatalf("product endpoint failure should not suppress advertised routes: %+v", snapshot.AdvertisedRoutes)
+		t.Fatalf("recovered gateway did not advertise route: %+v", snapshot.AdvertisedRoutes)
+	}
+}
+
+func TestStoreSuppressesAdvertisedRouteAfterValidationFailure(t *testing.T) {
+	store := NewStore("pairling-inst-abcdef")
+	store.SetAuthenticated()
+	store.SetTailnetIP("100.64.0.10")
+	store.SetListenerRunning(true)
+	store.SetUpstreamReachable(true)
+	proveGatewayReady(store)
+
+	store.RecordGatewayEvent("GET", "/sessions-visible", 422, "validation_failed")
+	snapshot := store.Snapshot()
+	if snapshot.GatewayHealthy {
+		t.Fatalf("validation failure should mark gateway unhealthy: %+v", snapshot)
+	}
+	if len(snapshot.AdvertisedRoutes) != 0 {
+		t.Fatalf("validation failure should suppress advertised routes: %+v", snapshot.AdvertisedRoutes)
+	}
+}
+
+func TestGatewayFailureClassification(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		status  int
+		outcome string
+	}{
+		{name: "upstream error", status: 502, outcome: "upstream_error"},
+		{name: "validation failure", status: 422, outcome: "validation_failed"},
+		{name: "timeout", status: 408, outcome: "timeout"},
+		{name: "connection refused", status: 0, outcome: "connection_refused"},
+		{name: "bad gateway response", status: 502, outcome: "forwarded"},
+		{name: "gateway timeout response", status: 504, outcome: "forwarded"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if !gatewayEventIsFailure(test.status, test.outcome) {
+				t.Fatalf("status=%d outcome=%q should be a gateway failure", test.status, test.outcome)
+			}
+		})
+	}
+}
+
+func TestForwardedApplicationResponsesDoNotPoisonGatewayHealth(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status int
+	}{
+		{name: "application error", status: 500},
+		{name: "runtime load shedding", status: 503},
+		{name: "rate limited", status: 429},
+		{name: "not found", status: 404},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if gatewayEventIsFailure(test.status, "forwarded") {
+				t.Fatalf("forwarded status=%d should not mark the gateway unhealthy", test.status)
+			}
+		})
 	}
 }
 
@@ -286,27 +429,56 @@ func TestStoreGatewayFailureResetsRecoveryProofStreak(t *testing.T) {
 	store.SetTailnetIP("100.64.0.10")
 	store.SetListenerRunning(true)
 	store.SetUpstreamReachable(true)
+	proveGatewayReady(store)
 
 	store.RecordGatewayEvent("GET", "/routez", 502, "upstream_error")
 	if store.Snapshot().GatewayHealthy {
 		t.Fatalf("route proof failure should mark route unhealthy")
 	}
 
-	store.RecordGatewayEvent("GET", "/routez", 200, "forwarded")
+	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
 	store.RecordGatewayEvent("GET", "/routez", 502, "upstream_error")
-	store.RecordGatewayEvent("GET", "/routez", 200, "forwarded")
+	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
 	snapshot := store.Snapshot()
 	if snapshot.GatewayHealthy {
 		t.Fatalf("failure between routez successes should reset recovery streak: %+v", snapshot)
 	}
 
-	store.RecordGatewayEvent("GET", "/routez", 200, "forwarded")
+	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
 	snapshot = store.Snapshot()
 	if !snapshot.GatewayHealthy {
 		t.Fatalf("two routez successes after latest failure should recover route health: %+v", snapshot)
 	}
 	if len(snapshot.AdvertisedRoutes) != 1 {
 		t.Fatalf("consecutive routez proofs should restore advertised route: %+v", snapshot.AdvertisedRoutes)
+	}
+}
+
+func TestStoreNonSuccessRouteProbeResetsRecoveryProofStreak(t *testing.T) {
+	store := NewStore("pairling-inst-abcdef")
+	store.SetAuthenticated()
+	store.SetTailnetIP("100.64.0.10")
+	store.SetListenerRunning(true)
+	store.SetUpstreamReachable(true)
+	proveGatewayReady(store)
+
+	store.RecordGatewayEvent("GET", "/routez", 502, "upstream_error")
+	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
+	store.RecordGatewayEvent("GET", "/routez", 401, "forwarded")
+	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
+
+	snapshot := store.Snapshot()
+	if snapshot.GatewayHealthy {
+		t.Fatalf("non-success routez result between successes should reset recovery streak: %+v", snapshot)
+	}
+	if len(snapshot.AdvertisedRoutes) != 0 {
+		t.Fatalf("interrupted route proof sequence should not advertise a route: %+v", snapshot.AdvertisedRoutes)
+	}
+
+	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
+	snapshot = store.Snapshot()
+	if !snapshot.GatewayHealthy {
+		t.Fatalf("two successes after the interrupted sequence should recover route health: %+v", snapshot)
 	}
 }
 

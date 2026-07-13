@@ -30,6 +30,7 @@ class TurnStateAlertPublisher:
         max_state_age_seconds: float = 60 * 60 * 24,
         min_turn_done_seconds: float = 180.0,
         prime_existing: bool = True,
+        mac_install_id: str = "",
         logger: Callable[[str], None] | None = None,
     ) -> None:
         self.turn_state_dir = turn_state_dir
@@ -42,6 +43,7 @@ class TurnStateAlertPublisher:
         self.max_state_age_seconds = max_state_age_seconds
         self.min_turn_done_seconds = min_turn_done_seconds
         self.prime_existing = prime_existing
+        self.mac_install_id = _bounded_optional(mac_install_id, 160)
         self.logger = logger
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -144,7 +146,7 @@ class TurnStateAlertPublisher:
             "provider": provider,
             "tool": _bounded_optional(payload.get("tool"), 80),
             "request_nonce": _bounded_optional(payload.get("request_nonce"), 160),
-            "mac_install_id": _bounded_optional(payload.get("mac_install_id"), 160),
+            "mac_install_id": _bounded_optional(payload.get("mac_install_id"), 160) or self.mac_install_id,
         }
         return {
             "state_key": path.stem,
@@ -213,11 +215,10 @@ class TurnStateAlertPublisher:
             "session_id": native_id,
             "provider": provider,
         })
-        if kind == "action_required":
-            if visible.get("request_nonce"):
-                payload["request_nonce"] = visible.get("request_nonce")
-            if visible.get("mac_install_id"):
-                payload["mac_install_id"] = visible.get("mac_install_id")
+        if kind == "action_required" and visible.get("request_nonce"):
+            payload["request_nonce"] = visible.get("request_nonce")
+        if visible.get("mac_install_id"):
+            payload["mac_install_id"] = visible.get("mac_install_id")
         return payload
 
     def _route_session_id_for_event(self, session_id: str) -> str:

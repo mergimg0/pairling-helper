@@ -20,6 +20,7 @@ TAILSCALE_VARIANT = "embedded_tsnet"
 AUTH_MODE = "scoped-device-bearer"
 PAIR_SERVICE_TYPE = "_pairling-pair._tcp"
 RUNTIME_BONJOUR_ADVERTISED = False
+LOCAL_MCP_DISPATCH_SCOPE = "pairling-tools:dispatch"
 
 DEFAULT_DEVICE_SCOPES = frozenset({
     "health:read",

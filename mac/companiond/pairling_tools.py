@@ -11,6 +11,7 @@ import socket
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -29,6 +30,12 @@ IPHONE_TIMEOUT_MS_MAX = 5_000
 FAST_VIBE_CHECK_TIMEOUT_SECONDS = max(1, min(int(os.environ.get("PAIRLING_FAST_VIBE_TIMEOUT_SECONDS", "6")), 9))
 IPHONE_HOST = os.environ.get("PHONE_TS_HOST", os.environ.get("PAIRLING_PHONE_TOOLS_HOST", "iphone-15-pro"))
 IPHONE_PORT = int(os.environ.get("PHONE_TS_PORT", os.environ.get("PAIRLING_PHONE_TOOLS_PORT", "7724")))
+WORKER_LEASE_SECONDS = 60
+REVOKED_WORKER_TTL_SECONDS = 10 * 60
+COMPLETION_TOMBSTONE_TTL_SECONDS = 10 * 60
+MAX_TRACKED_PHONE_DEVICES = 64
+MAX_REVOKED_WORKERS = 256
+MAX_COMPLETION_TOMBSTONES = 256
 
 
 @dataclass(frozen=True)
@@ -42,10 +49,22 @@ class ToolResult:
 
 class PhoneToolAvailabilityStore:
     def __init__(self) -> None:
-        self._state: dict[str, Any] = {}
+        self._lock = threading.RLock()
+        self._states: dict[str, dict[str, Any]] = {}
 
-    def update(self, payload: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
+    def update(
+        self,
+        payload: dict[str, Any],
+        *,
+        device_id: str | None = None,
+        now: float | None = None,
+        reactivate: bool = True,
+    ) -> dict[str, Any]:
+        del reactivate  # Worker activation truth belongs to PhoneToolWorkQueue.
         current = time.time() if now is None else now
+        normalized_device = str(device_id or payload.get("device_id") or "").strip()[:160]
+        if not normalized_device:
+            return self.snapshot(now=current)
         running = bool(payload.get("listener_running"))
         try:
             expires_in = int(payload.get("expires_in_seconds") or 30)
@@ -56,32 +75,95 @@ class PhoneToolAvailabilityStore:
         if not isinstance(tools, list):
             tools = PHONE_TOOL_LIST
         normalized_tools = sorted({str(tool) for tool in tools if str(tool) in ALLOWED_TOOLS})
-        state = {
-            "last_seen_at": current,
-            "expires_at": current + expires_in if running else current,
-            "listener_running": running,
-            "port": _bounded_int(payload.get("port"), default=IPHONE_PORT, minimum=1, maximum=65535),
-            "tools": normalized_tools,
-            "app_state": str(payload.get("app_state") or "unknown")[:40],
+        worker_id = str(payload.get("worker_id") or "legacy")[:100]
+        with self._lock:
+            self._prune_locked(current)
+            active_worker = str(self._states.get(normalized_device, {}).get("worker_id") or "")
+            # A delayed stop from an earlier lifecycle cannot turn off the
+            # current worker for this phone.
+            if not running and active_worker and active_worker != worker_id:
+                return self.snapshot(device_id=normalized_device, now=current)
+            self._states[normalized_device] = {
+                "device_id": normalized_device,
+                "last_seen_at": current,
+                "expires_at": current + expires_in if running else current,
+                "listener_running": running,
+                "port": _bounded_int(payload.get("port"), default=IPHONE_PORT, minimum=0, maximum=65535),
+                "tools": normalized_tools,
+                "app_state": str(payload.get("app_state") or "unknown")[:40],
+                "worker_id": worker_id,
+            }
+            self._bound_states_locked()
+            return self.snapshot(device_id=normalized_device, now=current)
+
+    def remove_device(self, device_id: str | None) -> None:
+        normalized_device = str(device_id or "").strip()[:160]
+        if not normalized_device:
+            return
+        with self._lock:
+            self._states.pop(normalized_device, None)
+
+    def snapshot(self, *, device_id: str | None = None, now: float | None = None) -> dict[str, Any]:
+        current = time.time() if now is None else now
+        with self._lock:
+            self._prune_locked(current)
+            normalized_device = str(device_id or "").strip()[:160]
+            if normalized_device:
+                state = dict(self._states.get(normalized_device, {}))
+                state["fresh"] = self._state_is_fresh(state, current)
+                return state
+            states = [dict(state) for state in self._states.values()]
+            fresh = [state for state in states if self._state_is_fresh(state, current)]
+            aggregate: dict[str, Any] = {
+                "fresh": len(fresh) == 1,
+                "ambiguous": len(fresh) > 1,
+                "devices": sorted(states, key=lambda state: str(state.get("device_id") or "")),
+            }
+            if len(fresh) == 1:
+                aggregate.update(fresh[0])
+            return aggregate
+
+    def is_fresh(
+        self,
+        tool: str | None = None,
+        *,
+        device_id: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        current = time.time() if now is None else now
+        with self._lock:
+            self._prune_locked(current)
+            normalized_device = str(device_id or "").strip()[:160]
+            candidates = [
+                state
+                for candidate_device, state in self._states.items()
+                if (not normalized_device or candidate_device == normalized_device)
+                and self._state_is_fresh(state, current)
+                and (not tool or tool in set(state.get("tools") or []))
+            ]
+            return len(candidates) == 1
+
+    @staticmethod
+    def _state_is_fresh(state: dict[str, Any], current: float) -> bool:
+        return bool(state.get("listener_running")) and float(state.get("expires_at") or 0) > current
+
+    def _prune_locked(self, current: float) -> None:
+        stale_before = current - REVOKED_WORKER_TTL_SECONDS
+        self._states = {
+            device_id: state
+            for device_id, state in self._states.items()
+            if float(state.get("last_seen_at") or 0) > stale_before
         }
-        self._state = state
-        return self.snapshot(now=current)
 
-    def snapshot(self, *, now: float | None = None) -> dict[str, Any]:
-        current = time.time() if now is None else now
-        state = dict(self._state)
-        state["fresh"] = self.is_fresh(now=current)
-        return state
-
-    def is_fresh(self, tool: str | None = None, *, now: float | None = None) -> bool:
-        current = time.time() if now is None else now
-        if not self._state.get("listener_running"):
-            return False
-        if float(self._state.get("expires_at") or 0) <= current:
-            return False
-        if tool and tool not in set(self._state.get("tools") or []):
-            return False
-        return True
+    def _bound_states_locked(self) -> None:
+        if len(self._states) <= MAX_TRACKED_PHONE_DEVICES:
+            return
+        oldest = sorted(
+            self._states,
+            key=lambda device_id: float(self._states[device_id].get("last_seen_at") or 0),
+        )
+        for device_id in oldest[: len(self._states) - MAX_TRACKED_PHONE_DEVICES]:
+            self._states.pop(device_id, None)
 
 
 PHONE_TOOL_AVAILABILITY = PhoneToolAvailabilityStore()
@@ -93,43 +175,238 @@ class PhoneToolWorkQueue:
         self._pending: list[dict[str, Any]] = []
         self._inflight: dict[str, dict[str, Any]] = {}
         self._results: dict[str, ToolResult] = {}
-        self._poller_state: dict[str, Any] = {}
+        self._pollers: dict[str, dict[str, Any]] = {}
+        self._active_workers: dict[str, dict[str, Any]] = {}
+        self._revoked_workers: OrderedDict[tuple[str, str], float] = OrderedDict()
+        self._completion_tombstones: OrderedDict[str, float] = OrderedDict()
+
+    @staticmethod
+    def _worker_id(worker_id: str | None) -> str:
+        return str(worker_id or "legacy")[:100]
+
+    @staticmethod
+    def _device_id(device_id: str | None) -> str:
+        return str(device_id or "").strip()[:160]
+
+    def activate_worker(
+        self,
+        *,
+        device_id: str | None,
+        worker_id: str | None,
+        supersedes_worker_id: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        normalized_device = self._device_id(device_id)
+        if not normalized_device:
+            return False
+        normalized_worker = self._worker_id(worker_id)
+        supersedes = str(supersedes_worker_id or "").strip()[:100]
+        current = time.time() if now is None else now
+        with self._condition:
+            self._prune_lifecycle_locked(current)
+            worker_key = (normalized_device, normalized_worker)
+            active_state = self._active_workers.get(normalized_device)
+            active_worker = str(active_state.get("worker_id") or "") if active_state else ""
+            if active_worker == normalized_worker:
+                active_state["last_seen_at"] = current
+                return True
+            if normalized_worker != "legacy" and worker_key in self._revoked_workers:
+                return False
+            # Replacement is a compare-and-swap against the worker lifecycle
+            # remembered by the phone. A delayed start for an older lifecycle
+            # cannot replace a newer worker merely because its request arrived
+            # last.
+            if active_worker:
+                migrating_predecessorless_v3 = (
+                    normalized_worker.startswith("v3:")
+                    and not active_worker.startswith("v3:")
+                    and not supersedes
+                )
+                if not migrating_predecessorless_v3 and (not supersedes or supersedes != active_worker):
+                    return False
+                self._revoke_worker_locked(normalized_device, active_worker, current)
+                self._cancel_worker_locked(
+                    normalized_device,
+                    active_worker,
+                    reason="iphone_worker_replaced",
+                )
+            self._active_workers[normalized_device] = {
+                "worker_id": normalized_worker,
+                "activated_at": current,
+                "last_seen_at": current,
+            }
+            self._bound_devices_locked(current)
+            self._condition.notify_all()
+            return True
+
+    def deactivate_worker(
+        self,
+        *,
+        device_id: str | None,
+        worker_id: str | None,
+        now: float | None = None,
+    ) -> bool:
+        normalized_device = self._device_id(device_id)
+        if not normalized_device:
+            return False
+        normalized_worker = self._worker_id(worker_id)
+        current = time.time() if now is None else now
+        with self._condition:
+            self._prune_lifecycle_locked(current)
+            self._revoke_worker_locked(normalized_device, normalized_worker, current)
+            active = self._active_workers.get(normalized_device)
+            if not active or active.get("worker_id") != normalized_worker:
+                return False
+            self._active_workers.pop(normalized_device, None)
+            self._cancel_worker_locked(normalized_device, normalized_worker, reason="iphone_worker_stopped")
+            self._condition.notify_all()
+            return True
+
+    def deactivate_device(self, device_id: str | None, *, reason: str = "iphone_credential_changed") -> bool:
+        normalized_device = self._device_id(device_id)
+        if not normalized_device:
+            return False
+        with self._condition:
+            active = self._active_workers.pop(normalized_device, None)
+            self._pollers.pop(normalized_device, None)
+            if active:
+                worker_id = str(active.get("worker_id") or "legacy")
+                self._revoke_worker_locked(normalized_device, worker_id, time.time())
+                self._cancel_worker_locked(normalized_device, worker_id, reason=reason)
+            # Credential invalidation is device-wide. Clear any stale request
+            # left by an older worker lifecycle as well as the active worker.
+            self._cancel_device_requests_locked(normalized_device, reason=reason)
+            self._condition.notify_all()
+            return active is not None
+
+    def _cancel_worker_locked(self, device_id: str, worker_id: str, *, reason: str) -> None:
+        poller = self._pollers.get(device_id)
+        if poller and poller.get("worker_id") == worker_id:
+            self._pollers.pop(device_id, None)
+
+        cancelled_ids = [
+            request_id
+            for request_id, request in self._inflight.items()
+            if request.get("assigned_device_id") == device_id
+            and request.get("assigned_worker_id") == worker_id
+        ]
+        for request_id in cancelled_ids:
+            self._inflight.pop(request_id, None)
+            self._results[request_id] = ToolResult(
+                False,
+                "iphone",
+                reason=reason,
+                error_message=reason.replace("_", " "),
+            )
+            self._mark_completion_tombstone_locked(request_id, time.time())
+
+        retained_pending: list[dict[str, Any]] = []
+        for request in self._pending:
+            if (
+                request.get("target_device_id") != device_id
+                or request.get("target_worker_id") != worker_id
+            ):
+                retained_pending.append(request)
+                continue
+            self._results[request["request_id"]] = ToolResult(
+                False,
+                "iphone",
+                reason=reason,
+                error_message=reason.replace("_", " "),
+            )
+            self._mark_completion_tombstone_locked(request["request_id"], time.time())
+        self._pending = retained_pending
+
+    def _cancel_device_requests_locked(self, device_id: str, *, reason: str) -> None:
+        workers = {
+            str(request.get("assigned_worker_id") or request.get("target_worker_id") or "legacy")
+            for request in [*self._pending, *self._inflight.values()]
+            if request.get("assigned_device_id") == device_id or request.get("target_device_id") == device_id
+        }
+        for worker_id in workers:
+            self._cancel_worker_locked(device_id, worker_id, reason=reason)
+
+    def worker_is_active(self, *, device_id: str | None, worker_id: str | None) -> bool:
+        if not device_id:
+            return False
+        normalized_worker = self._worker_id(worker_id)
+        with self._condition:
+            self._prune_lifecycle_locked(time.time())
+            active = self._active_workers.get(self._device_id(device_id))
+            return bool(active and active.get("worker_id") == normalized_worker)
 
     def report_poller(
         self,
         *,
         device_id: str | None,
         tools: list[str] | None,
+        worker_id: str | None = None,
         now: float | None = None,
         expires_in_seconds: int = 30,
     ) -> dict[str, Any]:
         current = time.time() if now is None else now
         normalized_tools = sorted({str(tool) for tool in (tools or PHONE_TOOL_LIST) if str(tool) in ALLOWED_TOOLS})
         expires = current + max(1, min(int(expires_in_seconds or 30), 120))
+        normalized_worker = self._worker_id(worker_id)
+        normalized_device = self._device_id(device_id)
         with self._condition:
-            self._poller_state = {
-                "device_id": device_id,
+            self._prune_lifecycle_locked(current)
+            active = self._active_workers.get(normalized_device)
+            if not normalized_device or not active or active.get("worker_id") != normalized_worker:
+                return self.snapshot(device_id=normalized_device, now=current)
+            active["last_seen_at"] = current
+            self._pollers[normalized_device] = {
+                "device_id": normalized_device,
+                "worker_id": normalized_worker,
                 "last_seen_at": current,
                 "expires_at": expires,
                 "tools": normalized_tools,
             }
             self._condition.notify_all()
-            return self.snapshot(now=current)
+            return self.snapshot(device_id=normalized_device, now=current)
 
-    def snapshot(self, *, now: float | None = None) -> dict[str, Any]:
-        current = time.time() if now is None else now
-        state = dict(self._poller_state)
-        state["fresh"] = self.is_fresh(now=current)
-        return state
-
-    def is_fresh(self, tool: str | None = None, *, now: float | None = None) -> bool:
+    def snapshot(self, *, device_id: str | None = None, now: float | None = None) -> dict[str, Any]:
         current = time.time() if now is None else now
         with self._condition:
-            if float(self._poller_state.get("expires_at") or 0) <= current:
-                return False
-            if tool and tool not in set(self._poller_state.get("tools") or []):
-                return False
-            return bool(self._poller_state.get("device_id"))
+            self._prune_lifecycle_locked(current)
+            normalized_device = self._device_id(device_id)
+            if normalized_device:
+                state = dict(self._pollers.get(normalized_device, {}))
+                state["fresh"] = self._poller_is_fresh_locked(state, current)
+                return state
+            fresh = self._fresh_pollers_locked(None, current)
+            aggregate: dict[str, Any] = {
+                "fresh": len(fresh) == 1,
+                "ambiguous": len(fresh) > 1,
+                "device_ids": sorted(str(state.get("device_id") or "") for state in fresh),
+            }
+            if len(fresh) == 1:
+                aggregate.update(fresh[0])
+            return aggregate
+
+    def is_fresh(
+        self,
+        tool: str | None = None,
+        *,
+        target_device_id: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        current = time.time() if now is None else now
+        with self._condition:
+            _, reason = self._resolve_target_locked(tool, target_device_id, current)
+            return reason is None
+
+    def unavailable_reason(
+        self,
+        tool: str | None = None,
+        *,
+        target_device_id: str | None = None,
+        now: float | None = None,
+    ) -> str | None:
+        current = time.time() if now is None else now
+        with self._condition:
+            _, reason = self._resolve_target_locked(tool, target_device_id, current)
+            return reason
 
     def next_request(
         self,
@@ -137,30 +414,45 @@ class PhoneToolWorkQueue:
         device_id: str | None,
         tools: list[str] | None,
         wait_seconds: int,
+        worker_id: str | None = None,
         now: Callable[[], float] = time.time,
     ) -> dict[str, Any] | None:
         normalized_tools = sorted({str(tool) for tool in (tools or PHONE_TOOL_LIST) if str(tool) in ALLOWED_TOOLS})
         wait_seconds = max(1, min(int(wait_seconds or 10), 25))
         deadline = now() + wait_seconds
+        normalized_worker = self._worker_id(worker_id)
         with self._condition:
             self.report_poller(
                 device_id=device_id,
                 tools=normalized_tools,
+                worker_id=normalized_worker,
                 now=now(),
                 expires_in_seconds=wait_seconds + 20,
             )
             while True:
+                active = self._active_workers.get(self._device_id(device_id))
+                if not device_id or not active or active.get("worker_id") != normalized_worker:
+                    return None
                 self._prune_locked(now())
+                active = self._active_workers.get(self._device_id(device_id))
+                if not active or active.get("worker_id") != normalized_worker:
+                    return None
                 for idx, request in enumerate(self._pending):
-                    if request["tool"] in normalized_tools:
+                    if (
+                        request["tool"] in normalized_tools
+                        and request.get("target_device_id") == device_id
+                        and request.get("target_worker_id") == normalized_worker
+                    ):
                         request = self._pending.pop(idx)
                         request["assigned_device_id"] = device_id
+                        request["assigned_worker_id"] = normalized_worker
                         self._inflight[request["request_id"]] = request
                         return {
                             "request_id": request["request_id"],
                             "tool": request["tool"],
                             "input": request["input"],
                             "created_at": request["created_at"],
+                            "deadline_at": request["expires_at"],
                         }
                 remaining = deadline - now()
                 if remaining <= 0:
@@ -174,14 +466,22 @@ class PhoneToolWorkQueue:
         ok: bool,
         result: str = "",
         error: str = "",
-    ) -> bool:
+        device_id: str | None = None,
+        worker_id: str | None = None,
+    ) -> str:
         request_id = str(request_id or "")
         if not request_id:
-            return False
+            return "stale"
         with self._condition:
-            request = self._inflight.pop(request_id, None)
+            self._prune_requests_locked(time.time())
+            request = self._inflight.get(request_id)
             if request is None:
-                return False
+                return "stale"
+            if device_id is not None and request.get("assigned_device_id") != device_id:
+                return "wrong_owner"
+            if worker_id is not None and request.get("assigned_worker_id") != self._worker_id(worker_id):
+                return "wrong_owner"
+            self._inflight.pop(request_id, None)
             self._results[request_id] = ToolResult(
                 bool(ok),
                 "iphone",
@@ -190,7 +490,7 @@ class PhoneToolWorkQueue:
                 error_message="" if ok else str(error or "phone tool failed"),
             )
             self._condition.notify_all()
-            return True
+            return "accepted"
 
     def submit(
         self,
@@ -198,6 +498,7 @@ class PhoneToolWorkQueue:
         input_payload: dict[str, Any],
         *,
         timeout_ms: int,
+        target_device_id: str | None = None,
         now: Callable[[], float] = time.time,
     ) -> ToolResult:
         timeout = max(0.05, min(timeout_ms, IPHONE_TIMEOUT_MS_MAX) / 1000)
@@ -211,8 +512,14 @@ class PhoneToolWorkQueue:
             "expires_at": deadline,
         }
         with self._condition:
-            if not self.is_fresh(tool, now=now()):
-                return ToolResult(False, "iphone", reason="iphone_no_reverse_worker", error_message="no fresh phone tool worker")
+            self._prune_requests_locked(now())
+            target, reason = self._resolve_target_locked(tool, target_device_id, now())
+            if target is None:
+                return ToolResult(False, "iphone", reason=reason, error_message=(reason or "iphone unavailable").replace("_", " "))
+            request["target_device_id"] = target.get("device_id")
+            request["target_worker_id"] = target.get("worker_id")
+            if self._worker_has_work_locked(str(target.get("device_id")), str(target.get("worker_id"))):
+                return ToolResult(False, "iphone", reason="iphone_worker_busy", error_message="phone tool worker is busy")
             self._pending.append(request)
             self._condition.notify_all()
             while True:
@@ -223,11 +530,56 @@ class PhoneToolWorkQueue:
                 if remaining <= 0:
                     self._pending = [item for item in self._pending if item["request_id"] != request_id]
                     self._inflight.pop(request_id, None)
+                    self._mark_completion_tombstone_locked(request_id, now())
                     return ToolResult(False, "iphone", reason="iphone_timeout", error_message="timed out")
                 self._condition.wait(timeout=remaining)
 
-    def _prune_locked(self, current: float) -> None:
+    def _resolve_target_locked(
+        self,
+        tool: str | None,
+        target_device_id: str | None,
+        current: float,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        self._prune_lifecycle_locked(current)
+        normalized_target = self._device_id(target_device_id)
+        candidates = self._fresh_pollers_locked(tool, current)
+        if normalized_target:
+            for state in candidates:
+                if state.get("device_id") == normalized_target:
+                    return state, None
+            return None, "iphone_target_unavailable"
+        if not candidates:
+            return None, "iphone_no_reverse_worker"
+        if len(candidates) > 1:
+            return None, "iphone_owner_ambiguous"
+        return candidates[0], None
+
+    def _fresh_pollers_locked(self, tool: str | None, current: float) -> list[dict[str, Any]]:
+        return [
+            dict(state)
+            for state in self._pollers.values()
+            if self._poller_is_fresh_locked(state, current)
+            and (not tool or tool in set(state.get("tools") or []))
+        ]
+
+    @staticmethod
+    def _poller_is_fresh_locked(state: dict[str, Any], current: float) -> bool:
+        return bool(state.get("device_id")) and float(state.get("expires_at") or 0) > current
+
+    def _worker_has_work_locked(self, device_id: str, worker_id: str) -> bool:
+        return any(
+            request.get("target_device_id") == device_id and request.get("target_worker_id") == worker_id
+            for request in self._pending
+        ) or any(
+            request.get("assigned_device_id") == device_id and request.get("assigned_worker_id") == worker_id
+            for request in self._inflight.values()
+        )
+
+    def _prune_requests_locked(self, current: float) -> None:
+        expired_pending = [item for item in self._pending if float(item.get("expires_at") or 0) <= current]
         self._pending = [item for item in self._pending if float(item.get("expires_at") or 0) > current]
+        for item in expired_pending:
+            self._mark_completion_tombstone_locked(str(item.get("request_id") or ""), current)
         expired = [
             request_id
             for request_id, item in self._inflight.items()
@@ -236,6 +588,69 @@ class PhoneToolWorkQueue:
         for request_id in expired:
             self._inflight.pop(request_id, None)
             self._results.pop(request_id, None)
+            self._mark_completion_tombstone_locked(request_id, current)
+
+    def _prune_locked(self, current: float) -> None:
+        self._prune_lifecycle_locked(current)
+        self._prune_requests_locked(current)
+
+    def _prune_lifecycle_locked(self, current: float) -> None:
+        expired_pollers = [
+            device_id
+            for device_id, state in self._pollers.items()
+            if float(state.get("expires_at") or 0) <= current
+        ]
+        for device_id in expired_pollers:
+            self._pollers.pop(device_id, None)
+        expired_workers = [
+            (device_id, str(state.get("worker_id") or "legacy"))
+            for device_id, state in self._active_workers.items()
+            if float(state.get("last_seen_at") or state.get("activated_at") or 0) + WORKER_LEASE_SECONDS <= current
+        ]
+        for device_id, worker_id in expired_workers:
+            self._active_workers.pop(device_id, None)
+            self._revoke_worker_locked(device_id, worker_id, current)
+            self._cancel_worker_locked(device_id, worker_id, reason="iphone_worker_expired")
+        if expired_workers:
+            self._condition.notify_all()
+        revoked_before = current - REVOKED_WORKER_TTL_SECONDS
+        while self._revoked_workers:
+            key, revoked_at = next(iter(self._revoked_workers.items()))
+            if revoked_at > revoked_before and len(self._revoked_workers) <= MAX_REVOKED_WORKERS:
+                break
+            self._revoked_workers.pop(key, None)
+        tombstone_before = current - COMPLETION_TOMBSTONE_TTL_SECONDS
+        while self._completion_tombstones:
+            request_id, cancelled_at = next(iter(self._completion_tombstones.items()))
+            if cancelled_at > tombstone_before and len(self._completion_tombstones) <= MAX_COMPLETION_TOMBSTONES:
+                break
+            self._completion_tombstones.pop(request_id, None)
+
+    def _revoke_worker_locked(self, device_id: str, worker_id: str, current: float) -> None:
+        if worker_id == "legacy":
+            return
+        key = (device_id, worker_id)
+        self._revoked_workers[key] = current
+        self._revoked_workers.move_to_end(key)
+
+    def _mark_completion_tombstone_locked(self, request_id: str, current: float) -> None:
+        if not request_id:
+            return
+        self._completion_tombstones[request_id] = current
+        self._completion_tombstones.move_to_end(request_id)
+
+    def _bound_devices_locked(self, current: float) -> None:
+        if len(self._active_workers) <= MAX_TRACKED_PHONE_DEVICES:
+            return
+        oldest = sorted(
+            self._active_workers,
+            key=lambda device_id: float(self._active_workers[device_id].get("last_seen_at") or 0),
+        )
+        for device_id in oldest[: len(self._active_workers) - MAX_TRACKED_PHONE_DEVICES]:
+            state = self._active_workers.pop(device_id)
+            worker_id = str(state.get("worker_id") or "legacy")
+            self._revoke_worker_locked(device_id, worker_id, current)
+            self._cancel_worker_locked(device_id, worker_id, reason="iphone_worker_evicted")
 
 
 PHONE_TOOL_WORK_QUEUE = PhoneToolWorkQueue()
@@ -249,20 +664,36 @@ class PhoneToolClient:
         port: int = IPHONE_PORT,
         token: str | None = None,
         work_queue: PhoneToolWorkQueue | None = None,
+        target_device_id: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.token = token if token is not None else _load_phone_token()
         self.work_queue = work_queue or PHONE_TOOL_WORK_QUEUE
+        self.target_device_id = str(target_device_id or "").strip()[:160] or None
 
     def is_available(self, tool: str, *, now: float | None = None) -> bool:
         if os.environ.get("PAIRLING_PHONE_TOOLS_DIRECT_TCP") == "1":
             return True
-        return self.work_queue.is_fresh(tool, now=now)
+        return self.work_queue.is_fresh(tool, target_device_id=self.target_device_id, now=now)
+
+    def unavailable_reason(self, tool: str, *, now: float | None = None) -> str | None:
+        if os.environ.get("PAIRLING_PHONE_TOOLS_DIRECT_TCP") == "1":
+            return None
+        return self.work_queue.unavailable_reason(
+            tool,
+            target_device_id=self.target_device_id,
+            now=now,
+        )
 
     def run(self, tool: str, input_payload: dict[str, Any], *, timeout_ms: int) -> ToolResult:
         if os.environ.get("PAIRLING_PHONE_TOOLS_DIRECT_TCP") != "1":
-            return self.work_queue.submit(tool, input_payload, timeout_ms=timeout_ms)
+            return self.work_queue.submit(
+                tool,
+                input_payload,
+                timeout_ms=timeout_ms,
+                target_device_id=self.target_device_id,
+            )
         if not self.token:
             return ToolResult(False, "iphone", reason="iphone_not_configured", error_message="phone token missing")
         request = json.dumps({
@@ -364,16 +795,18 @@ def run_pairling_tool(
     max_output_chars = _bounded_int(payload.get("max_output_chars"), default=MAX_OUTPUT_CHARS, minimum=64, maximum=MAX_OUTPUT_CHARS)
     mac_model = str(payload.get("mac_model") or "sonnet")
 
-    store = availability or PHONE_TOOL_AVAILABILITY
-    phone = iphone_client or PhoneToolClient()
+    # The listener heartbeat is diagnostic only. Routing truth comes from a
+    # live `/phone-tools/next` poll, because an advertised listener cannot
+    # receive queued work by itself.
+    del availability
+    requested_phone_device = str(payload.get("iphone_device_id") or "").strip()[:160] or None
+    phone = iphone_client or PhoneToolClient(target_device_id=requested_phone_device)
     mac = mac_runner or MacToolRunner()
     iphone_attempted = False
     iphone_reason: str | None = None
     iphone_error: str | None = None
 
-    iphone_ready = store.is_fresh(tool, now=started) or (
-        hasattr(phone, "is_available") and bool(phone.is_available(tool, now=started))
-    )
+    iphone_ready = hasattr(phone, "is_available") and bool(phone.is_available(tool, now=started))
     if strategy == "iphone_only" or (strategy == "auto" and iphone_ready):
         iphone_attempted = True
         phone_result = phone.run(tool, input_payload, timeout_ms=iphone_timeout_ms)
@@ -402,7 +835,10 @@ def run_pairling_tool(
                 diagnostics=_diagnostics(True, phone, mac_model),
             )
     elif strategy == "auto":
-        iphone_reason = "iphone_heartbeat_stale"
+        if hasattr(phone, "unavailable_reason"):
+            iphone_reason = phone.unavailable_reason(tool, now=started) or "iphone_no_reverse_worker"
+        else:
+            iphone_reason = "iphone_no_reverse_worker"
     else:
         iphone_reason = "iphone_disabled_by_strategy"
 
