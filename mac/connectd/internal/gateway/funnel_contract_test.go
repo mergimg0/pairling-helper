@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 )
@@ -31,11 +32,11 @@ func TestFunnelBootstrapMatchesContract(t *testing.T) {
 		t.Fatalf("parse contract: %v", err)
 	}
 
-	funnelTrueTotal := 0
+	contractPaths := make(map[string]bool)
 	checked := 0
 	for _, row := range contract.Rows {
 		if row.ConnectdFunnelBootstrap {
-			funnelTrueTotal++
+			contractPaths[row.Method+" "+row.SamplePath] = true
 		}
 		if !row.AssertFunnelParity {
 			continue
@@ -50,7 +51,17 @@ func TestFunnelBootstrapMatchesContract(t *testing.T) {
 	if checked == 0 {
 		t.Fatal("no assert_funnel_parity rows found; the contract is not wired")
 	}
-	if funnelTrueTotal != 5 {
-		t.Errorf("connectd_funnel_bootstrap true rows = %d, want exactly 5 (the funnel set)", funnelTrueTotal)
+	implementationPaths := make(map[string]bool)
+	for path := range funnelBootstrapGetPaths {
+		implementationPaths["GET "+path] = true
+	}
+	for path := range funnelBootstrapPostPaths {
+		implementationPaths["POST "+path] = true
+	}
+	if !reflect.DeepEqual(implementationPaths, contractPaths) {
+		t.Errorf("Funnel implementation paths = %v, contract paths = %v", implementationPaths, contractPaths)
+	}
+	if len(contractPaths) != 7 {
+		t.Errorf("connectd_funnel_bootstrap true rows = %d, want exactly 7", len(contractPaths))
 	}
 }

@@ -35,6 +35,7 @@ PACKAGED_SOURCE_PATHS=(
   "mac/connectd/go.sum"
   "mac/install"
   "mac/mcp"
+  "mac/packaging/bin/pairling"
   "relay/app_attest_validator.py"
 )
 SOURCE_DIRTY="${PAIRLING_SOURCE_DIRTY:-$(read_source_stamp "$REPO_ROOT/mac/SOURCE_DIRTY")}"

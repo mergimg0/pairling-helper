@@ -44,7 +44,9 @@ func TestAdversarialSSHGatewayBypass(t *testing.T) {
 		// §1 trap list — every one blocked even WITH a bearer.
 		{"pair/start", "POST", "/pair/start", false},
 		{"pair/claim", "POST", "/pair/claim", false},
+		{"pair/psk-activate", "POST", "/pair/psk-activate", false},
 		{"pair/psk-claim", "POST", "/pair/psk-claim", false},
+		{"pair/psk-claim-v2", "POST", "/pair/psk-claim-v2", false},
 		{"pair/revoke", "POST", "/pair/revoke", false},
 		{"pair/rotate-token", "POST", "/pair/rotate-token", false},
 		{"pair/bind-node", "POST", "/pair/bind-node", false},

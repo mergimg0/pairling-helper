@@ -972,26 +972,37 @@ class PTYBrokerSession:
         # Installed by the manager; invoked after each ingest so subscribers
         # learn about output at write time instead of polling raw_tail.
         self.on_output = None
+        # Installed by the manager. A naturally-ended child must relinquish
+        # every session id and TTY index just as an explicit terminate does.
+        self.on_exit = None
 
     def start(self) -> None:
         master_fd, slave_fd = pty.openpty()
         self.master_fd = master_fd
-        self.slave_tty = os.ttyname(slave_fd)
-        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", self.rows, self.columns, 0, 0))
-        self.process = subprocess.Popen(
-            self.argv,
-            cwd=self.project,
-            env=self.env,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            start_new_session=True,
-            close_fds=True,
-        )
-        self.pid = int(self.process.pid)
-        os.close(slave_fd)
-        os.set_blocking(self.master_fd, False)
-        threading.Thread(target=self._read_loop, name=f"pairling-pty-{self.session_id}", daemon=True).start()
+        try:
+            self.slave_tty = os.ttyname(slave_fd)
+            fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", self.rows, self.columns, 0, 0))
+            self.process = subprocess.Popen(
+                self.argv,
+                cwd=self.project,
+                env=self.env,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                start_new_session=True,
+                close_fds=True,
+            )
+            self.pid = int(self.process.pid)
+            os.set_blocking(self.master_fd, False)
+            threading.Thread(target=self._read_loop, name=f"pairling-pty-{self.session_id}", daemon=True).start()
+        except BaseException:
+            self.terminate(signal.SIGTERM)
+            raise
+        finally:
+            try:
+                os.close(slave_fd)
+            except OSError:
+                pass
 
     def is_alive(self) -> bool:
         return bool(self.process and self.process.poll() is None)
@@ -1345,6 +1356,12 @@ class PTYBrokerSession:
             self._closed = True
             with self._condition:
                 self._condition.notify_all()
+            hook = self.on_exit
+            if hook is not None:
+                try:
+                    hook(self)
+                except Exception:
+                    pass
 
 
 class PTYBrokerManager:
@@ -1367,6 +1384,7 @@ class PTYBrokerManager:
         self.source_revision = source_revision if source_revision is not None else _read_broker_source_revision(self.runtime_root)
         self.started_at = float(started_at or time.time())
         self._sessions: dict[str, PTYBrokerSession] = {}
+        self._reserved_session_ids: set[str] = set()
         self._by_tty: dict[str, str] = {}
         self._lock = threading.RLock()
         self._server_started = False
@@ -1453,31 +1471,57 @@ class PTYBrokerManager:
     def spawn(self, *, session_id: str, provider: str, native_id: str, project: str, command: str,
               rows: int = 30, columns: int = 120, env: dict[str, str] | None = None) -> PTYBrokerSession:
         self.start_attach_server()
-        safe_command = command
-        argv = ["/bin/zsh", "-ic", safe_command]
-        prune_capture_dir(self.log_dir)
-        raw_log = self.log_dir / f"broker-{provider}-{native_id}.log"
-        merged_env = dict(os.environ)
-        if env:
-            merged_env.update(env)
-        session = PTYBrokerSession(
-            session_id=session_id,
-            provider=provider,
-            native_id=native_id,
-            project=project,
-            argv=argv,
-            env=merged_env,
-            rows=rows,
-            columns=columns,
-            raw_log_path=raw_log,
-        )
-        session.on_output = self.notify_output
-        session.start()
         with self._lock:
-            self._sessions[session_id] = session
-            if session.slave_tty:
-                self._by_tty[session.slave_tty] = session_id
-        return session
+            if not session_id:
+                raise ValueError("broker session id is required")
+            existing = self._sessions.get(session_id)
+            if existing is not None and not existing.is_alive():
+                self._evict_session_locked(existing)
+            if session_id in self._sessions or session_id in self._reserved_session_ids:
+                raise ValueError(f"broker session id already exists: {session_id}")
+            self._reserved_session_ids.add(session_id)
+
+        session: PTYBrokerSession | None = None
+        try:
+            safe_command = command
+            argv = ["/bin/zsh", "-ic", safe_command]
+            prune_capture_dir(self.log_dir)
+            raw_log = self.log_dir / f"broker-{provider}-{native_id}.log"
+            merged_env = dict(os.environ)
+            if env:
+                merged_env.update(env)
+            session = PTYBrokerSession(
+                session_id=session_id,
+                provider=provider,
+                native_id=native_id,
+                project=project,
+                argv=argv,
+                env=merged_env,
+                rows=rows,
+                columns=columns,
+                raw_log_path=raw_log,
+            )
+            session.on_output = self.notify_output
+            session.on_exit = self._session_exited
+            session.start()
+            with self._lock:
+                self._reserved_session_ids.discard(session_id)
+                if session_id in self._sessions:
+                    raise RuntimeError(f"broker session ownership changed during spawn: {session_id}")
+                # A short-lived command may finish before start() returns and
+                # before the exit callback can find it in the manager. Do not
+                # publish a dead owner in that race.
+                if session.is_alive():
+                    self._sessions[session_id] = session
+                    if session.slave_tty:
+                        self._by_tty[session.slave_tty] = session_id
+            return session
+        except BaseException:
+            with self._lock:
+                self._reserved_session_ids.discard(session_id)
+            if session is not None:
+                session.terminate(sig=signal.SIGTERM)
+            raise
 
     def descriptor(self, session: PTYBrokerSession) -> dict:
         return {
@@ -1493,14 +1537,36 @@ class PTYBrokerManager:
             "alive": session.is_alive(),
         }
 
+    def _evict_session_locked(self, session: PTYBrokerSession) -> None:
+        for sid, existing in list(self._sessions.items()):
+            if existing is session:
+                self._sessions.pop(sid, None)
+        for tty, sid in list(self._by_tty.items()):
+            if self._sessions.get(sid) is None:
+                self._by_tty.pop(tty, None)
+
+    def _session_exited(self, session: PTYBrokerSession) -> None:
+        with self._lock:
+            self._evict_session_locked(session)
+
     def get(self, session_id: str) -> PTYBrokerSession | None:
         with self._lock:
-            return self._sessions.get(session_id)
+            session = self._sessions.get(session_id)
+            if session is not None and not session.is_alive():
+                self._evict_session_locked(session)
+                return None
+            return session
 
     def get_by_tty(self, tty_path: str) -> PTYBrokerSession | None:
         with self._lock:
             sid = self._by_tty.get(tty_path)
-            return self._sessions.get(sid or "")
+            session = self._sessions.get(sid or "")
+            if session is not None and not session.is_alive():
+                self._evict_session_locked(session)
+                return None
+            if session is None and sid is not None:
+                self._by_tty.pop(tty_path, None)
+            return session
 
     def register_alias(self, alias_session_id: str, session: PTYBrokerSession | str) -> None:
         if isinstance(session, str):
@@ -1509,19 +1575,34 @@ class PTYBrokerManager:
                 return
             session = resolved
         with self._lock:
+            if not alias_session_id:
+                raise ValueError("broker alias session id is required")
+            existing = self._sessions.get(alias_session_id)
+            if existing is not None and not existing.is_alive():
+                self._evict_session_locked(existing)
+                existing = None
+            if existing is not None and existing is not session:
+                raise ValueError(f"broker alias session id already exists: {alias_session_id}")
+            if alias_session_id in self._reserved_session_ids:
+                raise ValueError(f"broker alias session id is being spawned: {alias_session_id}")
             self._sessions[alias_session_id] = session
 
     def list_sessions(self) -> list[dict]:
         out: list[dict] = []
         with self._lock:
             seen: set[int] = set()
-            for session in self._sessions.values():
+            stale: list[PTYBrokerSession] = []
+            for session in list(self._sessions.values()):
                 ident = id(session)
                 if ident in seen:
                     continue
                 seen.add(ident)
                 if session.is_alive():
                     out.append(self.descriptor(session))
+                else:
+                    stale.append(session)
+            for session in stale:
+                self._evict_session_locked(session)
         return out
 
     def live_sessions(self) -> list[dict]:
@@ -1645,12 +1726,7 @@ class PTYBrokerManager:
         result = session.terminate(sig=sig)
         if sig in {signal.SIGTERM, signal.SIGKILL}:
             with self._lock:
-                for sid, existing in list(self._sessions.items()):
-                    if existing is session:
-                        self._sessions.pop(sid, None)
-                for tty, sid in list(self._by_tty.items()):
-                    if sid == session_id or self._sessions.get(sid) is None:
-                        self._by_tty.pop(tty, None)
+                self._evict_session_locked(session)
         return result
 
     def send_text(self, session_id: str, text: str) -> dict:

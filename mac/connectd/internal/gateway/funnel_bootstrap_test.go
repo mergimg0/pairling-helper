@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -41,7 +42,9 @@ func TestFunnelBootstrapAllowlist(t *testing.T) {
 		{http.MethodGet, "/healthz", false},
 		{http.MethodGet, "/readyz", false},
 		{http.MethodGet, "/manifest", false},
+		{http.MethodPost, "/pair/psk-activate", false},
 		{http.MethodPost, "/pair/psk-claim", false},
+		{http.MethodPost, "/pair/psk-claim-v2", false},
 	}
 
 	// Every one of these must be denied, even with a valid-looking bearer, since
@@ -163,6 +166,9 @@ func TestFunnelHealthAndManifestAreSynthesizedNotProxied(t *testing.T) {
 		if !strings.Contains(body, "deadbeef") {
 			t.Errorf("%s response missing mac_id_hash: %s", path, body)
 		}
+		if !strings.Contains(body, `"pairing_activation_contracts":["pairling.psk.activate.v1"]`) {
+			t.Errorf("%s response missing activation contract: %s", path, body)
+		}
 		if upstreamHit[path] {
 			t.Errorf("%s reached upstream; must be synthesized at connectd", path)
 		}
@@ -228,6 +234,118 @@ func TestFunnelLimiterCaps(t *testing.T) {
 	}
 }
 
+func TestFunnelLimiterDeniedUniqueIDsDoNotGrowState(t *testing.T) {
+	limiter := NewFunnelLimiter(1, 100, 1)
+	if !limiter.Allow("accepted") {
+		t.Fatal("first request should consume the global budget")
+	}
+
+	for i := 0; i < 5000; i++ {
+		if limiter.Allow(fmt.Sprintf("denied-%d", i)) {
+			t.Fatalf("request %d passed after the global budget was exhausted", i)
+		}
+	}
+
+	limiter.mu.Lock()
+	entries := len(limiter.perPair)
+	limiter.mu.Unlock()
+	if entries != 1 {
+		t.Fatalf("per-pair state entries = %d, want only the accepted identity", entries)
+	}
+}
+
+func TestFunnelActivationDoesNotConsumeECDHLimiter(t *testing.T) {
+	var upstreamCalls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	upstreamURL, _ := url.Parse(upstream.URL)
+	limiter := NewFunnelLimiter(100, 10, 1)
+	handler, err := NewHandler(Options{
+		Upstream:      upstreamURL,
+		Mode:          ExposureModeFunnelBootstrap,
+		FunnelLimiter: limiter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := func(path, pairID string) int {
+		req := httptest.NewRequest(
+			http.MethodPost,
+			path,
+			strings.NewReader(`{"pair_id":"`+pairID+`"}`),
+		)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if status := request("/pair/psk-claim-v2", "pairA"); status != http.StatusOK {
+		t.Fatalf("first claim status = %d, want 200", status)
+	}
+	for i := 0; i < 4; i++ {
+		if status := request("/pair/psk-activate", "pairA"); status != http.StatusOK {
+			t.Fatalf("activation retry %d status = %d, want 200", i+1, status)
+		}
+	}
+	release, ok := limiter.Acquire("occupied")
+	if !ok {
+		t.Fatal("failed to occupy the only ECDH slot")
+	}
+	defer release()
+	if status := request("/pair/psk-activate", "pairB"); status != http.StatusOK {
+		t.Fatalf("activation while ECDH is full status = %d, want 200", status)
+	}
+	if upstreamCalls != 6 {
+		t.Fatalf("upstream calls = %d, want 6", upstreamCalls)
+	}
+}
+
+func TestFunnelActivationHasIdentityIndependentGlobalLimit(t *testing.T) {
+	var upstreamCalls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	upstreamURL, _ := url.Parse(upstream.URL)
+	handler, err := NewHandler(Options{
+		Upstream:      upstreamURL,
+		Mode:          ExposureModeFunnelBootstrap,
+		FunnelLimiter: NewFunnelLimiter(2, 100, 100),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := func(pairID string) int {
+		req := httptest.NewRequest(
+			http.MethodPost,
+			"/pair/psk-activate",
+			strings.NewReader(`{"pair_id":"`+pairID+`"}`),
+		)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if status := request("random-a"); status != http.StatusOK {
+		t.Fatalf("first activation status = %d, want 200", status)
+	}
+	if status := request("random-b"); status != http.StatusOK {
+		t.Fatalf("second activation status = %d, want 200", status)
+	}
+	if status := request("random-c"); status != http.StatusTooManyRequests {
+		t.Fatalf("third unique activation status = %d, want 429", status)
+	}
+	if upstreamCalls != 2 {
+		t.Fatalf("upstream calls = %d, want 2", upstreamCalls)
+	}
+}
+
 // TestFunnelMarkerInjectedAndStripped verifies connectd sets the funnel-origin
 // marker only on the funnel handler (replacing any inbound spoof) and strips it
 // on the tailnet handler.
@@ -244,7 +362,7 @@ func TestFunnelMarkerInjectedAndStripped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/pair/psk-claim", strings.NewReader(`{"pair_id":"p"}`))
+	req := httptest.NewRequest(http.MethodPost, "/pair/psk-claim-v2", strings.NewReader(`{"pair_id":"p"}`))
 	req.Header.Set("X-Pairling-Funnel-Origin", "spoofed")
 	funnel.ServeHTTP(httptest.NewRecorder(), req)
 	if gotMarker != "1" {

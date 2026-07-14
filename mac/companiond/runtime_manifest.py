@@ -17,6 +17,7 @@ from runtime_contract import (
     CONTRACT_VERSION,
     DAEMON_LABEL,
     PAIR_SERVICE_TYPE,
+    PAIRING_CONTRACTS,
     PORT,
     RUNTIME_BONJOUR_ADVERTISED,
     RUNTIME_NAME,
@@ -252,6 +253,9 @@ def build_runtime_info(
     source_branch = os.environ.get("COMPANION_SOURCE_BRANCH", "unknown")
     source_dirty = None
     installed_at = os.environ.get("COMPANION_INSTALLED_AT")
+    # Process provenance must come from the executing script. The manifest is
+    # data inside that runtime and cannot redirect health checks to another
+    # directory by naming a different install_root.
     install_root = str(script.parent.parent) if script.parent.name == "companiond" else str(script.parent)
     source_hash = None
     verified = False
@@ -269,7 +273,6 @@ def build_runtime_info(
         if "source_dirty" in manifest:
             source_dirty = bool(manifest.get("source_dirty"))
         installed_at = str(manifest.get("installed_at") or installed_at or "")
-        install_root = str(manifest.get("install_root") or install_root)
         expected_hash = _manifest_file_hash(manifest, relative_path)
         if not expected_hash:
             verification_error = f"manifest missing hash for {relative_path}"
@@ -328,6 +331,7 @@ def build_manifest_payload(
         "ok": True,
         "schema_version": 1,
         "contract_version": CONTRACT_VERSION,
+        "pairing_contracts": dict(PAIRING_CONTRACTS),
         "runtime": public_runtime_info(runtime_info),
         "auth": {
             "mode": AUTH_MODE,
@@ -351,7 +355,7 @@ def build_manifest_payload(
             },
         },
         "endpoints": {
-            "public": ["/health", "/manifest", "/pair/start", "/pair/claim", "/pair/psk-claim"],
+            "public": ["/health", "/manifest", "/pair/start", "/pair/claim", "/pair/psk-activate", "/pair/psk-claim", "/pair/psk-claim-v2"],
             "authenticated": [
                 "/manifest",
                 "/sessions",

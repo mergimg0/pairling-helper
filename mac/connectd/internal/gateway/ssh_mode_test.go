@@ -64,7 +64,9 @@ func TestSSHModeBlocksTheTrapListEvenWithBearer(t *testing.T) {
 	}{
 		{http.MethodPost, "/pair/start"},
 		{http.MethodPost, "/pair/claim"},
+		{http.MethodPost, "/pair/psk-activate"},
 		{http.MethodPost, "/pair/psk-claim"},
+		{http.MethodPost, "/pair/psk-claim-v2"},
 		{http.MethodPost, "/pair/revoke"},
 		{http.MethodPost, "/pair/rotate-token"},
 		{http.MethodPost, "/pair/bind-node"},

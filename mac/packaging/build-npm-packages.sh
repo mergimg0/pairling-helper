@@ -91,6 +91,8 @@ PACKAGED_SOURCE_PATHS=(
   "mac/install"
   "mac/mcp"
   "mac/packaging/bin/pairling"
+  "mac/packaging/build-npm-packages.sh"
+  "mac/packaging/vendor-cpython.sh"
   "npm"
   "relay/app_attest_validator.py"
 )

@@ -55,6 +55,7 @@ import errno
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import copy
@@ -80,6 +81,11 @@ try:
         DEFAULT_DEVICE_SCOPES as RUNTIME_DEFAULT_DEVICE_SCOPES,
         LEGACY_TOKEN_RELATIVE_PATH,
         LOCAL_MCP_DISPATCH_SCOPE,
+        PAIR_ACTIVATION_CONTRACT,
+        PAIR_ACTIVATION_RESULT_CONTRACT,
+        PAIR_CLAIM_REQUEST_CONTRACT,
+        PAIR_CLAIM_RESULT_CONTRACT,
+        PAIRING_CONTRACTS,
         PORT as RUNTIME_PORT,
         RUNTIME_NAME as RUNTIME_NAME,
         TAILSCALE_VARIANT as RUNTIME_TAILSCALE_VARIANT,
@@ -91,7 +97,14 @@ try:
         fetch_connectd_status,
         redacted_connectd_summary,
     )
-    from pairling_pairing import DEFAULT_PAIR_TTL_SECONDS, PairingAdvertiser, PairingError, PairingStore, ReauthStore
+    from pairling_pairing import (
+        DEFAULT_PAIR_TTL_SECONDS,
+        DEFAULT_SMOKE_LEASE_TTL_SECONDS,
+        PairingAdvertiser,
+        PairingError,
+        PairingStore,
+        ReauthStore,
+    )
     from pairdrop_store import PairDropStore, PairDropStoreError
 except Exception:
     RUNTIME_AUTH_MODE = "scoped-device-bearer"
@@ -100,6 +113,16 @@ except Exception:
     RUNTIME_DEFAULT_DEVICE_SCOPES = frozenset()
     LEGACY_TOKEN_RELATIVE_PATH = ".claude/scripts/.notify-token"
     LOCAL_MCP_DISPATCH_SCOPE = "pairling-tools:dispatch"
+    PAIR_ACTIVATION_CONTRACT = "pairling.psk.activate.v1"
+    PAIR_ACTIVATION_RESULT_CONTRACT = "pairling.psk.activate.result.v1"
+    PAIR_CLAIM_REQUEST_CONTRACT = "pairling.psk.claim.request.v2"
+    PAIR_CLAIM_RESULT_CONTRACT = "pairling.psk.claim.result.v2"
+    PAIRING_CONTRACTS = {
+        "request": PAIR_CLAIM_REQUEST_CONTRACT,
+        "claim_result": PAIR_CLAIM_RESULT_CONTRACT,
+        "activation": PAIR_ACTIVATION_CONTRACT,
+        "activation_result": PAIR_ACTIVATION_RESULT_CONTRACT,
+    }
     RUNTIME_PORT = 7773
     RUNTIME_NAME = "pairling-mac-runtime"
     RUNTIME_TAILSCALE_VARIANT = "embedded_tsnet"
@@ -109,6 +132,7 @@ except Exception:
     fetch_connectd_status = None
     redacted_connectd_summary = None
     DEFAULT_PAIR_TTL_SECONDS = 180
+    DEFAULT_SMOKE_LEASE_TTL_SECONDS = 600
     PairingAdvertiser = None
     PairingError = None
     PairingStore = None
@@ -117,6 +141,8 @@ except Exception:
     PairDropStoreError = ValueError
     app_support_root = None
     devices_db_path = None
+
+PAIRING_ACTIVATION_CONTRACT = PAIR_ACTIVATION_CONTRACT
 
 try:
     from compose_recording_store import (
@@ -143,23 +169,6 @@ try:
 except Exception:
     RelayClaimVerifier = None
     relay_claims_required = None
-
-# Fail loud at boot: the PSK pair-claim path cannot carry a relay attested-claim
-# ticket, so a relay-required config breaks every PSK pairing with an
-# attested_claim_required 403, and the modern PSK-first client has no fallback.
-# Surface it at startup instead of silently at pair time. Default-off, so this
-# only fires on an explicit opt-in.
-if relay_claims_required is not None and relay_claims_required():
-    import sys as _sys
-    print(
-        "PAIRLING STARTUP WARNING: PAIRLING_RELAY_CLAIMS_REQUIRED is set, but "
-        "/pair/psk-claim cannot carry a relay attested-claim ticket. Every PSK "
-        "pairing will fail with attested_claim_required 403 and the PSK-first "
-        "client has no fallback. Disable relay-required pairing, or add ticket "
-        "support to the PSK claim path, before pairing over PSK.",
-        file=_sys.stderr,
-        flush=True,
-    )
 
 try:
     from push_dispatcher import PairlingPushDispatcher, PushDispatcherError
@@ -839,6 +848,8 @@ STANDARD_TURN_PUSH_PUBLISHER = None
 MAC_HEALTH_PUSH_PUBLISHER = None
 SENTINEL_PUSH_PUBLISHER = None
 FLEET_ACTIVITY_PUBLISHER = None
+PUSH_DELIVERY_RETRY_WORKER = None
+PUSH_DELIVERY_RETRY_INTERVAL_SECONDS = 5.0
 # The sentinel session id the fleet Live Activity registers its push token
 # under (mirror of FleetLiveActivityController.fleetSessionKey). The fleet
 # publisher targets this key so the dispatcher resolves the fleet token.
@@ -1136,7 +1147,20 @@ _inject_rate_state: dict[str, list[float]] = {}  # session_id -> [timestamps]
 _request_rate_lock = threading.Lock()
 _request_rate_state: dict[str, list[float]] = {}
 _REQUEST_RATE_MAX_KEYS = 4096
-_proof_replay_cache = ReplayCache() if ReplayCache is not None else None
+PAIRDROP_REQUEST_PROOF_CHUNK_BYTES = 512 * 1024
+REQUEST_PROOF_TRANSFER_FLOOR_BYTES = 4 * 1024 * 1024 * 1024
+REQUEST_PROOF_CACHE_MAX_ENTRIES = 131_072
+REQUEST_PROOF_CACHE_MAX_ENTRIES_PER_DEVICE = 16_384
+REQUEST_PROOF_CACHE_PATH = APP_SUPPORT_ROOT / "request-proofs.sqlite"
+_proof_replay_cache = (
+    ReplayCache(
+        database_path=REQUEST_PROOF_CACHE_PATH,
+        max_entries=REQUEST_PROOF_CACHE_MAX_ENTRIES,
+        max_entries_per_device=REQUEST_PROOF_CACHE_MAX_ENTRIES_PER_DEVICE,
+    )
+    if ReplayCache is not None
+    else None
+)
 SSE_MAX_EVENT_BYTES = 64 * 1024
 SSE_TRANSCRIPT_MAX_EVENT_BYTES = 256 * 1024
 SSE_TERMINAL_CHUNK_BYTES = 48 * 1024
@@ -1360,6 +1384,7 @@ _runtime_snapshot_cache: dict[tuple, tuple[float, object]] = {}
 _runtime_snapshot_key_locks: dict[tuple, threading.Lock] = {}
 _auth_result_cache_lock = threading.Lock()
 _auth_result_cache: dict[tuple, tuple[float, object]] = {}
+_auth_result_cache_generation = 0
 _client_workflow_audit_lock = threading.Lock()
 _client_workflow_audit_last: dict[tuple[str, ...], float] = {}
 _CLIENT_WORKFLOW_AUDIT_INTERVAL_SECONDS = 300.0
@@ -1429,7 +1454,7 @@ class _RuntimeAdmission:
             pass
         self._released = True
 
-PUBLIC_ENDPOINTS = {"/health", "/healthz", "/readyz", "/manifest", "/power-state", "/pair/start", "/pair/claim", "/pair/psk-claim", "/pair/reauth-challenge", "/pair/reauth-claim"}
+PUBLIC_ENDPOINTS = {"/health", "/healthz", "/readyz", "/manifest", "/power-state", "/pair/start", "/pair/claim", "/pair/psk-claim", "/pair/psk-claim-v2", "/pair/psk-activate", "/pair/reauth-challenge", "/pair/reauth-claim"}
 
 # Internal hook tier: loopback-only endpoints used by Claude Code hooks to
 # write the session registry without device pairing. Gated by client IP AND
@@ -1552,6 +1577,8 @@ POST_ONLY_ENDPOINTS = {
     "/pair/start",
     "/pair/claim",
     "/pair/psk-claim",
+    "/pair/psk-claim-v2",
+    "/pair/psk-activate",
     "/pair/reauth-challenge",
     "/pair/reauth-claim",
     "/pair/revoke",
@@ -1601,6 +1628,11 @@ POST_ONLY_ENDPOINTS = {
     "/pairdrop/uploads",
 }
 
+GET_OR_POST_ENDPOINTS = {
+    "/onestream-handoff",
+    "/sentinel/preferences",
+}
+
 HIGH_RISK_ENDPOINTS = {
     "/aperture-cli/open",
     "/open",
@@ -1647,6 +1679,7 @@ HIGH_RISK_ENDPOINTS = {
 }
 
 PROOF_REQUIRED_ENDPOINTS = HIGH_RISK_ENDPOINTS | {
+    "/onestream-handoff",
     "/sentinel/preferences",
     "/safety/ack",
     "/safety/request-activation",
@@ -1865,9 +1898,9 @@ def _required_scopes_for_request(path: str, method: str) -> set[str]:
         return {"pair:admin"}
     if path in {"/push/permission/allow", "/push/permission/deny"}:
         return {"session:signal"}
-    if path == "/sentinel/preferences" and method == "POST":
-        return {"pair:admin"}
-    if path in {"/sentinel/status", "/sentinel/preferences", "/sentinel/events"}:
+    if path == "/sentinel/preferences":
+        return {"worker:read"} if method == "GET" else {"pair:admin"}
+    if path in {"/sentinel/status", "/sentinel/events"}:
         return {"worker:read"}
     if path in {"/sentinel/snooze", "/sentinel/evaluate-now"}:
         return {"pair:admin"}
@@ -1884,7 +1917,7 @@ def _required_scopes_for_request(path: str, method: str) -> set[str]:
     if path in {"/spawn-session", "/resume-session", "/cross-provider-action"}:
         return {"session:spawn"}
     if path == "/onestream-handoff":
-        return {"session:spawn"} if method == "POST" else {"sessions:read"}
+        return {"sessions:read"} if method == "GET" else {"session:spawn"}
     if path in {"/llm-route", "/llm-route-stream"}:
         return {"llm:route"}
     if path == "/pairling-tools/run":
@@ -2074,23 +2107,34 @@ def _authenticate_device(token: str, *, required_scopes: set[str], path: str, me
         return None
     cache_key = _auth_cache_key(token, method=method, path=path, required_scopes=required_scopes)
     now = _time.time()
+    cache_generation = None
     if cache_key is not None:
         with _auth_result_cache_lock:
+            cache_generation = _auth_result_cache_generation
             cached = _auth_result_cache.get(cache_key)
             if cached is not None and now - cached[0] < AUTH_RESULT_CACHE_SECONDS:
-                return cached[1]
+                credential_expires_at = getattr(cached[1], "credential_expires_at", None)
+                if credential_expires_at is None or now < float(credential_expires_at):
+                    return cached[1]
+                _auth_result_cache.pop(cache_key, None)
 
-    auth_result = DEVICE_REGISTRY.authenticate(
-        token,
-        required_scopes=required_scopes,
-        path=path,
-    )
+    auth_kwargs = {
+        "required_scopes": required_scopes,
+        "path": path,
+    }
+    # A freshly claimed credential may prove only the read-only route identity
+    # before the phone durably saves it and acknowledges activation. No other
+    # endpoint accepts a pending bearer.
+    if path == "/routez" and method.upper() == "GET":
+        auth_kwargs["allow_pending"] = True
+    auth_result = DEVICE_REGISTRY.authenticate(token, **auth_kwargs)
     if cache_key is not None and getattr(auth_result, "ok", False):
         with _auth_result_cache_lock:
-            _auth_result_cache[cache_key] = (now, auth_result)
-            if len(_auth_result_cache) > AUTH_RESULT_CACHE_MAX:
-                for old_key in list(_auth_result_cache.keys())[: max(1, AUTH_RESULT_CACHE_MAX // 4)]:
-                    _auth_result_cache.pop(old_key, None)
+            if cache_generation == _auth_result_cache_generation:
+                _auth_result_cache[cache_key] = (now, auth_result)
+                if len(_auth_result_cache) > AUTH_RESULT_CACHE_MAX:
+                    for old_key in list(_auth_result_cache.keys())[: max(1, AUTH_RESULT_CACHE_MAX // 4)]:
+                        _auth_result_cache.pop(old_key, None)
     return auth_result
 
 
@@ -2396,18 +2440,18 @@ def _request_rate_check(key: str, max_per_min: int = 120) -> tuple[bool, int]:
     with _request_rate_lock:
         if key not in _request_rate_state and len(_request_rate_state) >= _REQUEST_RATE_MAX_KEYS:
             for existing_key, existing_timestamps in list(_request_rate_state.items()):
-                fresh = [stamp for stamp in existing_timestamps if stamp >= window_start]
+                fresh = [stamp for stamp in existing_timestamps if stamp > window_start]
                 if fresh:
                     _request_rate_state[existing_key] = fresh
                 else:
                     _request_rate_state.pop(existing_key, None)
             if len(_request_rate_state) >= _REQUEST_RATE_MAX_KEYS:
                 return False, 60
-        timestamps = [t for t in _request_rate_state.get(key, []) if t >= window_start]
+        timestamps = [t for t in _request_rate_state.get(key, []) if t > window_start]
         if len(timestamps) >= max_per_min:
             oldest = min(timestamps)
             _request_rate_state[key] = timestamps
-            return False, max(1, int(60 - (now - oldest)))
+            return False, max(1, math.ceil(60 - (now - oldest)))
         timestamps.append(now)
         _request_rate_state[key] = timestamps
     return True, 0
@@ -2440,8 +2484,10 @@ def _reauth_rate_check(device_id: str, headers, client_address) -> tuple[bool, i
 
 
 def _clear_auth_result_cache() -> None:
+    global _auth_result_cache_generation
     with _auth_result_cache_lock:
         _auth_result_cache.clear()
+        _auth_result_cache_generation += 1
 
 
 def _runtime_info_snapshot() -> dict:
@@ -2576,15 +2622,16 @@ def _agent_registry_bootstrap_schema(conn) -> None:
         approval_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(pending_approvals)").fetchall()
         }
-        approval_extensions = {
-            "screen_hash": "TEXT",
-            "screen_generation": "INTEGER",
-            "screen_nonce": "TEXT",
-            "screen_bound_at": "REAL",
-        }
-        for column, declaration in approval_extensions.items():
-            if column not in approval_columns:
-                conn.execute(f"ALTER TABLE pending_approvals ADD COLUMN {column} {declaration}")
+        if "screen_hash" not in approval_columns:
+            conn.execute("ALTER TABLE pending_approvals ADD COLUMN screen_hash TEXT")
+        if "screen_generation" not in approval_columns:
+            conn.execute(
+                "ALTER TABLE pending_approvals ADD COLUMN screen_generation INTEGER"
+            )
+        if "screen_nonce" not in approval_columns:
+            conn.execute("ALTER TABLE pending_approvals ADD COLUMN screen_nonce TEXT")
+        if "screen_bound_at" not in approval_columns:
+            conn.execute("ALTER TABLE pending_approvals ADD COLUMN screen_bound_at REAL")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_agent_sessions_claude_uuid "
             "ON agent_sessions(provider, claude_uuid)"
@@ -3618,6 +3665,250 @@ def _registry_metadata_from_row(row: dict | None) -> dict:
         return {}
 
 
+def _agent_registry_row_for_broker_id(provider: str, broker_id: str) -> dict | None:
+    """Resolve one canonical registry row from its durable broker identity.
+
+    Broker-owned Claude sessions begin life under a ``pending-*`` native id.
+    Claude's SessionStart hook then creates the durable ``s-*`` id.  The
+    canonical row retains the original broker id in metadata so requests that
+    opened during that short bootstrap window can continue to resolve without
+    guessing from project or transcript recency.
+    """
+    provider = str(provider or "").strip().lower()
+    broker_id = str(broker_id or "").strip()
+    if provider not in {"claude", "codex"} or broker_id != _qualified_session_id(
+        provider, _parse_agent_session_ref(broker_id)[1]
+    ):
+        return None
+    try:
+        with _agent_registry_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM agent_sessions WHERE provider = ? "
+                "AND metadata_json LIKE ? ORDER BY last_heartbeat DESC LIMIT 3",
+                (provider, f"%{broker_id}%"),
+            ).fetchall()
+    except Exception:
+        return None
+    matches = [
+        dict(row)
+        for row in rows
+        if str(_registry_metadata_from_row(dict(row)).get("broker_id") or "") == broker_id
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _agent_registry_resolve_native_alias(provider: str, native_id: str) -> str:
+    """Return the canonical native id for an exact broker-backed alias."""
+    provider = str(provider or "").strip().lower()
+    native_id = str(native_id or "").strip()
+    if not native_id or provider not in {"claude", "codex"}:
+        return native_id
+    if _agent_registry_get(provider, native_id) is not None:
+        return native_id
+    row = _agent_registry_row_for_broker_id(
+        provider, _qualified_session_id(provider, native_id)
+    )
+    return str(row.get("native_id") or native_id) if row else native_id
+
+
+def _agent_registry_link_claude_broker_registration(
+    canonical_native_id: str,
+    project: str,
+    *,
+    pid: int,
+    terminal_tty: str,
+    claude_uuid: str,
+    working_on: str,
+) -> dict:
+    """Atomically promote one pending Claude broker row to its hook id.
+
+    The link is allowed only when one live pending row matches the hook's exact
+    PID and project and its metadata proves ownership of that broker id.  Any
+    ambiguity fails closed and leaves both identities untouched.
+    """
+    canonical_native_id = str(canonical_native_id or "").strip()
+    project = str(project or "").strip()
+    pid = int(pid or 0)
+    terminal_tty = str(terminal_tty or "").strip()
+    claude_uuid = str(claude_uuid or "").strip()
+    working_on = str(working_on or "")[:500]
+    if (
+        not _safe_session_id(canonical_native_id)
+        or not project
+        or pid <= 0
+        or not claude_uuid
+    ):
+        return {"state": "not_applicable"}
+
+    now = _time.time()
+    try:
+        with _SESSION_TOMBSTONES_LOCK:
+            with _agent_registry_conn() as conn:
+                existing_raw = conn.execute(
+                    "SELECT * FROM agent_sessions WHERE provider = 'claude' "
+                    "AND native_id = ? LIMIT 1",
+                    (canonical_native_id,),
+                ).fetchone()
+                existing = dict(existing_raw) if existing_raw else None
+                existing_metadata = _registry_metadata_from_row(existing)
+                existing_broker_id = str(existing_metadata.get("broker_id") or "")
+                if existing_broker_id:
+                    expected_pid = int(existing.get("pid") or 0) if existing else 0
+                    if (
+                        str(existing.get("project") or "") != project
+                        or (expected_pid and expected_pid != pid)
+                        or str(existing.get("claude_uuid") or "") not in {"", claude_uuid}
+                    ):
+                        return {"state": "conflict", "reason": "canonical_identity_changed"}
+                    merged_metadata = dict(existing_metadata)
+                    merged_metadata.update({
+                        "canonical_native_id": canonical_native_id,
+                        "registered_by": "internal_session_register",
+                    })
+                    conn.execute(
+                        "UPDATE agent_sessions SET project=?, pid=?, "
+                        "terminal_tty=COALESCE(NULLIF(?, ''), terminal_tty), "
+                        "state='running', last_heartbeat=?, closed_at=NULL, "
+                        "metadata_json=?, claude_uuid=?, working_on=? "
+                        "WHERE provider='claude' AND native_id=?",
+                        (
+                            project,
+                            pid,
+                            terminal_tty,
+                            now,
+                            json.dumps(merged_metadata, sort_keys=True),
+                            claude_uuid,
+                            working_on,
+                            canonical_native_id,
+                        ),
+                    )
+                    result = {
+                        "state": "already_linked",
+                        "canonical_native_id": canonical_native_id,
+                        "broker_native_id": str(
+                            existing_metadata.get("broker_native_id") or ""
+                        ),
+                        "broker_id": existing_broker_id,
+                    }
+                else:
+                    pending_rows = [
+                        dict(row)
+                        for row in conn.execute(
+                            "SELECT * FROM agent_sessions WHERE provider='claude' "
+                            "AND native_id LIKE 'pending-%' AND project=? AND pid=? "
+                            "AND closed_at IS NULL ORDER BY started_at DESC LIMIT 3",
+                            (project, pid),
+                        ).fetchall()
+                    ]
+                    valid_pending = []
+                    for row in pending_rows:
+                        native_id = str(row.get("native_id") or "")
+                        metadata = _registry_metadata_from_row(row)
+                        broker_id = str(metadata.get("broker_id") or "")
+                        if (
+                            broker_id == _qualified_session_id("claude", native_id)
+                            and metadata.get("capture_backend") == "pty_broker"
+                        ):
+                            valid_pending.append((row, metadata, broker_id))
+                    if len(pending_rows) > 1 or len(valid_pending) != 1:
+                        if pending_rows:
+                            return {
+                                "state": "ambiguous",
+                                "reason": "pending_broker_identity_unverified",
+                            }
+                        return {"state": "not_found"}
+
+                    pending, pending_metadata, broker_id = valid_pending[0]
+                    pending_native_id = str(pending.get("native_id") or "")
+                    if existing is not None:
+                        if (
+                            str(existing.get("project") or "") != project
+                            or int(existing.get("pid") or 0) not in {0, pid}
+                            or str(existing.get("claude_uuid") or "") not in {"", claude_uuid}
+                        ):
+                            return {"state": "conflict", "reason": "canonical_identity_changed"}
+                    merged_metadata = dict(_registry_metadata_from_row(existing))
+                    merged_metadata.update(pending_metadata)
+                    merged_metadata.update({
+                        "broker_id": broker_id,
+                        "broker_native_id": pending_native_id,
+                        "canonical_native_id": canonical_native_id,
+                        "identity_link": "exact_pid_project",
+                        "registered_by": "internal_session_register",
+                    })
+                    chosen_tty = (
+                        terminal_tty
+                        or str(pending.get("terminal_tty") or "")
+                        or str((existing or {}).get("terminal_tty") or "")
+                    )
+                    started_at = float(
+                        (existing or {}).get("started_at")
+                        or pending.get("started_at")
+                        or now
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO agent_sessions
+                            (provider, native_id, project, pid, terminal_tty, state,
+                             started_at, last_heartbeat, closed_at, metadata_json,
+                             claude_uuid, working_on)
+                        VALUES ('claude', ?, ?, ?, ?, 'running', ?, ?, NULL, ?, ?, ?)
+                        ON CONFLICT(provider, native_id) DO UPDATE SET
+                            project=excluded.project,
+                            pid=excluded.pid,
+                            terminal_tty=excluded.terminal_tty,
+                            state='running',
+                            last_heartbeat=excluded.last_heartbeat,
+                            closed_at=NULL,
+                            metadata_json=excluded.metadata_json,
+                            claude_uuid=excluded.claude_uuid,
+                            working_on=excluded.working_on
+                        """,
+                        (
+                            canonical_native_id,
+                            project,
+                            pid,
+                            chosen_tty,
+                            started_at,
+                            now,
+                            json.dumps(merged_metadata, sort_keys=True),
+                            claude_uuid,
+                            working_on,
+                        ),
+                    )
+                    deleted = conn.execute(
+                        "DELETE FROM agent_sessions WHERE provider='claude' "
+                        "AND native_id=? AND project=? AND pid=? AND closed_at IS NULL",
+                        (pending_native_id, project, pid),
+                    )
+                    if deleted.rowcount != 1:
+                        raise RuntimeError("pending broker identity changed during registration")
+                    result = {
+                        "state": "linked",
+                        "canonical_native_id": canonical_native_id,
+                        "broker_native_id": pending_native_id,
+                        "broker_id": broker_id,
+                    }
+                # Keep the registry promotion uncommitted until the durable
+                # removal receipt is cleared. A tombstone store failure must
+                # roll back the canonical insert and pending-row delete rather
+                # than report failure after the identity already changed.
+                _clear_session_tombstone_for_reopen("claude", canonical_native_id)
+    except Exception as exc:
+        return {"state": "error", "reason": type(exc).__name__}
+
+    _invalidate_session_list_caches()
+    _publish_session_event(SESSION_SUMMARIES_TOPIC, {
+        "type": "session_identity_linked",
+        "provider": "claude",
+        "native_id": canonical_native_id,
+        "broker_id": result.get("broker_id"),
+        "project": project,
+        "heartbeat_at": now,
+    })
+    return result
+
+
 def _session_launch_context_from_metadata(metadata: dict | None) -> dict | None:
     if not isinstance(metadata, dict):
         return None
@@ -3685,14 +3976,15 @@ def _apply_launch_context_to_session_row(row: dict, metadata: dict | None) -> di
     return row
 
 
-def _agent_registry_live(provider: str) -> list[dict]:
+def _agent_registry_live(provider: str, *, limit: int = 100) -> list[dict]:
+    limit = max(1, min(int(limit or 100), 1000))
     try:
         with _agent_registry_conn() as conn:
             rows = conn.execute(
                 "SELECT * FROM agent_sessions "
                 "WHERE provider = ? AND closed_at IS NULL "
-                "ORDER BY last_heartbeat DESC LIMIT 100",
-                (provider,),
+                "ORDER BY last_heartbeat DESC LIMIT ?",
+                (provider, limit),
             ).fetchall()
             return [dict(r) for r in rows]
     except Exception:
@@ -3958,8 +4250,7 @@ def _clear_runtime_load_caches_for_tests() -> None:
     with _runtime_snapshot_cache_lock:
         _runtime_snapshot_cache.clear()
         _runtime_snapshot_key_locks.clear()
-    with _auth_result_cache_lock:
-        _auth_result_cache.clear()
+    _clear_auth_result_cache()
     _SESSION_TRANSCRIPT_STATS_CACHE.clear()
     _codex_rollout_paths_cache["ts"] = 0.0
     _codex_rollout_paths_cache["paths"] = []
@@ -4246,9 +4537,32 @@ def _daemon_snapshot() -> dict:
     }
 
 
+def _request_proof_health_snapshot() -> dict:
+    unavailable = {
+        "contract_version": "pairling-request-proof-health-v1",
+        "ok": False,
+        "durable": False,
+        "writable": False,
+        "entry_count": None,
+        "max_entries": REQUEST_PROOF_CACHE_MAX_ENTRIES,
+        "full": False,
+        "reason": "verifier_unavailable",
+    }
+    if verify_request_proof is None or _proof_replay_cache is None:
+        return unavailable
+    try:
+        status = _proof_replay_cache.status()
+    except Exception:
+        return unavailable
+    if not isinstance(status, dict):
+        return unavailable
+    return status
+
+
 def _readyz_payload() -> dict:
+    request_proof = _request_proof_health_snapshot()
     return {
-        "ok": True,
+        "ok": request_proof.get("ok") is True,
         "schema_version": 1,
         "contract_version": RUNTIME_CONTRACT_VERSION,
         "ts": _time.time(),
@@ -4259,6 +4573,7 @@ def _readyz_payload() -> dict:
             "version": DAEMON_VERSION,
             "threaded": True,
         },
+        "request_proof": request_proof,
     }
 
 
@@ -4315,13 +4630,19 @@ def _health_payload(authenticated: bool = False, auth_result=None) -> dict:
         coordinator = dict(coordinator)
         coordinator["pairling_connect"] = connect["summary"]
     routes = _health_routes(coordinator)
-    ok = coordinator.get("posture") in ("ready", "warning")
+    request_proof = _request_proof_health_snapshot()
+    ok = (
+        coordinator.get("posture") in ("ready", "warning")
+        and request_proof.get("ok") is True
+    )
     runtime_info = _runtime_info_snapshot()
     public_runtime = _public_runtime_info(runtime_info) if _public_runtime_info else runtime_info
     payload = {
         "ok": ok,
         "schema_version": 1,
         "contract_version": RUNTIME_CONTRACT_VERSION,
+        "pairing_contracts": dict(PAIRING_CONTRACTS),
+        "pairing_activation_contracts": [PAIRING_ACTIVATION_CONTRACT],
         "ts": _time.time(),
         "runtime": runtime_info if authenticated else public_runtime,
         "auth": {
@@ -4331,6 +4652,7 @@ def _health_payload(authenticated: bool = False, auth_result=None) -> dict:
         },
         "daemon": _daemon_snapshot(),
         "coordinator": coordinator,
+        "request_proof": request_proof,
     }
     if authenticated:
         payload["source"] = _health_source_identity(auth_result, runtime_info=runtime_info)
@@ -6251,7 +6573,122 @@ def _timestamp_from_json_prefix(prefix: str) -> float | None:
     return _transcript_timestamp_epoch(value)
 
 
-def _large_transcript_line_meaningful_at(prefix: str, provider: str) -> float | None:
+def _large_transcript_line_block_types(
+    handle,
+    start: int,
+    length: int,
+    provider: str,
+) -> set[str]:
+    """Read only JSON structure while skipping arbitrarily large values.
+
+    The scanner retains short field names and type values, never transcript
+    text. It follows the provider message/payload content array so nested tool
+    input objects cannot masquerade as provider-authored text blocks.
+    """
+    target_container = "payload" if provider == "codex" else "message"
+    frames: list[dict] = []
+    block_types: set[str] = set()
+    candidate_key: str | None = None
+    token = bytearray()
+    token_truncated = False
+    in_string = False
+    escaped = False
+    remaining = max(0, int(length))
+    handle.seek(start)
+
+    def finish_string() -> None:
+        nonlocal candidate_key
+        value = None if token_truncated else token.decode("ascii", errors="ignore")
+        if frames and frames[-1]["kind"] == "object" and frames[-1].get("pending_key") is not None:
+            key = frames[-1].pop("pending_key")
+            if frames[-1].get("target_block") and key == "type" and value:
+                block_types.add(value)
+            candidate_key = None
+        else:
+            candidate_key = value
+
+    while remaining > 0:
+        chunk = handle.read(min(_REVERSE_JSONL_CHUNK_BYTES, remaining))
+        if not chunk:
+            break
+        remaining -= len(chunk)
+        for byte in chunk:
+            if in_string:
+                if escaped:
+                    escaped = False
+                    if len(token) < 128:
+                        token.append(byte)
+                    else:
+                        token_truncated = True
+                    continue
+                if byte == 0x5C:
+                    escaped = True
+                    continue
+                if byte == 0x22:
+                    in_string = False
+                    finish_string()
+                    continue
+                if len(token) < 128:
+                    token.append(byte)
+                else:
+                    token_truncated = True
+                continue
+
+            if byte in b" \t\r\n":
+                continue
+            if byte == 0x22:
+                in_string = True
+                escaped = False
+                token.clear()
+                token_truncated = False
+                continue
+            if byte == 0x3A:  # :
+                if frames and frames[-1]["kind"] == "object" and candidate_key is not None:
+                    frames[-1]["pending_key"] = candidate_key
+                candidate_key = None
+                continue
+            if byte in (0x7B, 0x5B):  # { [
+                opened_by = None
+                if frames and frames[-1]["kind"] == "object":
+                    opened_by = frames[-1].pop("pending_key", None)
+                parent = frames[-1] if frames else None
+                kind = "object" if byte == 0x7B else "array"
+                target_content = bool(
+                    kind == "array"
+                    and opened_by == "content"
+                    and parent
+                    and parent.get("opened_by") == target_container
+                )
+                target_block = bool(
+                    kind == "object" and parent and parent.get("target_content")
+                )
+                frames.append({
+                    "kind": kind,
+                    "opened_by": opened_by,
+                    "target_content": target_content,
+                    "target_block": target_block,
+                })
+                candidate_key = None
+                continue
+            if byte in (0x7D, 0x5D):  # } ]
+                if frames:
+                    frames.pop()
+                candidate_key = None
+                continue
+            if byte == 0x2C:  # ,
+                if frames and frames[-1]["kind"] == "object":
+                    frames[-1].pop("pending_key", None)
+                candidate_key = None
+                continue
+            candidate_key = None
+    return block_types
+
+
+def _large_transcript_line_meaningful_at(
+    prefix: str,
+    provider: str,
+    block_types: set[str] | None = None,
+) -> float | None:
     """Classify a large provider row from bounded structural metadata.
 
     Provider JSONL writes the record type, role, timestamp, and content block
@@ -6271,10 +6708,10 @@ def _large_transcript_line_meaningful_at(prefix: str, provider: str) -> float | 
             return None
         if '"role":"assistant"' not in payload:
             return None
-        block = re.search(
-            r'"content":\[\{.{0,2048}?"type":"([^"]+)"', payload
-        )
-        if block is None or block.group(1) not in {"text", "input_text", "output_text"}:
+        block_types = block_types or set(re.findall(
+            r'(?:\[\{|},\{)"type":"([^"]+)"', payload
+        ))
+        if not block_types.intersection({"text", "input_text", "output_text"}):
             return None
     else:
         if '"type":"assistant"' not in compact:
@@ -6285,11 +6722,11 @@ def _large_transcript_line_meaningful_at(prefix: str, provider: str) -> float | 
             return None
         content_at = message.find('"content":')
         content = message[content_at:] if content_at >= 0 else ""
-        block = re.search(
-            r'"content":\[\{.{0,2048}?"type":"([^"]+)"', content
-        )
+        block_types = block_types or set(re.findall(
+            r'(?:\[\{|},\{)"type":"([^"]+)"', content
+        ))
         if not content.startswith('"content":"') and (
-            block is None or block.group(1) not in {"text", "input_text", "output_text"}
+            not block_types.intersection({"text", "input_text", "output_text"})
         ):
             return None
     lowered = prefix.lower()
@@ -6314,7 +6751,12 @@ def _last_meaningful_transcript_turn_at(
                     prefix = handle.read(min(length, _MEANINGFUL_LINE_PREFIX_BYTES)).decode(
                         "utf-8", errors="replace"
                     )
-                    meaningful = _large_transcript_line_meaningful_at(prefix, provider)
+                    block_types = _large_transcript_line_block_types(
+                        handle, start, length, provider
+                    )
+                    meaningful = _large_transcript_line_meaningful_at(
+                        prefix, provider, block_types
+                    )
                     if meaningful is not None:
                         return meaningful
                     continue
@@ -6681,7 +7123,7 @@ class ClaudeSessionsPgBackend:
             "claude_pid, claude_uuid, terminal_tty "
             "FROM sessions "
             + where_clause +
-            "ORDER BY last_heartbeat DESC LIMIT 50;"
+            "ORDER BY started_at DESC;"
         )
         proc = self._psql(sql, timeout=5, tabbed=True)
         if proc.returncode != 0:
@@ -6909,18 +7351,39 @@ class ClaudeSessionsSqliteBackend:
 
     def sessions_rows(self, live_only: bool, within_min: int) -> list[dict]:
         cutoff = _time.time() - max(1, int(within_min)) * 60
+        try:
+            with _agent_registry_conn() as conn:
+                if live_only:
+                    source = [
+                        dict(row)
+                        for row in conn.execute(
+                            "SELECT * FROM agent_sessions "
+                            "WHERE provider = 'claude' AND closed_at IS NULL "
+                            "ORDER BY started_at DESC"
+                        ).fetchall()
+                    ]
+                else:
+                    source = [
+                        dict(row)
+                        for row in conn.execute(
+                            "SELECT * FROM agent_sessions "
+                            "WHERE provider = 'claude' AND last_heartbeat >= ? "
+                            "ORDER BY started_at DESC",
+                            (cutoff,),
+                        ).fetchall()
+                    ]
+        except Exception:
+            source = []
         if live_only:
             source = [
-                row for row in _agent_registry_live("claude")
+                row for row in source
                 if (
                     row.get("claude_uuid")
                     and float(row.get("last_heartbeat") or 0) > cutoff
                 ) or _registry_row_has_live_terminal(row, "claude")
             ]
-        else:
-            source = _agent_registry_recent("claude", since_min=within_min, limit=1000)
         rows: list[dict] = []
-        for row in source[:50]:
+        for row in source:
             rows.append({
                 "id": str(row.get("native_id") or ""),
                 "project": str(row.get("project") or ""),
@@ -7020,13 +7483,19 @@ def _lookup_claude_uuid_for_session(session_id: str) -> str:
     session_id = _claude_native_session_id(session_id)
     if not session_id:
         return ""
-    return _claude_sessions_backend().uuid_for_session(session_id)
+    canonical_id = _agent_registry_resolve_native_alias("claude", session_id)
+    registry_row = _agent_registry_get("claude", canonical_id)
+    registry_uuid = str((registry_row or {}).get("claude_uuid") or "")
+    return registry_uuid or _claude_sessions_backend().uuid_for_session(canonical_id)
 
 
 def _lookup_claude_session_for_uuid(claude_uuid: str) -> str:
     claude_uuid = str(claude_uuid or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,180}", claude_uuid):
         return ""
+    registry_row = _agent_registry_get_by_claude_uuid("claude", claude_uuid)
+    if registry_row:
+        return str(registry_row.get("native_id") or "")
     return _claude_sessions_backend().session_for_uuid(claude_uuid)
 
 
@@ -7041,6 +7510,41 @@ def _start_live_activity_publisher():
     )
     publisher.start()
     return publisher
+
+
+def _start_push_delivery_retry_worker(
+    *,
+    dispatcher=None,
+    stop_event: threading.Event | None = None,
+    interval_seconds: float = PUSH_DELIVERY_RETRY_INTERVAL_SECONDS,
+):
+    """Own the one process-wide startup and due-time push retry drain."""
+    dispatcher = PUSH_DISPATCHER if dispatcher is None else dispatcher
+    if dispatcher is None:
+        return None
+    stop = stop_event or threading.Event()
+    wait_seconds = max(0.1, float(interval_seconds))
+
+    def run():
+        while not stop.is_set():
+            try:
+                dispatcher.drain_due_deliveries()
+            except Exception as exc:
+                print(
+                    f"[push-delivery-retry] drain failed: {type(exc).__name__}: {str(exc)[:120]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            stop.wait(wait_seconds)
+
+    thread = threading.Thread(
+        target=run,
+        name="pairling-push-delivery-retry",
+        daemon=True,
+    )
+    thread.stop_event = stop
+    thread.start()
+    return thread
 
 
 def _start_standard_turn_push_publisher():
@@ -7576,7 +8080,8 @@ def _terminal_surface_source(raw_session: str) -> dict:
     broker_error = ""
 
     if provider == "codex":
-        reg = _agent_registry_get("codex", native_id) or {}
+        registry_native_id = _agent_registry_resolve_native_alias("codex", native_id)
+        reg = _agent_registry_get("codex", registry_native_id) or {}
         metadata = {}
         try:
             metadata = json.loads(reg.get("metadata_json") or "{}")
@@ -7591,7 +8096,9 @@ def _terminal_surface_source(raw_session: str) -> dict:
             except Exception as e:
                 session = None
                 broker_error = str(e)[:160]
-            if session is not None:
+            if session is not None and _broker_session_owns_identity(
+                session, "codex", native_id
+            ):
                 try:
                     PTY_BROKER.register_alias(qualified, _broker_session_id(session))
                 except Exception:
@@ -7635,7 +8142,8 @@ def _terminal_surface_source(raw_session: str) -> dict:
         }
 
     if provider == "claude":
-        reg = _agent_registry_get("claude", native_id) or {}
+        registry_native_id = _agent_registry_resolve_native_alias("claude", native_id)
+        reg = _agent_registry_get("claude", registry_native_id) or {}
         metadata = {}
         try:
             metadata = json.loads(reg.get("metadata_json") or "{}")
@@ -7650,7 +8158,9 @@ def _terminal_surface_source(raw_session: str) -> dict:
             except Exception as e:
                 session = None
                 broker_error = str(e)[:160]
-            if session is not None:
+            if session is not None and _broker_session_owns_identity(
+                session, "claude", native_id
+            ):
                 try:
                     PTY_BROKER.register_alias(qualified, _broker_session_id(session))
                 except Exception:
@@ -9147,6 +9657,11 @@ def _claude_native_session_id(raw: str) -> str:
 
 def _decorate_claude_session_row(row: dict, native_id: str, claude_pid: int = 0,
                                  terminal_tty: str = "") -> dict:
+    registry_row = _agent_registry_get("claude", native_id)
+    registry_metadata = _registry_metadata_from_row(registry_row)
+    if registry_row:
+        claude_pid = int(claude_pid or registry_row.get("pid") or 0)
+        terminal_tty = str(terminal_tty or registry_row.get("terminal_tty") or "")
     row["provider"] = "claude"
     row["native_id"] = native_id
     row["id"] = _qualified_session_id("claude", native_id)
@@ -9167,11 +9682,12 @@ def _decorate_claude_session_row(row: dict, native_id: str, claude_pid: int = 0,
         "can_terminate": claude_pid > 0,
         "reason": reason,
     }
-    if terminal_tty:
-        _apply_launch_context_to_session_row(
-            row,
-            _registry_metadata_from_row(_agent_registry_get_by_tty("claude", terminal_tty)),
+    launch_metadata = registry_metadata
+    if terminal_tty and not launch_metadata:
+        launch_metadata = _registry_metadata_from_row(
+            _agent_registry_get_by_tty("claude", terminal_tty)
         )
+    _apply_launch_context_to_session_row(row, launch_metadata)
     return row
 
 
@@ -9189,6 +9705,17 @@ def _collapse_live_session_rows_by_terminal(rows: list[dict]) -> list[dict]:
         if current is None or _session_row_terminal_score(row) > _session_row_terminal_score(current):
             by_tty[key] = row
     return passthrough + list(by_tty.values())
+
+
+def _session_meaningful_sort_key(row: dict) -> tuple[int, float, int, str]:
+    started_at = int(row.get("started_at") or 0)
+    meaningful_at = float(row.get("last_meaningful_turn_at") or started_at)
+    return (
+        0 if (row.get("terminal_attention") or {}).get("needs_input") else 1,
+        -meaningful_at,
+        -started_at,
+        str(row.get("id") or ""),
+    )
 
 
 def _session_row_terminal_score(row: dict) -> tuple[int, int, int, int, int]:
@@ -9328,6 +9855,7 @@ def _approved_codex_transcript_path(path: Path, native_id: str) -> Path | None:
 def _resolve_codex_transcript(native_id: str) -> Path | None:
     if not _safe_session_id(native_id):
         return None
+    native_id = _agent_registry_resolve_native_alias("codex", native_id)
     reg = _agent_registry_get("codex", native_id)
     if reg:
         try:
@@ -9666,7 +10194,7 @@ def _codex_pending_registry_rows(seen: set[str], live_only: bool, active_within_
 
 def _codex_recent_closed_registry_rows(seen: set[str], active_within_min: int) -> list[dict]:
     rows: list[dict] = []
-    for reg in _agent_registry_recent("codex", since_min=active_within_min, limit=300):
+    for reg in _agent_registry_recent("codex", since_min=active_within_min, limit=1000):
         if not reg.get("closed_at"):
             continue
         native_id = reg.get("native_id") or ""
@@ -9708,6 +10236,7 @@ def _codex_recent_closed_registry_rows(seen: set[str], active_within_min: int) -
             "model": metadata.get("model"),
             "context_pct": None,
             "turn_count": turn_stats.get("turn_count"),
+            "last_meaningful_turn_at": turn_stats.get("last_meaningful_turn_at"),
             "capabilities": capabilities,
             "controllability": {
                 "can_send_text": False,
@@ -9742,7 +10271,7 @@ def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> li
             st = path.stat()
         except OSError:
             continue
-        if live_only and st.st_mtime < cutoff:
+        if st.st_mtime < cutoff:
             continue
         meta = _codex_rollout_meta(path)
         if not meta:
@@ -9755,11 +10284,7 @@ def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> li
         first_prompt = _codex_first_prompt(path, sid, history)
         started = int(_iso_to_epoch(meta.get("timestamp")) or st.st_mtime)
         working_on = idx.get("thread_name") if isinstance(idx.get("thread_name"), str) else None
-        turn_stats = (
-            _session_transcript_stats(path, "codex", sid)
-            if st.st_size <= TRANSCRIPT_STATS_MAX_SCAN_BYTES
-            else {"turn_count": None, "partial": True}
-        )
+        turn_stats = _session_transcript_stats(path, "codex", sid)
         row = {
             "id": _qualified_session_id("codex", sid),
             "provider": "codex",
@@ -9776,6 +10301,7 @@ def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> li
             "model": meta.get("model"),
             "context_pct": None,
             "turn_count": turn_stats.get("turn_count"),
+            "last_meaningful_turn_at": turn_stats.get("last_meaningful_turn_at"),
             "capabilities": CODEX_READ_ONLY_CAPABILITIES,
             "controllability": {
                 "can_send_text": False,
@@ -9792,22 +10318,17 @@ def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> li
             row["turn_started_at"] = state_payload.get("started_at")
             row["effort"] = state_payload.get("effort")
         rows.append(_codex_control_overlay(row, st.st_mtime, verify_process=True))
-        if len(rows) >= 50:
-            break
     _codex_register_terminal_only_rows(seen)
     rows.extend(_codex_pending_registry_rows(seen, live_only, active_within_min))
     if not live_only:
         rows.extend(_codex_recent_closed_registry_rows(seen, active_within_min))
     rows = _filter_tombstoned_session_rows(rows)
     rows = _collapse_live_session_rows_by_terminal(rows)
-    rows.sort(
-        key=lambda r: (
-            1 if (r.get("controllability") or {}).get("can_terminate") else 0,
-            int(r.get("last_heartbeat") or 0),
-        ),
-        reverse=True,
-    )
-    rows = rows[:50]
+    rows.sort(key=_session_meaningful_sort_key)
+    # Callers own their response limits. Keeping the ranked provider candidates
+    # here lets the 200-row dashboard and the mixed-provider 50-row endpoint
+    # apply their caps only after cross-provider ordering.
+    rows = rows[:500]
     return rows
 
 
@@ -11398,10 +11919,33 @@ class Handler(BaseHTTPRequestHandler):
             admission.release()
             self.send_error(405, "POST required")
             return
+        if u.path in GET_OR_POST_ENDPOINTS and self.command not in {"GET", "POST"}:
+            admission.release()
+            self.send_error(405, "GET or POST required")
+            return
         if u.path.startswith("/pickers/mcp/") and u.path.endswith("/restart") and self.command != "POST":
             admission.release()
             self.send_error(405, "POST required")
             return
+
+        if self.pairling_auth is not None and _is_high_risk_endpoint(u.path) and DEVICE_REGISTRY is not None:
+            max_per_min = _rate_limit_for_high_risk_endpoint(u.path)
+            rate_path = _rate_limit_key_path(u.path)
+            allowed, retry = _request_rate_check(
+                f"{self.pairling_auth.device_id}:{rate_path}",
+                max_per_min=max_per_min,
+            )
+            if not allowed:
+                admission.release()
+                self._send_json({
+                    "ok": False,
+                    "error": {
+                        "code": "rate_limited",
+                        "message": "too many mutating requests",
+                    },
+                    "retry_after": retry,
+                }, status=429, headers={"Retry-After": str(retry)})
+                return
 
         proof_verified = False
         if (
@@ -11420,15 +11964,26 @@ class Handler(BaseHTTPRequestHandler):
                 return
             body = self._read_body()
             local_install_id = str(getattr(PAIRING_STORE, "install_id", "") or getattr(self.pairling_auth, "install_id", "") or "")
-            proof_result = verify_request_proof(
-                headers=self.headers,
-                method=self.command,
-                path_and_query=_path_and_query(u),
-                body=body,
-                auth_result=self.pairling_auth,
-                local_install_id=local_install_id,
-                replay_cache=_proof_replay_cache,
-            )
+            try:
+                proof_result = verify_request_proof(
+                    headers=self.headers,
+                    method=self.command,
+                    path_and_query=_path_and_query(u),
+                    body=body,
+                    auth_result=self.pairling_auth,
+                    local_install_id=local_install_id,
+                    replay_cache=_proof_replay_cache,
+                )
+            except Exception:
+                admission.release()
+                self._send_json({
+                    "ok": False,
+                    "error": {
+                        "code": "proof_unavailable",
+                        "message": "request proof verifier is unavailable",
+                    },
+                }, status=503)
+                return
             if not proof_result.ok:
                 admission.release()
                 self._send_json({
@@ -11450,23 +12005,6 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         if self.pairling_auth is not None and _is_high_risk_endpoint(u.path) and DEVICE_REGISTRY is not None:
-            max_per_min = _rate_limit_for_high_risk_endpoint(u.path)
-            rate_path = _rate_limit_key_path(u.path)
-            allowed, retry = _request_rate_check(
-                f"{self.pairling_auth.device_id}:{rate_path}",
-                max_per_min=max_per_min,
-            )
-            if not allowed:
-                admission.release()
-                self._send_json({
-                    "ok": False,
-                    "error": {
-                        "code": "rate_limited",
-                        "message": "too many mutating requests",
-                    },
-                    "retry_after": retry,
-                }, status=429, headers={"Retry-After": str(retry)})
-                return
             try:
                 DEVICE_REGISTRY.record_audit(
                     "request.allowed",
@@ -11514,8 +12052,10 @@ class Handler(BaseHTTPRequestHandler):
                     self._handle_pair_start(q)
             elif u.path == "/pair/claim":
                 self._handle_pair_claim(q)
-            elif u.path == "/pair/psk-claim":
+            elif u.path in {"/pair/psk-claim", "/pair/psk-claim-v2"}:
                 self._handle_pair_psk_claim(q)
+            elif u.path == "/pair/psk-activate":
+                self._handle_pair_psk_activate(q)
             elif u.path == "/pair/reauth-challenge":
                 self._handle_pair_reauth_challenge(q)
             elif u.path == "/pair/reauth-claim":
@@ -11852,21 +12392,71 @@ class Handler(BaseHTTPRequestHandler):
             }, status=400)
             return
         claude_uuid = self._internal_claude_uuid(payload)
-        ok = _agent_registry_upsert(
+        pid = self._internal_pid(payload)
+        terminal_tty = self._internal_terminal_tty(payload)
+        working_on = str(payload.get("working_on") or "")[:500]
+        broker_link = {"state": "not_applicable"}
+        if provider == "claude" and claude_uuid:
+            broker_link = _agent_registry_link_claude_broker_registration(
+                session_id,
+                project,
+                pid=pid,
+                terminal_tty=terminal_tty,
+                claude_uuid=claude_uuid,
+                working_on=working_on,
+            )
+        if broker_link.get("state") in {"ambiguous", "conflict", "error"}:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "broker_identity_link_failed",
+                    "message": "Claude broker identity could not be linked safely.",
+                    "reason": broker_link.get("reason"),
+                },
+            }, status=409)
+            return
+        linked = broker_link.get("state") in {"linked", "already_linked"}
+        ok = linked or _agent_registry_upsert(
             provider,
             session_id,
             project,
-            pid=self._internal_pid(payload),
-            terminal_tty=self._internal_terminal_tty(payload),
+            pid=pid,
+            terminal_tty=terminal_tty,
             claude_uuid=claude_uuid if provider == "claude" else "",
-            working_on=str(payload.get("working_on") or "")[:500],
+            working_on=working_on,
             metadata={"registered_by": "internal_session_register"},
         )
+        broker_id = str(broker_link.get("broker_id") or "")
+        broker_alias_registered = False
+        if linked and broker_id and PTY_BROKER is not None:
+            try:
+                PTY_BROKER.register_alias(
+                    _qualified_session_id("claude", session_id), broker_id
+                )
+                broker_alias_registered = True
+            except Exception:
+                # The canonical row retains broker_id, so every lookup can
+                # rebuild this in-memory alias. Registration stays truthful
+                # even if the broker reconnects during the hook call.
+                broker_alias_registered = False
         # Mirrors the PG pg_notify('session_ready'): only fire once the row
         # carries a claude_uuid — that is what /turn-state-stream waits on.
         if provider == "claude" and ok and claude_uuid:
             _signal_session_ready(session_id)
-        self._send_json({"ok": bool(ok)})
+            broker_native_id = str(broker_link.get("broker_native_id") or "")
+            if broker_native_id:
+                _signal_session_ready(broker_native_id)
+        response = {
+            "ok": bool(ok),
+            "identity_link_state": broker_link.get("state"),
+        }
+        if linked:
+            response.update({
+                "session_id": _qualified_session_id("claude", session_id),
+                "broker_id": broker_id,
+                "broker_alias_registered": broker_alias_registered,
+            })
+        self._send_json(response, status=200 if ok else 503)
 
     def _handle_internal_session_heartbeat(self, q):
         payload = self._read_internal_json()
@@ -12022,7 +12612,8 @@ class Handler(BaseHTTPRequestHandler):
         ))
 
     def _handle_readyz(self, q):
-        self._send_json(_readyz_payload())
+        payload = _readyz_payload()
+        self._send_json(payload, status=200 if payload.get("ok") is True else 503)
 
     def _handle_routez(self, q):
         self._send_json(_routez_payload(auth_result=self.pairling_auth))
@@ -12377,13 +12968,38 @@ class Handler(BaseHTTPRequestHandler):
         try:
             payload = self._read_json_object()
             ttl = int(payload.get("ttl_seconds") or DEFAULT_PAIR_TTL_SECONDS)
-            started = PAIRING_STORE.start_pair(ttl_seconds=ttl)
-            bonjour = (
-                PAIRING_ADVERTISER.start(started, port=PORT)
-                if PAIRING_ADVERTISER is not None
-                else {"ok": False, "reason": "advertiser_unavailable"}
-            )
+            purpose = str(payload.get("purpose") or "").strip()
+            start_kwargs = {"ttl_seconds": ttl}
+            if purpose:
+                raw_scopes = payload.get("scopes")
+                if raw_scopes is not None and (
+                    not isinstance(raw_scopes, list)
+                    or not all(isinstance(scope, str) and scope for scope in raw_scopes)
+                ):
+                    raise ValueError("scopes must be a list of non-empty strings")
+                start_kwargs.update({
+                    "purpose": purpose,
+                    "scopes": raw_scopes,
+                    "lease_ttl_seconds": int(
+                        payload.get("lease_ttl_seconds") or DEFAULT_SMOKE_LEASE_TTL_SECONDS
+                    ),
+                })
+            started = PAIRING_STORE.start_pair(**start_kwargs)
+            if purpose == "runtime_truth_smoke":
+                bonjour = {"ok": False, "reason": "smoke_pairing_not_advertised"}
+            else:
+                bonjour = (
+                    PAIRING_ADVERTISER.start(started, port=PORT)
+                    if PAIRING_ADVERTISER is not None
+                    else {"ok": False, "reason": "advertiser_unavailable"}
+                )
             pairling_connect_routes = self._pairling_connect_routes()
+        except PairingError as exc:
+            self._send_json({
+                "ok": False,
+                "error": {"code": exc.code, "message": exc.message},
+            }, status=exc.status)
+            return
         except ValueError as exc:
             self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
             return
@@ -12396,6 +13012,8 @@ class Handler(BaseHTTPRequestHandler):
             "expires_at": started.expires_at,
             "install_id": started.install_id,
             "runtime_port": PORT,
+            "purpose": started.purpose,
+            "lease_expires_at": started.lease_expires_at,
             "pair_service": {
                 "type": started.service_type,
                 "txt": started.txt,
@@ -12488,51 +13106,123 @@ class Handler(BaseHTTPRequestHandler):
         if PAIRING_STORE is None:
             self._send_json({"ok": False, "error": {"code": "pairing_unavailable", "message": "Pairing store is unavailable"}}, status=503)
             return
-        allowed, retry_after = _request_rate_check(f"pair_psk:{self.client_address[0]}", max_per_min=5)
-        if not allowed:
-            self.send_response(429)
-            self.send_header("Retry-After", str(retry_after))
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"ok": False, "error": {"code": "rate_limited", "message": "too many psk claims"}}).encode("utf-8"))
-            return
         try:
             payload = self._read_json_object()
+            if payload.get("seal_proof_secret") is not True:
+                raise PairingError(
+                    "upgrade_required",
+                    426,
+                    "this Pairling version requires sealed proof credentials",
+                )
+            if payload.get("activation_contract") != "pairling.psk.activate.v1":
+                raise PairingError(
+                    "upgrade_required",
+                    426,
+                    "update Pairling on this iPhone before pairing with this Mac",
+                )
+            request_path = urlparse(str(getattr(self, "path", "/pair/psk-claim"))).path
+            require_request_binding = request_path == "/pair/psk-claim-v2"
+            if require_request_binding and "attested_claim_ticket" in payload:
+                raise PairingError(
+                    "plaintext_attested_claim_forbidden",
+                    400,
+                    "v2 pairing requires an encrypted relay claim ticket",
+                )
+            raw_protocol_version = payload.get("pv")
+            if require_request_binding and (
+                isinstance(raw_protocol_version, bool)
+                or not isinstance(raw_protocol_version, int)
+            ):
+                raise PairingError(
+                    "psk_request_binding_invalid",
+                    400,
+                    "v2 pairing requires an integer protocol version",
+                )
+            if (
+                require_request_binding
+                and "direct_attest_object" in payload
+                and not isinstance(payload.get("direct_attest_object"), dict)
+            ):
+                raise PairingError(
+                    "psk_request_binding_invalid",
+                    400,
+                    "v2 direct attestation must be an object",
+                )
+            pair_id = str(payload.get("pair_id") or "")
+            pair_digest = hashlib.sha256(pair_id.encode("utf-8")).hexdigest()[:24]
+            headers = getattr(self, "headers", {})
+            trusted_gateway = _pairdrop_gateway_provenance_ok(headers, self.client_address)
+            rate_keys = [f"pair_psk:pair:{pair_digest}"]
+            if not trusted_gateway:
+                rate_keys.insert(0, f"pair_psk:source:{self.client_address[0]}")
+            for rate_key in rate_keys:
+                allowed, retry_after = _request_rate_check(rate_key, max_per_min=5)
+                if not allowed:
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "error": {
+                                "code": "rate_limited",
+                                "message": "too many psk claims",
+                            },
+                        },
+                        status=429,
+                        headers={"Retry-After": str(retry_after)},
+                    )
+                    return
             host_chain = self._pairing_host_chain()
-            funnel_origin = _funnel_origin_request(self.headers, self.client_address)
-            require_direct_attest = _pair_claim_requires_app_attest(self.headers, self.client_address)
-            claim, k_token, aad, mac_confirm = PAIRING_STORE.psk_claim_pair(
-                pair_id=str(payload.get("pair_id") or ""),
+            runtime_routes = self._pairing_runtime_routes(list(host_chain))
+            transport = "pairling-connect" if any(
+                route.get("source") == "pairling_connectd" and route.get("status") == "ready"
+                for route in runtime_routes
+            ) else "http-local"
+            funnel_origin = _funnel_origin_request(headers, self.client_address)
+            require_direct_attest = _pair_claim_requires_app_attest(headers, self.client_address)
+            sealed_claim = PAIRING_STORE.psk_claim_pair(
+                pair_id=pair_id,
                 b_pub_b64=str(payload.get("b_pub") or ""),
                 confirm_b64=str(payload.get("confirm") or ""),
                 device_name=str(payload.get("device_name") or "Pairling iPhone"),
                 host_chain=host_chain,
-                se_public_key_der=str(payload.get("se_public_key_der") or ""),
+                se_public_key_der=(
+                    payload.get("se_public_key_der")
+                    if "se_public_key_der" in payload
+                    else None
+                ),
                 attest_object=(payload.get("direct_attest_object") if isinstance(payload.get("direct_attest_object"), dict) else None),
-                attest_key_id=str(payload.get("attest_key_id") or ""),
-                attest_environment=str(payload.get("attest_environment") or ""),
-                attested_claim_ticket=payload.get("attested_claim_ticket"),
-                relay_device_id=payload.get("relay_device_id"),
+                attest_key_id=(payload.get("attest_key_id") if "attest_key_id" in payload else None),
+                attest_environment=(payload.get("attest_environment") if "attest_environment" in payload else None),
+                attested_claim_ticket=(
+                    None if require_request_binding else payload.get("attested_claim_ticket")
+                ),
+                enc_attested_claim_ticket=(
+                    payload.get("enc_attested_claim_ticket")
+                    if "enc_attested_claim_ticket" in payload
+                    else None
+                ),
+                attested_claim_ticket_nonce=(
+                    payload.get("attested_claim_ticket_nonce")
+                    if "attested_claim_ticket_nonce" in payload
+                    else None
+                ),
+                relay_device_id=(payload.get("relay_device_id") if "relay_device_id" in payload else None),
                 relay_required=bool(relay_claims_required and relay_claims_required()),
                 relay_claim_verifier=RELAY_CLAIM_VERIFIER,
                 funnel_origin=funnel_origin,
                 require_direct_attest=require_direct_attest,
+                seal_proof_secret=True,
+                request_contract=(payload.get("request_contract") if "request_contract" in payload else None),
+                request_binding=(payload.get("request_binding") if "request_binding" in payload else None),
+                protocol_version=(
+                    raw_protocol_version
+                    if require_request_binding
+                    else int(raw_protocol_version or 0)
+                ),
+                activation_contract=str(payload.get("activation_contract") or ""),
+                require_request_binding=require_request_binding,
+                runtime_routes=runtime_routes,
+                transport=transport,
             )
-            nonce, enc_token = PAIRING_STORE.seal_psk_token(k_token, claim.device.token, aad)
-            # Seal proof_secret (the request-proof HMAC key) under K_token for
-            # clients that can unseal it, so it never crosses a plaintext transport
-            # in the clear. The bearer token is already sealed; proof_secret was
-            # not, which leaked it to a passive sniffer on the LAN path. Back-compat:
-            # a client that does not send seal_proof_secret still receives the
-            # cleartext field in the response below.
-            seal_proof = bool(payload.get("seal_proof_secret"))
-            proof_secret_nonce = None
-            enc_proof_secret = None
-            if seal_proof:
-                proof_secret_aad = aad + b"\npairling.psk.proof_secret.v1"
-                proof_secret_nonce, enc_proof_secret = PAIRING_STORE.seal_psk_token(
-                    k_token, claim.device.proof_secret, proof_secret_aad
-                )
             if PAIRING_ADVERTISER is not None:
                 PAIRING_ADVERTISER.stop()
         except PairingError as exc:
@@ -12541,38 +13231,271 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
             return
-        runtime_routes = self._pairing_runtime_routes(list(claim.host_chain))
-        transport = "pairling-connect" if any(
-            route.get("source") == "pairling_connectd" and route.get("status") == "ready"
-            for route in runtime_routes
-        ) else "http-local"
-        device_block = {
-            "id": claim.device.device_id,
-            "scopes": list(claim.device.scopes),
-            "relay_device_id": claim.relay_device_id,
-            "attestation_status": claim.attestation_status,
-        }
-        if seal_proof and enc_proof_secret is not None and proof_secret_nonce is not None:
-            device_block["enc_proof_secret"] = base64.b64encode(enc_proof_secret).decode("ascii")
-            device_block["proof_secret_nonce"] = base64.b64encode(proof_secret_nonce).decode("ascii")
-        else:
-            device_block["proof_secret"] = claim.device.proof_secret
-        response = {
-            "ok": True,
-            "device": device_block,
-            "enc_token": base64.b64encode(enc_token).decode("ascii"),
-            "nonce": base64.b64encode(nonce).decode("ascii"),
-            "mac_confirm": base64.b64encode(mac_confirm).decode("ascii"),
-            "install_id": claim.device.install_id,
-            "runtime": {
-                "port": claim.runtime_port,
-                "host_chain": list(claim.host_chain),
-                "cert_pin": claim.cert_pin,
-                "transport": transport,
-                "routes": runtime_routes,
+        if sealed_claim.response_payload is not None:
+            self._send_json(sealed_claim.response_payload)
+            return
+        self._send_json(
+            {
+                "ok": False,
+                "error": {
+                    "code": "pair_response_unsigned",
+                    "message": "The Mac could not produce a verified pairing response.",
+                },
             },
-        }
-        self._send_json(response)
+            status=503,
+        )
+
+    def _handle_pair_psk_activate(self, q):
+        if PAIRING_STORE is None:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "pairing_unavailable",
+                        "message": "Pairing store is unavailable",
+                    },
+                },
+                status=503,
+            )
+            return
+        pair_id = ""
+        device_id = ""
+        remote_activation = False
+        remote_notification_marker_created = False
+
+        def clear_remote_notification_marker():
+            nonlocal remote_notification_marker_created
+            if not remote_notification_marker_created or PUSH_DISPATCHER is None:
+                return
+            try:
+                PUSH_DISPATCHER.complete_remote_pairing_notification(
+                    pair_id=pair_id,
+                    device_id=device_id,
+                )
+            except Exception:
+                pass
+            remote_notification_marker_created = False
+
+        try:
+            payload = self._read_json_object()
+            pair_id = str(payload.get("pair_id") or "")
+            device_id = str(payload.get("device_id") or "")
+            activation_nonce = str(payload.get("activation_nonce") or "")
+            token_hash = str(payload.get("token_hash") or "")
+            activation_proof = str(payload.get("activation_proof") or "")
+            if (
+                not pair_id
+                or not device_id
+                or not activation_nonce
+                or not re.fullmatch(r"[0-9a-f]{64}", token_hash)
+                or not re.fullmatch(r"[0-9a-f]{64}", activation_proof)
+            ):
+                raise ValueError("activation payload is incomplete")
+            pair_digest = hashlib.sha256(pair_id.encode("utf-8")).hexdigest()[:24]
+            headers = getattr(self, "headers", {})
+            trusted_gateway = _pairdrop_gateway_provenance_ok(headers, self.client_address)
+            remote_activation = trusted_gateway or not _loopback_client_address(self.client_address)
+            rate_keys = [f"pair_psk_activate:pair:{pair_digest}"]
+            if not trusted_gateway:
+                rate_keys.insert(0, f"pair_psk_activate:source:{self.client_address[0]}")
+            for rate_key in rate_keys:
+                allowed, retry_after = _request_rate_check(rate_key, max_per_min=10)
+                if not allowed:
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "error": {
+                                "code": "rate_limited",
+                                "message": "too many pairing activations",
+                            },
+                        },
+                        status=429,
+                        headers={"Retry-After": str(retry_after)},
+                    )
+                    return
+            if PUSH_DISPATCHER is not None:
+                try:
+                    if not remote_activation:
+                        pending_reader = getattr(
+                            PUSH_DISPATCHER,
+                            "remote_pairing_notification_pending",
+                            None,
+                        )
+                        if callable(pending_reader):
+                            remote_activation = bool(pending_reader(
+                                pair_id=pair_id,
+                                device_id=device_id,
+                            ))
+                except Exception:
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "error": {
+                                "code": "push_notification_pending",
+                                "message": "pairing cannot continue until its security notification is durable",
+                            },
+                        },
+                        status=503,
+                    )
+                    return
+            elif remote_activation:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "push_notification_pending",
+                            "message": "pairing cannot continue until its security notification is durable",
+                        },
+                    },
+                    status=503,
+                )
+                return
+
+            before_activation = None
+            if remote_activation:
+                def persist_remote_notification_marker():
+                    nonlocal remote_notification_marker_created
+                    try:
+                        PUSH_DISPATCHER.mark_remote_pairing_notification_pending(
+                            pair_id=pair_id,
+                            device_id=device_id,
+                        )
+                    except Exception as exc:
+                        raise PairingError(
+                            "push_notification_pending",
+                            503,
+                            "pairing cannot continue until its security notification is durable",
+                        ) from exc
+                    remote_notification_marker_created = True
+
+                before_activation = persist_remote_notification_marker
+
+            activated = PAIRING_STORE.activate_psk_claim(
+                pair_id=pair_id,
+                device_id=device_id,
+                activation_nonce=activation_nonce,
+                token_hash=token_hash,
+                activation_proof=activation_proof,
+                before_activation=before_activation,
+            )
+            if remote_activation and not remote_notification_marker_created:
+                raise RuntimeError("remote activation did not persist its notification marker")
+            # Activation may revoke a previous credential for the same phone.
+            # Do not leave that device authorized by the short GET cache.
+            _clear_auth_result_cache()
+        except PairingError as exc:
+            clear_remote_notification_marker()
+            response = {
+                "ok": False,
+                "error": {"code": exc.code, "message": exc.message},
+            }
+            if isinstance(getattr(exc, "activation_result", None), dict):
+                response.update(exc.activation_result)
+                response["error"] = {"code": exc.code, "message": exc.message}
+            self._send_json(
+                response,
+                status=exc.status,
+            )
+            return
+        except ValueError as exc:
+            self._send_json(
+                {"ok": False, "error": {"code": "bad_request", "message": str(exc)}},
+                status=400,
+            )
+            return
+        except Exception:
+            clear_remote_notification_marker()
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "pair_activation_failed",
+                        "message": "pairing activation could not be completed",
+                    },
+                },
+                status=503,
+            )
+            return
+        if activated.superseded_device_ids:
+            try:
+                if PUSH_DISPATCHER is None:
+                    raise RuntimeError("push dispatcher unavailable")
+                for superseded_device_id in activated.superseded_device_ids:
+                    cleanup = PUSH_DISPATCHER.drop_device(
+                        device_id=superseded_device_id,
+                        reason="pair_superseded",
+                    )
+                    if not isinstance(cleanup, dict) or cleanup.get("ok") is not True:
+                        raise RuntimeError("push cleanup did not confirm success")
+            except Exception:
+                # Activation is already durable. Fail this acknowledgement so
+                # the phone retains its staged credentials and retries the
+                # idempotent activation until revoked push tokens are gone.
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "push_cleanup_pending",
+                            "message": "pairing is active but notification cleanup is still pending",
+                        },
+                    },
+                    status=503,
+                )
+                return
+        if remote_activation:
+            try:
+                if PUSH_DISPATCHER is None:
+                    raise RuntimeError("push dispatcher unavailable")
+                remote_event_id = "remote_join:" + hashlib.sha256(
+                    f"{pair_id}\0{device_id}".encode("utf-8")
+                ).hexdigest()[:32]
+                broadcast = PUSH_DISPATCHER.broadcast_alert(
+                    exclude_device_id=device_id,
+                    exclude_device_ids=activated.superseded_device_ids,
+                    event_id=remote_event_id,
+                    kind="remote_join",
+                    route="pairling-connect",
+                    title="New device paired remotely",
+                    body="A device joined this Mac through Pairling Connect.",
+                    pairling_extra={"source": "pairing_activation"},
+                )
+                if (
+                    not isinstance(broadcast, dict)
+                    or int(broadcast.get("persistence_errors") or 0) > 0
+                ):
+                    raise RuntimeError("remote join notification was not durably recorded")
+                PUSH_DISPATCHER.complete_remote_pairing_notification(
+                    pair_id=pair_id,
+                    device_id=device_id,
+                )
+            except Exception:
+                # Activation is durable and idempotent. Withholding its
+                # acknowledgement makes the phone retry until every existing
+                # device has a durable remote-join outbox record.
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "push_notification_pending",
+                            "message": "pairing is active but its security notification is still pending",
+                        },
+                    },
+                    status=503,
+                )
+                return
+        if not isinstance(activated.activation_result, dict):
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "activation_result_unavailable",
+                        "message": "pairing activation result could not be authenticated",
+                    },
+                },
+                status=503,
+            )
+            return
+        self._send_json(activated.activation_result)
 
     def _handle_pair_reauth_challenge(self, q):
         if REAUTH_STORE is None:
@@ -13132,12 +14055,7 @@ class Handler(BaseHTTPRequestHandler):
         if live_only:
             projected_rows = [self._strict_live_projection(row) for row in rows]
             rows = [row for row in projected_rows if row is not None]
-        rows.sort(key=lambda r: (
-            0 if (r.get("terminal_attention") or {}).get("needs_input") else 1,
-            -float(r.get("last_meaningful_turn_at") or r.get("started_at") or 0),
-            -int(r.get("started_at") or 0),
-            str(r.get("id") or ""),
-        ))
+        rows.sort(key=_session_meaningful_sort_key)
         rows = rows[:max(1, min(int(limit or 200), 500))]
         for row in rows:
             row["runtime_truth_summary"] = self._runtime_truth_summary_for_row(row)
@@ -13376,6 +14294,7 @@ class Handler(BaseHTTPRequestHandler):
             ]
             rows = _filter_tombstoned_session_rows(rows)
             rows = _collapse_live_session_rows_by_terminal(rows)
+            rows = rows[:50]
             _record_sessions_scan(rows)
             body = json.dumps({"count": len(rows), "items": rows}).encode()
             self.send_response(200)
@@ -13462,6 +14381,8 @@ class Handler(BaseHTTPRequestHandler):
                     row["first_prompt"] = _peek_first_prompt(transcript)
             rows.append(row)
 
+        rows = [self._decorate_session_lifecycle_row(row) for row in rows]
+
         # Tombstone any zombies discovered during process-liveness GC. One
         # batch write so /sessions stays fast even with several stale rows.
         if zombie_ids:
@@ -13475,7 +14396,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
             rows = _filter_tombstoned_session_rows(rows)
             rows = _collapse_live_session_rows_by_terminal(rows)
-            rows.sort(key=lambda r: int(r.get("last_heartbeat") or 0), reverse=True)
+            rows.sort(key=_session_meaningful_sort_key)
             rows = rows[:50]
         else:
             rows = _filter_tombstoned_session_rows(rows)
@@ -14165,7 +15086,10 @@ class Handler(BaseHTTPRequestHandler):
             project = self._lookup_pg_project(session_id)
             return _terminal_capture_for_tty(tty, project)
         if provider == "codex":
-            reg = _agent_registry_get("codex", native_id) or {}
+            registry_native_id = _agent_registry_resolve_native_alias(
+                "codex", native_id
+            )
+            reg = _agent_registry_get("codex", registry_native_id) or {}
             try:
                 metadata = json.loads(reg.get("metadata_json") or "{}")
             except Exception:
@@ -15305,10 +16229,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _registry_truth_for_session(self, raw_session: str) -> dict:
         provider, native_id = _parse_agent_session_ref(raw_session)
+        registry_native_id = _agent_registry_resolve_native_alias(
+            provider, native_id
+        )
         try:
             rows = self._collect_visible_session_rows(provider, active_within_min=60 * 24 * 14, limit=300)
             for row in rows:
-                if row.get("id") == raw_session or row.get("native_id") == native_id:
+                if (
+                    row.get("id") == raw_session
+                    or row.get("native_id") in {native_id, registry_native_id}
+                ):
                     return {
                         "state": row.get("state"),
                         "readable_state": row.get("readable_state"),
@@ -15331,6 +16261,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _turn_truth_for_session(self, provider: str, native_id: str) -> dict:
         try:
+            native_id = _agent_registry_resolve_native_alias(provider, native_id)
             payload = _codex_turn_state_payload(native_id, apply_boundary=False) if provider == "codex" else {}
             if not payload and provider == "claude":
                 payload = self._turn_state_summary(_lookup_claude_uuid_for_session(native_id))
@@ -15382,6 +16313,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _process_truth_for_session(self, provider: str, native_id: str) -> dict:
         if provider == "codex":
+            native_id = _agent_registry_resolve_native_alias("codex", native_id)
             reg = _agent_registry_get("codex", native_id)
             if not reg:
                 return {
@@ -15411,6 +16343,7 @@ class Handler(BaseHTTPRequestHandler):
                 "terminal_tty": reg.get("terminal_tty") or None,
             }
         if provider == "claude":
+            native_id = _agent_registry_resolve_native_alias("claude", native_id)
             try:
                 pid = int(self._lookup_claude_pid(native_id) or 0)
             except Exception as exc:
@@ -15884,8 +16817,19 @@ class Handler(BaseHTTPRequestHandler):
         if not native_id:
             return None
         qualified = _qualified_session_id(provider, native_id)
+        try:
+            direct_session = PTY_BROKER.get(qualified)
+        except Exception:
+            direct_session = None
+        if direct_session is not None and _broker_session_owns_identity(
+            direct_session, provider, native_id
+        ):
+            return qualified, direct_session
         if provider == "codex":
-            reg = _agent_registry_get("codex", native_id) or {}
+            registry_session_id = _agent_registry_resolve_native_alias(
+                "codex", native_id
+            )
+            reg = _agent_registry_get("codex", registry_session_id) or {}
             try:
                 metadata = json.loads(reg.get("metadata_json") or "{}")
             except Exception:
@@ -15896,7 +16840,9 @@ class Handler(BaseHTTPRequestHandler):
                     session = PTY_BROKER.get(broker_id)
                 except Exception:
                     session = None
-                if session:
+                if session and _broker_session_owns_identity(
+                    session, "codex", native_id
+                ):
                     try:
                         PTY_BROKER.register_alias(qualified, _broker_session_id(session))
                     except Exception:
@@ -15908,7 +16854,9 @@ class Handler(BaseHTTPRequestHandler):
                     session = PTY_BROKER.get_by_tty(tty)
                 except Exception:
                     session = None
-                if session:
+                if session and _broker_session_owns_identity(
+                    session, "codex", native_id
+                ):
                     try:
                         PTY_BROKER.register_alias(qualified, _broker_session_id(session))
                     except Exception:
@@ -15918,7 +16866,10 @@ class Handler(BaseHTTPRequestHandler):
             session_id = _claude_native_session_id(raw_session)
             if not session_id:
                 return None
-            reg = _agent_registry_get("claude", session_id) or {}
+            registry_session_id = _agent_registry_resolve_native_alias(
+                "claude", session_id
+            )
+            reg = _agent_registry_get("claude", registry_session_id) or {}
             try:
                 metadata = json.loads(reg.get("metadata_json") or "{}")
             except Exception:
@@ -15929,7 +16880,9 @@ class Handler(BaseHTTPRequestHandler):
                     session = PTY_BROKER.get(broker_id)
                 except Exception:
                     session = None
-                if session:
+                if session and _broker_session_owns_identity(
+                    session, "claude", session_id
+                ):
                     try:
                         PTY_BROKER.register_alias(qualified, _broker_session_id(session))
                     except Exception:
@@ -15941,7 +16894,9 @@ class Handler(BaseHTTPRequestHandler):
                     session = PTY_BROKER.get_by_tty(tty)
                 except Exception:
                     session = None
-                if session:
+                if session and _broker_session_owns_identity(
+                    session, "claude", session_id
+                ):
                     qualified = _qualified_session_id("claude", session_id)
                     try:
                         PTY_BROKER.register_alias(qualified, _broker_session_id(session))
@@ -15986,7 +16941,10 @@ class Handler(BaseHTTPRequestHandler):
             session_id = _claude_native_session_id(raw_session)
             return provider, session_id, self._lookup_terminal_tty(session_id)
         if provider == "codex":
-            reg = _agent_registry_get("codex", native_id) or {}
+            registry_session_id = _agent_registry_resolve_native_alias(
+                "codex", native_id
+            )
+            reg = _agent_registry_get("codex", registry_session_id) or {}
             tty = reg.get("terminal_tty") or ""
             if not tty:
                 candidates = _codex_terminal_tty_candidates(reg)
@@ -16930,7 +17888,7 @@ class Handler(BaseHTTPRequestHandler):
         native_id = _claude_native_session_id(session_id)
         if not native_id:
             return None
-        session_id = native_id
+        session_id = _agent_registry_resolve_native_alias("claude", native_id)
         projects_root = HOME / ".claude" / "projects"
 
         if _safe_session_id(session_id) and session_id.startswith("s-"):
@@ -20845,6 +21803,8 @@ Worker instructions:
                 return
         aperture_payload = payload.get("aperture") if isinstance(payload.get("aperture"), dict) else {}
         launch_strategy = str(payload.get("launch_strategy") or q.get("launch_strategy", ["direct_pairling"])[0] or "direct_pairling").strip().lower()
+        requested_spawn_backend = str(payload.get("spawn_backend") or "").strip().lower()
+        requested_native_id = str(payload.get("native_id") or "").strip()
         project = str(payload.get("project") or q.get("project", [""])[0]).strip()
         provider = str(payload.get("provider") or aperture_payload.get("client_id") or q.get("provider", ["claude"])[0]).lower()
         # Thick new-session (field report item 6): an optional first prompt
@@ -20860,6 +21820,15 @@ Worker instructions:
                 first_prompt = ""
         if launch_strategy not in {"direct_pairling", "aperture_cli"}:
             self.send_error(400, "launch_strategy must be direct_pairling or aperture_cli")
+            return
+        if requested_spawn_backend not in {"", "terminal_app", "broker"}:
+            self.send_error(400, "spawn_backend must be terminal_app or broker")
+            return
+        if requested_native_id and re.fullmatch(r"pending-[a-f0-9]{16}", requested_native_id) is None:
+            self.send_error(400, "native_id must be pending- followed by 16 lowercase hex characters")
+            return
+        if requested_native_id and launch_strategy != "direct_pairling":
+            self.send_error(400, "native_id is supported only for direct_pairling launches")
             return
         if not _valid_provider_filter(provider, allow_all=False):
             _send_unknown_provider(self, provider)
@@ -20946,12 +21915,20 @@ Worker instructions:
                 }, status=400)
                 return
 
-        if launch_strategy == "aperture_cli" or os.environ.get("PAIRLING_SPAWN_BACKEND", "terminal_app").lower() == "broker":
+        spawn_backend = requested_spawn_backend or os.environ.get("PAIRLING_SPAWN_BACKEND", "terminal_app").lower()
+        if requested_native_id and spawn_backend != "broker":
+            self.send_error(400, "native_id is supported only for broker launches")
+            return
+        if launch_strategy == "aperture_cli" or spawn_backend == "broker":
             self._handle_spawn_session_broker(
                 project,
                 provider,
                 launch_context=aperture_launch_context,
-                native_id_override=preview_native_id if launch_strategy == "aperture_cli" else None,
+                native_id_override=(
+                    preview_native_id
+                    if launch_strategy == "aperture_cli"
+                    else (requested_native_id or None)
+                ),
             )
             return
 
@@ -21669,6 +22646,7 @@ Worker instructions:
             _store_action_receipt(device_id, receipt_session_id, client_action_id, body_hash, receipt, action_kind="send_text", audit_action={"type": "send_text", "chars": len(text)})
             body = json.dumps({
                 "ok": bool(result.get("ok")),
+                "session_id": receipt_session_id,
                 "tty": _broker_slave_tty(session),
                 "pid": _broker_pid(session),
                 "broker_id": _broker_session_id(session),
@@ -21809,6 +22787,7 @@ Worker instructions:
         _store_action_receipt(device_id, receipt_session_id, client_action_id, body_hash, receipt, action_kind="send_text", audit_action={"type": "send_text", "chars": len(text)})
         body = json.dumps({
             "ok": result.get("ok", False),
+            "session_id": receipt_session_id,
             "tty": tty,
             "pid": pid,
             "reason": result.get("reason"),
@@ -21991,6 +22970,7 @@ Worker instructions:
             _store_action_receipt(receipt_context["device_id"], receipt_session_id, receipt_context["client_action_id"], receipt_context["body_hash"], receipt, action_kind="send_text", audit_action={"type": "send_text", "chars": len(text)})
             body = json.dumps({
                 "ok": bool(result.get("ok")),
+                "session_id": receipt_session_id,
                 "tty": _broker_slave_tty(broker_session),
                 "pid": _broker_pid(broker_session),
                 "broker_id": _broker_session_id(broker_session),
@@ -22171,6 +23151,7 @@ Worker instructions:
             )
             self._send_json({
                 "ok": False,
+                "session_id": receipt_session_id,
                 "pid": None,
                 "signal": sig_name,
                 "error": conflict["error"]["message"],
@@ -22181,6 +23162,7 @@ Worker instructions:
         if deduped_receipt:
             self._send_json({
                 "ok": deduped_receipt.get("state") == "applied",
+                "session_id": receipt_session_id,
                 "pid": deduped_receipt.get("pid"),
                 "signal": sig_name,
                 "error": None,
@@ -22214,6 +23196,7 @@ Worker instructions:
             )
             body = {
                 "ok": ok,
+                "session_id": receipt_session_id,
                 "pid": pid,
                 "signal": sig_name,
                 "error": err,
@@ -25786,19 +26769,29 @@ Worker instructions:
         session_id = _claude_native_session_id(session_id)
         if not session_id:
             return None
-        return _claude_sessions_backend().session_age_seconds(session_id)
+        canonical_id = _agent_registry_resolve_native_alias("claude", session_id)
+        registry_row = _agent_registry_get("claude", canonical_id)
+        if registry_row and registry_row.get("started_at"):
+            return max(0.0, _time.time() - float(registry_row["started_at"]))
+        return _claude_sessions_backend().session_age_seconds(canonical_id)
 
     def _lookup_terminal_tty(self, session_id: str) -> str:
         session_id = _claude_native_session_id(session_id)
         if not session_id:
             return ""
-        return _claude_sessions_backend().terminal_tty(session_id)
+        canonical_id = _agent_registry_resolve_native_alias("claude", session_id)
+        registry_row = _agent_registry_get("claude", canonical_id)
+        registry_tty = str((registry_row or {}).get("terminal_tty") or "")
+        return registry_tty or _claude_sessions_backend().terminal_tty(canonical_id)
 
     def _lookup_claude_pid(self, session_id: str) -> int:
         session_id = _claude_native_session_id(session_id)
         if not session_id:
             return 0
-        return _claude_sessions_backend().claude_pid(session_id)
+        canonical_id = _agent_registry_resolve_native_alias("claude", session_id)
+        registry_row = _agent_registry_get("claude", canonical_id)
+        registry_pid = int((registry_row or {}).get("pid") or 0)
+        return registry_pid or _claude_sessions_backend().claude_pid(canonical_id)
 
     # ----- /llm-route-stream: SSE streaming variant -----
     def _handle_llm_route_stream(self, q):
@@ -26291,6 +27284,7 @@ if __name__ == "__main__":
                 print(f"[push-device-gc] dropped {len(_gc['dropped'])} revoked device registrations", file=sys.stderr, flush=True)
         except Exception as exc:
             print(f"[push-device-gc] sweep failed: {type(exc).__name__}: {str(exc)[:120]}", file=sys.stderr, flush=True)
+    PUSH_DELIVERY_RETRY_WORKER = _start_push_delivery_retry_worker()
     LIVE_ACTIVITY_PUBLISHER = _start_live_activity_publisher()
     FLEET_ACTIVITY_PUBLISHER = _start_fleet_activity_publisher()
     STANDARD_TURN_PUSH_PUBLISHER = _start_standard_turn_push_publisher()

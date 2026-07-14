@@ -21,6 +21,16 @@ AUTH_MODE = "scoped-device-bearer"
 PAIR_SERVICE_TYPE = "_pairling-pair._tcp"
 RUNTIME_BONJOUR_ADVERTISED = False
 LOCAL_MCP_DISPATCH_SCOPE = "pairling-tools:dispatch"
+PAIR_CLAIM_REQUEST_CONTRACT = "pairling.psk.claim.request.v2"
+PAIR_CLAIM_RESULT_CONTRACT = "pairling.psk.claim.result.v2"
+PAIR_ACTIVATION_CONTRACT = "pairling.psk.activate.v1"
+PAIR_ACTIVATION_RESULT_CONTRACT = "pairling.psk.activate.result.v1"
+PAIRING_CONTRACTS = {
+    "request": PAIR_CLAIM_REQUEST_CONTRACT,
+    "claim_result": PAIR_CLAIM_RESULT_CONTRACT,
+    "activation": PAIR_ACTIVATION_CONTRACT,
+    "activation_result": PAIR_ACTIVATION_RESULT_CONTRACT,
+}
 
 DEFAULT_DEVICE_SCOPES = frozenset({
     "health:read",

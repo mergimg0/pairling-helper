@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,6 +86,7 @@ class RelayClaimVerifier:
         self.audience = audience
         self.now_fn = now_fn
         self._used_nonces: set[str] = set()
+        self._nonce_lock = threading.Lock()
         self._public_keys = self._load_public_keys(public_key_paths or [])
 
     @classmethod
@@ -142,9 +144,6 @@ class RelayClaimVerifier:
         nonce = str(payload.get("nonce") or "")
         if not nonce:
             raise RelayClaimError("attested_claim_invalid", "relay claim nonce missing")
-        if nonce in self._used_nonces:
-            raise RelayClaimError("attested_claim_replayed", "relay claim nonce already used")
-
         expected_device_name_hash = payload.get("device_name_hash")
         if expected_device_name_hash and device_name:
             if expected_device_name_hash != _sha256_hex(device_name):
@@ -159,7 +158,10 @@ class RelayClaimVerifier:
                 raise RelayClaimError("attested_claim_invalid", "relay pair secret reference mismatch")
             relay_pair_secret_ref = str(relay_pair_secret_ref or computed_ref)
 
-        self._used_nonces.add(nonce)
+        with self._nonce_lock:
+            if nonce in self._used_nonces:
+                raise RelayClaimError("attested_claim_replayed", "relay claim nonce already used")
+            self._used_nonces.add(nonce)
         return RelayClaimVerification(
             payload=payload,
             relay_device_id=relay_device_id or subject,
@@ -167,6 +169,14 @@ class RelayClaimVerifier:
             relay_pair_secret=relay_pair_secret,
             relay_pair_secret_ref=relay_pair_secret_ref,
         )
+
+    def release(self, verification: RelayClaimVerification) -> None:
+        """Release a reservation only when local claim finalization rolled back."""
+        nonce = str(verification.payload.get("nonce") or "")
+        if not nonce:
+            return
+        with self._nonce_lock:
+            self._used_nonces.discard(nonce)
 
     def _verify_hs256(self, parts: list[str]) -> None:
         if not self.hs256_secret:

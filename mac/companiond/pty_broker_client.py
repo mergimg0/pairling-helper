@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import os
 import secrets
@@ -13,6 +14,14 @@ from typing import Any
 
 
 _RPC_MAX_FRAME_BYTES = 8 * 1024 * 1024
+_READ_RPC_TIMEOUT_SECONDS = 0.35
+_RETRYABLE_SOCKET_ERRNOS = {
+    errno.EAGAIN,
+    errno.ECONNREFUSED,
+    errno.ECONNRESET,
+    errno.ENOENT,
+    errno.ETIMEDOUT,
+}
 
 
 def ensure_pty_broker_token(companion_dir: Path) -> str:
@@ -75,14 +84,15 @@ class PTYBrokerClient:
         self.token = token
         self.timeout = timeout
 
-    def _rpc(self, op: str, **fields) -> dict:
+    def _rpc(self, op: str, *, rpc_timeout: float | None = None, **fields) -> dict:
         request = {"op": op, "token": self.token, **fields}
-        deadline = time.time() + self.timeout
+        timeout = self.timeout if rpc_timeout is None else max(0.05, float(rpc_timeout))
+        deadline = time.time() + timeout
         last_error: Exception | None = None
         while True:
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-                    conn.settimeout(max(0.25, min(1.0, deadline - time.time())))
+                    conn.settimeout(max(0.05, min(1.0, deadline - time.time())))
                     conn.connect(str(self.socket_path))
                     _write_frame(conn, request)
                     response = _read_frame(conn)
@@ -92,11 +102,22 @@ class PTYBrokerClient:
                 return response
             except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError) as exc:
                 last_error = exc
+                if (
+                    isinstance(exc, OSError)
+                    and not isinstance(exc, (FileNotFoundError, ConnectionRefusedError, socket.timeout))
+                    and exc.errno not in _RETRYABLE_SOCKET_ERRNOS
+                ):
+                    raise RuntimeError(
+                        f"PTY broker unavailable: {type(exc).__name__}: {exc}"
+                    ) from exc
                 if time.time() >= deadline:
                     raise RuntimeError(f"PTY broker unavailable: {type(exc).__name__}: {exc}") from exc
                 time.sleep(0.05)
             except Exception:
                 raise
+
+    def _read_rpc(self, op: str, **fields) -> dict:
+        return self._rpc(op, rpc_timeout=min(self.timeout, _READ_RPC_TIMEOUT_SECONDS), **fields)
 
     def spawn(self, *, session_id: str, provider: str, native_id: str, project: str, command: str,
               rows: int = 30, columns: int = 120, env: dict[str, str] | None = None) -> dict:
@@ -113,10 +134,10 @@ class PTYBrokerClient:
         )["session"]
 
     def get(self, session_id: str) -> dict | None:
-        return self._rpc("get", session_id=session_id).get("session")
+        return self._read_rpc("get", session_id=session_id).get("session")
 
     def get_by_tty(self, tty: str) -> dict | None:
-        return self._rpc("get_by_tty", tty=tty).get("session")
+        return self._read_rpc("get_by_tty", tty=tty).get("session")
 
     def register_alias(self, alias: str, session: str | dict) -> None:
         session_id = session.get("session_id") if isinstance(session, dict) else str(session or "")
@@ -124,7 +145,7 @@ class PTYBrokerClient:
             self._rpc("register_alias", alias=alias, session_id=session_id)
 
     def snapshot(self, session_id: str, public_session_id: str | None = None) -> dict | None:
-        return self._rpc("snapshot", session_id=session_id, public_session_id=public_session_id or "").get("snapshot")
+        return self._read_rpc("snapshot", session_id=session_id, public_session_id=public_session_id or "").get("snapshot")
 
     def snapshot_v2(
         self,
@@ -138,10 +159,10 @@ class PTYBrokerClient:
             kwargs["window_start"] = int(window_start)
         if window_size is not None:
             kwargs["window_size"] = int(window_size)
-        return self._rpc("snapshot_v2", **kwargs).get("surface")
+        return self._read_rpc("snapshot_v2", **kwargs).get("surface")
 
     def delta_v2(self, session_id: str, since_generation: int, public_session_id: str | None = None) -> dict | None:
-        return self._rpc(
+        return self._read_rpc(
             "delta_v2",
             session_id=session_id,
             since_generation=max(0, int(since_generation or 0)),
@@ -149,7 +170,7 @@ class PTYBrokerClient:
         ).get("delta")
 
     def raw_tail(self, session_id: str, since: int = 0) -> tuple[bytes, int, int, bool, int, float | None] | None:
-        tail = self._rpc("raw_tail", session_id=session_id, since=max(0, int(since or 0))).get("tail")
+        tail = self._read_rpc("raw_tail", session_id=session_id, since=max(0, int(since or 0))).get("tail")
         if not isinstance(tail, dict):
             return None
         data = base64.b64decode(str(tail.get("b64") or ""))
@@ -173,11 +194,11 @@ class PTYBrokerClient:
         return self._rpc("terminate", session_id=session_id, sig=int(sig)).get("result") or {"ok": False, "reason": "empty broker result"}
 
     def status(self) -> dict:
-        status = self._rpc("status").get("status")
+        status = self._read_rpc("status").get("status")
         return status if isinstance(status, dict) else {}
 
     def list_sessions(self) -> list[dict]:
-        sessions = self._rpc("list_sessions").get("sessions")
+        sessions = self._read_rpc("list_sessions").get("sessions")
         return sessions if isinstance(sessions, list) else []
 
     def live_sessions(self) -> list[dict]:

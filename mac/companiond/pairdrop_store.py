@@ -205,6 +205,7 @@ class PairDropStore:
         )
         self.objects_dir = self.root / "objects"
         self.partials_dir = self.root / "partials"
+        self.purge_dir = self.root / ".purge-recovery"
         self.thumbnails_dir = self.root / "thumbnails"
         self.exports_dir = self.root / "exports"
         self.db_path = self.root / "index.sqlite"
@@ -223,23 +224,336 @@ class PairDropStore:
             self._migrate_legacy_vault()
 
     def _ensure_root(self) -> None:
-        for path in [
+        owned_directories = [
             self.root,
             self.objects_dir,
             self.partials_dir,
+            self.purge_dir,
             self.thumbnails_dir,
             self.exports_dir,
-        ]:
+        ]
+        for path in owned_directories:
             path.mkdir(parents=True, exist_ok=True)
+            try:
+                path_stat = path.lstat()
+            except OSError as exc:
+                raise PairDropStoreError("unsafe_owned_directory") from exc
+            if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISDIR(path_stat.st_mode):
+                raise PairDropStoreError("unsafe_owned_directory")
         try:
             # PairDrop stores private user files; the vault root must not be world-readable.
             os.chmod(self.root, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+            os.chmod(self.purge_dir, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
         except OSError:
             pass
         with self._initialization_lock():
             with self._connect() as conn:
                 conn.execute("PRAGMA journal_mode=WAL")
                 self._ensure_schema(conn)
+
+    @contextmanager
+    def _purge_directory_fd(self) -> Iterator[int]:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        root_fd = -1
+        purge_fd = -1
+        try:
+            try:
+                root_fd = os.open(self.root, flags)
+                if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+                    raise PairDropStoreError("unsafe_purge_recovery_path")
+                purge_fd = os.open(".purge-recovery", flags, dir_fd=root_fd)
+                if not stat.S_ISDIR(os.fstat(purge_fd).st_mode):
+                    raise PairDropStoreError("unsafe_purge_recovery_path")
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR, errno.ENOENT}:
+                    raise PairDropStoreError("unsafe_purge_recovery_path") from exc
+                raise
+            yield purge_fd
+        finally:
+            if purge_fd >= 0:
+                os.close(purge_fd)
+            if root_fd >= 0:
+                os.close(root_fd)
+
+    @contextmanager
+    def _object_parent_directory_fd(
+        self,
+        storage_relpath: str,
+        *,
+        create_shard: bool = False,
+    ) -> Iterator[tuple[int, str]]:
+        relative = Path(str(storage_relpath or ""))
+        if (
+            not storage_relpath
+            or relative.is_absolute()
+            or len(relative.parts) != 3
+            or relative.parts[0] != "objects"
+            or re.fullmatch(r"[a-f0-9]{2}", relative.parts[1]) is None
+            or re.fullmatch(r"pd_[a-f0-9]{32}\.blob", relative.name) is None
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise PairDropStoreError("unsafe_object_path")
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptors: list[int] = []
+        try:
+            try:
+                current_fd = os.open(self.root, flags)
+                descriptors.append(current_fd)
+                if not stat.S_ISDIR(os.fstat(current_fd).st_mode):
+                    raise PairDropStoreError("unsafe_object_path")
+                for index, component in enumerate(relative.parts[:-1]):
+                    if create_shard and index == len(relative.parts[:-1]) - 1:
+                        try:
+                            os.mkdir(component, 0o700, dir_fd=current_fd)
+                        except FileExistsError:
+                            pass
+                    current_fd = os.open(component, flags, dir_fd=current_fd)
+                    descriptors.append(current_fd)
+                    if not stat.S_ISDIR(os.fstat(current_fd).st_mode):
+                        raise PairDropStoreError("unsafe_object_path")
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR, errno.ENOENT}:
+                    raise PairDropStoreError("unsafe_object_path") from exc
+                raise
+            yield descriptors[-1], relative.name
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    @contextmanager
+    def _owned_child_directory_fd(self, name: str, error_code: str) -> Iterator[int]:
+        if name not in {"objects", "partials"}:
+            raise PairDropStoreError(error_code)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        root_fd = -1
+        child_fd = -1
+        try:
+            try:
+                root_fd = os.open(self.root, flags)
+                if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+                    raise PairDropStoreError(error_code)
+                child_fd = os.open(name, flags, dir_fd=root_fd)
+                if not stat.S_ISDIR(os.fstat(child_fd).st_mode):
+                    raise PairDropStoreError(error_code)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR, errno.ENOENT}:
+                    raise PairDropStoreError(error_code) from exc
+                raise
+            yield child_fd
+        finally:
+            if child_fd >= 0:
+                os.close(child_fd)
+            if root_fd >= 0:
+                os.close(root_fd)
+
+    def _fsync_published_object(self, storage_relpath: str, expected_size: int) -> None:
+        object_fd = -1
+        try:
+            with (
+                self._owned_child_directory_fd("partials", "unsafe_partial_path") as partials_fd,
+                self._owned_child_directory_fd("objects", "unsafe_object_path") as objects_fd,
+                self._object_parent_directory_fd(storage_relpath) as (object_parent_fd, object_name),
+            ):
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                try:
+                    object_fd = os.open(object_name, flags, dir_fd=object_parent_fd)
+                except FileNotFoundError as exc:
+                    raise PairDropStoreError("missing_object") from exc
+                object_stat = os.fstat(object_fd)
+                if not stat.S_ISREG(object_stat.st_mode):
+                    raise PairDropStoreError("unsafe_object_path")
+                if object_stat.st_size != expected_size:
+                    raise PairDropStoreError("byte_size_mismatch")
+                os.fsync(object_fd)
+                self._fsync_directory_pair(partials_fd, object_parent_fd)
+                os.fsync(objects_fd)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR}:
+                raise PairDropStoreError("unsafe_object_path") from exc
+            raise
+        finally:
+            if object_fd >= 0:
+                os.close(object_fd)
+
+    def _write_inline_object(
+        self,
+        storage_relpath: str,
+        partial_name: str,
+        data: bytes,
+    ) -> None:
+        descriptor = -1
+        moved = False
+        try:
+            with (
+                self._owned_child_directory_fd("partials", "unsafe_partial_path") as partials_fd,
+                self._object_parent_directory_fd(
+                    storage_relpath,
+                    create_shard=True,
+                ) as (object_parent_fd, object_name),
+            ):
+                flags = (
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                descriptor = os.open(partial_name, flags, 0o600, dir_fd=partials_fd)
+                view = memoryview(data)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError(errno.EIO, "short PairDrop write")
+                    view = view[written:]
+                os.fsync(descriptor)
+                os.close(descriptor)
+                descriptor = -1
+                os.replace(
+                    partial_name,
+                    object_name,
+                    src_dir_fd=partials_fd,
+                    dst_dir_fd=object_parent_fd,
+                )
+                moved = True
+            self._fsync_published_object(storage_relpath, len(data))
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR}:
+                raise PairDropStoreError(
+                    "unsafe_object_path" if moved else "unsafe_partial_path"
+                ) from exc
+            if exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}:
+                raise PairDropStoreError("insufficient_storage") from exc
+            raise
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    def _unlink_object_if_present(self, storage_relpath: str) -> bool:
+        with (
+            self._owned_child_directory_fd("objects", "unsafe_object_path") as objects_fd,
+            self._object_parent_directory_fd(storage_relpath) as (object_parent_fd, object_name),
+        ):
+            object_stat = self._purge_entry_stat(object_parent_fd, object_name)
+            if object_stat is not None and (
+                stat.S_ISLNK(object_stat.st_mode) or not stat.S_ISREG(object_stat.st_mode)
+            ):
+                raise PairDropStoreError("unsafe_object_path")
+            removed = object_stat is not None
+            if removed:
+                os.unlink(object_name, dir_fd=object_parent_fd)
+            os.fsync(object_parent_fd)
+            os.fsync(objects_fd)
+            return removed
+
+    @staticmethod
+    def _fsync_directory_pair(source_fd: int, destination_fd: int) -> None:
+        first_error: OSError | None = None
+        try:
+            os.fsync(source_fd)
+        except OSError as exc:
+            first_error = exc
+        if destination_fd != source_fd:
+            try:
+                os.fsync(destination_fd)
+            except OSError as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    @staticmethod
+    def _purge_entry_stat(directory_fd: int, name: str) -> os.stat_result | None:
+        try:
+            return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+
+    @staticmethod
+    def _require_regular_purge_entry(info: os.stat_result | None) -> None:
+        if info is not None and not stat.S_ISREG(info.st_mode):
+            raise PairDropStoreError("unsafe_purge_recovery_path")
+
+    @staticmethod
+    def _unlink_purge_entry(directory_fd: int, name: str) -> None:
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+
+    def _write_purge_recovery_record(
+        self,
+        directory_fd: int,
+        name: str,
+        *,
+        file_id: str,
+        display_name_sha256: str,
+        storage_relpath: str,
+    ) -> None:
+        payload = json.dumps(
+            {
+                "contract": "pairdrop-purge-recovery-v1",
+                "file_id": file_id,
+                "display_name_sha256": display_name_sha256,
+                "storage_relpath": storage_relpath,
+                "reason": "commit_state_unavailable",
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8") + b"\n"
+        temporary_name = f".{name}.{secrets.token_hex(8)}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = -1
+        try:
+            descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+            written = 0
+            while written < len(payload):
+                written += os.write(descriptor, payload[written:])
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            os.replace(
+                temporary_name,
+                name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            os.fsync(directory_fd)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+
+    def _fresh_file_row_state(self, file_id: str) -> bool | None:
+        connection = None
+        try:
+            connection = sqlite3.connect(
+                str(self.db_path),
+                timeout=self.sqlite_busy_timeout_ms / 1000,
+            )
+            connection.execute("PRAGMA busy_timeout=10000")
+            return connection.execute(
+                "SELECT 1 FROM files WHERE id = ?",
+                (file_id,),
+            ).fetchone() is not None
+        except Exception:
+            return None
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+    def _open_purge_connection(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            str(self.db_path),
+            timeout=self.sqlite_busy_timeout_ms / 1000,
+        )
+        connection.execute("PRAGMA busy_timeout=10000")
+        connection.row_factory = sqlite3.Row
+        return connection
 
     @contextmanager
     def _initialization_lock(self) -> Iterator[None]:
@@ -294,7 +608,7 @@ class PairDropStore:
             str(self.db_path),
             timeout=self.sqlite_busy_timeout_ms / 1000,
         )
-        conn.execute(f"PRAGMA busy_timeout={self.sqlite_busy_timeout_ms}")
+        conn.execute("PRAGMA busy_timeout=10000")
         conn.row_factory = sqlite3.Row
         try:
             yield conn
@@ -513,7 +827,7 @@ class PairDropStore:
             try:
                 conn = sqlite3.connect(str(snapshot_db), timeout=self.sqlite_busy_timeout_ms / 1000)
                 conn.row_factory = sqlite3.Row
-                conn.execute(f"PRAGMA busy_timeout={self.sqlite_busy_timeout_ms}")
+                conn.execute("PRAGMA busy_timeout=10000")
                 conn.execute("PRAGMA query_only=ON")
                 table = conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files'"
@@ -955,19 +1269,14 @@ class PairDropStore:
         file_id = "pd_" + secrets.token_hex(16)
         relpath = Path("objects") / digest[:2] / f"{file_id}.blob"
         partial = self.partials_dir / f"{file_id}.partial"
-        target = self.root / relpath
         now = _now_iso()
-        target_written = False
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
             with self._connect() as conn:
                 self._ensure_schema(conn)
                 conn.execute("BEGIN IMMEDIATE")
                 self._expire_upload_reservations(conn, now)
                 self._require_reserved_capacity(conn, additional_bytes=len(data))
-                partial.write_bytes(data)
-                os.replace(partial, target)
-                target_written = True
+                self._write_inline_object(str(relpath), partial.name, data)
                 conn.execute(
                     """
                     INSERT INTO files (
@@ -1001,19 +1310,25 @@ class PairDropStore:
                     "sha256": digest,
                 })
         except Exception as exc:
-            for candidate in (partial, target if target_written else None):
-                if candidate is None:
-                    continue
+            durable_row_state = self._fresh_file_row_state(file_id)
+            if durable_row_state is False:
                 try:
-                    candidate.unlink()
-                except OSError:
+                    partial.unlink(missing_ok=True)
+                except (OSError, TypeError):
                     pass
-            if isinstance(exc, OSError) and exc.errno in {
-                errno.ENOSPC,
-                getattr(errno, "EDQUOT", -1),
-            }:
-                raise PairDropStoreError("insufficient_storage") from exc
-            raise
+                try:
+                    self._unlink_object_if_present(str(relpath))
+                except (OSError, PairDropStoreError):
+                    pass
+            if durable_row_state is True:
+                self._fsync_published_object(str(relpath), len(data))
+            else:
+                if isinstance(exc, OSError) and exc.errno in {
+                    errno.ENOSPC,
+                    getattr(errno, "EDQUOT", -1),
+                }:
+                    raise PairDropStoreError("insufficient_storage") from exc
+                raise
         item = self.get_file(file_id)
         self._audit("file.created", {
             "file_id": file_id,
@@ -1165,7 +1480,39 @@ class PairDropStore:
                 str(source_device_id or ""),
                 str(source_install_id or ""),
             )
+        if session["state"] == "committed":
+            self._verified_committed_upload_file(session)
         return session
+
+    def _verified_committed_upload_file(self, session: dict[str, Any]) -> dict[str, Any]:
+        file_id = str(session.get("file_id") or "")
+        if session.get("state") != "committed" or not self._valid_id(file_id):
+            raise PairDropStoreError("completion_file_conflict")
+        item = self.get_file(file_id)
+        expected_size = int(session.get("total_byte_count") or 0)
+        expected_sha256 = str(session.get("expected_sha256") or "")
+        expected_relpath = str(
+            Path("objects") / expected_sha256[:2] / f"{file_id}.blob"
+        )
+        if (
+            item.get("kind") != "file"
+            or int(item.get("byte_size") or 0) != expected_size
+            or str(item.get("sha256") or "") != expected_sha256
+            or str(item.get("storage_relpath") or "") != expected_relpath
+        ):
+            raise PairDropStoreError("completion_file_conflict")
+        with self._object_parent_directory_fd(expected_relpath) as (
+            object_parent_fd,
+            object_name,
+        ):
+            object_stat = self._purge_entry_stat(object_parent_fd, object_name)
+            if object_stat is None:
+                raise PairDropStoreError("missing_object")
+            if stat.S_ISLNK(object_stat.st_mode) or not stat.S_ISREG(object_stat.st_mode):
+                raise PairDropStoreError("unsafe_object_path")
+            if object_stat.st_size != expected_size:
+                raise PairDropStoreError("byte_size_mismatch")
+        return item
 
     def write_upload_chunk(
         self,
@@ -1444,7 +1791,7 @@ class PairDropStore:
                 "ok": True,
                 "state": "committed",
                 "upload_id": upload_id,
-                "file": self.get_file(session["file_id"]),
+                "file": self._verified_committed_upload_file(session),
             }
         if session["state"] in {"cancelled", "expired", "failed_terminal"}:
             raise PairDropStoreError("upload_not_completable")
@@ -1482,7 +1829,6 @@ class PairDropStore:
         digest = str(session["expected_sha256"])
         partial = self._partial_path(upload_id)
         target = self.objects_dir / digest[:2] / f"{file_id}.blob"
-        target.parent.mkdir(parents=True, exist_ok=True)
 
         if target.exists() or target.is_symlink():
             recovered = self._recover_completed_upload_session(session)
@@ -1507,7 +1853,23 @@ class PairDropStore:
         elif current_identity != verified_partial_identity:
             raise PairDropStoreError("partial_changed")
 
-        os.replace(partial, target)
+        storage_relpath = str(Path("objects") / digest[:2] / f"{file_id}.blob")
+        with (
+            self._owned_child_directory_fd("partials", "unsafe_partial_path") as partials_fd,
+            self._object_parent_directory_fd(
+                storage_relpath,
+                create_shard=True,
+            ) as (object_parent_fd, object_name),
+        ):
+            existing = self._purge_entry_stat(object_parent_fd, object_name)
+            if existing is not None:
+                raise PairDropStoreError("completion_file_conflict")
+            os.replace(
+                partial.name,
+                object_name,
+                src_dir_fd=partials_fd,
+                dst_dir_fd=object_parent_fd,
+            )
         # Rename updates ctime on macOS even though it moves the same inode and
         # content. Compare every stable content-identity field except ctime.
         if self._file_identity(target)[:-1] != verified_partial_identity[:-1]:
@@ -1608,6 +1970,7 @@ class PairDropStore:
         if not object_verified and self._sha256_file(object_path) != digest:
             raise PairDropStoreError("completion_file_conflict")
         relpath = object_path.relative_to(self.root)
+        self._fsync_published_object(str(relpath), byte_size)
         now = _now_iso()
         with self._connect() as conn:
             self._ensure_schema(conn)
@@ -1768,24 +2131,28 @@ class PairDropStore:
         if type(limit) is not int or limit < 1 or limit > MAX_LIST_PAGE_SIZE:
             raise PairDropStoreError("bad_limit")
         cursor_values = _decode_file_cursor(cursor) if cursor is not None else None
-        where = "deleted_at IS NULL"
-        parameters: list[Any] = []
+        parameters: list[Any]
         if cursor_values is not None:
             created_at, file_id = cursor_values
-            where += " AND (created_at < ? OR (created_at = ? AND id < ?))"
-            parameters.extend((created_at, created_at, file_id))
-        parameters.append(limit + 1)
-        with self._connect() as conn:
-            self._ensure_schema(conn)
-            rows = conn.execute(
-                f"""
+            query = """
                 SELECT * FROM files
-                 WHERE {where}
+                 WHERE deleted_at IS NULL
+                   AND (created_at < ? OR (created_at = ? AND id < ?))
                  ORDER BY created_at DESC, id DESC
                  LIMIT ?
-                """,
-                parameters,
-            ).fetchall()
+            """
+            parameters = [created_at, created_at, file_id, limit + 1]
+        else:
+            query = """
+                SELECT * FROM files
+                 WHERE deleted_at IS NULL
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?
+            """
+            parameters = [limit + 1]
+        with self._connect() as conn:
+            self._ensure_schema(conn)
+            rows = conn.execute(query, parameters).fetchall()
         has_more = len(rows) > limit
         page_rows = rows[:limit]
         next_cursor = None
@@ -1812,18 +2179,282 @@ class PairDropStore:
         return self._public_row(row)
 
     def delete_file(self, file_id: str) -> dict[str, Any]:
-        item = self.get_file(file_id)
-        now = _now_iso()
+        if not self._valid_id(file_id):
+            raise PairDropStoreError("bad_file_id")
+        newly_deleted = False
         with self._connect() as conn:
             self._ensure_schema(conn)
-            conn.execute(
-                "UPDATE files SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
-                (now, now, file_id),
-            )
-            self._record_event(conn, "deleted", file_id, {"byte_size": item.get("byte_size", 0)})
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
+            if row is None:
+                raise PairDropStoreError("not_found")
+            item = self._public_row(row)
+            deleted_at = str(row["deleted_at"] or "")
+            if not deleted_at:
+                deleted_at = _now_iso()
+                changed = conn.execute(
+                    """
+                    UPDATE files
+                       SET deleted_at = ?, updated_at = ?
+                     WHERE id = ? AND deleted_at IS NULL
+                    """,
+                    (deleted_at, deleted_at, file_id),
+                ).rowcount
+                if changed != 1:
+                    raise PairDropStoreError("delete_conflict")
+                conn.execute(
+                    """
+                    UPDATE upload_sessions
+                       SET create_idempotency_key = NULL
+                     WHERE file_id = ?
+                    """,
+                    (file_id,),
+                )
+                self._record_event(
+                    conn,
+                    "deleted",
+                    file_id,
+                    {"byte_size": item.get("byte_size", 0)},
+                )
+                newly_deleted = True
             conn.commit()
-        self._audit("file.deleted", {"file_id": file_id, "byte_size": item.get("byte_size", 0)})
-        return {"ok": True, "id": file_id, "deleted_at": now}
+        if item.get("kind") == "file":
+            self._unlink_object_if_present(str(item.get("storage_relpath") or ""))
+        if newly_deleted:
+            self._audit(
+                "file.deleted",
+                {"file_id": file_id, "byte_size": item.get("byte_size", 0)},
+            )
+        return {
+            "ok": True,
+            "id": file_id,
+            "deleted_at": deleted_at,
+            "idempotent": not newly_deleted,
+        }
+
+    def purge_deleted_file(self, file_id: str, *, expected_display_name: str) -> dict[str, Any]:
+        """Physically remove one known deleted fixture.
+
+        This is intentionally not exposed by the HTTP API. Maintenance tools
+        must name the exact deleted file so they cannot turn a stale id into a
+        broad data-deletion primitive.
+        """
+        if not self._valid_id(file_id):
+            raise PairDropStoreError("bad_file_id")
+        if not isinstance(expected_display_name, str) or not expected_display_name:
+            raise PairDropStoreError("expected_display_name_required")
+        display_digest = hashlib.sha256(expected_display_name.encode("utf-8")).hexdigest()
+        display_tag = display_digest[:16]
+        quarantine_name = f"{file_id}-{display_tag}.blob"
+        recovery_name = f"{file_id}-{display_tag}.json"
+        recovered_cleanup = False
+        committed = False
+        with self._purge_directory_fd() as purge_fd:
+            quarantine_stat = self._purge_entry_stat(purge_fd, quarantine_name)
+            recovery_stat = self._purge_entry_stat(purge_fd, recovery_name)
+            self._require_regular_purge_entry(quarantine_stat)
+            self._require_regular_purge_entry(recovery_stat)
+
+            conn = self._open_purge_connection()
+            try:
+                self._ensure_schema(conn)
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
+                if row is None:
+                    if quarantine_stat is None and recovery_stat is None:
+                        raise PairDropStoreError("not_found")
+                    self._unlink_purge_entry(purge_fd, quarantine_name)
+                    self._unlink_purge_entry(purge_fd, recovery_name)
+                    os.fsync(purge_fd)
+                    recovered_cleanup = True
+                    committed = True
+                else:
+                    item = self._public_row(row)
+                    if not row["deleted_at"]:
+                        raise PairDropStoreError("not_deleted")
+                    if row["display_name"] != expected_display_name:
+                        raise PairDropStoreError("display_name_mismatch")
+                    storage_relpath = str(item.get("storage_relpath") or "")
+                    with self._object_parent_directory_fd(storage_relpath) as (
+                        object_parent_fd,
+                        object_name,
+                    ):
+                        path_stat = self._purge_entry_stat(object_parent_fd, object_name)
+                    if path_stat is not None and (
+                        stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode)
+                    ):
+                        raise PairDropStoreError("unsafe_object_path")
+                    if path_stat is not None and quarantine_stat is not None:
+                        raise PairDropStoreError("ambiguous_purge_recovery_state")
+
+                    moved_to_quarantine = False
+                    try:
+                        if path_stat is not None:
+                            with self._object_parent_directory_fd(storage_relpath) as (
+                                object_parent_fd,
+                                object_name,
+                            ):
+                                current_stat = self._purge_entry_stat(object_parent_fd, object_name)
+                                if (
+                                    current_stat is None
+                                    or not stat.S_ISREG(current_stat.st_mode)
+                                    or current_stat.st_dev != path_stat.st_dev
+                                    or current_stat.st_ino != path_stat.st_ino
+                                ):
+                                    raise PairDropStoreError("unsafe_object_path")
+                                os.replace(
+                                    object_name,
+                                    quarantine_name,
+                                    src_dir_fd=object_parent_fd,
+                                    dst_dir_fd=purge_fd,
+                                )
+                                moved_to_quarantine = True
+                                self._fsync_directory_pair(object_parent_fd, purge_fd)
+                        upload_ids = [
+                            str(upload["upload_id"])
+                            for upload in conn.execute(
+                                "SELECT upload_id FROM upload_sessions WHERE file_id = ?",
+                                (file_id,),
+                            ).fetchall()
+                        ]
+                        for upload_id in upload_ids:
+                            conn.execute("DELETE FROM upload_chunks WHERE upload_id = ?", (upload_id,))
+                            candidate_events = conn.execute(
+                                """
+                                SELECT seq, summary_json FROM events
+                                 WHERE file_id IS NULL AND summary_json LIKE ?
+                                """,
+                                (f"%{upload_id}%",),
+                            ).fetchall()
+                            for event in candidate_events:
+                                try:
+                                    summary = json.loads(event["summary_json"] or "{}")
+                                except (TypeError, json.JSONDecodeError):
+                                    continue
+                                if (
+                                    isinstance(summary, dict)
+                                    and summary.get("upload_id") == upload_id
+                                ):
+                                    conn.execute(
+                                        "DELETE FROM events WHERE seq = ?",
+                                        (event["seq"],),
+                                    )
+                        conn.execute("DELETE FROM upload_sessions WHERE file_id = ?", (file_id,))
+                        conn.execute("DELETE FROM events WHERE file_id = ?", (file_id,))
+                        conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+                        conn.commit()
+                        committed = True
+                    except BaseException as exc:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                        durable_row_state = self._fresh_file_row_state(file_id)
+                        if durable_row_state is False:
+                            committed = True
+                        elif durable_row_state is True:
+                            if moved_to_quarantine:
+                                with self._object_parent_directory_fd(storage_relpath) as (
+                                    object_parent_fd,
+                                    object_name,
+                                ):
+                                    restored_stat = self._purge_entry_stat(
+                                        object_parent_fd,
+                                        object_name,
+                                    )
+                                if restored_stat is None:
+                                    try:
+                                        with self._object_parent_directory_fd(storage_relpath) as (
+                                            object_parent_fd,
+                                            object_name,
+                                        ):
+                                            quarantine_entry = self._purge_entry_stat(
+                                                purge_fd,
+                                                quarantine_name,
+                                            )
+                                            self._require_regular_purge_entry(quarantine_entry)
+                                            if quarantine_entry is None:
+                                                raise PairDropStoreError(
+                                                    "purge_recovery_required",
+                                                    "PairDrop lost its quarantine file while restoring a failed purge.",
+                                                )
+                                            os.replace(
+                                                quarantine_name,
+                                                object_name,
+                                                src_dir_fd=purge_fd,
+                                                dst_dir_fd=object_parent_fd,
+                                            )
+                                            self._fsync_directory_pair(
+                                                purge_fd,
+                                                object_parent_fd,
+                                            )
+                                    except (OSError, PairDropStoreError) as restore_exc:
+                                        self._write_purge_recovery_record(
+                                            purge_fd,
+                                            recovery_name,
+                                            file_id=file_id,
+                                            display_name_sha256=display_digest,
+                                            storage_relpath=storage_relpath,
+                                        )
+                                        raise PairDropStoreError(
+                                            "purge_recovery_required",
+                                            "PairDrop could not restore a file after purge commit failed; retry the exact purge.",
+                                        ) from restore_exc
+                                else:
+                                    self._write_purge_recovery_record(
+                                        purge_fd,
+                                        recovery_name,
+                                        file_id=file_id,
+                                        display_name_sha256=display_digest,
+                                        storage_relpath=storage_relpath,
+                                    )
+                                    raise PairDropStoreError(
+                                        "purge_recovery_required",
+                                        "PairDrop found a live object while restoring a failed purge; retry the exact purge.",
+                                    ) from exc
+                            self._unlink_purge_entry(purge_fd, recovery_name)
+                            os.fsync(purge_fd)
+                            raise
+                        else:
+                            self._write_purge_recovery_record(
+                                purge_fd,
+                                recovery_name,
+                                file_id=file_id,
+                                display_name_sha256=display_digest,
+                                storage_relpath=storage_relpath,
+                            )
+                            if isinstance(exc, Exception):
+                                raise PairDropStoreError(
+                                    "purge_recovery_required",
+                                    "PairDrop could not prove whether the purge committed; retry the exact purge.",
+                                ) from exc
+                            raise
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+            if committed and not recovered_cleanup:
+                try:
+                    self._unlink_purge_entry(purge_fd, quarantine_name)
+                    self._unlink_purge_entry(purge_fd, recovery_name)
+                    os.fsync(purge_fd)
+                except OSError as exc:
+                    raise PairDropStoreError(
+                        "purge_cleanup_pending",
+                        "PairDrop committed the purge but could not remove its recovery file; retry the exact purge.",
+                    ) from exc
+        self._audit("file.purged", {
+            "file_id": file_id,
+            "display_name_sha256": display_digest,
+        })
+        return {
+            "ok": True,
+            "id": file_id,
+            "purged": True,
+            "recovered_cleanup": recovered_cleanup,
+        }
 
     def attach_descriptor(self, file_id: str, *, session_id: str = "") -> dict[str, Any]:
         descriptor = self.verified_read_descriptor(file_id)
@@ -2063,21 +2694,35 @@ class PairDropStore:
         removed = 0
         preserved_active = 0
         skipped_symlinks = 0
-        for path in self.partials_dir.glob("*.partial"):
-            try:
-                path_stat = path.lstat()
-                if path.is_symlink():
-                    skipped_symlinks += 1
+        with self._owned_child_directory_fd(
+            "partials",
+            "unsafe_partial_path",
+        ) as partials_fd:
+            for name in os.listdir(partials_fd):
+                if not name.endswith(".partial"):
                     continue
-                upload_id = path.name.removesuffix(".partial")
-                if upload_id in active_upload_ids:
-                    preserved_active += 1
+                try:
+                    path_stat = os.stat(
+                        name,
+                        dir_fd=partials_fd,
+                        follow_symlinks=False,
+                    )
+                    if stat.S_ISLNK(path_stat.st_mode):
+                        skipped_symlinks += 1
+                        continue
+                    if not stat.S_ISREG(path_stat.st_mode):
+                        continue
+                    upload_id = name.removesuffix(".partial")
+                    if upload_id in active_upload_ids:
+                        preserved_active += 1
+                        continue
+                    if path_stat.st_mtime < cutoff:
+                        os.unlink(name, dir_fd=partials_fd)
+                        removed += 1
+                except FileNotFoundError:
                     continue
-                if path_stat.st_mtime < cutoff:
-                    path.unlink()
-                    removed += 1
-            except FileNotFoundError:
-                continue
+            if removed:
+                os.fsync(partials_fd)
         self._audit("partials.cleaned", {
             "removed": removed,
             "preserved_active": preserved_active,
@@ -2117,23 +2762,32 @@ class PairDropStore:
         return path
 
     def _write_partial_range(self, upload_id: str, offset: int, data: bytes) -> None:
-        path = self._partial_path(upload_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        if not self._valid_upload_id(upload_id):
+            raise PairDropStoreError("bad_upload_id")
+        partial_name = f"{upload_id}.partial"
         flags = os.O_RDWR | os.O_CREAT
         no_follow = getattr(os, "O_NOFOLLOW", 0)
         if no_follow:
             flags |= no_follow
         fd = -1
         try:
-            fd = os.open(str(path), flags, 0o600)
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise PairDropStoreError("unsafe_partial_path")
-            with os.fdopen(fd, "r+b", closefd=True) as handle:
-                fd = -1
-                handle.seek(offset)
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
+            with self._owned_child_directory_fd(
+                "partials",
+                "unsafe_partial_path",
+            ) as partials_fd:
+                fd = os.open(partial_name, flags, 0o600, dir_fd=partials_fd)
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise PairDropStoreError("unsafe_partial_path")
+                with os.fdopen(fd, "r+b", closefd=True) as handle:
+                    fd = -1
+                    handle.seek(offset)
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                # The SQLite offset is not allowed to become durable before
+                # the partial's directory entry. This matters on the first
+                # chunk, when the file itself has just been created.
+                os.fsync(partials_fd)
         except OSError as exc:
             if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR}:
                 raise PairDropStoreError("unsafe_partial_path") from exc
@@ -2145,15 +2799,21 @@ class PairDropStore:
                 os.close(fd)
 
     def _truncate_partial(self, upload_id: str, byte_count: int) -> None:
-        path = self._partial_path(upload_id)
+        if not self._valid_upload_id(upload_id):
+            raise PairDropStoreError("bad_upload_id")
+        partial_name = f"{upload_id}.partial"
         flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
         fd = -1
         try:
-            fd = os.open(str(path), flags)
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise PairDropStoreError("unsafe_partial_path")
-            os.ftruncate(fd, byte_count)
-            os.fsync(fd)
+            with self._owned_child_directory_fd(
+                "partials",
+                "unsafe_partial_path",
+            ) as partials_fd:
+                fd = os.open(partial_name, flags, dir_fd=partials_fd)
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise PairDropStoreError("unsafe_partial_path")
+                os.ftruncate(fd, byte_count)
+                os.fsync(fd)
         except OSError as exc:
             if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR}:
                 raise PairDropStoreError("unsafe_partial_path") from exc
@@ -2163,12 +2823,36 @@ class PairDropStore:
                 os.close(fd)
 
     def _partial_range_hash(self, upload_id: str, offset: int, byte_count: int) -> str:
-        path = self._partial_path(upload_id)
-        if path.is_symlink() or not path.is_file():
-            raise PairDropStoreError("missing_partial")
-        with path.open("rb") as handle:
-            handle.seek(offset)
-            data = handle.read(byte_count)
+        if not self._valid_upload_id(upload_id):
+            raise PairDropStoreError("bad_upload_id")
+        partial_name = f"{upload_id}.partial"
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = -1
+        try:
+            with self._owned_child_directory_fd(
+                "partials",
+                "unsafe_partial_path",
+            ) as partials_fd:
+                try:
+                    fd = os.open(partial_name, flags, dir_fd=partials_fd)
+                except FileNotFoundError as exc:
+                    raise PairDropStoreError("missing_partial") from exc
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise PairDropStoreError("unsafe_partial_path")
+                os.lseek(fd, offset, os.SEEK_SET)
+                data = bytearray()
+                while len(data) < byte_count:
+                    chunk = os.read(fd, min(1024 * 1024, byte_count - len(data)))
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR}:
+                raise PairDropStoreError("unsafe_partial_path") from exc
+            raise
+        finally:
+            if fd >= 0:
+                os.close(fd)
         if len(data) != byte_count:
             raise PairDropStoreError("chunk_mismatch")
         return hashlib.sha256(data).hexdigest()

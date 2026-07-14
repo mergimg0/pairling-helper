@@ -40,6 +40,8 @@ const (
 // copy first; every other handler deletes it, so a client can never forge it.
 const funnelOriginHeader = "X-Pairling-Funnel-Origin"
 
+const pairingActivationContract = "pairling.psk.activate.v1"
+
 // Chat attachment uploads (POST /upload) carry whole photos/short videos in
 // one shot — the 1MB default rejected most camera photos with 413.
 const chatUploadMaxBodyBytes int64 = 25 * 1024 * 1024
@@ -91,7 +93,7 @@ type Options struct {
 	// named in its QR, without the upstream's identity fields ever being exposed.
 	FunnelMacIDHash string
 	// FunnelLimiter, when set, owns identity-independent rate limiting on the
-	// funnel claim path. Used instead of RateLimiter for the funnel handler.
+	// funnel pairing paths. Used instead of RateLimiter for the funnel handler.
 	FunnelLimiter *FunnelLimiter
 }
 
@@ -189,7 +191,10 @@ func isFunnelSynthesizedPath(path string) bool {
 }
 
 func (h *Handler) writeFunnelHealth(w http.ResponseWriter, r *http.Request, path string) {
-	body := map[string]any{"ok": true}
+	body := map[string]any{
+		"ok":                           true,
+		"pairing_activation_contracts": []string{pairingActivationContract},
+	}
 	if (path == "/health" || path == "/manifest") && h.funnelMacIDHash != "" {
 		body["mac_id_hash"] = h.funnelMacIDHash
 	}
@@ -220,18 +225,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeFunnelHealth(w, r, path)
 		return
 	}
-	if h.funnelLimiter != nil && h.mode == ExposureModeFunnelBootstrap && r.Method == http.MethodPost && isPrePairClaimPath(path) {
+	if h.funnelLimiter != nil && h.mode == ExposureModeFunnelBootstrap && r.Method == http.MethodPost && isFunnelRateLimitedPath(path) {
 		body, err := io.ReadAll(io.LimitReader(r.Body, prePairMaxBodyBytes+1))
 		if err != nil || int64(len(body)) > prePairMaxBodyBytes {
 			h.reject(w, r, http.StatusRequestEntityTooLarge, "request_too_large")
 			return
 		}
-		release, ok := h.funnelLimiter.Acquire(extractPairID(body))
+		pairID := extractPairID(body)
+		var release func()
+		var ok bool
+		if isFunnelECDHClaimPath(path) {
+			release, ok = h.funnelLimiter.Acquire(pairID)
+		} else {
+			ok = h.funnelLimiter.Allow(pairID)
+		}
 		if !ok {
 			h.reject(w, r, http.StatusTooManyRequests, "rate_limited")
 			return
 		}
-		defer release()
+		if release != nil {
+			defer release()
+		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
 	}
@@ -354,16 +368,36 @@ func (l *FunnelLimiter) Acquire(pairID string) (release func(), ok bool) {
 	default:
 		return nil, false
 	}
+	if !l.Allow(pairID) {
+		<-l.ecdhSem
+		return nil, false
+	}
+	return func() { <-l.ecdhSem }, true
+}
+
+// Allow consumes the Funnel request budget without taking an ECDH slot. The
+// activation path uses this because it verifies an HMAC and updates SQLite,
+// but it must still share the public global and per-pair spray limits.
+func (l *FunnelLimiter) Allow(pairID string) bool {
+	if l == nil {
+		return true
+	}
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	now := l.now()
 	cutoff := now.Add(-l.window)
 	l.globalHits = pruneTimes(l.globalHits, cutoff)
-	ph := pruneTimes(l.perPair[pairID], cutoff)
+	prior, existed := l.perPair[pairID]
+	ph := pruneTimes(prior, cutoff)
 	if len(l.globalHits) >= l.globalLimit || len(ph) >= l.perPairLimit {
-		l.perPair[pairID] = ph
-		l.mu.Unlock()
-		<-l.ecdhSem
-		return nil, false
+		if len(ph) == 0 {
+			if existed {
+				delete(l.perPair, pairID)
+			}
+		} else {
+			l.perPair[pairID] = ph
+		}
+		return false
 	}
 	l.globalHits = append(l.globalHits, now)
 	l.perPair[pairID] = append(ph, now)
@@ -381,8 +415,7 @@ func (l *FunnelLimiter) Acquire(pairID string) (release func(), ok bool) {
 			}
 		}
 	}
-	l.mu.Unlock()
-	return func() { <-l.ecdhSem }, true
+	return true
 }
 
 func pruneTimes(times []time.Time, cutoff time.Time) []time.Time {
@@ -633,11 +666,21 @@ var funnelBootstrapGetPaths = map[string]bool{
 }
 
 var funnelBootstrapPostPaths = map[string]bool{
-	"/pair/psk-claim": true,
+	"/pair/psk-activate": true,
+	"/pair/psk-claim":    true,
+	"/pair/psk-claim-v2": true,
 }
 
 func isPrePairClaimPath(path string) bool {
-	return path == "/pair/claim" || path == "/pair/psk-claim"
+	return path == "/pair/claim" || path == "/pair/psk-activate" || path == "/pair/psk-claim" || path == "/pair/psk-claim-v2"
+}
+
+func isFunnelECDHClaimPath(path string) bool {
+	return path == "/pair/claim" || path == "/pair/psk-claim" || path == "/pair/psk-claim-v2"
+}
+
+func isFunnelRateLimitedPath(path string) bool {
+	return isFunnelECDHClaimPath(path) || path == "/pair/psk-activate"
 }
 
 func isReauthPath(path string) bool {
@@ -832,8 +875,10 @@ var prePairGetPaths = map[string]bool{
 }
 
 var prePairPostPaths = map[string]bool{
-	"/pair/claim":     true,
-	"/pair/psk-claim": true,
+	"/pair/claim":        true,
+	"/pair/psk-activate": true,
+	"/pair/psk-claim":    true,
+	"/pair/psk-claim-v2": true,
 }
 
 type MemoryRateLimiter struct {

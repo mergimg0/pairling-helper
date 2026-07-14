@@ -72,7 +72,9 @@ func TestAdversarialPairlingConnectBypass(t *testing.T) {
 		{"routez allowed", "GET", "/routez", true},
 		{"manifest allowed", "GET", "/manifest", true},
 		{"pair claim allowed", "POST", "/pair/claim", true},
+		{"pair psk-activate allowed", "POST", "/pair/psk-activate", true},
 		{"pair psk-claim allowed", "POST", "/pair/psk-claim", true},
+		{"pair psk-claim-v2 allowed", "POST", "/pair/psk-claim-v2", true},
 	}
 
 	for _, tc := range cases {
