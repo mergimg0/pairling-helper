@@ -116,6 +116,9 @@ def ensure_local_mcp_bridge_device(
     registry: DeviceRegistry | None = None,
     credential_path: Path | None = None,
     install_id: str | None = None,
+    planned_device_id: str | None = None,
+    planned_token: str | None = None,
+    planned_proof_secret: str | None = None,
 ) -> dict[str, Any]:
     device_registry = registry or DeviceRegistry()
     target, trusted_root = _credential_context(
@@ -128,6 +131,9 @@ def ensure_local_mcp_bridge_device(
             target=target,
             trusted_root=trusted_root,
             install_id=install_id,
+            planned_device_id=planned_device_id,
+            planned_token=planned_token,
+            planned_proof_secret=planned_proof_secret,
         )
 
 
@@ -137,7 +143,20 @@ def _ensure_local_mcp_bridge_device_locked(
     target: Path,
     trusted_root: Path,
     install_id: str | None,
+    planned_device_id: str | None,
+    planned_token: str | None,
+    planned_proof_secret: str | None,
 ) -> dict[str, Any]:
+    planned_values = (planned_device_id, planned_token, planned_proof_secret)
+    if any(value is not None for value in planned_values):
+        if not all(isinstance(value, str) and value for value in planned_values):
+            raise ValueError("planned local MCP identity must provide all credential values")
+        if (
+            not str(planned_device_id).startswith("dev_local_mcp_")
+            or not str(planned_token).startswith("pld_")
+            or not str(planned_proof_secret).startswith("prf_")
+        ):
+            raise ValueError("planned local MCP identity has an invalid format")
     install_id_value = (
         _pairling_install_id()
         if install_id is None
@@ -208,7 +227,9 @@ def _ensure_local_mcp_bridge_device_locked(
         device_name=LOCAL_MCP_DEVICE_NAME,
         scopes=LOCAL_MCP_SCOPES,
         install_id=install_id_value,
-        device_id="dev_local_mcp_" + secrets.token_hex(12),
+        device_id=planned_device_id or "dev_local_mcp_" + secrets.token_hex(12),
+        token=planned_token,
+        proof_secret=planned_proof_secret,
         purpose=LOCAL_MCP_DEVICE_PURPOSE,
     )
     credential = {

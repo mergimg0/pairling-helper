@@ -78,7 +78,6 @@ done
 "$PYTHON3_BIN" - "$REPO_ROOT" "$JSON_MODE" "$FIRST_RUN_MODE" <<'PY'
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import plistlib
@@ -114,7 +113,7 @@ DEVICES_DB = APP_SUPPORT / "devices.sqlite"
 MCP_CREDENTIAL = Path(os.environ.get("PAIRLING_MCP_CREDENTIAL", str(APP_SUPPORT / "mcp-bridge.json")))
 MCP_ADAPTER = CURRENT / "mcp" / "phone_tools.py"
 MCP_SHIM = home / ".claude" / "mcp-servers" / "phone-tools.py"
-USER_PAIRLING = home / ".local" / "bin" / "pairling"
+USER_PAIRLING = Path(os.environ.get("PAIRLING_USER_BIN_DIR", str(home / ".local" / "bin"))) / "pairling"
 PAIR_ROOT = APP_SUPPORT / "pair"
 USER_PLIST = home / "Library" / "LaunchAgents" / f"{PAIRLING_LABEL}.plist"
 CONNECTD_USER_PLIST = home / "Library" / "LaunchAgents" / f"{PAIRLING_CONNECTD_LABEL}.plist"
@@ -123,6 +122,10 @@ CLAUDE_INJECTOR = home / "Applications" / "ClaudeInjector.app" / "Contents" / "M
 
 sys.path.insert(0, str(repo_root / "mac" / "companiond"))
 from pairling_connectd_status import fetch_connectd_status, redacted_connectd_summary
+from runtime_manifest import (
+    classify_ptybroker_identity,
+    verified_managed_release_identity,
+)
 
 checks = []
 
@@ -162,17 +165,17 @@ def run(args, timeout=5):
         return 127, "", f"{type(exc).__name__}: {exc}"
 
 
+def developer_id_requirement(team_id: str) -> str:
+    return (
+        "anchor apple generic and "
+        f'certificate leaf[subject.OU] = "{team_id}" and '
+        "certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+    )
+
+
 def load_plist(path):
     with path.open("rb") as fh:
         return plistlib.load(fh)
-
-
-def sha256_file(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def valid_install_id(value: object) -> str | None:
@@ -528,40 +531,20 @@ def ptybroker_deployment_status(*, launchd_loaded: bool) -> dict:
     live, error = ptybroker_status_rpc()
     if live is None:
         return {**base, "state": "unreachable_socket", "evidence": error}
-    reasons = []
+    state, reasons = classify_ptybroker_identity(live, desired)
+    if not isinstance(live, dict):
+        return {**base, "state": state, "reasons": reasons, "evidence": "status response is not an object"}
     live_root = live.get("runtime_root")
-    if live_root:
-        if os.path.realpath(str(live_root)) != str(desired.get("runtime_root")):
-            reasons.append("runtime_root_mismatch")
-    else:
-        reasons.append("runtime_root_missing")
     live_script = live.get("script_path")
-    if live_script:
-        if os.path.realpath(str(live_script)) != str(desired.get("script_path")):
-            reasons.append("script_path_mismatch")
-    else:
-        reasons.append("script_path_missing")
     live_revision = live.get("source_revision")
-    if desired.get("source_revision") and not live_revision:
-        reasons.append("source_revision_missing")
-    elif live_revision and desired.get("source_revision") and str(live_revision) != str(desired.get("source_revision")):
-        reasons.append("source_revision_mismatch")
-    try:
-        live_protocol = int(live.get("protocol_version") or 0)
-    except (TypeError, ValueError):
-        live_protocol = 0
-    if live_protocol != int(desired.get("protocol_version") or 0):
-        if not live.get("protocol_version"):
-            reasons.append("protocol_version_missing")
-        else:
-            reasons.append("protocol_version_mismatch")
-    state = "current" if not reasons else "stale_deferred"
+    pid = live.get("pid")
+    live_session_count = live.get("live_session_count")
     return {
         **base,
         "state": state,
         "restart_deferred": state == "stale_deferred",
-        "pid": live.get("pid"),
-        "live_session_count": live.get("live_session_count"),
+        "pid": pid,
+        "live_session_count": live_session_count,
         "live_source_revision": live_revision,
         "live_runtime_root": live_root,
         "live_script_path": live_script,
@@ -626,17 +609,81 @@ def next_action_for_stage(stage: str, *, remote_status: str, pair_window_open: b
 
 
 manifest = None
-if MANIFEST_PATH.is_file():
-    try:
-        manifest = json.loads(MANIFEST_PATH.read_text())
-        add("manifest_exists", True, "error", "Installed Pairling manifest exists.", str(MANIFEST_PATH))
-    except Exception as exc:
-        add("manifest_exists", False, "error", f"Manifest is unreadable: {type(exc).__name__}: {exc}", str(MANIFEST_PATH))
-else:
-    add("manifest_exists", False, "error", "Installed Pairling manifest is missing.", str(MANIFEST_PATH))
+release_root = None
+managed_release_identity = None
+managed_release_error = None
+try:
+    if not CURRENT.is_symlink():
+        raise OSError("runtime/current is not a symlink")
+    literal_target = Path(os.readlink(CURRENT))
+    if not literal_target.is_absolute():
+        raise OSError("runtime/current must use an absolute release target")
+    releases_root = CURRENT.parent / "releases"
+    current_before = CURRENT.resolve(strict=True)
+    managed_release_identity = verified_managed_release_identity(
+        literal_target,
+        releases_root,
+    )
+    release_root = Path(managed_release_identity["root"])
+    current_after = CURRENT.resolve(strict=True)
+    if current_before != release_root or current_after != release_root:
+        raise OSError("runtime/current changed during managed release verification")
+    add(
+        "current_release_link",
+        True,
+        "error",
+        "runtime/current names a verified managed release directly.",
+        {
+            "target": str(literal_target),
+            "runtime_version": managed_release_identity["runtime_version"],
+            "source_revision": managed_release_identity["source_revision"],
+            "source_dirty": managed_release_identity["source_dirty"],
+        },
+    )
+except Exception as exc:
+    managed_release_error = f"{type(exc).__name__}: {exc}"
+    managed_release_identity = None
+    release_root = None
+    add(
+        "current_release_link",
+        False,
+        "error",
+        f"runtime/current is not a verified managed release: {managed_release_error}",
+        str(CURRENT),
+    )
 
-if manifest:
-    add("manifest_contract", manifest.get("contract_version") == "pairling-runtime-v1", "error", "Manifest contract is pairling-runtime-v1.", manifest.get("contract_version"))
+verified_manifest_path = release_root / "manifest.json" if release_root is not None else MANIFEST_PATH
+if verified_manifest_path.is_symlink():
+    add("manifest_exists", False, "error", "Installed Pairling manifest must not be a symlink.", str(verified_manifest_path))
+elif verified_manifest_path.is_file() and managed_release_identity is not None:
+    try:
+        manifest = json.loads(verified_manifest_path.read_text())
+        add("manifest_exists", True, "error", "Installed Pairling manifest exists.", str(verified_manifest_path))
+    except Exception as exc:
+        add("manifest_exists", False, "error", f"Manifest is unreadable: {type(exc).__name__}: {exc}", str(verified_manifest_path))
+else:
+    add("manifest_exists", False, "error", "Installed Pairling manifest is missing or its managed release identity failed.", str(verified_manifest_path))
+
+if managed_release_identity is not None:
+    add(
+        "runtime_release_sealed",
+        True,
+        "error",
+        "Installed Pairling release passed the managed inventory, seal, and ACL proof.",
+        managed_release_identity,
+    )
+else:
+    add(
+        "runtime_release_sealed",
+        False,
+        "error",
+        "Installed Pairling release did not pass the managed inventory, seal, and ACL proof.",
+        managed_release_error,
+    )
+
+if manifest and managed_release_identity is not None and release_root is not None:
+    manifest_contract_ok = manifest.get("contract_version") == "pairling-runtime-v1" and manifest.get("schema_version") == 2
+    add("manifest_contract", manifest_contract_ok, "error", "Manifest contract and schema are current.", {"contract_version": manifest.get("contract_version"), "schema_version": manifest.get("schema_version")})
     runtime = manifest.get("runtime") if isinstance(manifest.get("runtime"), dict) else {}
     add("runtime_port", runtime.get("port") == PAIRLING_PORT, "error", "Runtime port is locked to 7773.", runtime.get("port"))
     launchd = manifest.get("launchd") if isinstance(manifest.get("launchd"), dict) else {}
@@ -646,21 +693,13 @@ if manifest:
         "connectd_label": launchd.get("connectd_label"),
     }
     add("launchd_labels", launchd.get("daemon_label") == PAIRLING_LABEL and launchd.get("ptybroker_label") == PAIRLING_PTYBROKER_LABEL and launchd.get("connectd_label") == PAIRLING_CONNECTD_LABEL, "error", "Manifest launchd labels are Pairling labels.", launchd_evidence)
-    mismatches = []
-    for item in manifest.get("files") or []:
-        rel = item.get("path")
-        expected = item.get("sha256")
-        if not rel or not expected:
-            mismatches.append(f"malformed file entry: {item}")
-            continue
-        path = CURRENT / rel
-        if not path.is_file():
-            mismatches.append(f"missing {rel}")
-            continue
-        actual = sha256_file(path)
-        if actual != expected:
-            mismatches.append(f"{rel}: {actual} != {expected}")
-    add("manifest_hashes", not mismatches, "error", "Installed file hashes match manifest." if not mismatches else "Installed file hashes do not match manifest.", mismatches)
+    add(
+        "manifest_hashes",
+        True,
+        "error",
+        "Installed runtime exactly matches its schema 2 managed release manifest and identity stamps.",
+        managed_release_identity,
+    )
 else:
     add("manifest_contract", False, "error", "Cannot validate contract without manifest.")
     add("runtime_port", False, "error", "Cannot validate runtime port without manifest.")
@@ -822,6 +861,8 @@ add("launchagent_loaded", code == 0 and "state = running" in out, "error", "Pair
 add("launchagent_loaded_from_current", str(CURRENT / "companiond" / "pairlingd.py") in out, "error", "Loaded Pairling LaunchAgent uses runtime/current.", out[:2000])
 
 code, out, err = run(["launchctl", "print", f"gui/{os.getuid()}/{PAIRLING_CONNECTD_LABEL}"])
+connectd_launchd_pid_match = re.search(r"(?m)^\s*pid = ([0-9]+)\s*$", out)
+connectd_launchd_pid = int(connectd_launchd_pid_match.group(1)) if connectd_launchd_pid_match else None
 add("connectd_launchagent_loaded", code == 0 and "state = running" in out, "error", "Pairling Connect LaunchAgent is running." if code == 0 else "Pairling Connect LaunchAgent is not loaded.", (out or err)[:2000])
 add("connectd_loaded_from_current", str(CURRENT / "connectd" / "pairling-connectd") in out, "error", "Loaded Pairling Connect LaunchAgent uses runtime/current.", out[:2000])
 
@@ -835,6 +876,13 @@ add(
     ptybroker_deployment["state"] == "current",
     "warning",
     f"Pairling PTY broker deployment state is {ptybroker_deployment['state']}.",
+    ptybroker_deployment,
+)
+add(
+    "ptybroker_activation_ready",
+    ptybroker_deployment["state"] in {"current", "stale_deferred"},
+    "error",
+    "Pairling PTY broker answered its status check.",
     ptybroker_deployment,
 )
 
@@ -906,6 +954,28 @@ add(
     "Pairling Connect status does not expose browser auth URLs.",
     connectd_summary,
 )
+connectd_identity_evidence = {
+    "launchd_pid": connectd_launchd_pid,
+    "status_pid": connectd_status.get("pid"),
+    "version": connectd_status.get("version"),
+    "source_revision": connectd_status.get("source_revision"),
+    "source_dirty": connectd_status.get("source_dirty"),
+}
+connectd_identity_ok = (
+    managed_release_identity is not None
+    and connectd_launchd_pid is not None
+    and int(connectd_status.get("pid") or 0) == connectd_launchd_pid
+    and connectd_status.get("version") == managed_release_identity.get("runtime_version")
+    and connectd_status.get("source_revision") == managed_release_identity.get("source_revision")
+    and connectd_status.get("source_dirty") is managed_release_identity.get("source_dirty")
+)
+add(
+    "connectd_live_identity",
+    connectd_identity_ok,
+    "error",
+    "Live Pairling Connect process matches launchd and the verified managed release.",
+    connectd_identity_evidence,
+)
 
 provider_evidence = {}
 for name in ["claude", "codex"]:
@@ -953,10 +1023,14 @@ expected_team = os.environ.get("PAIRLING_CONNECTD_TEAM_ID", "965AVD34A3")
 staged_connectd = CURRENT / "connectd" / "pairling-connectd"
 if staged_connectd.exists():
     vcode, vout, verr = run(["/usr/bin/codesign", "--verify", "--strict", str(staged_connectd)], timeout=8)
+    rcode, rout, rerr = (0, "", "") if expected_team == "-" else run([
+        "/usr/bin/codesign", "--verify", "--strict", "--verbose=2",
+        f"-R={developer_id_requirement(expected_team)}", str(staged_connectd),
+    ], timeout=8)
     icode, iout, ierr = run(["/usr/bin/codesign", "-dvv", str(staged_connectd)], timeout=8)
     team_line = next((l for l in ((iout or "") + (ierr or "")).splitlines() if l.startswith("TeamIdentifier=")), "")
     team_id = team_line.split("=", 1)[1] if "=" in team_line else ""
-    signed_ok = vcode == 0 and (expected_team == "-" or team_id == expected_team)
+    signed_ok = vcode == 0 and rcode == 0 and (expected_team == "-" or team_id == expected_team)
     if not signed_ok:
         release_blockers.append("Staged pairling-connectd is not a valid Developer ID build from the expected team.")
     add(
@@ -964,7 +1038,7 @@ if staged_connectd.exists():
         signed_ok,
         "warning",
         "Staged pairling-connectd passes codesign --verify --strict with the expected Team ID.",
-        {"binary": str(staged_connectd), "team_id": team_id or None, "expected_team": expected_team, "verify": (vout or verr)[:1000]},
+        {"binary": str(staged_connectd), "team_id": team_id or None, "expected_team": expected_team, "verify": (vout or verr)[:1000], "developer_id_verify": (rout or rerr)[:1000]},
     )
 else:
     release_blockers.append("Staged pairling-connectd is not present; run pairling setup.")
@@ -985,12 +1059,17 @@ expected_python_identifier = os.environ.get("PAIRLING_PYTHON_IDENTIFIER", "dev.p
 staged_python = CURRENT / "python" / "bin" / "python3"
 if staged_python.exists():
     pvcode, pvout, pverr = run(["/usr/bin/codesign", "--verify", "--strict", str(staged_python)], timeout=10)
+    prcode, prout, prerr = (0, "", "") if expected_team == "-" else run([
+        "/usr/bin/codesign", "--verify", "--strict", "--verbose=2",
+        f"-R={developer_id_requirement(expected_team)}", str(staged_python),
+    ], timeout=10)
     picode, piout, pierr = run(["/usr/bin/codesign", "-dvv", str(staged_python)], timeout=10)
     pinfo = (piout or "") + (pierr or "")
     p_team = next((l.split("=", 1)[1] for l in pinfo.splitlines() if l.startswith("TeamIdentifier=")), "")
     p_id = next((l.split("=", 1)[1] for l in pinfo.splitlines() if l.startswith("Identifier=")), "")
     python_signed_ok = (
         pvcode == 0
+        and prcode == 0
         and (expected_team == "-" or p_team == expected_team)
         and p_id == expected_python_identifier
     )
@@ -1001,7 +1080,7 @@ if staged_python.exists():
         python_signed_ok,
         "warning",
         "Staged vendored CPython is signed dev.pairling.python by the expected Team ID.",
-        {"python": str(staged_python), "team_id": p_team or None, "identifier": p_id or None, "expected_identifier": expected_python_identifier},
+        {"python": str(staged_python), "team_id": p_team or None, "identifier": p_id or None, "expected_identifier": expected_python_identifier, "developer_id_verify": (prout or prerr)[:1000]},
     )
 else:
     add(

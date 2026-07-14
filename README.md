@@ -25,8 +25,9 @@ npm/                      Sources of the published packages
 mac/                      The runtime payload sources (daemon, installer, CLI)
 mac/packaging/build-npm-packages.sh   Assembles and packs the three packages
 .github/workflows/release-npm.yml     OIDC publish with provenance
-RELEASE-BINARIES.json     SHA-256 + Apple Team ID of the signed binaries for
-                          the current release tag (committed before tagging)
+RELEASE-BINARIES.json     Schema 5 evidence for the source revision, exact
+                          mirror source tree, code identity, asset digests, and
+                          Accepted Apple notarization receipts
 ```
 
 ## Trust & release model
@@ -37,12 +38,15 @@ RELEASE-BINARIES.json     SHA-256 + Apple Team ID of the signed binaries for
 2. The compiled `pairling-connectd` binaries are built, **Developer ID-signed,
    and notarized on the maintainer's Mac** — the Apple signing key is never
    present in CI. Binaries are attached to the GitHub Release as assets, and
-   their SHA-256 digests + Team ID are committed in `RELEASE-BINARIES.json`
-   inside the tagged commit.
+   their source stamps, SHA-256 digests, architecture, Team ID, and Accepted
+   notarization receipts are committed in `RELEASE-BINARIES.json` inside the
+   tagged commit. The same evidence pins every mirrored source file and its
+   executable mode.
 3. The `release-npm` workflow verifies each asset against the committed
-   digests and the pinned Team ID (`965AVD34A3`), assembles the packages from
-   the mirrored sources, and publishes to npm with `--provenance` — so the
-   attestation pins the exact commit whose committed digests pin the binaries.
+   evidence, retained receipt file, and pinned Team ID (`965AVD34A3`). Python
+   archives are scanned before safe extraction, then every Mach-O Developer ID
+   certificate and the runtime itself are checked. The workflow publishes with
+   `--provenance`.
 4. On the consuming Mac, `pairling setup` refuses any `pairling-connectd` that
    fails `codesign --verify --strict` or carries a different Team ID.
 

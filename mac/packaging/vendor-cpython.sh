@@ -15,15 +15,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-# Pinned upstream build (python-build-standalone). Bump deliberately.
-PBS_TAG="20260610"
-PY_VERSION="3.12.13"
 PYTHON_CODESIGN_IDENTIFIER="dev.pairling.python"
-CRYPTOGRAPHY_VERSION="45.0.7"
-
-# SHA-256 of the install_only tarballs for PBS_TAG / PY_VERSION.
-PBS_SHA_aarch64="e18ddd4c1e8f4a1d6c4590b37f423d76aec734447edc20ed08e93983d95f2132"
-PBS_SHA_x86_64="ba02164e4db381af8c288c0bc1657584a835e9121a0fa2836b0f2e712ff8cdf5"
+INPUTS_FILE="${PAIRLING_PYTHON_RUNTIME_INPUTS:-$REPO_ROOT/mac/packaging/python-runtime-inputs.json}"
 
 ARCH=""
 OUT_DIR=""
@@ -59,12 +52,55 @@ log() { printf '%s\n' "$*"; }
 
 [[ -n "$ARCH" && -n "$OUT_DIR" ]] || { usage >&2; exit 2; }
 case "$ARCH" in
-  arm64) PBS_TRIPLE="aarch64-apple-darwin"; EXPECTED_SHA="$PBS_SHA_aarch64"; WHEEL_PLATFORM="macosx_11_0_arm64" ;;
-  x64)   PBS_TRIPLE="x86_64-apple-darwin";  EXPECTED_SHA="$PBS_SHA_x86_64"; WHEEL_PLATFORM="macosx_10_9_x86_64" ;;
+  arm64) WHEEL_PLATFORM="macosx_11_0_arm64" ;;
+  x64)   WHEEL_PLATFORM="macosx_10_9_x86_64" ;;
   *) fail "unsupported --arch: $ARCH (use arm64 or x64)" ;;
 esac
 
-ASSET="cpython-${PY_VERSION}+${PBS_TAG}-${PBS_TRIPLE}-install_only.tar.gz"
+[[ -f "$INPUTS_FILE" && ! -L "$INPUTS_FILE" ]] \
+  || fail "Python runtime inputs must be a real file: $INPUTS_FILE"
+if ! INPUT_VALUES="$(python3 - "$INPUTS_FILE" "$ARCH" <<'PY'
+import json, re, sys
+from pathlib import Path
+
+path, arch = Path(sys.argv[1]), sys.argv[2]
+value = json.loads(path.read_text(encoding="utf-8"))
+if set(value) != {"schema_version", "python_version", "python_build_standalone", "wheels"}:
+    raise SystemExit("Python runtime inputs have unexpected top-level keys")
+if value["schema_version"] != 1 or not re.fullmatch(r"3\.12\.[0-9]+", value["python_version"]):
+    raise SystemExit("Python runtime inputs have an unsupported schema or Python version")
+pbs = value["python_build_standalone"]
+if set(pbs) != {"tag", "assets"} or set(pbs["assets"]) != {"arm64", "x64"}:
+    raise SystemExit("Python build standalone inputs are incomplete")
+wheels = value["wheels"]
+if set(wheels) != {"cryptography", "cffi", "pycparser"}:
+    raise SystemExit("Python wheel inputs are incomplete")
+asset = pbs["assets"][arch]
+fields = [value["python_version"], pbs["tag"], asset["filename"], asset["sha256"]]
+for name in ("cryptography", "cffi", "pycparser"):
+    row = wheels[name]
+    if set(row) != {"version", "arm64", "x64"}:
+        raise SystemExit(f"Python wheel input is incomplete: {name}")
+    selected = row[arch]
+    if set(selected) != {"filename", "sha256"}:
+        raise SystemExit(f"Python wheel asset input is incomplete: {name}.{arch}")
+    fields.extend((row["version"], selected["filename"], selected["sha256"]))
+if any("\t" in str(field) or "\n" in str(field) for field in fields):
+    raise SystemExit("Python runtime inputs contain unsafe text")
+for digest in fields[3::3]:
+    if not re.fullmatch(r"[0-9a-f]{64}", str(digest)):
+        raise SystemExit("Python runtime inputs contain an invalid digest")
+print("\t".join(str(field) for field in fields))
+PY
+)"; then
+  fail "could not validate pinned Python runtime inputs"
+fi
+IFS=$'\t' read -r PY_VERSION PBS_TAG ASSET EXPECTED_SHA \
+  CRYPTOGRAPHY_VERSION CRYPTOGRAPHY_WHEEL CRYPTOGRAPHY_SHA \
+  CFFI_VERSION CFFI_WHEEL CFFI_SHA \
+  PYCPARSER_VERSION PYCPARSER_WHEEL PYCPARSER_SHA <<<"$INPUT_VALUES"
+[[ -n "$PY_VERSION" && -n "$ASSET" && -n "$PYCPARSER_SHA" ]] \
+  || fail "could not load pinned Python runtime inputs"
 URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/${ASSET}"
 
 WORK="$(mktemp -d)"
@@ -109,35 +145,121 @@ PY_REAL="$WORK/python/bin/python${PY_VERSION%.*}"
 rm -f "$WORK/python/bin/python3" "$WORK/python/bin/python"
 cp "$PY_REAL" "$WORK/python/bin/python3"
 chmod 755 "$WORK/python/bin/python3"
+# These convenience links are unused by Pairling. npm drops symlinks while
+# packing, so leaving them here would make the signed staging manifest differ
+# from the published archive.
+rm -f \
+  "$WORK/python/bin/2to3" \
+  "$WORK/python/bin/idle3" \
+  "$WORK/python/bin/pydoc3" \
+  "$WORK/python/bin/python3-config"
+symlink_residue="$(find "$WORK/python" -type l -print -quit)"
+[[ -z "$symlink_residue" ]] || fail "vendored CPython contains an unsupported symlink: $symlink_residue"
 
 SITE_PACKAGES="$PY_LIB/site-packages"
 mkdir -p "$SITE_PACKAGES"
-log "Vendoring cryptography==$CRYPTOGRAPHY_VERSION for $ARCH"
+WHEEL_DIR="$WORK/wheels"
+mkdir -m 700 "$WHEEL_DIR"
+log "Downloading the pinned Python wheels for $ARCH"
+python3 -m pip download \
+  --quiet \
+  --disable-pip-version-check \
+  --no-deps \
+  --only-binary=:all: \
+  --platform "$WHEEL_PLATFORM" \
+  --implementation cp \
+  --python-version "${PY_VERSION%.*}" \
+  --abi "cp$(printf '%s' "${PY_VERSION%.*}" | tr -d '.')" \
+  --dest "$WHEEL_DIR" \
+  "cryptography==$CRYPTOGRAPHY_VERSION" \
+  "cffi==$CFFI_VERSION" \
+  "pycparser==$PYCPARSER_VERSION"
+wheel_count="$(find "$WHEEL_DIR" -maxdepth 1 -type f | wc -l | tr -d '[:space:]')"
+[[ "$wheel_count" == "3" ]] || fail "Python dependency download produced $wheel_count files instead of 3"
+for wheel_record in \
+  "$CRYPTOGRAPHY_WHEEL:$CRYPTOGRAPHY_SHA" \
+  "$CFFI_WHEEL:$CFFI_SHA" \
+  "$PYCPARSER_WHEEL:$PYCPARSER_SHA"; do
+  wheel_name="${wheel_record%%:*}"
+  wheel_sha="${wheel_record#*:}"
+  [[ -f "$WHEEL_DIR/$wheel_name" && ! -L "$WHEEL_DIR/$wheel_name" ]] \
+    || fail "pinned Python wheel was not downloaded: $wheel_name"
+  actual_wheel_sha="$(/usr/bin/shasum -a 256 "$WHEEL_DIR/$wheel_name" | awk '{ print $1 }')"
+  [[ "$actual_wheel_sha" == "$wheel_sha" ]] \
+    || fail "SHA-256 mismatch for Python wheel $wheel_name"
+done
+log "Vendoring pinned Python wheels for $ARCH"
 python3 -m pip install \
   --quiet \
   --upgrade \
+  --disable-pip-version-check \
+  --no-index \
+  --no-deps \
   --no-compile \
   --only-binary=:all: \
   --platform "$WHEEL_PLATFORM" \
   --implementation cp \
   --python-version "${PY_VERSION%.*}" \
-  --abi cp312 \
+  --abi "cp$(printf '%s' "${PY_VERSION%.*}" | tr -d '.')" \
   --target "$SITE_PACKAGES" \
-  "cryptography==$CRYPTOGRAPHY_VERSION"
+  "$WHEEL_DIR/$CRYPTOGRAPHY_WHEEL" \
+  "$WHEEL_DIR/$CFFI_WHEEL" \
+  "$WHEEL_DIR/$PYCPARSER_WHEEL"
 find "$WORK/python" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 find "$WORK/python" -name '*.pyc' -delete 2>/dev/null || true
 
+INPUTS_SHA="$(/usr/bin/shasum -a 256 "$INPUTS_FILE" | awk '{ print $1 }')"
+python3 - "$WORK/python/PAIRLING-BUILD.json" "$INPUTS_FILE" "$INPUTS_SHA" "$ARCH" <<'PY'
+import json, sys
+from pathlib import Path
+
+output, inputs_path, inputs_sha, arch = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+inputs = json.loads(inputs_path.read_text(encoding="utf-8"))
+pbs = inputs["python_build_standalone"]
+value = {
+    "schema_version": 1,
+    "architecture": arch,
+    "inputs_sha256": inputs_sha,
+    "python_version": inputs["python_version"],
+    "python_build_standalone": {
+        "tag": pbs["tag"],
+        **pbs["assets"][arch],
+    },
+    "wheels": {
+        name: {
+            "version": row["version"],
+            **row[arch],
+        }
+        for name, row in sorted(inputs["wheels"].items())
+    },
+}
+output.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+output.chmod(0o644)
+PY
+
 # Smoke: the pruned interpreter must still import the daemon's stdlib surface.
-# Only executable when the vendored arch matches the host (cross-arch builds —
-# e.g. x64 on Apple Silicon CI — can't reliably exec the other slice).
+# An Apple Silicon release Mac must prove the Intel slice through Rosetta. A
+# cross-arch package that cannot execute is not a release artifact.
 HOST_ARCH="$(/usr/bin/uname -m)"
-HOST_NORM="x64"; [[ "$HOST_ARCH" == "arm64" ]] && HOST_NORM="arm64"
+case "$HOST_ARCH" in
+  arm64) HOST_NORM="arm64" ;;
+  x86_64) HOST_NORM="x64" ;;
+  *) fail "cannot prove CPython execution on unsupported host architecture: $HOST_ARCH" ;;
+esac
+SMOKE_CODE="import json,sqlite3,ssl,hashlib,hmac,socket,subprocess,select,pty,termios,fcntl,struct,plistlib,urllib.request,cryptography,cffi,pycparser,platform,sys; expected='${ARCH}'; actual='arm64' if platform.machine() == 'arm64' else 'x64' if platform.machine() == 'x86_64' else platform.machine(); assert actual == expected, (actual, expected); assert platform.python_version() == '${PY_VERSION}'; assert cryptography.__version__ == '${CRYPTOGRAPHY_VERSION}'; assert cffi.__version__ == '${CFFI_VERSION}'; assert pycparser.__version__ == '${PYCPARSER_VERSION}'; print('stdlib-ok', actual)"
 if [[ "$ARCH" == "$HOST_NORM" ]]; then
-  "$WORK/python/bin/python3" -c "import json,sqlite3,ssl,hashlib,hmac,socket,subprocess,select,pty,termios,fcntl,struct,plistlib,urllib.request,cryptography,cffi; print('stdlib-ok')" \
+  PYTHONDONTWRITEBYTECODE=1 "$WORK/python/bin/python3" -B -c "$SMOKE_CODE" \
     || fail "pruned CPython failed stdlib import smoke"
+elif [[ "$HOST_NORM" == "arm64" && "$ARCH" == "x64" ]]; then
+  [[ -x /usr/bin/arch ]] || fail "Rosetta smoke requires /usr/bin/arch"
+  PYTHONDONTWRITEBYTECODE=1 /usr/bin/arch -x86_64 "$WORK/python/bin/python3" -B -c "$SMOKE_CODE" \
+    || fail "x64 CPython failed the required Rosetta stdlib import smoke"
 else
-  log "Skipping exec smoke for cross-arch build ($ARCH on $HOST_NORM host)"
+  fail "cannot prove cross-arch CPython execution ($ARCH on $HOST_NORM host)"
 fi
+bytecode_residue="$(find "$WORK/python" \( -name '__pycache__' -o -name '*.pyc' \) -print -quit)"
+[[ -z "$bytecode_residue" ]] \
+  || fail "vendored CPython contains forbidden bytecode after smoke: $bytecode_residue"
 
 # --- sign every Mach-O under our Developer ID -------------------------------
 sign_one() {
@@ -148,6 +270,12 @@ sign_one() {
     /usr/bin/codesign --force --timestamp --options runtime --identifier "$identifier" --sign "$SIGN_IDENTITY" "$f"
   fi
   /usr/bin/codesign --verify --strict "$f"
+  if [[ "$SIGN_IDENTITY" != "-" ]]; then
+    /usr/bin/codesign --verify --strict --verbose=2 \
+      -R="anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists" \
+      "$f" \
+      || fail "Python Mach-O is not signed with a Developer ID Application certificate: $f"
+  fi
 }
 
 if [[ -z "$SIGN_IDENTITY" ]]; then

@@ -30,11 +30,32 @@ import (
 	"tailscale.com/tsnet"
 )
 
+var (
+	buildVersion        = "development"
+	buildSourceRevision = "unknown"
+	buildSourceDirty    = "true"
+)
+
+type buildInfo struct {
+	SchemaVersion  int    `json:"schema_version"`
+	Version        string `json:"version"`
+	SourceRevision string `json:"source_revision"`
+	SourceDirty    bool   `json:"source_dirty"`
+}
+
 func main() {
 	os.Exit(run(os.Args[1:]))
 }
 
 func run(args []string) int {
+	if len(args) == 1 && args[0] == "--build-info-json" {
+		if err := writeBuildInfo(os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "cannot write build info: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
 	fs := flag.NewFlagSet("pairling-connectd", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 
@@ -84,15 +105,24 @@ func run(args []string) int {
 		log.Printf("cannot prepare state dir: %v", err)
 		return 1
 	}
+	info, err := currentBuildInfo()
+	if err != nil {
+		log.Printf("cannot read build identity: %v", err)
+		return 1
+	}
 
 	statusStore := status.NewStore(*hostname)
 	statusStore.SetControlURLMode(controlURLMode(*controlURL))
 	statusStore.SetListenPort(listenPort(*listenAddr))
-	statusStore.SetConnectdVersion(status.DefaultConnectdVersion)
+	statusStore.SetBuildIdentity(os.Getpid(), info.Version, info.SourceRevision, info.SourceDirty)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	statusServer := startStatusServer(*statusAddr, statusStore)
+	statusServer, err := startStatusServer(*statusAddr, statusStore)
+	if err != nil {
+		log.Printf("cannot start status server: %v", err)
+		return 1
+	}
 	defer shutdownHTTPServer(statusServer)
 
 	srv := &tsnet.Server{
@@ -257,6 +287,29 @@ func run(args []string) int {
 	}
 }
 
+func currentBuildInfo() (buildInfo, error) {
+	dirty, err := strconv.ParseBool(strings.TrimSpace(buildSourceDirty))
+	if err != nil {
+		return buildInfo{}, fmt.Errorf("invalid source dirty stamp: %w", err)
+	}
+	return buildInfo{
+		SchemaVersion:  1,
+		Version:        strings.TrimSpace(buildVersion),
+		SourceRevision: strings.TrimSpace(buildSourceRevision),
+		SourceDirty:    dirty,
+	}, nil
+}
+
+func writeBuildInfo(writer io.Writer) error {
+	info, err := currentBuildInfo()
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(writer)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(info)
+}
+
 func controlURLMode(raw string) string {
 	if strings.TrimSpace(raw) == "" {
 		return status.DefaultControlURLMode
@@ -344,7 +397,7 @@ func ensurePrivateDir(path string) error {
 	return os.Chmod(cleaned, 0o700)
 }
 
-func startStatusServer(addr string, store *status.Store) *http.Server {
+func startStatusServer(addr string, store *status.Store) (*http.Server, error) {
 	mux := http.NewServeMux()
 	mux.Handle("/status", store.Handler())
 	mux.HandleFunc("/auth/open", func(w http.ResponseWriter, r *http.Request) {
@@ -359,13 +412,17 @@ func startStatusServer(addr string, store *status.Store) *http.Server {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
 	go func() {
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("status server stopped: %v", err)
 			store.SetLastError(err.Error())
 		}
 	}()
-	return server
+	return server, nil
 }
 
 var openAuthURL = func(rawURL string) error {

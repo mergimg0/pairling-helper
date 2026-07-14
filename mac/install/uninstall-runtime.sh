@@ -66,6 +66,10 @@ is_dry_run() {
   [[ "$DRY_RUN" == "1" || "$DRY_RUN" == "true" || "$DRY_RUN" == "TRUE" ]]
 }
 
+launchd_skipped() {
+  [[ "${PAIRLING_TESTING_SKIP_LAUNCHD:-0}" == "1" ]]
+}
+
 install_lock_wait_seconds() {
   local raw="${PAIRLING_INSTALL_LOCK_WAIT_SECONDS:-30}"
   if [[ ! "$raw" =~ ^[0-9]+$ ]]; then
@@ -155,6 +159,39 @@ cleanup_created_lock_parents() {
   fi
 }
 
+fsync_directory() {
+  local directory="$1"
+  [[ -d "$directory" && ! -L "$directory" ]] || {
+    printf 'ERROR: cannot flush unsafe directory: %s\n' "$directory" >&2
+    return 1
+  }
+  if [[ -x /usr/bin/perl ]]; then
+    /usr/bin/perl -MIO::Handle -MFcntl=O_RDONLY -e '
+      my $path = shift @ARGV;
+      sysopen(my $handle, $path, O_RDONLY) or die "open $path: $!\n";
+      $handle->sync or die "fsync $path: $!\n";
+    ' "$directory"
+    return
+  fi
+  local python_bin
+  python_bin="$(command -v python3 2>/dev/null || true)"
+  if [[ -n "$python_bin" && -x "$python_bin" ]]; then
+    "$python_bin" - "$directory" <<'PY'
+import os
+import sys
+
+descriptor = os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+    return
+  fi
+  printf 'ERROR: Pairling could not find a system helper to flush directory changes.\n' >&2
+  return 1
+}
+
 uninstall_on_exit() {
   local code=$?
   if ! release_install_lock; then
@@ -198,7 +235,7 @@ validate_state_target() {
 }
 
 validate_logs_target() {
-  [[ "$DELETE_LOGS" == "true" ]] || return 0
+  [[ "$DELETE_LOGS" == "true" || "$DELETE_STATE" == "true" ]] || return 0
   if [[ "$LOGS_ROOT" != /* || "$LOGS_ROOT" == "/" || "$LOGS_ROOT" == "$HOME" ]]; then
     printf 'ERROR: refusing to delete unsafe Pairling logs path: %s\n' "$LOGS_ROOT" >&2
     return 1
@@ -219,12 +256,119 @@ validate_logs_target() {
       return 1
       ;;
   esac
+  case "$LOGS_ROOT/" in
+    "$APP_SUPPORT/"*)
+      printf 'ERROR: refusing to delete Pairling logs path inside app state: %s\n' "$LOGS_ROOT" >&2
+      return 1
+      ;;
+  esac
+  if [[ -d "$APP_SUPPORT" && -d "$LOGS_ROOT" ]]; then
+    local canonical_app_support canonical_logs_root
+    canonical_app_support="$(cd "$APP_SUPPORT" && pwd -P)"
+    canonical_logs_root="$(cd "$LOGS_ROOT" && pwd -P)"
+    case "$canonical_app_support/" in
+      "$canonical_logs_root/"*)
+        printf 'ERROR: refusing to delete Pairling logs path overlapping app state: %s\n' "$LOGS_ROOT" >&2
+        return 1
+        ;;
+    esac
+    case "$canonical_logs_root/" in
+      "$canonical_app_support/"*)
+        printf 'ERROR: refusing to delete Pairling logs path overlapping app state: %s\n' "$LOGS_ROOT" >&2
+        return 1
+        ;;
+    esac
+  fi
   case "$HOME/" in
     "$LOGS_ROOT/"*)
       printf 'ERROR: refusing to delete Pairling logs path containing the home directory: %s\n' "$LOGS_ROOT" >&2
       return 1
       ;;
   esac
+}
+
+validate_stale_state_tombstones() {
+  local parent base tombstone
+  parent="$(dirname "$APP_SUPPORT")"
+  base="$(basename "$APP_SUPPORT")"
+  [[ -d "$parent" && ! -L "$parent" ]] || return 0
+  while IFS= read -r -d '' tombstone; do
+    validate_state_tombstone "$tombstone"
+  done < <(find -P "$parent" -mindepth 1 -maxdepth 1 -name ".${base}.uninstalling.*" -print0)
+}
+
+validate_state_tombstone() {
+  local tombstone="$1" parent base prefix suffix owner unexpected
+  parent="$(dirname "$APP_SUPPORT")"
+  base="$(basename "$APP_SUPPORT")"
+  prefix="$parent/.${base}.uninstalling."
+  case "$tombstone" in
+    "$prefix"*) ;;
+    *)
+      printf 'ERROR: refusing to recover an unrelated uninstall path: %s\n' "$tombstone" >&2
+      return 1
+      ;;
+  esac
+  suffix="${tombstone#"$prefix"}"
+  if [[ ! "$suffix" =~ ^[0-9]+$ ]]; then
+    printf 'ERROR: refusing to recover a malformed Pairling uninstall path: %s\n' "$tombstone" >&2
+    return 1
+  fi
+  if [[ -L "$tombstone" || ! -d "$tombstone" ]]; then
+    printf 'ERROR: refusing to recover a linked or non-directory Pairling uninstall path: %s\n' "$tombstone" >&2
+    return 1
+  fi
+  owner="$(stat -f '%u' "$tombstone" 2>/dev/null || printf 'unknown')"
+  if [[ "$owner" != "$(id -u)" ]]; then
+    printf 'ERROR: refusing to recover a Pairling uninstall path owned by another user: %s\n' "$tombstone" >&2
+    return 1
+  fi
+  unexpected="$(find -P "$tombstone" -mindepth 1 -maxdepth 1 ! -name state -print -quit 2>/dev/null || true)"
+  if [[ -n "$unexpected" ]]; then
+    printf 'ERROR: refusing to recover a Pairling uninstall path with unexpected contents: %s\n' "$tombstone" >&2
+    return 1
+  fi
+  if [[ -e "$tombstone/state" || -L "$tombstone/state" ]]; then
+    if [[ -L "$tombstone/state" || ! -d "$tombstone/state" ]]; then
+      printf 'ERROR: refusing to recover a linked or non-directory Pairling state tombstone: %s\n' "$tombstone/state" >&2
+      return 1
+    fi
+    owner="$(stat -f '%u' "$tombstone/state" 2>/dev/null || printf 'unknown')"
+    if [[ "$owner" != "$(id -u)" ]]; then
+      printf 'ERROR: refusing to recover Pairling state owned by another user: %s\n' "$tombstone/state" >&2
+      return 1
+    fi
+  fi
+}
+
+remove_state_tombstone() {
+  local tombstone="$1" parent
+  parent="$(dirname "$tombstone")"
+  [[ -e "$tombstone" || -L "$tombstone" ]] || return 0
+  /bin/chmod -RN "$tombstone" 2>/dev/null || true
+  find -P "$tombstone" -type d -exec chmod u+rwx {} + 2>/dev/null || true
+  find -P "$tombstone" -type f -exec chmod u+rw {} + 2>/dev/null || true
+  rm -rf "$tombstone"
+  if [[ -e "$tombstone" || -L "$tombstone" ]]; then
+    printf 'ERROR: Pairling could not remove uninstall staging path: %s\n' "$tombstone" >&2
+    return 1
+  fi
+  fsync_directory "$parent"
+}
+
+recover_stale_state_tombstones() {
+  [[ "$INSTALL_LOCK_HELD" == 1 ]] || {
+    printf 'ERROR: refusing to recover Pairling state without the install lock.\n' >&2
+    return 1
+  }
+  local parent base tombstone
+  parent="$(dirname "$APP_SUPPORT")"
+  base="$(basename "$APP_SUPPORT")"
+  while IFS= read -r -d '' tombstone; do
+    validate_state_tombstone "$tombstone"
+    remove_state_tombstone "$tombstone"
+    printf 'Removed interrupted Pairling state deletion: %s\n' "$tombstone"
+  done < <(find -P "$parent" -mindepth 1 -maxdepth 1 -name ".${base}.uninstalling.*" -print0)
 }
 
 delete_state_under_lock() {
@@ -241,7 +385,7 @@ delete_state_under_lock() {
   parent="$(dirname "$APP_SUPPORT")"
   base="$(basename "$APP_SUPPORT")"
   tombstone="$parent/.${base}.uninstalling.$$"
-  if ! mkdir "$tombstone" 2>/dev/null; then
+  if ! mkdir -m 700 "$tombstone" 2>/dev/null; then
     printf 'ERROR: Pairling could not reserve uninstall staging path: %s\n' "$tombstone" >&2
     return 1
   fi
@@ -252,8 +396,9 @@ delete_state_under_lock() {
   fi
 
   INSTALL_LOCK_DIR="$tombstone/state/runtime/.install.lock"
+  fsync_directory "$parent"
   release_install_lock
-  rm -rf "$tombstone"
+  remove_state_tombstone "$tombstone"
 }
 
 confirm() {
@@ -279,6 +424,10 @@ bootout_user() {
     printf 'dry-run: would unload %s\n' "$label"
     return
   fi
+  if launchd_skipped; then
+    printf 'testing: skipped unloading %s\n' "$label"
+    return
+  fi
   launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
   launchctl bootout "gui/$(id -u)" "$plist" >/dev/null 2>&1 || true
 }
@@ -291,6 +440,10 @@ bootout_system() {
   fi
   if is_dry_run; then
     printf 'dry-run: would unload system/%s\n' "$label"
+    return
+  fi
+  if launchd_skipped; then
+    printf 'testing: skipped unloading system/%s\n' "$label"
     return
   fi
   if sudo -n true >/dev/null 2>&1; then
@@ -316,6 +469,10 @@ teardown_legacy_mintd() {
       "$MINTD_SYSTEM_PLIST" "$MINTD_SYSTEM_DIR" "$MINTD_SERVICE_ACCOUNT"
     return
   fi
+  if launchd_skipped; then
+    printf 'testing: skipped legacy silent-join mint broker removal\n'
+    return
+  fi
   if sudo -n true >/dev/null 2>&1; then
     sudo launchctl bootout "system/$MINTD_SYSTEM_LABEL" >/dev/null 2>&1 || true
     sudo launchctl bootout system "$MINTD_SYSTEM_PLIST" >/dev/null 2>&1 || true
@@ -328,9 +485,42 @@ teardown_legacy_mintd() {
   fi
 }
 
+print_dry_run_plan() {
+  printf 'dry-run: would acquire install lock %s\n' "$INSTALL_LOCK_DIR"
+  bootout_user "$PAIRLING_DAEMON_LABEL" "$USER_PLIST"
+  bootout_user "$PAIRLING_CONNECTD_LABEL" "$CONNECTD_USER_PLIST"
+  bootout_user "$PAIRLING_PTYBROKER_LABEL" "$PTYBROKER_USER_PLIST"
+  printf 'dry-run: would remove LaunchAgent plist %s\n' "$USER_PLIST"
+  printf 'dry-run: would remove LaunchAgent plist %s\n' "$CONNECTD_USER_PLIST"
+  printf 'dry-run: would remove LaunchAgent plist %s\n' "$PTYBROKER_USER_PLIST"
+  teardown_legacy_mintd
+  printf 'dry-run: would remove Pairling pairing state %s\n' "$APP_SUPPORT/pair"
+
+  if [[ "$DELETE_LOGS" == "true" ]]; then
+    printf 'dry-run: would delete Pairling logs %s\n' "$LOGS_ROOT"
+  else
+    printf 'dry-run: would preserve Pairling logs %s\n' "$LOGS_ROOT"
+  fi
+
+  if [[ "$DELETE_STATE" == "true" ]]; then
+    printf 'dry-run: would delete Pairling state %s\n' "$APP_SUPPORT"
+  else
+    printf 'dry-run: would preserve Pairling state and devices %s\n' "$APP_SUPPORT"
+  fi
+
+  printf 'dry-run: provider transcripts and user projects would not be removed.\n'
+}
+
 confirm
 validate_state_target
 validate_logs_target
+if is_dry_run; then
+  if [[ "$DELETE_STATE" == "true" ]]; then
+    validate_stale_state_tombstones
+  fi
+  print_dry_run_plan
+  exit 0
+fi
 if [[ -e "$APP_SUPPORT" || -L "$APP_SUPPORT" ]]; then
   APP_SUPPORT_PREEXISTED=1
 fi
@@ -339,6 +529,9 @@ if [[ -e "$RUNTIME_ROOT" || -L "$RUNTIME_ROOT" ]]; then
 fi
 trap uninstall_on_exit EXIT
 acquire_install_lock
+if [[ "$DELETE_STATE" == "true" ]]; then
+  recover_stale_state_tombstones
+fi
 
 bootout_user "$PAIRLING_DAEMON_LABEL" "$USER_PLIST"
 bootout_user "$PAIRLING_CONNECTD_LABEL" "$CONNECTD_USER_PLIST"

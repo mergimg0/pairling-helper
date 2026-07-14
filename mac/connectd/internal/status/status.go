@@ -40,6 +40,10 @@ type AdvertisedRoute struct {
 type Snapshot struct {
 	OK                   bool              `json:"ok"`
 	SchemaVersion        int               `json:"schema_version"`
+	PID                  int               `json:"pid"`
+	Version              string            `json:"version"`
+	SourceRevision       string            `json:"source_revision"`
+	SourceDirty          bool              `json:"source_dirty"`
 	AuthState            string            `json:"auth_state"`
 	Hostname             string            `json:"hostname"`
 	FunnelHostname       string            `json:"funnel_hostname,omitempty"`
@@ -122,6 +126,16 @@ func (s *Store) SetConnectdVersion(version string) {
 			version = DefaultConnectdVersion
 		}
 		snapshot.ConnectdVersion = version
+	})
+}
+
+func (s *Store) SetBuildIdentity(pid int, version, sourceRevision string, sourceDirty bool) {
+	s.update(func(snapshot *Snapshot) {
+		snapshot.PID = pid
+		snapshot.Version = strings.TrimSpace(version)
+		snapshot.SourceRevision = strings.TrimSpace(sourceRevision)
+		snapshot.SourceDirty = sourceDirty
+		snapshot.ConnectdVersion = strings.TrimSpace(version)
 	})
 }
 

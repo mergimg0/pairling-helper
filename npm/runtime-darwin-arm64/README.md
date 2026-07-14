@@ -4,7 +4,7 @@ Pairling Mac runtime binaries for Apple Silicon:
 
 - `bin/pairling-connectd` — the Pairling Connect route layer (embedded
   tailnet), Developer ID-signed and notarized.
-- `python/` — (future releases) the vendored, signed CPython runtime that the
+- `python/` — the vendored, signed CPython runtime that the
   Pairling daemon runs under (`dev.pairling.python` identity).
 - `manifest.json` — SHA-256 digests and the expected codesign Team ID for every
   shipped binary.

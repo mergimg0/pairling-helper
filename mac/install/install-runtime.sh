@@ -8,7 +8,8 @@ if [[ -z "${PYTHONPYCACHEPREFIX:-}" ]]; then
   export PYTHONPYCACHEPREFIX
 fi
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+MANIFEST_REPO_PATH="$REPO_ROOT"
 VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/mac/VERSION")"
 read_source_stamp() {
   local path="$1"
@@ -58,6 +59,7 @@ while [[ "$APP_SUPPORT" != "/" && "$APP_SUPPORT" == */ ]]; do
 done
 RUNTIME_ROOT="$APP_SUPPORT/runtime"
 RELEASES_ROOT="$RUNTIME_ROOT/releases"
+SOURCE_SNAPSHOT_ROOT="$RUNTIME_ROOT/source-snapshots"
 STATE_ROOT="$APP_SUPPORT/state"
 PAIR_ROOT="$APP_SUPPORT/pair"
 LOGS_ROOT="${PAIRLING_LOGS_ROOT:-${COMPANION_LOGS_ROOT:-$HOME/Library/Logs/Pairling}}"
@@ -86,6 +88,7 @@ CONNECTD_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_CONNECTD_LABEL.plist"
 PTYBROKER_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_PTYBROKER_LABEL.plist"
 MCP_SERVER_DIR="$HOME/.claude/mcp-servers"
 MCP_SERVER_SHIM="$MCP_SERVER_DIR/phone-tools.py"
+USER_PAIRLING_WRAPPER="${PAIRLING_USER_BIN_DIR:-$HOME/.local/bin}/pairling"
 
 # Resolve no interpreter through installer-owned paths until their direct
 # directory boundary has passed the same symlink check used before mutation.
@@ -98,9 +101,106 @@ if [[ -L "$RUNTIME_ROOT" ]]; then
   exit 1
 fi
 
+PYTHON_CODESIGN_IDENTIFIER="dev.pairling.python"
+
+sha256_with_system_tools() {
+  /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+}
+
+verify_package_snapshot_before_execution() {
+  local package_root="${PAIRLING_RUNTIME_PACKAGE_ROOT:-}"
+  local payload_manifest="$(dirname "$REPO_ROOT")/payload-manifest.json"
+  local snapshot_mode="${PAIRLING_PACKAGE_SNAPSHOT:-}"
+  local snapshot_root resolved_repo resolved_runtime expected_payload expected_runtime actual_payload actual_runtime owner mode
+  if [[ -z "$snapshot_mode" ]]; then
+    if [[ -n "$package_root" && -f "$payload_manifest" ]]; then
+      printf 'ERROR: npm package setup must enter through the verified Pairling shim snapshot.\n' >&2
+      return 1
+    fi
+    return 0
+  fi
+  if [[ "$snapshot_mode" != "payload" && "$snapshot_mode" != "full" ]]; then
+    printf 'ERROR: verified npm snapshot mode must be payload or full.\n' >&2
+    return 1
+  fi
+  expected_payload="${PAIRLING_VERIFIED_PAYLOAD_MANIFEST_SHA256:-}"
+  expected_runtime="${PAIRLING_VERIFIED_RUNTIME_MANIFEST_SHA256:-}"
+  if [[ ! "$expected_payload" =~ ^[0-9a-f]{64}$ || ! "$expected_runtime" =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'ERROR: verified npm snapshot manifest digests are missing or malformed.\n' >&2
+    return 1
+  fi
+  if [[ -L "$REPO_ROOT" || ! -d "$REPO_ROOT" || -L "$package_root" || ! -d "$package_root" ]]; then
+    printf 'ERROR: verified npm snapshot roots must be real directories.\n' >&2
+    return 1
+  fi
+  snapshot_root="$(cd "$REPO_ROOT/../.." && pwd -P)"
+  resolved_repo="$(cd "$REPO_ROOT" && pwd -P)"
+  resolved_runtime="$(cd "$package_root" && pwd -P)"
+  if [[ "$resolved_repo" != "$snapshot_root/pairling/payload" ]]; then
+    printf 'ERROR: verified npm snapshot layout is not canonical.\n' >&2
+    return 1
+  fi
+  if [[ "$snapshot_mode" == "full" && "$resolved_runtime" != "$snapshot_root/runtime" ]]; then
+    printf 'ERROR: verified full npm snapshot runtime layout is not canonical.\n' >&2
+    return 1
+  fi
+  if [[ "$snapshot_mode" == "payload" && "$resolved_runtime" == "$snapshot_root"/* ]]; then
+    printf 'ERROR: verified payload npm snapshot must use the direct signed runtime package.\n' >&2
+    return 1
+  fi
+  if [[ -L "$snapshot_root" || ! -d "$snapshot_root" ]]; then
+    printf 'ERROR: verified npm snapshot root is missing or linked: %s\n' "$snapshot_root" >&2
+    return 1
+  fi
+  owner="$(stat -f '%u' "$snapshot_root" 2>/dev/null || printf unknown)"
+  mode="$(stat -f '%Lp' "$snapshot_root" 2>/dev/null || printf unknown)"
+  if [[ "$owner" != "$(id -u)" || "$mode" != "700" ]]; then
+    printf 'ERROR: verified npm snapshot root must be private and owned by this user: %s\n' "$snapshot_root" >&2
+    return 1
+  fi
+  if [[ -L "$payload_manifest" || ! -f "$payload_manifest" || -L "$package_root/manifest.json" || ! -f "$package_root/manifest.json" ]]; then
+    printf 'ERROR: verified npm snapshot manifests are missing or linked.\n' >&2
+    return 1
+  fi
+  actual_payload="$(sha256_with_system_tools "$payload_manifest")"
+  actual_runtime="$(sha256_with_system_tools "$package_root/manifest.json")"
+  if [[ "$actual_payload" != "$expected_payload" || "$actual_runtime" != "$expected_runtime" ]]; then
+    printf 'ERROR: verified npm snapshot manifest digest changed before installer execution.\n' >&2
+    return 1
+  fi
+  if ! /usr/bin/python3 - "$payload_manifest" "$package_root/manifest.json" "$expected_runtime" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload_path = Path(sys.argv[1])
+runtime_path = Path(sys.argv[2])
+expected_runtime_digest = sys.argv[3]
+try:
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"verified npm snapshot manifest could not be parsed: {exc}") from exc
+
+architecture = runtime.get("architecture")
+if architecture not in ("arm64", "x64"):
+    raise SystemExit("verified npm runtime architecture is missing or unsupported")
+runtime_manifests = payload.get("runtime_manifests")
+if not isinstance(runtime_manifests, dict) or set(runtime_manifests) != {"darwin-arm64", "darwin-x64"}:
+    raise SystemExit("verified npm payload runtime manifest identities are incomplete")
+platform_key = f"darwin-{architecture}"
+if runtime_manifests.get(platform_key) != expected_runtime_digest:
+    raise SystemExit("verified npm runtime manifest is not bound to the selected payload platform")
+PY
+  then
+    printf 'ERROR: verified npm snapshot platform binding failed.\n' >&2
+    return 1
+  fi
+}
+
 resolve_python_bin() {
   local explicit="${PAIRLING_DAEMON_PYTHON:-${COMPANION_DAEMON_PYTHON:-}}"
-  local candidate marker current_python="" current_target=""
+  local candidate marker
   if [[ -n "$explicit" ]]; then
     if [[ ! -x "$explicit" ]]; then
       printf 'ERROR: configured Pairling Python is not executable: %s\n' "$explicit" >&2
@@ -114,13 +214,9 @@ resolve_python_bin() {
     printf '%s\n' "$explicit"
     return 0
   fi
-  if [[ -L "$CURRENT_LINK" ]]; then
-    current_target="$(readlink "$CURRENT_LINK" 2>/dev/null || true)"
-    case "$current_target" in
-      "$RELEASES_ROOT"/*) current_python="$CURRENT_LINK/python/bin/python3" ;;
-    esac
-  fi
-  for candidate in "$current_python" "$(command -v python3 2>/dev/null || true)" /usr/bin/python3; do
+  # Never execute through runtime/current while bootstrapping. The link and its
+  # release have not passed managed-release verification or the install lock yet.
+  for candidate in /usr/bin/python3; do
     [[ -n "$candidate" && -x "$candidate" ]] || continue
     marker="$("$candidate" -c 'print("pairling-python-ready")' 2>/dev/null || true)"
     if [[ "$marker" == "pairling-python-ready" ]]; then
@@ -132,7 +228,82 @@ resolve_python_bin() {
   return 1
 }
 
+verify_developer_id_application() {
+  local path="$1" team="$2"
+  /usr/bin/codesign --verify --strict --verbose=2 \
+    -R="anchor apple generic and certificate leaf[subject.OU] = \"$team\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists" \
+    "$path" >/dev/null 2>&1
+}
+
+verify_package_python_before_execution() {
+  local explicit="${PAIRLING_DAEMON_PYTHON:-${COMPANION_DAEMON_PYTHON:-}}"
+  local package_root="${PAIRLING_RUNTIME_PACKAGE_ROOT:-}"
+  local resolved_root python_root identifier team required_team
+  [[ -n "$explicit" && -n "$package_root" ]] || return 0
+  case "$explicit" in
+    */python/bin/python3) ;;
+    *) return 0 ;;
+  esac
+  if [[ -L "$package_root" || ! -d "$package_root" || ! -f "$package_root/manifest.json" || -L "$package_root/manifest.json" ]]; then
+    printf 'ERROR: npm runtime package root or manifest is missing or linked: %s\n' "$package_root" >&2
+    return 1
+  fi
+  if [[ -L "$explicit" || ! -f "$explicit" || ! -x "$explicit" ]]; then
+    printf 'ERROR: npm vendored Python must be a real executable file: %s\n' "$explicit" >&2
+    return 1
+  fi
+  resolved_root="$(cd "$package_root" && pwd -P)"
+  python_root="$(cd "$(dirname "$explicit")/../.." && pwd -P)"
+  if [[ "$python_root" != "$resolved_root" ]]; then
+    printf 'ERROR: npm vendored Python is outside its declared runtime package: %s\n' "$explicit" >&2
+    return 1
+  fi
+  if ! /usr/bin/codesign --verify --strict "$explicit" >/dev/null 2>&1; then
+    printf 'ERROR: npm vendored Python failed code signature verification before execution: %s\n' "$explicit" >&2
+    return 1
+  fi
+  identifier="$(/usr/bin/codesign -dvv "$explicit" 2>&1 | sed -n 's/^Identifier=//p')"
+  if [[ "$identifier" != "$PYTHON_CODESIGN_IDENTIFIER" ]]; then
+    printf 'ERROR: npm vendored Python identifier is not %s: %s\n' "$PYTHON_CODESIGN_IDENTIFIER" "$explicit" >&2
+    return 1
+  fi
+  required_team="${PAIRLING_CONNECTD_TEAM_ID:-965AVD34A3}"
+  if [[ "$required_team" != "-" ]]; then
+    if ! verify_developer_id_application "$explicit" "$required_team"; then
+      printf 'ERROR: npm vendored Python is not signed with the expected Developer ID Application certificate: %s\n' "$explicit" >&2
+      return 1
+    fi
+    team="$(/usr/bin/codesign -dvv "$explicit" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+    if [[ "$team" != "$required_team" ]]; then
+      printf 'ERROR: npm vendored Python TeamIdentifier does not match %s: %s\n' "$required_team" "$explicit" >&2
+      return 1
+    fi
+  fi
+}
+
+verify_package_snapshot_before_execution
+verify_package_python_before_execution
 PYTHON3_BIN="$(resolve_python_bin)"
+
+pin_control_python() {
+  local resolved
+  resolved="$("$PYTHON3_BIN" - "$PYTHON3_BIN" <<'PY'
+import os
+import sys
+
+print(os.path.realpath(sys.argv[1]))
+PY
+)"
+  if [[ -z "$resolved" || ! -x "$resolved" ]]; then
+    log "ERROR: Pairling could not pin its control interpreter before changing runtime/current." >&2
+    return 1
+  fi
+  if [[ "$("$resolved" -B -c 'print("pairling-python-ready")' 2>/dev/null || true)" != "pairling-python-ready" ]]; then
+    log "ERROR: Pairling control interpreter is not functional: $resolved" >&2
+    return 1
+  fi
+  PYTHON3_BIN="$resolved"
+}
 PAIRDROP_ROOT="$("$PYTHON3_BIN" - "$PAIRDROP_ROOT_WAS_SET" "$PAIRDROP_ROOT_INPUT" "$CONFIG_FILE" "$HOME/PairDrop" <<'PY'
 import json
 import sys
@@ -164,7 +335,6 @@ export PAIRLING_PAIRDROP_ROOT="$PAIRDROP_ROOT"
 # daemon under it, so a Pairling-signed python (identity dev.pairling.python),
 # not a generic system python3, owns the daemon's TCC grants — and npm churn
 # can't remove the running interpreter.
-PYTHON_CODESIGN_IDENTIFIER="dev.pairling.python"
 DRY_RUN="${PAIRLING_DRY_RUN:-0}"
 
 log() {
@@ -228,9 +398,15 @@ GUIDED_COMPLETE=0
 WIZARD_FATAL=0
 INSTALL_TRANSACTION_ACTIVE=0
 INSTALL_TRANSACTION_DIR=""
+INSTALL_TRANSACTION_OPERATION=""
+INSTALL_TRANSACTION_ROOT="$RUNTIME_ROOT/transactions"
+INSTALL_TRANSACTION_PENDING="$INSTALL_TRANSACTION_ROOT/pending"
+INSTALL_TRANSACTION_COMMITTED="$INSTALL_TRANSACTION_ROOT/committed"
+INSTALL_TRANSACTION_RECOVERED="$INSTALL_TRANSACTION_ROOT/recovered"
 INSTALL_LOCK_DIR="$RUNTIME_ROOT/.install.lock"
 INSTALL_LOCK_HELD=0
 ACTIVE_STAGING_DIR=""
+ACTIVE_SOURCE_SNAPSHOT=""
 
 validate_app_support_root() {
   if [[ "$APP_SUPPORT" != /* || "$APP_SUPPORT" == "/" || "$APP_SUPPORT" == "$HOME" ]]; then
@@ -266,6 +442,7 @@ validate_app_support_root() {
 $APP_SUPPORT|app support
 $RUNTIME_ROOT|runtime
 $RELEASES_ROOT|runtime releases
+$INSTALL_TRANSACTION_ROOT|runtime transactions
 $PLIST_BUILD_DIR|runtime plist staging
 $STATE_ROOT|state
 $PAIR_ROOT|pairing state
@@ -357,9 +534,54 @@ release_install_lock() {
 
 cleanup_active_staging() {
   if [[ -n "$ACTIVE_STAGING_DIR" && -d "$ACTIVE_STAGING_DIR" ]]; then
-    rm -rf "$ACTIVE_STAGING_DIR"
+    remove_release_tree "$ACTIVE_STAGING_DIR"
   fi
   ACTIVE_STAGING_DIR=""
+}
+
+cleanup_source_snapshot() {
+  if [[ -n "$ACTIVE_SOURCE_SNAPSHOT" && -d "$ACTIVE_SOURCE_SNAPSHOT" ]]; then
+    remove_source_snapshot_tree "$ACTIVE_SOURCE_SNAPSHOT"
+    fsync_directory "$SOURCE_SNAPSHOT_ROOT"
+  fi
+  ACTIVE_SOURCE_SNAPSHOT=""
+}
+
+remove_source_snapshot_tree() {
+  local target="$1"
+  case "$target" in
+    "$SOURCE_SNAPSHOT_ROOT"/.package.*) ;;
+    *)
+      log "ERROR: refusing to remove an unmanaged Pairling source snapshot: $target" >&2
+      return 1
+      ;;
+  esac
+  if [[ -L "$target" || ! -d "$target" ]]; then
+    log "ERROR: Pairling source snapshot is not a real managed directory: $target" >&2
+    return 1
+  fi
+  /bin/chmod -RN "$target" 2>/dev/null || true
+  find -P "$target" -type d -exec chmod u+rwx {} +
+  find -P "$target" -type f -exec chmod u+rw {} +
+  rm -rf "$target"
+  if [[ -e "$target" || -L "$target" ]]; then
+    log "ERROR: Pairling could not remove source snapshot: $target" >&2
+    return 1
+  fi
+}
+
+cleanup_stale_source_snapshots() {
+  local stale
+  mkdir -p "$SOURCE_SNAPSHOT_ROOT"
+  chmod 700 "$SOURCE_SNAPSHOT_ROOT"
+  if [[ -L "$SOURCE_SNAPSHOT_ROOT" || ! -d "$SOURCE_SNAPSHOT_ROOT" ]]; then
+    log "ERROR: Pairling source snapshot root must be a real directory: $SOURCE_SNAPSHOT_ROOT" >&2
+    return 1
+  fi
+  while IFS= read -r -d '' stale; do
+    remove_source_snapshot_tree "$stale"
+  done < <(find -P "$SOURCE_SNAPSHOT_ROOT" -mindepth 1 -maxdepth 1 -name '.package.*' -print0)
+  fsync_directory "$SOURCE_SNAPSHOT_ROOT"
 }
 
 # _machine_path_blocks: returns success when a machine condition should keep the
@@ -713,6 +935,10 @@ stage_note() {
 # is set, so a re-run cannot silently reset a choice made earlier.
 provider_setup_stage() {
   local setup_py="$REPO_ROOT/mac/companiond/provider_setup.py"
+  if is_dry_run; then
+    stage_ok "would detect providers; visibility would remain unchanged"
+    return 0
+  fi
   if [ -f "$CURRENT_LINK/companiond/provider_setup.py" ]; then
     setup_py="$CURRENT_LINK/companiond/provider_setup.py"
   fi
@@ -730,7 +956,7 @@ provider_setup_stage() {
   fi
   local current_excluded=""
   current_excluded="$("$PYTHON3_BIN" "$setup_py" current 2>/dev/null || true)"
-  if is_dry_run || [ "${WIZARD_TUI:-0}" != 1 ]; then
+  if [ "${WIZARD_TUI:-0}" != 1 ]; then
     if [ -n "$current_excluded" ]; then
       stage_ok "provider visibility unchanged (excluded: $current_excluded)"
     else
@@ -966,6 +1192,7 @@ guided_on_exit() {
     rollback_install_transaction || true
   fi
   cleanup_active_staging || true
+  cleanup_source_snapshot || true
   if ! release_install_lock; then
     code=1
   fi
@@ -993,6 +1220,7 @@ install_mutation_on_exit() {
     rollback_install_transaction || true
   fi
   cleanup_active_staging || true
+  cleanup_source_snapshot || true
   if ! release_install_lock; then
     code=1
   fi
@@ -1396,7 +1624,7 @@ run_staged_psk_dependency_checks() {
   run_app_attest_import_check "$staged_python" "$tmp/companiond" "staged runtime copy"
 }
 
-ensure_state() {
+ensure_state_migrations() {
   PAIRLING_APP_SUPPORT_ROOT="$APP_SUPPORT" PAIRLING_LOGS_ROOT="$LOGS_ROOT" \
     "$PYTHON3_BIN" - "$REPO_ROOT" "$APP_SUPPORT" "$LOGS_ROOT" "$MCP_CREDENTIAL" "$PAIRLING_RUNTIME_PORT" <<'PY'
 import sys
@@ -1457,17 +1685,42 @@ with sqlite3.connect(path) as db:
     """)
 PY
   chmod 600 "$DEVICES_DB" 2>/dev/null || true
-  PAIRLING_APP_SUPPORT_ROOT="$APP_SUPPORT" PAIRLING_MCP_CREDENTIAL="$MCP_CREDENTIAL" \
-    "$PYTHON3_BIN" - "$REPO_ROOT" <<'PY'
-import sys
+}
 
-repo_root = sys.argv[1]
+ensure_local_mcp_bridge() {
+  local transaction_journal=""
+  if [[ "$INSTALL_TRANSACTION_ACTIVE" == 1 && "$INSTALL_TRANSACTION_DIR" == "$INSTALL_TRANSACTION_PENDING" ]]; then
+    transaction_journal="$INSTALL_TRANSACTION_DIR/journal.json"
+  fi
+  PAIRLING_APP_SUPPORT_ROOT="$APP_SUPPORT" PAIRLING_MCP_CREDENTIAL="$MCP_CREDENTIAL" \
+    "$PYTHON3_BIN" - "$REPO_ROOT" "$transaction_journal" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repo_root, journal_value = sys.argv[1:]
 sys.path.insert(0, repo_root + "/mac/companiond")
 
 from local_mcp_bridge import ensure_local_mcp_bridge_device
 
-ensure_local_mcp_bridge_device()
+planned = None
+if journal_value:
+    journal = json.loads(Path(journal_value).read_text(encoding="utf-8"))
+    planned = journal["mcp_credential"].get("planned")
+kwargs = {}
+if planned is not None:
+    kwargs = {
+        "planned_device_id": planned["device_id"],
+        "planned_token": planned["token"],
+        "planned_proof_secret": planned["proof_secret"],
+    }
+ensure_local_mcp_bridge_device(**kwargs)
 PY
+}
+
+ensure_state() {
+  ensure_state_migrations
+  ensure_local_mcp_bridge
 }
 
 clear_release_quarantine() {
@@ -1502,6 +1755,136 @@ remove_python_bytecode() {
   fi
 }
 
+verify_release_manifest() {
+  local scan_root="$1" expected_install_root="$2"
+  local expected_version="${3:-$VERSION}" expected_revision="${4:-$REVISION}" expected_dirty="${5:-$SOURCE_DIRTY}"
+  "$PYTHON3_BIN" - \
+    "$REPO_ROOT/mac/companiond" \
+    "$scan_root" \
+    "$expected_install_root" \
+    "$expected_version" \
+    "$expected_revision" \
+    "$expected_dirty" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+source_root, scan_value, install_value, version, revision, dirty = sys.argv[1:]
+sys.path.insert(0, source_root)
+from runtime_manifest import _verify_runtime_payload
+
+root = Path(scan_value)
+manifest_path = root / "manifest.json"
+if root.is_symlink() or not root.is_dir() or manifest_path.is_symlink():
+    raise SystemExit("runtime release and manifest must be real paths")
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+if manifest.get("schema_version") != 2:
+    raise SystemExit("runtime manifest schema does not match the installer")
+install_path = Path(install_value)
+manifest_install_path = Path(str(manifest.get("install_root") or ""))
+if not install_path.is_absolute() or not manifest_install_path.is_absolute():
+    raise SystemExit("runtime manifest install root must be absolute")
+expected_lexical = install_path.parent.resolve(strict=True) / install_path.name
+manifest_lexical = manifest_install_path.parent.resolve(strict=True) / manifest_install_path.name
+if manifest_lexical != expected_lexical:
+    raise SystemExit("runtime manifest install root does not match the release")
+if manifest.get("runtime_version") != version:
+    raise SystemExit("runtime manifest version does not match the installer")
+if manifest.get("source_revision") != revision:
+    raise SystemExit("runtime manifest revision does not match the installer")
+if manifest.get("source_dirty") is not (dirty == "true"):
+    raise SystemExit("runtime manifest source state does not match the installer")
+stamps = {
+    "runtime_version": (root / "mac" / "VERSION").read_text(encoding="utf-8").strip(),
+    "source_revision": (root / "mac" / "SOURCE_REVISION").read_text(encoding="utf-8").strip(),
+    "source_dirty": (root / "mac" / "SOURCE_DIRTY").read_text(encoding="utf-8").strip().lower(),
+}
+if stamps["runtime_version"] != version or stamps["source_revision"] != revision:
+    raise SystemExit("runtime identity stamps do not match the installer")
+if stamps["source_dirty"] not in {"true", "false"} or (stamps["source_dirty"] == "true") is not (dirty == "true"):
+    raise SystemExit("runtime source state stamp does not match the installer")
+verified, error = _verify_runtime_payload(root, manifest, manifest_path)
+if not verified:
+    raise SystemExit(error or "runtime manifest verification failed")
+PY
+}
+
+managed_release_identity() {
+  local target="$1"
+  "$PYTHON3_BIN" - "$REPO_ROOT/mac/companiond" "$target" "$RELEASES_ROOT" <<'PY'
+import sys
+
+source_root, target, releases_root = sys.argv[1:]
+sys.path.insert(0, source_root)
+from runtime_manifest import verified_managed_release_identity
+
+identity = verified_managed_release_identity(target, releases_root)
+values = (
+    identity["root"],
+    identity["runtime_version"],
+    identity["source_revision"],
+    "true" if identity["source_dirty"] else "false",
+)
+if any("\t" in value or "\n" in value for value in values):
+    raise SystemExit("release identity contains an unsafe delimiter")
+print("\t".join(values))
+PY
+}
+
+remove_release_tree() {
+  local root="$1"
+  [[ -e "$root" || -L "$root" ]] || return 0
+  if [[ -d "$root" && ! -L "$root" ]]; then
+    # Published releases are read-only. Restore owner write access only inside
+    # the tree that is about to be removed, without following symlinks.
+    /bin/chmod -RN "$root" 2>/dev/null || true
+    find -P "$root" -type d -exec chmod u+rwx {} +
+    find -P "$root" -type f -exec chmod u+rw {} +
+  fi
+  rm -rf "$root"
+}
+
+seal_release_payload() {
+  local root="$1"
+  if ! /bin/chmod -RN "$root"; then
+    log "ERROR: could not remove extended ACLs from the staged runtime: $root" >&2
+    return 1
+  fi
+  "$PYTHON3_BIN" - "$root" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+if not root.is_dir() or root.is_symlink():
+    raise SystemExit(f"runtime release root is not a real directory: {root}")
+
+for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode):
+        continue
+    if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+        raise SystemExit(f"unsupported runtime release entry while sealing: {path}")
+    os.chmod(path, stat.S_IMODE(metadata.st_mode) & ~0o222, follow_symlinks=False)
+
+for path in root.rglob("*"):
+    metadata = path.lstat()
+    if not stat.S_ISLNK(metadata.st_mode) and stat.S_IMODE(metadata.st_mode) & 0o222:
+        raise SystemExit(f"runtime release entry remained writable: {path}")
+PY
+}
+
+seal_release_root() {
+  local root="$1"
+  seal_release_payload "$root"
+  chmod a-w "$root"
+  if [[ -w "$root" ]]; then
+    log "ERROR: runtime release root remained writable after sealing: $root" >&2
+    return 1
+  fi
+}
+
 atomic_symlink_switch() {
   local target="$1" destination="$2" directory base temporary="" attempts=0
   directory="$(dirname "$destination")"
@@ -1523,8 +1906,29 @@ atomic_symlink_switch() {
     rm -f "$temporary"
     return 1
   fi
-  if ! mv -f "$temporary" "$destination"; then
+  if ! "$PYTHON3_BIN" - "$temporary" "$destination" "$target" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+temporary = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+expected = sys.argv[3]
+os.replace(temporary, destination)
+if not destination.is_symlink() or os.readlink(destination) != expected:
+    raise SystemExit(f"atomic symlink switch did not install the expected target: {destination}")
+descriptor = os.open(destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+  then
     rm -f "$temporary"
+    return 1
+  fi
+  if [[ ! -L "$destination" || "$(readlink "$destination")" != "$target" ]]; then
+    printf 'ERROR: atomic symlink switch postcondition failed for %s.\n' "$destination" >&2
     return 1
   fi
 }
@@ -1537,9 +1941,1006 @@ snapshot_install_path() {
   elif [[ -f "$source" ]]; then
     printf 'file\n' > "$INSTALL_TRANSACTION_DIR/$name.kind"
     cp -p "$source" "$INSTALL_TRANSACTION_DIR/$name.file"
+  elif [[ -e "$source" ]]; then
+    log "ERROR: managed install path is not a file or symlink: $source" >&2
+    return 1
   else
     printf 'absent\n' > "$INSTALL_TRANSACTION_DIR/$name.kind"
   fi
+}
+
+snapshot_pairdrop_directory() {
+  "$PYTHON3_BIN" - "$PAIRDROP_ROOT" "$INSTALL_TRANSACTION_DIR/pairdrop.json" "$HOME" <<'PY'
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+output = Path(sys.argv[2])
+home = Path(sys.argv[3])
+if not root.is_absolute() or root in {Path("/"), home}:
+    raise SystemExit(f"PairDrop storage is not a safe transaction target: {root}")
+try:
+    metadata = root.lstat()
+except FileNotFoundError:
+    payload = {"kind": "absent", "path": str(root)}
+else:
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit(f"PairDrop storage is not a real directory: {root}")
+    if metadata.st_uid != os.geteuid():
+        raise SystemExit(f"PairDrop storage is not owned by this user: {root}")
+    payload = {
+        "kind": "directory",
+        "path": str(root),
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "uid": metadata.st_uid,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+    }
+temporary = output.with_name(f".{output.name}.tmp-{os.getpid()}")
+with temporary.open("x", encoding="utf-8") as handle:
+    json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+    handle.write("\n")
+    handle.flush()
+    os.fchmod(handle.fileno(), 0o600)
+    os.fsync(handle.fileno())
+os.replace(temporary, output)
+PY
+}
+
+prepare_install_transaction_root() {
+  [[ "$INSTALL_LOCK_HELD" == 1 ]] || {
+    log "ERROR: refusing to manage an install transaction without the install lock." >&2
+    return 1
+  }
+  if [[ -L "$INSTALL_TRANSACTION_ROOT" ]]; then
+    log "ERROR: Pairling install transaction root must not be a symlink: $INSTALL_TRANSACTION_ROOT" >&2
+    return 1
+  fi
+  if [[ ! -e "$INSTALL_TRANSACTION_ROOT" ]]; then
+    mkdir -m 700 "$INSTALL_TRANSACTION_ROOT"
+    fsync_directory "$RUNTIME_ROOT"
+  fi
+  if [[ ! -d "$INSTALL_TRANSACTION_ROOT" ]]; then
+    log "ERROR: Pairling install transaction root is not a directory: $INSTALL_TRANSACTION_ROOT" >&2
+    return 1
+  fi
+  local owner mode
+  owner="$(stat -f '%u' "$INSTALL_TRANSACTION_ROOT" 2>/dev/null || printf unknown)"
+  mode="$(stat -f '%Lp' "$INSTALL_TRANSACTION_ROOT" 2>/dev/null || printf unknown)"
+  if [[ "$owner" != "$(id -u)" || "$mode" != "700" ]]; then
+    log "ERROR: Pairling install transaction root must be private and owned by this user: $INSTALL_TRANSACTION_ROOT" >&2
+    return 1
+  fi
+}
+
+remove_install_transaction_tree() {
+  local target="$1" owner
+  case "$target" in
+    "$INSTALL_TRANSACTION_PENDING"|"$INSTALL_TRANSACTION_COMMITTED"|"$INSTALL_TRANSACTION_RECOVERED"|"$INSTALL_TRANSACTION_ROOT"/.pending.*) ;;
+    *)
+      log "ERROR: refusing to remove an unmanaged install transaction path: $target" >&2
+      return 1
+      ;;
+  esac
+  [[ -e "$target" || -L "$target" ]] || return 0
+  if [[ -L "$target" || ! -d "$target" ]]; then
+    log "ERROR: install transaction path is not a real directory: $target" >&2
+    return 1
+  fi
+  owner="$(stat -f '%u' "$target" 2>/dev/null || printf unknown)"
+  if [[ "$owner" != "$(id -u)" ]]; then
+    log "ERROR: install transaction path is owned by another user: $target" >&2
+    return 1
+  fi
+  /bin/chmod -RN "$target" 2>/dev/null || true
+  find -P "$target" -type d -exec chmod u+rwx {} +
+  find -P "$target" -type f -exec chmod u+rw {} +
+  rm -rf "$target"
+  if [[ -e "$target" || -L "$target" ]]; then
+    log "ERROR: Pairling could not remove install transaction path: $target" >&2
+    return 1
+  fi
+  fsync_directory "$INSTALL_TRANSACTION_ROOT"
+}
+
+cleanup_unpublished_install_transactions() {
+  local stale owner mode
+  while IFS= read -r -d '' stale; do
+    if [[ -L "$stale" || ! -d "$stale" ]]; then
+      log "ERROR: unpublished install transaction is not a real directory: $stale" >&2
+      return 1
+    fi
+    owner="$(stat -f '%u' "$stale" 2>/dev/null || printf unknown)"
+    mode="$(stat -f '%Lp' "$stale" 2>/dev/null || printf unknown)"
+    if [[ "$owner" != "$(id -u)" || "$mode" != "700" ]]; then
+      log "ERROR: unpublished install transaction is not private and user-owned: $stale" >&2
+      return 1
+    fi
+    remove_install_transaction_tree "$stale"
+  done < <(find -P "$INSTALL_TRANSACTION_ROOT" -mindepth 1 -maxdepth 1 -name '.pending.*' -print0)
+}
+
+validate_install_transaction_root_entries() {
+  local entry name marker_count=0
+  while IFS= read -r -d '' entry; do
+    name="$(basename "$entry")"
+    case "$name" in
+      pending|committed|recovered)
+        marker_count="$((marker_count + 1))"
+        ;;
+      *)
+        log "ERROR: unexpected entry in Pairling install transaction root: $entry" >&2
+        return 1
+        ;;
+    esac
+  done < <(find -P "$INSTALL_TRANSACTION_ROOT" -mindepth 1 -maxdepth 1 -print0)
+  if [[ "$marker_count" -gt 1 ]]; then
+    log "ERROR: conflicting Pairling install transaction markers require manual inspection." >&2
+    return 1
+  fi
+}
+
+write_install_transaction_journal() {
+  local operation="$1" expected_target="${2:-}"
+  "$PYTHON3_BIN" - \
+    "$INSTALL_TRANSACTION_DIR" "$operation" "$expected_target" "$RELEASE_NAME" \
+    "$CONFIG_FILE" "$CURRENT_LINK" "$PREVIOUS_LINK" \
+    "$USER_PLIST" "$CONNECTD_USER_PLIST" "$PTYBROKER_USER_PLIST" \
+    "$MCP_SERVER_SHIM" "$USER_PAIRLING_WRAPPER" "$RELEASES_ROOT" \
+    "$MCP_CREDENTIAL" "$DEVICES_DB" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+import time
+from pathlib import Path
+
+(
+    directory_value,
+    operation,
+    expected_target,
+    expected_release_name,
+    config,
+    current,
+    previous,
+    companiond_plist,
+    connectd_plist,
+    ptybroker_plist,
+    mcp_server_shim,
+    shell_wrapper,
+    releases_root,
+    mcp_credential_value,
+    devices_db_value,
+) = sys.argv[1:]
+directory = Path(directory_value)
+metadata = directory.lstat()
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+    raise SystemExit("install transaction staging path is not a real directory")
+if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+    raise SystemExit("install transaction staging path is not private and user-owned")
+if operation not in {"setup", "rollback"}:
+    raise SystemExit(f"unsupported install transaction operation: {operation}")
+
+mcp_credential = Path(mcp_credential_value)
+try:
+    credential_metadata = mcp_credential.lstat()
+except FileNotFoundError:
+    mcp_credential_preexisting = False
+else:
+    if stat.S_ISLNK(credential_metadata.st_mode) or not stat.S_ISREG(credential_metadata.st_mode):
+        raise SystemExit("local MCP credential is not a regular file")
+    if credential_metadata.st_uid != os.geteuid():
+        raise SystemExit("local MCP credential is owned by another user")
+    mcp_credential_preexisting = True
+
+inventory = {}
+for path in sorted(directory.iterdir(), key=lambda item: item.name):
+    if path.name == "journal.json" or path.name.startswith(".journal.json.tmp-"):
+        continue
+    item = path.lstat()
+    if stat.S_ISLNK(item.st_mode) or not stat.S_ISREG(item.st_mode):
+        raise SystemExit(f"unsupported install transaction snapshot entry: {path.name}")
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+        os.fsync(handle.fileno())
+    inventory[path.name] = {
+        "sha256": digest.hexdigest(),
+        "mode": stat.S_IMODE(item.st_mode),
+        "size": item.st_size,
+    }
+
+journal = {
+    "schema_version": 1,
+    "phase": "prepared",
+    "operation": operation,
+    "owner_uid": os.geteuid(),
+    "created_at": time.time(),
+    "expected_release_name": expected_release_name,
+    "expected_target": expected_target or None,
+    "releases_root": releases_root,
+    "destinations": {
+        "config": config,
+        "current": current,
+        "previous": previous,
+        "companiond_plist": companiond_plist,
+        "connectd_plist": connectd_plist,
+        "ptybroker_plist": ptybroker_plist,
+        "mcp_server_shim": mcp_server_shim,
+        "shell_wrapper": shell_wrapper,
+    },
+    "mcp_credential": {
+        "path": mcp_credential_value,
+        "database": devices_db_value,
+        "preexisting": mcp_credential_preexisting,
+        "planned": None,
+        "created": None,
+    },
+    "snapshots": inventory,
+}
+journal_path = directory / "journal.json"
+temporary = directory / f".journal.json.tmp-{os.getpid()}"
+with temporary.open("x", encoding="utf-8") as handle:
+    json.dump(journal, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fchmod(handle.fileno(), 0o600)
+    os.fsync(handle.fileno())
+os.replace(temporary, journal_path)
+descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+}
+
+validate_install_transaction_directory() {
+  local directory="$1"
+  "$PYTHON3_BIN" - \
+    "$directory" "$CONFIG_FILE" "$CURRENT_LINK" "$PREVIOUS_LINK" \
+    "$USER_PLIST" "$CONNECTD_USER_PLIST" "$PTYBROKER_USER_PLIST" \
+    "$MCP_SERVER_SHIM" "$USER_PAIRLING_WRAPPER" "$RELEASES_ROOT" "$HOME" \
+    "$MCP_CREDENTIAL" "$DEVICES_DB" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+(
+    directory_value,
+    config,
+    current,
+    previous,
+    companiond_plist,
+    connectd_plist,
+    ptybroker_plist,
+    mcp_server_shim,
+    shell_wrapper,
+    releases_root_value,
+    home_value,
+    mcp_credential_value,
+    devices_db_value,
+) = sys.argv[1:]
+directory = Path(directory_value)
+metadata = directory.lstat()
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+    raise SystemExit("install transaction is not a real directory")
+if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+    raise SystemExit("install transaction is not private and user-owned")
+journal_path = directory / "journal.json"
+journal_metadata = journal_path.lstat()
+if stat.S_ISLNK(journal_metadata.st_mode) or not stat.S_ISREG(journal_metadata.st_mode):
+    raise SystemExit("install transaction journal is not a regular file")
+if stat.S_IMODE(journal_metadata.st_mode) != 0o600:
+    raise SystemExit("install transaction journal is not private")
+
+def strict_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate journal key: {key}")
+        result[key] = value
+    return result
+
+with journal_path.open("r", encoding="utf-8") as handle:
+    journal = json.load(handle, object_pairs_hook=strict_object)
+if not isinstance(journal, dict) or journal.get("schema_version") != 1:
+    raise SystemExit("install transaction journal schema is unsupported")
+if journal.get("phase") != "prepared" or journal.get("operation") not in {"setup", "rollback"}:
+    raise SystemExit("install transaction journal state is invalid")
+if journal.get("owner_uid") != os.geteuid():
+    raise SystemExit("install transaction journal owner does not match this user")
+expected_destinations = {
+    "config": config,
+    "current": current,
+    "previous": previous,
+    "companiond_plist": companiond_plist,
+    "connectd_plist": connectd_plist,
+    "ptybroker_plist": ptybroker_plist,
+    "mcp_server_shim": mcp_server_shim,
+    "shell_wrapper": shell_wrapper,
+}
+if journal.get("destinations") != expected_destinations:
+    raise SystemExit("install transaction destinations do not match this install")
+if journal.get("releases_root") != releases_root_value:
+    raise SystemExit("install transaction release root does not match this install")
+
+mcp_record = journal.get("mcp_credential")
+if not isinstance(mcp_record, dict) or set(mcp_record) != {
+    "path", "database", "preexisting", "planned", "created"
+}:
+    raise SystemExit("install transaction local MCP credential record is malformed")
+if mcp_record.get("path") != mcp_credential_value or mcp_record.get("database") != devices_db_value:
+    raise SystemExit("install transaction local MCP credential paths do not match this install")
+if not isinstance(mcp_record.get("preexisting"), bool):
+    raise SystemExit("install transaction local MCP credential presence is malformed")
+planned_mcp = mcp_record.get("planned")
+created_mcp = mcp_record.get("created")
+if mcp_record["preexisting"] and (planned_mcp is not None or created_mcp is not None):
+    raise SystemExit("install transaction cannot own a preexisting local MCP credential")
+if planned_mcp is not None:
+    expected_planned_keys = {"device_id", "token", "proof_secret", "token_hash"}
+    if not isinstance(planned_mcp, dict) or set(planned_mcp) != expected_planned_keys:
+        raise SystemExit("install transaction planned local MCP credential is malformed")
+    for key in expected_planned_keys:
+        if not isinstance(planned_mcp.get(key), str) or not planned_mcp[key]:
+            raise SystemExit(f"install transaction planned local MCP credential {key} is malformed")
+    if (
+        not planned_mcp["device_id"].startswith("dev_local_mcp_")
+        or not planned_mcp["token"].startswith("pld_")
+        or not planned_mcp["proof_secret"].startswith("prf_")
+        or len(planned_mcp["token_hash"]) != 64
+        or hashlib.sha256(planned_mcp["token"].encode("utf-8")).hexdigest()
+        != planned_mcp["token_hash"]
+    ):
+        raise SystemExit("install transaction planned local MCP credential identity is invalid")
+if created_mcp is not None:
+    expected_created_keys = {
+        "device_id", "token_hash", "sha256", "mode", "uid", "device", "inode", "size"
+    }
+    if not isinstance(created_mcp, dict) or set(created_mcp) != expected_created_keys:
+        raise SystemExit("install transaction created local MCP credential record is malformed")
+    for key in ("device_id", "token_hash", "sha256"):
+        if not isinstance(created_mcp.get(key), str) or not created_mcp[key]:
+            raise SystemExit(f"install transaction created local MCP credential {key} is malformed")
+    if len(created_mcp["token_hash"]) != 64 or len(created_mcp["sha256"]) != 64:
+        raise SystemExit("install transaction created local MCP credential hashes are malformed")
+    for key in ("mode", "uid", "device", "inode", "size"):
+        if not isinstance(created_mcp.get(key), int) or isinstance(created_mcp.get(key), bool):
+            raise SystemExit(f"install transaction created local MCP credential {key} is malformed")
+    if created_mcp["uid"] != os.geteuid() or not 0 <= created_mcp["mode"] <= 0o7777:
+        raise SystemExit("install transaction created local MCP credential ownership or mode is invalid")
+    if planned_mcp is None or (
+        created_mcp["device_id"] != planned_mcp["device_id"]
+        or created_mcp["token_hash"] != planned_mcp["token_hash"]
+    ):
+        raise SystemExit("install transaction created local MCP credential does not match its plan")
+
+releases_root = Path(releases_root_value)
+target_value = journal.get("expected_target")
+if target_value is not None:
+    if not isinstance(target_value, str) or not target_value:
+        raise SystemExit("install transaction expected target is malformed")
+    target = Path(target_value)
+    if not target.is_absolute() or target.name in {"", ".", ".."}:
+        raise SystemExit("install transaction expected target is unsafe")
+    if target.parent.resolve(strict=True) != releases_root.resolve(strict=True):
+        raise SystemExit("install transaction expected target is outside releases")
+
+install_names = tuple(expected_destinations)
+required_names = {"pairdrop.json", "companiond.loaded", "connectd.loaded", "ptybroker.loaded"}
+for name in install_names:
+    kind_path = directory / f"{name}.kind"
+    kind = kind_path.read_text(encoding="utf-8").strip()
+    if kind not in {"absent", "file", "symlink"}:
+        raise SystemExit(f"install transaction snapshot kind is invalid: {name}")
+    required_names.add(f"{name}.kind")
+    file_path = directory / f"{name}.file"
+    target_path = directory / f"{name}.target"
+    if kind == "file":
+        required_names.add(f"{name}.file")
+        if target_path.exists() or target_path.is_symlink():
+            raise SystemExit(f"install transaction has conflicting target snapshot: {name}")
+    elif kind == "symlink":
+        required_names.add(f"{name}.target")
+        if file_path.exists() or file_path.is_symlink():
+            raise SystemExit(f"install transaction has conflicting file snapshot: {name}")
+        link_target = target_path.read_text(encoding="utf-8").rstrip("\n")
+        if not link_target or "\n" in link_target or "\r" in link_target:
+            raise SystemExit(f"install transaction symlink target is malformed: {name}")
+        if name in {"current", "previous"}:
+            release = Path(link_target)
+            if not release.is_absolute() or release.parent.resolve(strict=True) != releases_root.resolve(strict=True):
+                raise SystemExit(f"install transaction runtime link target is outside releases: {name}")
+    elif file_path.exists() or file_path.is_symlink() or target_path.exists() or target_path.is_symlink():
+        raise SystemExit(f"install transaction has data for an absent snapshot: {name}")
+
+for name in ("companiond", "connectd", "ptybroker"):
+    state = (directory / f"{name}.loaded").read_text(encoding="utf-8").strip()
+    if state not in {"loaded", "absent", "skipped"}:
+        raise SystemExit(f"install transaction launchd state is invalid: {name}")
+
+pairdrop = json.loads((directory / "pairdrop.json").read_text(encoding="utf-8"), object_pairs_hook=strict_object)
+if not isinstance(pairdrop, dict) or pairdrop.get("kind") not in {"absent", "directory"}:
+    raise SystemExit("install transaction PairDrop snapshot is invalid")
+pairdrop_path = Path(str(pairdrop.get("path") or ""))
+if not pairdrop_path.is_absolute() or pairdrop_path in {Path("/"), Path(home_value)}:
+    raise SystemExit("install transaction PairDrop path is unsafe")
+if pairdrop.get("kind") == "directory":
+    for key in ("mode", "uid", "device", "inode"):
+        if not isinstance(pairdrop.get(key), int) or isinstance(pairdrop.get(key), bool):
+            raise SystemExit(f"install transaction PairDrop {key} is invalid")
+    if pairdrop["uid"] != os.geteuid() or not 0 <= pairdrop["mode"] <= 0o7777:
+        raise SystemExit("install transaction PairDrop ownership or mode is invalid")
+
+snapshot_inventory = journal.get("snapshots")
+if not isinstance(snapshot_inventory, dict) or set(snapshot_inventory) != required_names:
+    raise SystemExit("install transaction snapshot inventory is incomplete")
+actual_names = {
+    path.name
+    for path in directory.iterdir()
+    if path.name != "journal.json"
+}
+if actual_names != required_names:
+    raise SystemExit("install transaction directory contains unexpected entries")
+for name in sorted(required_names):
+    path = directory / name
+    item = path.lstat()
+    if stat.S_ISLNK(item.st_mode) or not stat.S_ISREG(item.st_mode):
+        raise SystemExit(f"install transaction snapshot is not a regular file: {name}")
+    expected = snapshot_inventory.get(name)
+    if not isinstance(expected, dict):
+        raise SystemExit(f"install transaction snapshot metadata is invalid: {name}")
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if (
+        expected.get("sha256") != digest.hexdigest()
+        or expected.get("mode") != stat.S_IMODE(item.st_mode)
+        or expected.get("size") != item.st_size
+    ):
+        raise SystemExit(f"install transaction snapshot changed: {name}")
+PY
+}
+
+publish_install_transaction() {
+  "$PYTHON3_BIN" - "$INSTALL_TRANSACTION_DIR" "$INSTALL_TRANSACTION_PENDING" "$INSTALL_TRANSACTION_ROOT" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+staging = Path(sys.argv[1])
+pending = Path(sys.argv[2])
+root = Path(sys.argv[3])
+if pending.exists() or pending.is_symlink():
+    raise SystemExit("an install transaction is already pending")
+os.rename(staging, pending)
+descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+}
+
+move_install_transaction_marker() {
+  local source="$1" destination="$2"
+  "$PYTHON3_BIN" - "$source" "$destination" "$INSTALL_TRANSACTION_ROOT" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+root = Path(sys.argv[3])
+if destination.exists() or destination.is_symlink():
+    raise SystemExit(f"install transaction marker already exists: {destination}")
+os.rename(source, destination)
+descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+}
+
+update_install_transaction_target() {
+  local target="$1"
+  [[ "$INSTALL_TRANSACTION_ACTIVE" == 1 && "$INSTALL_TRANSACTION_DIR" == "$INSTALL_TRANSACTION_PENDING" ]] || {
+    log "ERROR: no pending install transaction can accept a target." >&2
+    return 1
+  }
+  validate_install_transaction_directory "$INSTALL_TRANSACTION_DIR"
+  "$PYTHON3_BIN" - "$INSTALL_TRANSACTION_DIR/journal.json" "$target" "$RELEASES_ROOT" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+journal_path = Path(sys.argv[1])
+target = Path(sys.argv[2])
+releases_root = Path(sys.argv[3])
+if not target.is_absolute() or target.parent.resolve(strict=True) != releases_root.resolve(strict=True):
+    raise SystemExit("install transaction target is outside releases")
+payload = json.loads(journal_path.read_text(encoding="utf-8"))
+payload["expected_target"] = str(target)
+temporary = journal_path.with_name(f".{journal_path.name}.tmp-{os.getpid()}")
+with temporary.open("x", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fchmod(handle.fileno(), 0o600)
+    os.fsync(handle.fileno())
+os.replace(temporary, journal_path)
+descriptor = os.open(journal_path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+  validate_install_transaction_directory "$INSTALL_TRANSACTION_DIR"
+}
+
+plan_install_transaction_mcp_credential() {
+  [[ "$INSTALL_TRANSACTION_ACTIVE" == 1 && "$INSTALL_TRANSACTION_DIR" == "$INSTALL_TRANSACTION_PENDING" ]] || {
+    log "ERROR: no pending install transaction can plan a local MCP credential." >&2
+    return 1
+  }
+  validate_install_transaction_directory "$INSTALL_TRANSACTION_DIR"
+  "$PYTHON3_BIN" - "$INSTALL_TRANSACTION_DIR/journal.json" <<'PY'
+import hashlib
+import json
+import os
+import secrets
+import sys
+from pathlib import Path
+
+journal_path = Path(sys.argv[1])
+journal = json.loads(journal_path.read_text(encoding="utf-8"))
+record = journal["mcp_credential"]
+if record["preexisting"] or record.get("planned") is not None:
+    raise SystemExit(0)
+token = "pld_" + secrets.token_urlsafe(32)
+record["planned"] = {
+    "device_id": "dev_local_mcp_" + secrets.token_hex(12),
+    "token": token,
+    "proof_secret": "prf_" + secrets.token_urlsafe(32),
+    "token_hash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+}
+temporary = journal_path.with_name(f".{journal_path.name}.tmp-{os.getpid()}")
+with temporary.open("x", encoding="utf-8") as handle:
+    json.dump(journal, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fchmod(handle.fileno(), 0o600)
+    os.fsync(handle.fileno())
+os.replace(temporary, journal_path)
+directory_descriptor = os.open(journal_path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(directory_descriptor)
+finally:
+    os.close(directory_descriptor)
+PY
+  validate_install_transaction_directory "$INSTALL_TRANSACTION_DIR"
+}
+
+record_install_transaction_mcp_credential() {
+  [[ "$INSTALL_TRANSACTION_ACTIVE" == 1 && "$INSTALL_TRANSACTION_DIR" == "$INSTALL_TRANSACTION_PENDING" ]] || {
+    log "ERROR: no pending install transaction can record a local MCP credential." >&2
+    return 1
+  }
+  validate_install_transaction_directory "$INSTALL_TRANSACTION_DIR"
+  "$PYTHON3_BIN" - "$INSTALL_TRANSACTION_DIR/journal.json" "$MCP_CREDENTIAL" "$DEVICES_DB" <<'PY'
+import hashlib
+import json
+import os
+import sqlite3
+import stat
+import sys
+from pathlib import Path
+
+journal_path = Path(sys.argv[1])
+credential_path = Path(sys.argv[2])
+database_path = Path(sys.argv[3])
+journal = json.loads(journal_path.read_text(encoding="utf-8"))
+record = journal["mcp_credential"]
+if record["preexisting"]:
+    raise SystemExit(0)
+planned = record.get("planned")
+if not isinstance(planned, dict):
+    raise SystemExit("local MCP credential creation was not planned durably")
+
+metadata = credential_path.lstat()
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+    raise SystemExit("new local MCP credential is not a regular file")
+if metadata.st_uid != os.geteuid():
+    raise SystemExit("new local MCP credential is owned by another user")
+descriptor = os.open(credential_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    opened = os.fstat(descriptor)
+    if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+        raise SystemExit("new local MCP credential changed while being opened")
+    content = bytearray()
+    while True:
+        chunk = os.read(descriptor, 64 * 1024)
+        if not chunk:
+            break
+        content.extend(chunk)
+        if len(content) > 1024 * 1024:
+            raise SystemExit("new local MCP credential is unexpectedly large")
+finally:
+    os.close(descriptor)
+try:
+    credential = json.loads(bytes(content).decode("utf-8"))
+except (UnicodeError, json.JSONDecodeError) as exc:
+    raise SystemExit("new local MCP credential is malformed") from exc
+device_id = str(credential.get("device_id") or "")
+token = str(credential.get("token") or "")
+if device_id != planned["device_id"] or not token:
+    raise SystemExit("new local MCP credential identity is malformed")
+token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+if token_hash != planned["token_hash"]:
+    raise SystemExit("new local MCP credential token does not match its durable plan")
+
+database_metadata = database_path.lstat()
+if stat.S_ISLNK(database_metadata.st_mode) or not stat.S_ISREG(database_metadata.st_mode):
+    raise SystemExit("Pairling device registry is not a regular file")
+if database_metadata.st_uid != os.geteuid():
+    raise SystemExit("Pairling device registry is owned by another user")
+with sqlite3.connect(database_path, timeout=5.0) as database:
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA busy_timeout = 5000")
+    row = database.execute(
+        "SELECT device_name, token_hash, purpose, revoked_at FROM devices WHERE device_id = ?",
+        (device_id,),
+    ).fetchone()
+if (
+    row is None
+    or str(row["device_name"] or "") != "Pairling MCP Bridge"
+    or str(row["purpose"] or "") != "local_mcp_bridge"
+    or str(row["token_hash"] or "") != token_hash
+    or row["revoked_at"] is not None
+):
+    raise SystemExit("new local MCP credential does not match one active internal device row")
+
+created = {
+    "device_id": device_id,
+    "token_hash": token_hash,
+    "sha256": hashlib.sha256(content).hexdigest(),
+    "mode": stat.S_IMODE(metadata.st_mode),
+    "uid": metadata.st_uid,
+    "device": metadata.st_dev,
+    "inode": metadata.st_ino,
+    "size": metadata.st_size,
+}
+existing = record.get("created")
+if existing is not None and existing != created:
+    raise SystemExit("install transaction already records a different local MCP credential")
+record["created"] = created
+temporary = journal_path.with_name(f".{journal_path.name}.tmp-{os.getpid()}")
+with temporary.open("x", encoding="utf-8") as handle:
+    json.dump(journal, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fchmod(handle.fileno(), 0o600)
+    os.fsync(handle.fileno())
+os.replace(temporary, journal_path)
+directory_descriptor = os.open(journal_path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(directory_descriptor)
+finally:
+    os.close(directory_descriptor)
+PY
+  validate_install_transaction_directory "$INSTALL_TRANSACTION_DIR"
+}
+
+rollback_created_mcp_credential() {
+  "$PYTHON3_BIN" - "$INSTALL_TRANSACTION_DIR/journal.json" <<'PY'
+import hashlib
+import json
+import os
+import sqlite3
+import stat
+import sys
+import time
+from pathlib import Path
+
+journal = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+record = journal["mcp_credential"]
+planned = record.get("planned")
+created = record.get("created")
+if planned is None:
+    raise SystemExit(0)
+credential_path = Path(record["path"])
+database_path = Path(record["database"])
+
+credential_exists = False
+credential_identity = None
+try:
+    metadata = credential_path.lstat()
+except FileNotFoundError:
+    metadata = None
+else:
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit("created local MCP credential was replaced by a non-file")
+    if metadata.st_uid != os.geteuid():
+        raise SystemExit("created local MCP credential is owned by another user")
+    if created is not None:
+        actual_identity = (
+            metadata.st_uid,
+            metadata.st_dev,
+            metadata.st_ino,
+            stat.S_IMODE(metadata.st_mode),
+            metadata.st_size,
+        )
+        expected_identity = (
+            created["uid"],
+            created["device"],
+            created["inode"],
+            created["mode"],
+            created["size"],
+        )
+        if actual_identity != expected_identity:
+            raise SystemExit("created local MCP credential changed before rollback")
+    descriptor = os.open(credential_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise SystemExit("created local MCP credential changed while being opened")
+        content = bytearray()
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > 1024 * 1024:
+                raise SystemExit("created local MCP credential is unexpectedly large")
+    finally:
+        os.close(descriptor)
+    if created is not None and hashlib.sha256(content).hexdigest() != created["sha256"]:
+        raise SystemExit("created local MCP credential content changed before rollback")
+    credential = json.loads(bytes(content).decode("utf-8"))
+    if (
+        str(credential.get("device_id") or "") != planned["device_id"]
+        or hashlib.sha256(str(credential.get("token") or "").encode("utf-8")).hexdigest()
+        != planned["token_hash"]
+    ):
+        raise SystemExit("created local MCP credential identity changed before rollback")
+    credential_exists = True
+    credential_identity = (metadata.st_dev, metadata.st_ino)
+
+database_metadata = database_path.lstat()
+if stat.S_ISLNK(database_metadata.st_mode) or not stat.S_ISREG(database_metadata.st_mode):
+    raise SystemExit("Pairling device registry is not a regular file")
+if database_metadata.st_uid != os.geteuid():
+    raise SystemExit("Pairling device registry is owned by another user")
+with sqlite3.connect(database_path, timeout=5.0, isolation_level=None) as database:
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA busy_timeout = 5000")
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        row = database.execute(
+            "SELECT device_name, token_hash, purpose, revoked_at FROM devices WHERE device_id = ?",
+            (planned["device_id"],),
+        ).fetchone()
+        if row is None and credential_exists:
+            raise RuntimeError("planned local MCP credential file has no matching device row")
+        if row is not None and (
+            str(row["device_name"] or "") != "Pairling MCP Bridge"
+            or str(row["purpose"] or "") != "local_mcp_bridge"
+            or str(row["token_hash"] or "") != planned["token_hash"]
+        ):
+            raise RuntimeError("recorded local MCP device row changed before rollback")
+        if row is not None and row["revoked_at"] is None:
+            revoked_at = time.time()
+            changed = database.execute(
+                "UPDATE devices SET revoked_at = ? WHERE device_id = ? AND device_name = ? "
+                "AND purpose = ? AND token_hash = ? AND revoked_at IS NULL",
+                (
+                    revoked_at,
+                    planned["device_id"],
+                    "Pairling MCP Bridge",
+                    "local_mcp_bridge",
+                    planned["token_hash"],
+                ),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("recorded local MCP device row changed during rollback")
+            database.execute(
+                "INSERT INTO audit_events (ts, event, device_id, outcome, path, detail_json) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    revoked_at,
+                    "device.revoked",
+                    planned["device_id"],
+                    "ok",
+                    None,
+                    json.dumps({"reason": "install_transaction_rollback"}, sort_keys=True),
+                ),
+            )
+        database.execute("COMMIT")
+    except BaseException:
+        database.execute("ROLLBACK")
+        raise
+
+if credential_exists:
+    parent_fd = os.open(
+        credential_path.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        latest = os.stat(credential_path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (latest.st_dev, latest.st_ino) != credential_identity:
+            raise SystemExit("created local MCP credential changed before removal")
+        os.unlink(credential_path.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+PY
+}
+
+install_transaction_fault_point() {
+  local point="$1"
+  if [[ "${PAIRLING_TEST_KILL_AT_INSTALL_POINT:-}" == "$point" ]]; then
+    kill -KILL "$$"
+  fi
+}
+
+restore_pairdrop_directory() {
+  "$PYTHON3_BIN" - "$INSTALL_TRANSACTION_DIR/pairdrop.json" <<'PY'
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+snapshot = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+root = Path(snapshot["path"])
+if not root.is_absolute() or root == Path("/"):
+    raise SystemExit(f"unsafe PairDrop rollback path: {root}")
+
+try:
+    parent_fd = os.open(root.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+except FileNotFoundError:
+    if snapshot["kind"] == "absent":
+        raise SystemExit(0)
+    raise
+
+try:
+    try:
+        current = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if snapshot["kind"] == "absent":
+            raise SystemExit(0)
+        raise SystemExit(f"original PairDrop directory disappeared during rollback: {root}")
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
+        raise SystemExit(f"PairDrop rollback target is not a real directory: {root}")
+    if current.st_uid != os.geteuid():
+        raise SystemExit(f"PairDrop rollback target is owned by another user: {root}")
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(root.name, flags, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(directory_fd)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise SystemExit(f"PairDrop rollback target changed while being opened: {root}")
+        if snapshot["kind"] == "directory":
+            expected_identity = (snapshot["device"], snapshot["inode"])
+            if (opened.st_dev, opened.st_ino) != expected_identity:
+                raise SystemExit(f"PairDrop rollback target was replaced: {root}")
+            os.fchmod(directory_fd, snapshot["mode"])
+            os.fsync(directory_fd)
+        else:
+            if os.listdir(directory_fd):
+                raise SystemExit(f"PairDrop rollback preserved a newly populated directory: {root}")
+    finally:
+        os.close(directory_fd)
+
+    if snapshot["kind"] == "absent":
+        latest = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (latest.st_dev, latest.st_ino) != (current.st_dev, current.st_ino):
+            raise SystemExit(f"PairDrop rollback target changed before removal: {root}")
+        os.rmdir(root.name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+finally:
+    os.close(parent_fd)
+PY
+}
+
+verify_restored_pairdrop_directory() {
+  "$PYTHON3_BIN" - "$INSTALL_TRANSACTION_DIR/pairdrop.json" <<'PY'
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+snapshot = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+root = Path(snapshot["path"])
+try:
+    metadata = root.lstat()
+except FileNotFoundError:
+    if snapshot["kind"] != "absent":
+        raise SystemExit(f"PairDrop directory was not restored: {root}")
+else:
+    if snapshot["kind"] == "absent":
+        raise SystemExit(f"new PairDrop directory remained after rollback: {root}")
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit(f"restored PairDrop path is not a real directory: {root}")
+    expected = (snapshot["uid"], snapshot["device"], snapshot["inode"], snapshot["mode"])
+    actual = (metadata.st_uid, metadata.st_dev, metadata.st_ino, stat.S_IMODE(metadata.st_mode))
+    if actual != expected:
+        raise SystemExit(f"restored PairDrop directory metadata does not match its snapshot: {root}")
+PY
+}
+
+atomic_restore_file() {
+  local source="$1" destination="$2"
+  mkdir -p "$(dirname "$destination")"
+  "$PYTHON3_BIN" - "$source" "$destination" <<'PY'
+import os
+import shutil
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+metadata = source.lstat()
+if not stat.S_ISREG(metadata.st_mode):
+    raise SystemExit(f"rollback source is not a regular file: {source}")
+fd, temporary_value = tempfile.mkstemp(prefix=f".{destination.name}.pairling-", dir=destination.parent)
+temporary = Path(temporary_value)
+try:
+    with source.open("rb") as input_handle, os.fdopen(fd, "wb", closefd=True) as output_handle:
+        shutil.copyfileobj(input_handle, output_handle, 1024 * 1024)
+        output_handle.flush()
+        os.fchmod(output_handle.fileno(), stat.S_IMODE(metadata.st_mode))
+        os.fsync(output_handle.fileno())
+    os.replace(temporary, destination)
+    descriptor = os.open(destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+finally:
+    try:
+        temporary.unlink()
+    except FileNotFoundError:
+        pass
+PY
+}
+
+remove_install_path() {
+  local destination="$1"
+  "$PYTHON3_BIN" - "$destination" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+destination = Path(sys.argv[1])
+try:
+    destination.unlink()
+except FileNotFoundError:
+    pass
+if not destination.parent.is_dir():
+    raise SystemExit(0)
+descriptor = os.open(destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
 }
 
 restore_install_path() {
@@ -1551,11 +2952,9 @@ restore_install_path() {
       atomic_symlink_switch "$target" "$destination"
       ;;
     file)
-      mkdir -p "$(dirname "$destination")"
-      rm -f "$destination"
-      cp -p "$INSTALL_TRANSACTION_DIR/$name.file" "$destination"
+      atomic_restore_file "$INSTALL_TRANSACTION_DIR/$name.file" "$destination"
       ;;
-    *) rm -f "$destination" ;;
+    *) remove_install_path "$destination" ;;
   esac
 }
 
@@ -1599,39 +2998,82 @@ restore_ptybroker_launchd_state() {
   if launchctl print "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1; then
     return 0
   fi
-  [[ -f "$PTYBROKER_USER_PLIST" ]] || return 1
+  [[ -f "$PTYBROKER_USER_PLIST" && ! -L "$PTYBROKER_USER_PLIST" ]] || return 1
   launchctl bootstrap "gui/$(id -u)" "$PTYBROKER_USER_PLIST" >/dev/null 2>&1 || true
   launchctl kickstart "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1 || true
   launchctl print "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1
 }
 
+restore_launch_agent_state() {
+  local label="$1" plist="$2" name="$3" expected
+  expected="$(cat "$INSTALL_TRANSACTION_DIR/$name.loaded" 2>/dev/null || printf 'skipped')"
+  [[ "$expected" != "skipped" ]] || return 0
+  if [[ "$expected" == "absent" ]]; then
+    unload_launch_agent "$label"
+    return
+  fi
+  [[ -f "$plist" && ! -L "$plist" ]] || return 1
+  reload_launch_agent "$label" "$plist"
+}
+
 begin_install_transaction() {
-  INSTALL_TRANSACTION_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pairling-install-transaction.XXXXXX")"
-  snapshot_install_path "$CONFIG_FILE" config
-  snapshot_install_path "$CURRENT_LINK" current
-  snapshot_install_path "$PREVIOUS_LINK" previous
-  snapshot_install_path "$USER_PLIST" companiond_plist
-  snapshot_install_path "$CONNECTD_USER_PLIST" connectd_plist
-  snapshot_install_path "$PTYBROKER_USER_PLIST" ptybroker_plist
-  snapshot_launchd_loaded "$PAIRLING_PTYBROKER_LABEL" ptybroker
+  local operation="${1:-setup}" staging=""
+  [[ "$INSTALL_LOCK_HELD" == 1 ]] || {
+    log "ERROR: refusing to begin an install transaction without the install lock." >&2
+    return 1
+  }
+  case "$operation" in
+    setup|rollback) ;;
+    *)
+      log "ERROR: unsupported install transaction operation: $operation" >&2
+      return 1
+      ;;
+  esac
+  prepare_install_transaction_root
+  cleanup_unpublished_install_transactions
+  validate_install_transaction_root_entries
+  if [[ -e "$INSTALL_TRANSACTION_PENDING" || -L "$INSTALL_TRANSACTION_PENDING" ||
+        -e "$INSTALL_TRANSACTION_COMMITTED" || -L "$INSTALL_TRANSACTION_COMMITTED" ||
+        -e "$INSTALL_TRANSACTION_RECOVERED" || -L "$INSTALL_TRANSACTION_RECOVERED" ]]; then
+    log "ERROR: an earlier Pairling install transaction must be recovered before setup can continue." >&2
+    return 1
+  fi
+  staging="$(mktemp -d "$INSTALL_TRANSACTION_ROOT/.pending.XXXXXX")"
+  chmod 700 "$staging"
+  INSTALL_TRANSACTION_DIR="$staging"
+  INSTALL_TRANSACTION_OPERATION="$operation"
+
+  if ! snapshot_install_path "$CONFIG_FILE" config ||
+     ! snapshot_install_path "$CURRENT_LINK" current ||
+     ! snapshot_install_path "$PREVIOUS_LINK" previous ||
+     ! snapshot_install_path "$USER_PLIST" companiond_plist ||
+     ! snapshot_install_path "$CONNECTD_USER_PLIST" connectd_plist ||
+     ! snapshot_install_path "$PTYBROKER_USER_PLIST" ptybroker_plist ||
+     ! snapshot_install_path "$MCP_SERVER_SHIM" mcp_server_shim ||
+     ! snapshot_install_path "$USER_PAIRLING_WRAPPER" shell_wrapper ||
+     ! snapshot_pairdrop_directory ||
+     ! snapshot_launchd_loaded "$PAIRLING_DAEMON_LABEL" companiond ||
+     ! snapshot_launchd_loaded "$PAIRLING_CONNECTD_LABEL" connectd ||
+     ! snapshot_launchd_loaded "$PAIRLING_PTYBROKER_LABEL" ptybroker ||
+     ! write_install_transaction_journal "$operation" "${RELEASE_ROOT:-}"; then
+    remove_install_transaction_tree "$staging" || true
+    INSTALL_TRANSACTION_DIR=""
+    INSTALL_TRANSACTION_OPERATION=""
+    return 1
+  fi
+  if ! publish_install_transaction; then
+    remove_install_transaction_tree "$staging" || true
+    INSTALL_TRANSACTION_DIR=""
+    INSTALL_TRANSACTION_OPERATION=""
+    return 1
+  fi
+  INSTALL_TRANSACTION_DIR="$INSTALL_TRANSACTION_PENDING"
   INSTALL_TRANSACTION_ACTIVE=1
+  validate_install_transaction_directory "$INSTALL_TRANSACTION_DIR"
+  install_transaction_fault_point transaction_pending
 }
 
-commit_install_transaction() {
-  if [[ "$INSTALL_TRANSACTION_ACTIVE" != 1 ]]; then
-    return
-  fi
-  rm -rf "$INSTALL_TRANSACTION_DIR"
-  INSTALL_TRANSACTION_ACTIVE=0
-  INSTALL_TRANSACTION_DIR=""
-}
-
-rollback_install_transaction() {
-  if [[ "$INSTALL_TRANSACTION_ACTIVE" != 1 || -z "$INSTALL_TRANSACTION_DIR" ]]; then
-    return
-  fi
-  INSTALL_TRANSACTION_ACTIVE=0
-  set +e
+restore_install_transaction_snapshot() {
   local rollback_failed=0
   restore_install_path "$CONFIG_FILE" config || rollback_failed=1
   restore_install_path "$CURRENT_LINK" current || rollback_failed=1
@@ -1639,31 +3081,97 @@ rollback_install_transaction() {
   restore_install_path "$USER_PLIST" companiond_plist || rollback_failed=1
   restore_install_path "$CONNECTD_USER_PLIST" connectd_plist || rollback_failed=1
   restore_install_path "$PTYBROKER_USER_PLIST" ptybroker_plist || rollback_failed=1
+  restore_install_path "$MCP_SERVER_SHIM" mcp_server_shim || rollback_failed=1
+  restore_install_path "$USER_PAIRLING_WRAPPER" shell_wrapper || rollback_failed=1
+  restore_pairdrop_directory || rollback_failed=1
+  rollback_created_mcp_credential || rollback_failed=1
   verify_restored_install_path "$CONFIG_FILE" config || rollback_failed=1
   verify_restored_install_path "$CURRENT_LINK" current || rollback_failed=1
   verify_restored_install_path "$PREVIOUS_LINK" previous || rollback_failed=1
   verify_restored_install_path "$USER_PLIST" companiond_plist || rollback_failed=1
   verify_restored_install_path "$CONNECTD_USER_PLIST" connectd_plist || rollback_failed=1
   verify_restored_install_path "$PTYBROKER_USER_PLIST" ptybroker_plist || rollback_failed=1
-  if ! launchd_skipped && ! is_dry_run; then
-    restore_ptybroker_launchd_state || rollback_failed=1
+  verify_restored_install_path "$MCP_SERVER_SHIM" mcp_server_shim || rollback_failed=1
+  verify_restored_install_path "$USER_PAIRLING_WRAPPER" shell_wrapper || rollback_failed=1
+  verify_restored_pairdrop_directory || rollback_failed=1
+  install_transaction_fault_point recovery_paths_restored
+  restore_ptybroker_launchd_state || rollback_failed=1
+  restore_launch_agent_state "$PAIRLING_DAEMON_LABEL" "$USER_PLIST" companiond || rollback_failed=1
+  restore_launch_agent_state "$PAIRLING_CONNECTD_LABEL" "$CONNECTD_USER_PLIST" connectd || rollback_failed=1
+  [[ "$rollback_failed" == 0 ]]
+}
+
+commit_install_transaction() {
+  if [[ "$INSTALL_TRANSACTION_ACTIVE" != 1 || "$INSTALL_TRANSACTION_DIR" != "$INSTALL_TRANSACTION_PENDING" ]]; then
+    return
   fi
-  if ! launchd_skipped && ! is_dry_run; then
-    launchctl bootout "gui/$(id -u)/$PAIRLING_DAEMON_LABEL" >/dev/null 2>&1 || true
-    launchctl bootout "gui/$(id -u)/$PAIRLING_CONNECTD_LABEL" >/dev/null 2>&1 || true
-    [[ -f "$USER_PLIST" ]] && launchctl bootstrap "gui/$(id -u)" "$USER_PLIST" >/dev/null 2>&1 || true
-    [[ -f "$CONNECTD_USER_PLIST" ]] && launchctl bootstrap "gui/$(id -u)" "$CONNECTD_USER_PLIST" >/dev/null 2>&1 || true
-    [[ -f "$USER_PLIST" ]] && launchctl kickstart -k "gui/$(id -u)/$PAIRLING_DAEMON_LABEL" >/dev/null 2>&1 || true
-    [[ -f "$CONNECTD_USER_PLIST" ]] && launchctl kickstart -k "gui/$(id -u)/$PAIRLING_CONNECTD_LABEL" >/dev/null 2>&1 || true
-  fi
-  rm -rf "$INSTALL_TRANSACTION_DIR"
+  validate_install_transaction_directory "$INSTALL_TRANSACTION_DIR"
+  move_install_transaction_marker "$INSTALL_TRANSACTION_PENDING" "$INSTALL_TRANSACTION_COMMITTED"
+  INSTALL_TRANSACTION_ACTIVE=0
+  INSTALL_TRANSACTION_DIR="$INSTALL_TRANSACTION_COMMITTED"
+  install_transaction_fault_point transaction_committed
+  validate_install_transaction_directory "$INSTALL_TRANSACTION_DIR"
+  remove_install_transaction_tree "$INSTALL_TRANSACTION_DIR"
   INSTALL_TRANSACTION_DIR=""
-  set -e
-  if [[ "$rollback_failed" == 1 ]]; then
+  INSTALL_TRANSACTION_OPERATION=""
+}
+
+rollback_install_transaction() {
+  if [[ "$INSTALL_TRANSACTION_ACTIVE" != 1 || "$INSTALL_TRANSACTION_DIR" != "$INSTALL_TRANSACTION_PENDING" ]]; then
+    return
+  fi
+  if ! validate_install_transaction_directory "$INSTALL_TRANSACTION_DIR"; then
+    INSTALL_TRANSACTION_ACTIVE=0
+    log "ERROR: refusing to restore a damaged Pairling install transaction." >&2
+    return 1
+  fi
+  INSTALL_TRANSACTION_ACTIVE=0
+  if ! restore_install_transaction_snapshot; then
     log "ERROR: incomplete runtime activation rollback needs manual repair; run pairling doctor --json." >&2
     return 1
   fi
+  move_install_transaction_marker "$INSTALL_TRANSACTION_PENDING" "$INSTALL_TRANSACTION_RECOVERED"
+  INSTALL_TRANSACTION_DIR="$INSTALL_TRANSACTION_RECOVERED"
+  install_transaction_fault_point transaction_recovered
+  validate_install_transaction_directory "$INSTALL_TRANSACTION_DIR"
+  remove_install_transaction_tree "$INSTALL_TRANSACTION_DIR"
+  INSTALL_TRANSACTION_DIR=""
+  INSTALL_TRANSACTION_OPERATION=""
   log "Rolled back the incomplete runtime activation and PairDrop configuration." >&2
+}
+
+recover_pending_install_transaction() {
+  [[ "$INSTALL_LOCK_HELD" == 1 ]] || {
+    log "ERROR: refusing to recover an install transaction without the install lock." >&2
+    return 1
+  }
+  if [[ ! -e "$INSTALL_TRANSACTION_ROOT" && ! -L "$INSTALL_TRANSACTION_ROOT" ]]; then
+    return 0
+  fi
+  prepare_install_transaction_root
+  cleanup_unpublished_install_transactions
+  validate_install_transaction_root_entries
+
+  if [[ -e "$INSTALL_TRANSACTION_COMMITTED" || -L "$INSTALL_TRANSACTION_COMMITTED" ]]; then
+    validate_install_transaction_directory "$INSTALL_TRANSACTION_COMMITTED"
+    remove_install_transaction_tree "$INSTALL_TRANSACTION_COMMITTED"
+    log "Finished cleanup for a committed Pairling install transaction." >&2
+    return 0
+  fi
+  if [[ -e "$INSTALL_TRANSACTION_RECOVERED" || -L "$INSTALL_TRANSACTION_RECOVERED" ]]; then
+    validate_install_transaction_directory "$INSTALL_TRANSACTION_RECOVERED"
+    remove_install_transaction_tree "$INSTALL_TRANSACTION_RECOVERED"
+    log "Finished cleanup for a recovered Pairling install transaction." >&2
+    return 0
+  fi
+  if [[ -e "$INSTALL_TRANSACTION_PENDING" || -L "$INSTALL_TRANSACTION_PENDING" ]]; then
+    validate_install_transaction_directory "$INSTALL_TRANSACTION_PENDING"
+    INSTALL_TRANSACTION_DIR="$INSTALL_TRANSACTION_PENDING"
+    INSTALL_TRANSACTION_ACTIVE=1
+    INSTALL_TRANSACTION_OPERATION="recovery"
+    log "Recovering an interrupted Pairling install transaction." >&2
+    rollback_install_transaction
+  fi
 }
 
 ensure_pairdrop_folder() {
@@ -1748,6 +3256,105 @@ verify_payload_manifest() {
   fi
 }
 
+verify_platform_runtime_manifest() {
+  local prebuilt="${PAIRLING_CONNECTD_PREBUILT:-}" root="${PAIRLING_RUNTIME_PACKAGE_ROOT:-}"
+  local provided_python="${PAIRLING_DAEMON_PYTHON:-}" python_root=""
+  [[ -n "$prebuilt" ]] || return 0
+  if [[ -z "$root" ]]; then
+    root="$(cd "$(dirname "$prebuilt")/.." && pwd)"
+  fi
+  if [[ ! -f "$root/manifest.json" ]]; then
+    if [[ -n "${PAIRLING_RUNTIME_PACKAGE_ROOT:-}" ]]; then
+      log "ERROR: npm runtime package manifest is missing: $root/manifest.json" >&2
+      WIZARD_FATAL=1
+      exit 1
+    fi
+    return 0
+  fi
+  if [[ "$(cd "$(dirname "$prebuilt")/.." && pwd)" != "$(cd "$root" && pwd)" ]]; then
+    log "ERROR: connectd is outside the declared npm runtime package: $prebuilt" >&2
+    WIZARD_FATAL=1
+    exit 1
+  fi
+  case "$provided_python" in
+    */python/bin/python3)
+      python_root="$(cd "$(dirname "$provided_python")/../.." && pwd)"
+      if [[ "$python_root" != "$(cd "$root" && pwd)" ]]; then
+        log "ERROR: vendored Python is outside the declared npm runtime package: $provided_python" >&2
+        WIZARD_FATAL=1
+        exit 1
+      fi
+      ;;
+  esac
+  if ! "$PYTHON3_BIN" "$REPO_ROOT/mac/install/verify-runtime-package-manifest.py" \
+    "$root" "$VERSION" "$REVISION"; then
+    WIZARD_FATAL=1
+    exit 1
+  fi
+}
+
+snapshot_packaged_sources() {
+  local payload_manifest runtime_root snapshot_payload snapshot_runtime
+  case "${PAIRLING_PACKAGE_SNAPSHOT:-}" in
+    payload|full) return 0 ;;
+  esac
+  payload_manifest="$(payload_manifest_path)"
+  runtime_root="${PAIRLING_RUNTIME_PACKAGE_ROOT:-}"
+  [[ -n "$payload_manifest" && -n "$runtime_root" ]] || return 0
+  if [[ -L "$REPO_ROOT" || ! -d "$REPO_ROOT" || -L "$runtime_root" || ! -d "$runtime_root" ]]; then
+    log "ERROR: npm package sources must be real directories before setup can snapshot them." >&2
+    WIZARD_FATAL=1
+    return 1
+  fi
+
+  cleanup_stale_source_snapshots
+  ACTIVE_SOURCE_SNAPSHOT="$(mktemp -d "$SOURCE_SNAPSHOT_ROOT/.package.XXXXXX")"
+  chmod 700 "$ACTIVE_SOURCE_SNAPSHOT"
+  fsync_directory "$SOURCE_SNAPSHOT_ROOT"
+  snapshot_payload="$ACTIVE_SOURCE_SNAPSHOT/main/payload"
+  snapshot_runtime="$ACTIVE_SOURCE_SNAPSHOT/runtime"
+  mkdir -p "$snapshot_payload" "$snapshot_runtime"
+  /bin/cp -R "$REPO_ROOT/." "$snapshot_payload/"
+  /bin/cp -p "$payload_manifest" "$ACTIVE_SOURCE_SNAPSHOT/main/payload-manifest.json"
+  /bin/cp -R "$runtime_root/." "$snapshot_runtime/"
+
+  REPO_ROOT="$snapshot_payload"
+  PAIRLING_RUNTIME_PACKAGE_ROOT="$snapshot_runtime"
+  PAIRLING_CONNECTD_PREBUILT="$snapshot_runtime/bin/pairling-connectd"
+  if [[ -x "$snapshot_runtime/python/bin/python3" ]]; then
+    PAIRLING_DAEMON_PYTHON="$snapshot_runtime/python/bin/python3"
+  fi
+}
+
+adopt_snapshot_python() {
+  local candidate="${PAIRLING_DAEMON_PYTHON:-}"
+  case "$candidate" in
+    "$ACTIVE_SOURCE_SNAPSHOT"/*/python/bin/python3)
+      if [[ "$("$candidate" -B -c 'print("pairling-python-ready")' 2>/dev/null || true)" != "pairling-python-ready" ]]; then
+        log "ERROR: verified package snapshot Python is not functional: $candidate" >&2
+        WIZARD_FATAL=1
+        return 1
+      fi
+      PYTHON3_BIN="$candidate"
+      ;;
+  esac
+}
+
+adopt_current_release_sources() {
+  if [[ -z "$RELEASE_ROOT" || -L "$RELEASE_ROOT" || ! -d "$RELEASE_ROOT" ]]; then
+    log "ERROR: Pairling cannot adopt an unverified runtime source root: $RELEASE_ROOT" >&2
+    return 1
+  fi
+  REPO_ROOT="$RELEASE_ROOT"
+  if [[ -x "$RELEASE_ROOT/python/bin/python3" ]]; then
+    PYTHON3_BIN="$RELEASE_ROOT/python/bin/python3"
+    PAIRLING_DAEMON_PYTHON="$PYTHON3_BIN"
+    export PAIRLING_DAEMON_PYTHON
+  fi
+  cleanup_source_snapshot
+  unset PAIRLING_RUNTIME_PACKAGE_ROOT PAIRLING_CONNECTD_PREBUILT
+}
+
 release_content_digest() {
   "$PYTHON3_BIN" - "$1" <<'PY'
 import hashlib
@@ -1791,16 +3398,21 @@ PY
 }
 
 copy_release() {
-  local tmp content_digest existing_digest
+  local tmp content_digest existing_digest stale_staging
   if [[ "$INSTALL_LOCK_HELD" != 1 ]]; then
     log "ERROR: refusing to stage a runtime without the Pairling install lock." >&2
     return 1
   fi
   mkdir -p "$RELEASES_ROOT"
-  find "$RELEASES_ROOT" -maxdepth 1 -type d -name ".${RELEASE_NAME}.staging.*" -exec rm -rf {} +
+  while IFS= read -r -d '' stale_staging; do
+    remove_release_tree "$stale_staging"
+  done < <(find -P "$RELEASES_ROOT" -mindepth 1 -maxdepth 1 -type d -name '.*.staging.*' -print0)
   tmp="$(mktemp -d "$RELEASES_ROOT/.${RELEASE_NAME}.staging.XXXXXX")"
   ACTIVE_STAGING_DIR="$tmp"
+  snapshot_packaged_sources
   verify_payload_manifest
+  verify_platform_runtime_manifest
+  adopt_snapshot_python
   mkdir -p "$tmp/bin" "$tmp/companiond" "$tmp/companiond/providers" "$tmp/companiond/integrations/aperture_cli" "$tmp/connectd" "$tmp/mac" "$tmp/mcp"
   cp "$REPO_ROOT/mac/companiond/pairlingd.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/runtime_contract.py" "$tmp/companiond/"
@@ -1864,17 +3476,30 @@ copy_release() {
   chmod 755 "$tmp/companiond/pairlingd.py" "$tmp/mcp/phone_tools.py"
   clear_release_quarantine "$tmp"
   remove_python_bytecode "$tmp"
+  seal_release_payload "$tmp"
   content_digest="$(release_content_digest "$tmp")"
   RELEASE_ROOT="$RELEASES_ROOT/$RELEASE_NAME-${content_digest:0:16}"
-  if [[ -e "$RELEASE_ROOT" ]]; then
+  if [[ -e "$RELEASE_ROOT" || -L "$RELEASE_ROOT" ]]; then
+    if [[ -L "$RELEASE_ROOT" || ! -d "$RELEASE_ROOT" ]]; then
+      remove_release_tree "$tmp"
+      log "ERROR: immutable runtime release path is not a real directory: $RELEASE_ROOT" >&2
+      WIZARD_FATAL=1
+      exit 1
+    fi
     existing_digest="$(release_content_digest "$RELEASE_ROOT")"
     if [[ "$existing_digest" != "$content_digest" || ! -f "$RELEASE_ROOT/manifest.json" ]]; then
-      rm -rf "$tmp"
+      remove_release_tree "$tmp"
       log "ERROR: immutable runtime release path is present with different or incomplete bytes: $RELEASE_ROOT" >&2
       WIZARD_FATAL=1
       exit 1
     fi
-    rm -rf "$tmp"
+    if ! verify_release_manifest "$RELEASE_ROOT" "$RELEASE_ROOT"; then
+      remove_release_tree "$tmp"
+      log "ERROR: existing immutable runtime release failed manifest or seal verification: $RELEASE_ROOT" >&2
+      WIZARD_FATAL=1
+      exit 1
+    fi
+    remove_release_tree "$tmp"
     ACTIVE_STAGING_DIR=""
   else
     write_manifest "$tmp" "$RELEASE_ROOT"
@@ -1882,6 +3507,9 @@ copy_release() {
       log "ERROR: forced test failure after staged runtime manifest" >&2
       return 1
     fi
+    seal_release_root "$tmp"
+    verify_release_manifest "$tmp" "$RELEASE_ROOT"
+    fsync_release_tree "$tmp"
     mv "$tmp" "$RELEASE_ROOT"
     fsync_directory "$RELEASES_ROOT"
     ACTIVE_STAGING_DIR=""
@@ -1955,11 +3583,6 @@ stage_vendored_python() {
   if [[ ! -x "$src_tree/bin/python3" ]]; then
     return 0
   fi
-  if [[ "$("$src_tree/bin/python3" -c 'print("pairling-python-ready")' 2>/dev/null || true)" != "pairling-python-ready" ]]; then
-    log "ERROR: vendored python is not functional; refusing to stage: $src_tree/bin/python3" >&2
-    WIZARD_FATAL=1
-    exit 1
-  fi
   local required_team="${PAIRLING_CONNECTD_TEAM_ID:-965AVD34A3}"
   # Always enforce signature integrity and the dev.pairling.python identity
   # (cert-independent defense in depth). Pin the Apple Team ID unless the dev
@@ -1979,12 +3602,22 @@ stage_vendored_python() {
   if [[ "$required_team" == "-" ]]; then
     log "WARNING: vendored python Team ID pin disabled (PAIRLING_CONNECTD_TEAM_ID=-). Dev builds only."
   else
+    if ! verify_developer_id_application "$src_tree/bin/python3" "$required_team"; then
+      log "ERROR: vendored python is not signed with the expected Developer ID Application certificate; refusing to stage." >&2
+      WIZARD_FATAL=1
+      exit 1
+    fi
     team="$(/usr/bin/codesign -dvv "$src_tree/bin/python3" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
     if [[ "$team" != "$required_team" ]]; then
       log "ERROR: vendored python TeamIdentifier '${team:-none}' does not match required '$required_team'; refusing to stage." >&2
       WIZARD_FATAL=1
       exit 1
     fi
+  fi
+  if [[ "$("$src_tree/bin/python3" -c 'print("pairling-python-ready")' 2>/dev/null || true)" != "pairling-python-ready" ]]; then
+    log "ERROR: vendored python is not functional; refusing to stage: $src_tree/bin/python3" >&2
+    WIZARD_FATAL=1
+    exit 1
   fi
   rm -rf "$dest"
   mkdir -p "$(dirname "$dest")"
@@ -1998,6 +3631,35 @@ stage_vendored_python() {
   log "Staged vendored CPython (daemon will run under dev.pairling.python via $CURRENT_LINK/python/bin/python3)"
 }
 
+verify_connectd_prebuilt() {
+  local prebuilt="$1" required_team team
+  if [[ ! -f "$prebuilt" ]]; then
+    log "ERROR: PAIRLING_CONNECTD_PREBUILT points at a missing file: $prebuilt" >&2
+    return 1
+  fi
+  required_team="${PAIRLING_CONNECTD_TEAM_ID:-965AVD34A3}"
+  if [[ "$required_team" == "-" ]]; then
+    log "WARNING: connectd signature verification disabled (PAIRLING_CONNECTD_TEAM_ID=-). Dev builds only."
+    return 0
+  fi
+  if ! /usr/bin/codesign --verify --strict "$prebuilt" >/dev/null 2>&1; then
+    log "ERROR: connectd binary failed codesign verification; refusing to stage: $prebuilt" >&2
+    WIZARD_FATAL=1
+    return 1
+  fi
+  if ! verify_developer_id_application "$prebuilt" "$required_team"; then
+    log "ERROR: connectd binary is not signed with the expected Developer ID Application certificate; refusing to stage: $prebuilt" >&2
+    WIZARD_FATAL=1
+    return 1
+  fi
+  team="$(/usr/bin/codesign -dvv "$prebuilt" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+  if [[ "$team" != "$required_team" ]]; then
+    log "ERROR: connectd binary TeamIdentifier '${team:-none}' does not match required '$required_team'; refusing to stage: $prebuilt" >&2
+    WIZARD_FATAL=1
+    return 1
+  fi
+}
+
 build_connectd_binary() {
   local out="$1"
   # npm-delivered binary: the shim points PAIRLING_CONNECTD_PREBUILT at the
@@ -2005,27 +3667,7 @@ build_connectd_binary() {
   # a valid signature from the pinned Team ID or setup refuses to stage it.
   local prebuilt_env="${PAIRLING_CONNECTD_PREBUILT:-}"
   if [[ -n "$prebuilt_env" ]]; then
-    if [[ ! -f "$prebuilt_env" ]]; then
-      log "ERROR: PAIRLING_CONNECTD_PREBUILT points at a missing file: $prebuilt_env" >&2
-      exit 1
-    fi
-    local required_team="${PAIRLING_CONNECTD_TEAM_ID:-965AVD34A3}"
-    if [[ "$required_team" == "-" ]]; then
-      log "WARNING: connectd signature verification disabled (PAIRLING_CONNECTD_TEAM_ID=-). Dev builds only."
-    else
-      if ! /usr/bin/codesign --verify --strict "$prebuilt_env" >/dev/null 2>&1; then
-        log "ERROR: connectd binary failed codesign verification; refusing to stage: $prebuilt_env" >&2
-        WIZARD_FATAL=1
-        exit 1
-      fi
-      local team
-      team="$(/usr/bin/codesign -dvv "$prebuilt_env" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
-      if [[ "$team" != "$required_team" ]]; then
-        log "ERROR: connectd binary TeamIdentifier '${team:-none}' does not match required '$required_team'; refusing to stage: $prebuilt_env" >&2
-        WIZARD_FATAL=1
-        exit 1
-      fi
-    fi
+    verify_connectd_prebuilt "$prebuilt_env" || exit 1
     cp "$prebuilt_env" "$out"
     chmod 755 "$out"
     return
@@ -2069,13 +3711,59 @@ finally:
 PY
 }
 
+fsync_release_tree() {
+  "$PYTHON3_BIN" - "$1" <<'PY'
+import fcntl
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+if root.is_symlink() or not root.is_dir():
+    raise SystemExit(f"release tree is not a real directory: {root}")
+
+def flush(descriptor: int) -> None:
+    if sys.platform == "darwin":
+        try:
+            fcntl.fcntl(descriptor, 51)  # F_FULLFSYNC
+            return
+        except OSError:
+            pass
+    os.fsync(descriptor)
+
+paths = sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix())
+for path in paths:
+    metadata = path.lstat()
+    if stat.S_ISREG(metadata.st_mode):
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            flush(descriptor)
+        finally:
+            os.close(descriptor)
+    elif not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit(f"unsupported release entry during durability flush: {path}")
+for path in sorted(
+    [root, *(item for item in paths if item.is_dir())],
+    key=lambda item: len(item.parts),
+    reverse=True,
+):
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        flush(descriptor)
+    finally:
+        os.close(descriptor)
+PY
+}
+
 write_manifest() {
   local root="$1" recorded_install_root="${2:-$1}"
-  "$PYTHON3_BIN" - "$REPO_ROOT" "$root" "$recorded_install_root" "$VERSION" "$REVISION" "$BRANCH" "$SOURCE_DIRTY" "$APP_SUPPORT" "$LOGS_ROOT" "$DEVICES_DB" "$PAIRLING_RUNTIME_PORT" "$PAIRDROP_ROOT" <<'PY'
+  "$PYTHON3_BIN" - "$MANIFEST_REPO_PATH" "$root" "$recorded_install_root" "$VERSION" "$REVISION" "$BRANCH" "$SOURCE_DIRTY" "$APP_SUPPORT" "$LOGS_ROOT" "$DEVICES_DB" "$PAIRLING_RUNTIME_PORT" "$PAIRDROP_ROOT" <<'PY'
 import os
 import getpass
 import hashlib
 import json
+import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2083,6 +3771,14 @@ from pathlib import Path
 repo_root, scan_root, install_root, version, revision, branch, dirty, app_support, logs_root, devices_db, port, pairdrop_root = sys.argv[1:]
 root = Path(scan_root)
 files = []
+directories = []
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 def visit(directory: Path) -> None:
     for path in sorted(directory.iterdir(), key=lambda item: item.name):
@@ -2091,28 +3787,32 @@ def visit(directory: Path) -> None:
             continue
         if path.name == "__pycache__" or path.suffix == ".pyc":
             raise RuntimeError(f"forbidden Python bytecode in staged runtime: {rel}")
-        if path.is_symlink():
-            target = path.readlink().as_posix()
-            files.append({
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RuntimeError(f"symlinks are forbidden in staged runtime releases: {rel}")
+        if stat.S_ISDIR(metadata.st_mode):
+            directories.append({
                 "path": rel,
-                "kind": "symlink",
-                "target": target,
-                "sha256": hashlib.sha256(target.encode("utf-8")).hexdigest(),
+                "mode": f"{stat.S_IMODE(metadata.st_mode) & ~0o222:04o}",
             })
-        elif path.is_dir():
             visit(path)
-        elif path.is_file():
+        elif stat.S_ISREG(metadata.st_mode):
             files.append({
                 "path": rel,
                 "kind": "file",
-                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "sha256": sha256_file(path),
+                "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
             })
+        else:
+            raise RuntimeError(f"unsupported entry in staged runtime: {rel}")
 
 visit(root)
 
 now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 manifest = {
-    "schema_version": 1,
+    "schema_version": 2,
+    "root_mode": f"{stat.S_IMODE(root.lstat().st_mode) & ~0o222:04o}",
+    "manifest_mode": "0444",
     "runtime_name": "pairlingd",
     "runtime_version": version,
     "contract_version": "pairling-runtime-v1",
@@ -2150,6 +3850,7 @@ manifest = {
         "homebrew_tap": "pairling-app/tap",
         "homebrew_cask": "pairling-helper",
     },
+    "directories": directories,
     "files": files,
 }
 manifest_path = root / "manifest.json"
@@ -2159,6 +3860,7 @@ with temporary_path.open("x", encoding="utf-8") as handle:
     handle.flush()
     os.fsync(handle.fileno())
 os.replace(temporary_path, manifest_path)
+os.chmod(manifest_path, 0o444, follow_symlinks=False)
 descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
 try:
     os.fsync(descriptor)
@@ -2182,8 +3884,9 @@ switch_current() {
 }
 
 install_mcp_adapter_shim() {
-  mkdir -p "$MCP_SERVER_DIR"
-  "$PYTHON3_BIN" - "$MCP_SERVER_SHIM" "$CURRENT_LINK/mcp/phone_tools.py" <<'PY'
+  local generated
+  generated="$(mktemp "${TMPDIR:-/tmp}/pairling-mcp-shim.XXXXXX")"
+  "$PYTHON3_BIN" - "$generated" "$CURRENT_LINK/mcp/phone_tools.py" <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -2213,13 +3916,14 @@ runpy.run_path(str(PAIRLING_MCP_ADAPTER), run_name="__main__")
 ''')
 os.chmod(shim, 0o755)
 PY
+  install_managed_file "$generated" "$MCP_SERVER_SHIM" 0755
+  rm -f "$generated"
 }
 
 install_shell_wrapper() {
-  local user_bin="${PAIRLING_USER_BIN_DIR:-$HOME/.local/bin}"
-  local target="$user_bin/pairling"
-  local tmp="$target.tmp"
-  mkdir -p "$user_bin"
+  local target="$USER_PAIRLING_WRAPPER"
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/pairling-shell-wrapper.XXXXXX")"
   cat >"$tmp" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -2265,7 +3969,8 @@ printf 'Pairling runtime command is not installed. Run:\n  npm install -g pairli
 exit 127
 SH
   chmod 755 "$tmp"
-  mv "$tmp" "$target"
+  install_managed_file "$tmp" "$target" 0755
+  rm -f "$tmp"
 }
 
 render_plists() {
@@ -2292,32 +3997,97 @@ render_plists() {
   "$PYTHON3_BIN" "$REPO_ROOT/mac/install/render-launchd.py" "${render_args[@]}"
 }
 
+unload_launch_agent() {
+  local label="$1" domain="gui/$(id -u)" target attempts=0
+  target="$domain/$label"
+  if launchctl print "$target" >/dev/null 2>&1; then
+    if ! launchctl bootout "$target"; then
+      if launchctl print "$target" >/dev/null 2>&1; then
+        log "ERROR: could not unload $label before activation." >&2
+        return 1
+      fi
+    fi
+    while launchctl print "$target" >/dev/null 2>&1; do
+      attempts="$((attempts + 1))"
+      if [[ "$attempts" -ge 50 ]]; then
+        log "ERROR: $label remained loaded after bootout." >&2
+        return 1
+      fi
+      sleep 0.1
+    done
+  fi
+}
+
+reload_launch_agent() {
+  local label="$1" plist="$2" domain="gui/$(id -u)" target
+  target="$domain/$label"
+  unload_launch_agent "$label" || return 1
+  if ! launchctl bootstrap "$domain" "$plist"; then
+    log "ERROR: could not bootstrap $label from $plist." >&2
+    return 1
+  fi
+  if ! launchctl print "$target" >/dev/null 2>&1; then
+    log "ERROR: $label was not registered after bootstrap." >&2
+    return 1
+  fi
+  if ! launchctl kickstart -k "$target"; then
+    log "ERROR: could not start $label after bootstrap." >&2
+    return 1
+  fi
+}
+
+install_managed_file() {
+  local source="$1" destination="$2" mode="$3"
+  mkdir -p "$(dirname "$destination")"
+  "$PYTHON3_BIN" - "$source" "$destination" "$mode" <<'PY'
+import os
+import secrets
+import shutil
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+mode = int(sys.argv[3], 8)
+temporary = destination.parent / f".{destination.name}.pairling-{os.getpid()}-{secrets.token_hex(8)}"
+try:
+    with source.open("rb") as reader, temporary.open("xb") as writer:
+        shutil.copyfileobj(reader, writer, 1024 * 1024)
+        writer.flush()
+        os.fsync(writer.fileno())
+    os.chmod(temporary, mode, follow_symlinks=False)
+    os.replace(temporary, destination)
+    descriptor = os.open(destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+finally:
+    try:
+        temporary.unlink()
+    except FileNotFoundError:
+        pass
+PY
+}
+
 start_user_agent() {
-  mkdir -p "$HOME/Library/LaunchAgents"
-  cp "$PLIST_BUILD_DIR/$PAIRLING_DAEMON_LABEL.plist" "$USER_PLIST"
-  chmod 644 "$USER_PLIST"
+  install_managed_file "$PLIST_BUILD_DIR/$PAIRLING_DAEMON_LABEL.plist" "$USER_PLIST" 0644
   if is_dry_run; then
     log "dry-run: rendered $USER_PLIST"
     return
   fi
   if launchd_skipped; then return 0; fi
-  launchctl bootout "gui/$(id -u)" "$USER_PLIST" >/dev/null 2>&1 || true
-  launchctl bootstrap "gui/$(id -u)" "$USER_PLIST" >/dev/null 2>&1 || true
-  launchctl kickstart -k "gui/$(id -u)/$PAIRLING_DAEMON_LABEL"
+  reload_launch_agent "$PAIRLING_DAEMON_LABEL" "$USER_PLIST"
 }
 
 start_connectd_agent() {
-  mkdir -p "$HOME/Library/LaunchAgents"
-  cp "$PLIST_BUILD_DIR/$PAIRLING_CONNECTD_LABEL.plist" "$CONNECTD_USER_PLIST"
-  chmod 644 "$CONNECTD_USER_PLIST"
+  install_managed_file "$PLIST_BUILD_DIR/$PAIRLING_CONNECTD_LABEL.plist" "$CONNECTD_USER_PLIST" 0644
   if is_dry_run; then
     log "dry-run: rendered $CONNECTD_USER_PLIST"
     return
   fi
   if launchd_skipped; then return 0; fi
-  launchctl bootout "gui/$(id -u)" "$CONNECTD_USER_PLIST" >/dev/null 2>&1 || true
-  launchctl bootstrap "gui/$(id -u)" "$CONNECTD_USER_PLIST" >/dev/null 2>&1 || true
-  launchctl kickstart -k "gui/$(id -u)/$PAIRLING_CONNECTD_LABEL"
+  reload_launch_agent "$PAIRLING_CONNECTD_LABEL" "$CONNECTD_USER_PLIST"
 }
 
 ptybroker_live_session_count() {
@@ -2414,11 +4184,13 @@ PY
 ptybroker_deployment_state_json() {
   "$PYTHON3_BIN" - "$CURRENT_LINK" "${1:-{}}" <<'PY'
 import json
-import os
 import sys
 from pathlib import Path
 
 current = Path(sys.argv[1])
+sys.path.insert(0, str(current / "companiond"))
+from runtime_manifest import classify_ptybroker_identity
+
 def load_json_arg(raw):
     text = str(raw or "").strip()
     decoder = json.JSONDecoder()
@@ -2433,7 +4205,7 @@ def load_json_arg(raw):
     return {}
 
 payload = load_json_arg(sys.argv[2])
-live = payload.get("status") if isinstance(payload.get("status"), dict) else payload
+live = payload.get("status") if isinstance(payload, dict) and isinstance(payload.get("status"), dict) else payload
 
 def read_revision(root: Path):
     for path in [root / "manifest.json", root / "mac" / "SOURCE_REVISION", root / "SOURCE_REVISION"]:
@@ -2455,34 +4227,7 @@ desired = {
     "source_revision": read_revision(desired_root),
     "protocol_version": 1,
 }
-reasons = []
-live_root = live.get("runtime_root")
-if live_root:
-    if os.path.realpath(str(live_root)) != str(desired_root):
-        reasons.append("runtime_root_mismatch")
-else:
-    reasons.append("runtime_root_missing")
-live_script = live.get("script_path")
-if live_script:
-    if os.path.realpath(str(live_script)) != str(desired["script_path"]):
-        reasons.append("script_path_mismatch")
-else:
-    reasons.append("script_path_missing")
-live_revision = live.get("source_revision")
-if desired["source_revision"] and not live_revision:
-    reasons.append("source_revision_missing")
-elif live_revision and desired["source_revision"] and str(live_revision) != str(desired["source_revision"]):
-    reasons.append("source_revision_mismatch")
-try:
-    live_protocol = int(live.get("protocol_version") or 0)
-except (TypeError, ValueError):
-    live_protocol = 0
-if live_protocol != desired["protocol_version"]:
-    if not live.get("protocol_version"):
-        reasons.append("protocol_version_missing")
-    else:
-        reasons.append("protocol_version_mismatch")
-state = "current" if not reasons else "stale_deferred"
+state, reasons = classify_ptybroker_identity(live, desired)
 print(json.dumps({
     "state": state,
     "restart_deferred": state == "stale_deferred",
@@ -2514,6 +4259,14 @@ def load_json_arg(raw):
     return {}
 
 state = load_json_arg(sys.argv[1])
+if state.get("state") == "incompatible":
+    reasons = ", ".join(str(item) for item in state.get("reasons") or []) or "invalid status"
+    print(
+        "ERROR: ptybroker status is incompatible with this runtime; "
+        f"live PTYs were preserved; reasons={reasons}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 if state.get("state") != "stale_deferred":
     raise SystemExit(0)
 live = state.get("live") if isinstance(state.get("live"), dict) else {}
@@ -2562,10 +4315,9 @@ ensure_ptybroker_agent() {
   mkdir -p "$HOME/Library/LaunchAgents"
   local rendered="$PLIST_BUILD_DIR/$PAIRLING_PTYBROKER_LABEL.plist"
   local changed=0
-  if [[ ! -f "$PTYBROKER_USER_PLIST" ]] || ! cmp -s "$rendered" "$PTYBROKER_USER_PLIST"; then
-    cp "$rendered" "$PTYBROKER_USER_PLIST"
-    chmod 644 "$PTYBROKER_USER_PLIST"
+  if [[ -L "$PTYBROKER_USER_PLIST" || ! -f "$PTYBROKER_USER_PLIST" ]] || ! cmp -s "$rendered" "$PTYBROKER_USER_PLIST"; then
     changed=1
+    install_managed_file "$rendered" "$PTYBROKER_USER_PLIST" 0644
   fi
   if is_dry_run; then
     if [[ "$changed" == "1" ]]; then
@@ -2577,8 +4329,7 @@ ensure_ptybroker_agent() {
   fi
   if launchd_skipped; then return 0; fi
   if ! launchctl print "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1; then
-    launchctl bootstrap "gui/$(id -u)" "$PTYBROKER_USER_PLIST" >/dev/null 2>&1 || true
-    launchctl kickstart "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1 || true
+    reload_launch_agent "$PAIRLING_PTYBROKER_LABEL" "$PTYBROKER_USER_PLIST"
     return
   fi
   local status_json
@@ -2600,11 +4351,10 @@ ensure_ptybroker_agent() {
 reconcile_ptybroker() {
   trap install_mutation_on_exit EXIT
   acquire_install_lock
+  recover_pending_install_transaction
   ensure_state
   render_plists
-  mkdir -p "$HOME/Library/LaunchAgents"
-  cp "$PLIST_BUILD_DIR/$PAIRLING_PTYBROKER_LABEL.plist" "$PTYBROKER_USER_PLIST"
-  chmod 644 "$PTYBROKER_USER_PLIST"
+  install_managed_file "$PLIST_BUILD_DIR/$PAIRLING_PTYBROKER_LABEL.plist" "$PTYBROKER_USER_PLIST" 0644
   if is_dry_run; then
     log "dry-run: would reconcile $PAIRLING_PTYBROKER_LABEL"
     release_install_lock
@@ -2612,8 +4362,7 @@ reconcile_ptybroker() {
     return
   fi
   if ! launchctl print "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1; then
-    launchctl bootstrap "gui/$(id -u)" "$PTYBROKER_USER_PLIST" >/dev/null 2>&1 || true
-    launchctl kickstart "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1 || true
+    reload_launch_agent "$PAIRLING_PTYBROKER_LABEL" "$PTYBROKER_USER_PLIST"
     log "Started $PAIRLING_PTYBROKER_LABEL"
     return
   fi
@@ -2668,58 +4417,262 @@ run_doctor() {
 }
 
 verify_runtime_activation() {
-  local doctor_json doctor_error
+  local expected_version="${1:-$VERSION}" expected_revision="${2:-$REVISION}" expected_dirty="${3:-$SOURCE_DIRTY}"
+  local doctor_json doctor_error doctor_status=0
   if is_dry_run || launchd_skipped; then
     log "Skipping live activation proof because launchd is disabled for this run."
     return
   fi
-  "$PYTHON3_BIN" - "$PAIRLING_RUNTIME_PORT" "${PAIRLING_CONNECTD_STATUS_PORT:-7774}" "${PAIRLING_ACTIVATION_WAIT_SECONDS:-20}" <<'PY'
+  "$PYTHON3_BIN" - \
+    "$PAIRLING_RUNTIME_PORT" \
+    "${PAIRLING_CONNECTD_STATUS_PORT:-7774}" \
+    "${PAIRLING_ACTIVATION_WAIT_SECONDS:-20}" \
+    "$CURRENT_LINK" \
+    "$RELEASE_ROOT" \
+    "$expected_version" \
+    "$expected_revision" \
+    "$expected_dirty" \
+    "$REPO_ROOT" \
+    "$APP_SUPPORT" \
+    "$LOGS_ROOT" <<'PY'
 import json
+import os
+import signal
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
+from pathlib import Path
 
-runtime_port, connectd_port, wait_seconds = map(int, sys.argv[1:])
+runtime_port, connectd_port, wait_seconds = map(int, sys.argv[1:4])
+current = Path(sys.argv[4])
+expected_root_path = Path(sys.argv[5])
+if expected_root_path.is_symlink() or not expected_root_path.is_dir():
+    raise SystemExit("staged release root is not a real directory")
+expected_root = expected_root_path.resolve(strict=True)
+expected_lexical_root = expected_root_path.parent.resolve(strict=True) / expected_root_path.name
+expected_version = sys.argv[6]
+expected_revision = sys.argv[7]
+expected_dirty = sys.argv[8] == "true"
+control_root = Path(sys.argv[9])
+app_support = Path(sys.argv[10])
+logs_root = Path(sys.argv[11])
+if control_root.is_symlink() or not control_root.is_dir():
+    raise SystemExit("runtime activation control root is missing or linked")
+sys.path.insert(0, str(control_root / "mac" / "companiond"))
+
+from pairling_devices import (
+    DeviceRegistry,
+    SMOKE_DEVICE_PURPOSE,
+    generate_device_id,
+    generate_proof_secret,
+    generate_token,
+    resolve_install_id,
+)
+from request_proof import (
+    BODY_SHA256_HEADER,
+    INSTALL_ID_HEADER,
+    PROOF_HEADER,
+    REQUEST_ID_HEADER,
+    TIMESTAMP_HEADER,
+    body_sha256_hex,
+    canonical_request,
+    proof_hex,
+)
+
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 deadline = time.monotonic() + max(1, wait_seconds)
 last_error = "activation endpoints did not answer"
 
-def fetch(url):
-    with opener.open(url, timeout=2) as response:
+def fetch(url, *, credential=None):
+    headers = {}
+    if credential is not None:
+        parsed = urllib.parse.urlsplit(url)
+        path_and_query = parsed.path or "/"
+        if parsed.query:
+            path_and_query += "?" + parsed.query
+        timestamp_ms = str(int(time.time() * 1000))
+        request_id = str(uuid.uuid4()).lower()
+        body_hash = body_sha256_hex(b"")
+        canonical = canonical_request(
+            method="GET",
+            path_and_query=path_and_query,
+            timestamp_ms=timestamp_ms,
+            request_id=request_id,
+            body_sha256=body_hash,
+            install_id=credential["install_id"],
+            device_id=credential["device_id"],
+        )
+        headers = {
+            "Authorization": f"Bearer {credential['token']}",
+            INSTALL_ID_HEADER: credential["install_id"],
+            REQUEST_ID_HEADER: request_id,
+            TIMESTAMP_HEADER: timestamp_ms,
+            BODY_SHA256_HEADER: body_hash,
+            PROOF_HEADER: proof_hex(
+                secret=credential["proof_secret"],
+                canonical=canonical,
+            ),
+        }
+    request = urllib.request.Request(url, headers=headers)
+    with opener.open(request, timeout=2) as response:
         if response.status != 200:
             raise RuntimeError(f"{url} returned HTTP {response.status}")
         return json.loads(response.read().decode("utf-8"))
 
-while time.monotonic() < deadline:
+registry = DeviceRegistry(app_support / "devices.sqlite", logs_root / "audit.jsonl")
+install_id = resolve_install_id(app_support)
+activation_device_id = generate_device_id()
+credential = {
+    "device_id": activation_device_id,
+    "install_id": install_id,
+    "token": generate_token(),
+    "proof_secret": generate_proof_secret(),
+}
+
+def stop_for_signal(signum, _frame):
+    raise SystemExit(f"runtime activation interrupted by signal {signum}")
+
+for stop_signal in (signal.SIGTERM, signal.SIGHUP):
+    signal.signal(stop_signal, stop_for_signal)
+
+activation_ok = False
+credential_was_accepted = False
+revoked = False
+cleanup_error = ""
+try:
+    created = registry.create_device(
+        device_name="Pairling Installer Activation",
+        install_id=install_id,
+        scopes=("health:read",),
+        token=credential["token"],
+        proof_secret=credential["proof_secret"],
+        device_id=activation_device_id,
+        purpose=SMOKE_DEVICE_PURPOSE,
+        lease_expires_at=time.time() + max(60, wait_seconds + 30),
+    )
+    if created.device_id != activation_device_id:
+        raise RuntimeError("runtime activation credential identity changed while it was created")
+    while time.monotonic() < deadline:
+        try:
+            if not current.is_symlink():
+                raise RuntimeError("runtime/current is not a symlink")
+            literal_target = Path(os.readlink(current))
+            if not literal_target.is_absolute():
+                raise RuntimeError("runtime/current does not use an absolute release target")
+            literal_lexical_target = literal_target.parent.resolve(strict=True) / literal_target.name
+            if literal_lexical_target != expected_lexical_root:
+                raise RuntimeError("runtime/current does not name the staged release directly")
+            if current.resolve(strict=True) != expected_root:
+                raise RuntimeError("runtime/current does not resolve to the staged release")
+            manifest = json.loads((expected_root / "manifest.json").read_text(encoding="utf-8"))
+            if manifest.get("schema_version") != 2:
+                raise RuntimeError("installed manifest schema does not match the staged release")
+            if manifest.get("runtime_version") != expected_version:
+                raise RuntimeError("installed manifest runtime version does not match the staged release")
+            if manifest.get("source_revision") != expected_revision:
+                raise RuntimeError("installed manifest source revision does not match the staged release")
+            if manifest.get("source_dirty") is not expected_dirty:
+                raise RuntimeError("installed manifest source state does not match the staged release")
+            if Path(str(manifest.get("install_root") or "")).resolve(strict=False) != expected_root:
+                raise RuntimeError("installed manifest root does not match the staged release")
+            ready = fetch(f"http://127.0.0.1:{runtime_port}/readyz")
+            health = fetch(
+                f"http://127.0.0.1:{runtime_port}/health",
+                credential=credential,
+            )
+            credential_was_accepted = True
+            connectd = fetch(f"http://127.0.0.1:{connectd_port}/status")
+            if ready.get("ok") is not True or ready.get("contract_version") != "pairling-runtime-v1":
+                raise RuntimeError("/readyz did not report the Pairling runtime contract as ready")
+            if health.get("contract_version") != "pairling-runtime-v1" or int(health.get("schema_version") or 0) < 1:
+                raise RuntimeError("/health did not report the Pairling runtime contract")
+            runtime = health.get("runtime") if isinstance(health.get("runtime"), dict) else {}
+            if runtime.get("verified") is not True:
+                raise RuntimeError("/health did not report a verified installed runtime")
+            if runtime.get("runtime_version") != expected_version:
+                raise RuntimeError("/health runtime version does not match the staged release")
+            if runtime.get("source_revision") != expected_revision:
+                raise RuntimeError("/health source revision does not match the staged release")
+            if runtime.get("source_dirty") is not expected_dirty:
+                raise RuntimeError("/health source state does not match the staged release")
+            runtime_root_value = runtime.get("install_root")
+            if not isinstance(runtime_root_value, str) or not runtime_root_value:
+                raise RuntimeError("/health did not report the executing runtime root")
+            runtime_root_path = Path(runtime_root_value)
+            if not runtime_root_path.is_absolute() or runtime_root_path.resolve(strict=True) != expected_root:
+                raise RuntimeError("/health executing runtime root does not match the staged release")
+            if int(connectd.get("schema_version") or 0) < 2:
+                raise RuntimeError("connectd /status did not report schema v2")
+            if int(connectd.get("pid") or 0) < 1:
+                raise RuntimeError("connectd /status did not report the serving process id")
+            if connectd.get("version") != expected_version:
+                raise RuntimeError("connectd /status version does not match the staged release")
+            if connectd.get("source_revision") != expected_revision:
+                raise RuntimeError("connectd /status source revision does not match the staged release")
+            if connectd.get("source_dirty") is not expected_dirty:
+                raise RuntimeError("connectd /status source state does not match the staged release")
+            if connectd.get("upstream_reachable") is not True:
+                raise RuntimeError("connectd /status did not prove the runtime upstream reachable")
+            activation_ok = True
+            break
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            time.sleep(0.5)
+finally:
     try:
-        ready = fetch(f"http://127.0.0.1:{runtime_port}/readyz")
-        health = fetch(f"http://127.0.0.1:{runtime_port}/health")
-        connectd = fetch(f"http://127.0.0.1:{connectd_port}/status")
-        if ready.get("ok") is not True or ready.get("contract_version") != "pairling-runtime-v1":
-            raise RuntimeError("/readyz did not report the Pairling runtime contract as ready")
-        if health.get("ok") is not True or health.get("contract_version") != "pairling-runtime-v1":
-            raise RuntimeError("/health did not report the Pairling runtime contract as healthy")
-        runtime = health.get("runtime") if isinstance(health.get("runtime"), dict) else {}
-        if runtime.get("verified") is not True:
-            raise RuntimeError("/health did not report a verified installed runtime")
-        if int(connectd.get("schema_version") or 0) < 2:
-            raise RuntimeError("connectd /status did not report schema v2")
-        if connectd.get("upstream_reachable") is not True:
-            raise RuntimeError("connectd /status did not prove the runtime upstream reachable")
-        raise SystemExit(0)
+        revoked = registry.revoke_device(
+            activation_device_id,
+            reason=(
+                "installer_activation_complete"
+                if activation_ok
+                else "installer_activation_failed"
+            ),
+        )
     except Exception as exc:
-        last_error = f"{type(exc).__name__}: {exc}"
-        time.sleep(0.5)
-raise SystemExit(f"runtime activation proof failed: {last_error}")
+        cleanup_error = f"{type(exc).__name__}: {exc}"
+rejection_deadline = time.monotonic() + (3 if credential_was_accepted else 0.5)
+credential_rejected = False
+while revoked and time.monotonic() < rejection_deadline:
+    try:
+        fetch(
+            f"http://127.0.0.1:{runtime_port}/health",
+            credential=credential,
+        )
+    except urllib.error.HTTPError as exc:
+        exc.read()
+        if exc.code == 403:
+            credential_rejected = True
+            break
+    except Exception:
+        pass
+    time.sleep(0.25)
+if not activation_ok:
+    cleanup_detail = ""
+    if not revoked:
+        cleanup_detail = "; activation credential revocation was not confirmed"
+    elif credential_was_accepted and not credential_rejected:
+        cleanup_detail = "; revoked activation credential rejection was not confirmed"
+    if cleanup_error:
+        cleanup_detail += "; cleanup error: " + cleanup_error
+    raise SystemExit(f"runtime activation proof failed: {last_error}{cleanup_detail}")
+if cleanup_error:
+    raise SystemExit("runtime activation credential cleanup failed: " + cleanup_error)
+if not revoked:
+    raise SystemExit("runtime activation credential could not be revoked")
+if not credential_rejected:
+    raise SystemExit("runtime activation credential remained usable after revocation")
 PY
 
   doctor_json="$(mktemp "${TMPDIR:-/tmp}/pairling-doctor.XXXXXX")"
   doctor_error="$doctor_json.err"
-  if ! PAIRLING_DAEMON_PYTHON="$PYTHON3_BIN" "$REPO_ROOT/mac/install/doctor.sh" --json >"$doctor_json" 2>"$doctor_error"; then
+  PAIRLING_DAEMON_PYTHON="$PYTHON3_BIN" "$REPO_ROOT/mac/install/doctor.sh" --json >"$doctor_json" 2>"$doctor_error" || doctor_status=$?
+  if [[ "$doctor_status" != 0 ]]; then
     cat "$doctor_error" >&2
-    cat "$doctor_json" >&2
+    log "ERROR: Pairling doctor exited $doctor_status during activation proof." >&2
     rm -f "$doctor_json" "$doctor_error"
-    log "ERROR: Pairling doctor rejected the activated runtime." >&2
     return 1
   fi
   if ! "$PYTHON3_BIN" - "$doctor_json" <<'PY'
@@ -2728,25 +4681,50 @@ import sys
 from pathlib import Path
 
 payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-if payload.get("ok") is not True or payload.get("contract_version") != "pairling-runtime-v1":
-    raise SystemExit("doctor did not report a healthy Pairling runtime contract")
+if payload.get("contract_version") != "pairling-runtime-v1":
+    raise SystemExit("doctor did not report the Pairling runtime contract")
 checks = {str(row.get("id")): row for row in payload.get("checks", []) if isinstance(row, dict)}
 required = {
+    "current_release_link",
     "manifest_exists",
     "manifest_contract",
+    "manifest_hashes",
+    "runtime_release_sealed",
+    "runtime_port",
+    "launchd_labels",
+    "lifecycle_sources_compile",
+    "app_support_writable",
+    "logs_writable",
+    "devices_db",
+    "pair_storage_permissions",
+    "launchagent_plist",
+    "launchagent_port_env",
+    "connectd_launchagent_plist",
+    "connectd_launchagent_env",
+    "ptybroker_launchagent_plist",
     "launchagent_loaded",
     "launchagent_loaded_from_current",
     "connectd_launchagent_loaded",
     "connectd_loaded_from_current",
+    "ptybroker_launchagent_loaded",
+    "ptybroker_loaded_from_current",
+    "ptybroker_activation_ready",
+    "port_7773_listener",
+    "legacy_port_7723_clear",
     "health_endpoint",
     "health_contract",
+    "mcp_adapter_installed",
+    "mcp_adapter_shim",
+    "shell_pairling_wrapper",
     "connectd_status_schema_v2",
+    "connectd_live_identity",
 }
 failed = sorted(name for name in required if checks.get(name, {}).get("status") != "ok")
 if failed:
     raise SystemExit("doctor activation checks failed: " + ", ".join(failed))
 PY
   then
+    cat "$doctor_error" >&2
     rm -f "$doctor_json" "$doctor_error"
     return 1
   fi
@@ -2754,30 +4732,51 @@ PY
 }
 
 rollback() {
-  if [[ ! -L "$PREVIOUS_LINK" ]]; then
-    log "ERROR: no previous runtime symlink exists at $PREVIOUS_LINK" >&2
-    exit 1
-  fi
-  local current_target previous_target
-  current_target="$(readlink "$CURRENT_LINK" 2>/dev/null || true)"
-  previous_target="$(readlink "$PREVIOUS_LINK")"
+  local current_target previous_target current_identity previous_identity
+  local current_root current_version current_revision current_dirty
+  local rollback_root rollback_version rollback_revision rollback_dirty
   trap install_mutation_on_exit EXIT
   acquire_install_lock
-  RELEASE_ROOT="$previous_target"
-  begin_install_transaction
-  atomic_symlink_switch "$previous_target" "$CURRENT_LINK"
-  if [[ -n "$current_target" ]]; then
-    atomic_symlink_switch "$current_target" "$PREVIOUS_LINK"
-  else
-    rm -f "$PREVIOUS_LINK"
+  recover_pending_install_transaction
+  if [[ ! -L "$CURRENT_LINK" || ! -L "$PREVIOUS_LINK" ]]; then
+    log "ERROR: rollback requires verified current and previous runtime symlinks." >&2
+    exit 1
   fi
+  current_target="$(readlink "$CURRENT_LINK")"
+  previous_target="$(readlink "$PREVIOUS_LINK")"
+  if ! current_identity="$(managed_release_identity "$current_target")"; then
+    log "ERROR: current runtime is not a verified rollback source: $current_target" >&2
+    exit 1
+  fi
+  if ! previous_identity="$(managed_release_identity "$previous_target")"; then
+    log "ERROR: previous runtime is not rollback eligible: $previous_target" >&2
+    exit 1
+  fi
+  IFS=$'\t' read -r current_root current_version current_revision current_dirty <<<"$current_identity"
+  IFS=$'\t' read -r rollback_root rollback_version rollback_revision rollback_dirty <<<"$previous_identity"
+  if [[ -z "$rollback_root" || -z "$rollback_version" || -z "$rollback_revision" || -z "$rollback_dirty" ]]; then
+    log "ERROR: previous runtime identity is incomplete: $previous_target" >&2
+    exit 1
+  fi
+  if [[ -z "$current_root" || "$rollback_root" == "$current_root" ]]; then
+    log "ERROR: current and previous runtime links name the same release." >&2
+    exit 1
+  fi
+  RELEASE_ROOT="$rollback_root"
+  pin_control_python
+  begin_install_transaction rollback
+  atomic_symlink_switch "$current_target" "$PREVIOUS_LINK"
+  atomic_symlink_switch "$rollback_root" "$CURRENT_LINK"
+  install_transaction_fault_point rollback_links_switched
   render_plists
   ensure_ptybroker_agent
   start_user_agent
   start_connectd_agent
-  verify_runtime_activation
+  install_transaction_fault_point rollback_services_started
+  verify_runtime_activation "$rollback_version" "$rollback_revision" "$rollback_dirty"
+  install_transaction_fault_point rollback_activation_proved
   commit_install_transaction
-  append_history "rollback" "rolled back to $previous_target"
+  append_history "rollback" "rolled back to $rollback_root"
   release_install_lock
   trap - EXIT
 }
@@ -2830,10 +4829,6 @@ install_runtime() {
   if [ "$GUIDED_TTY" = 1 ]; then wizard_palette_init; fi
   if is_dry_run; then GUIDED_STAGE_TOTAL=6; else GUIDED_STAGE_TOTAL=9; fi
   trap guided_on_exit EXIT
-  acquire_install_lock
-  # When WIZARD_TUI is 1 the guided stages add the splash, the live safety step,
-  # and the bash recovery menu, all behind a WIZARD_TUI check and the dry-run
-  # guard. When it is 0 the existing plain printf flow runs unchanged.
   setup_intro
   log "Pairling setup preview:"
   log "  app support: $(display_path "$APP_SUPPORT")"
@@ -2843,28 +4838,86 @@ install_runtime() {
   log "  Connect LaunchAgent: $PAIRLING_CONNECTD_LABEL"
   log "  runtime port: $PAIRLING_RUNTIME_PORT"
 
+  if is_dry_run; then
+    validate_app_support_root
+
+    stage_begin "Preparing the Mac runtime"
+    run_compile_checks
+    run_psk_dependency_checks
+    stage_ok "source checks passed; no Pairling state was changed"
+
+    stage_begin "PairDrop folder"
+    stage_ok "would secure $(display_path "$PAIRDROP_ROOT") at mode 0700"
+
+    stage_begin "Staging runtime"
+    verify_payload_manifest
+    verify_platform_runtime_manifest
+    if [[ -n "${PAIRLING_CONNECTD_PREBUILT:-}" ]]; then
+      verify_connectd_prebuilt "$PAIRLING_CONNECTD_PREBUILT"
+    fi
+    stage_ok "package inputs verified; would stage $RELEASE_NAME"
+
+    stage_begin "Starting Pairling services"
+    stage_ok "would render and activate the three Pairling LaunchAgents"
+
+    stage_begin "macOS permissions"
+    guided_permission_notice
+    stage_ok "no Mac privacy permission is required to pair"
+
+    stage_begin "Providers"
+    provider_setup_stage
+
+    GUIDED_COMPLETE=1
+    return 0
+  fi
+
+  acquire_install_lock
+  recover_pending_install_transaction
+  # When WIZARD_TUI is 1 the guided stages add the splash, the live safety step,
+  # and the bash recovery menu, all behind a WIZARD_TUI check. When it is 0 the
+  # existing plain printf flow runs unchanged.
+
   stage_begin "Preparing the Mac runtime"
   run_compile_checks
   run_psk_dependency_checks
-  ensure_state
+  # These migrations only add or reconcile durable local identity and schema
+  # state. They are idempotent and monotonic, so they intentionally run outside
+  # the reversible file transaction. Never snapshot devices.sqlite: restoring a
+  # whole database could erase device changes made by another live request. The
+  # one reversible state action, local MCP credential creation, runs below after
+  # the durable pending marker has been published.
+  ensure_state_migrations
   stage_ok "checks passed and state is ready"
 
-  begin_install_transaction
+  begin_install_transaction setup
+  plan_install_transaction_mcp_credential
+  install_transaction_fault_point mcp_credential_planned
+  ensure_local_mcp_bridge
+  install_transaction_fault_point mcp_credential_created_unrecorded
+  record_install_transaction_mcp_credential
+  install_transaction_fault_point mcp_credential_ready
 
   stage_begin "PairDrop folder"
   ensure_pairdrop_folder
+  install_transaction_fault_point pairdrop_ready
   stage_ok "$(display_path "$PAIRDROP_ROOT") is ready (private, mode 0700)"
 
   stage_begin "Staging runtime"
   copy_release
+  update_install_transaction_target "$RELEASE_ROOT"
+  install_transaction_fault_point release_published
   persist_pairdrop_folder
+  install_transaction_fault_point pairdrop_config_persisted
   if launchd_skipped && [[ "${PAIRLING_TEST_FAIL_AFTER_PAIRDROP_PERSIST:-0}" == 1 ]]; then
     log "ERROR: forced test failure after PairDrop configuration persistence" >&2
     false
   fi
   switch_current
+  install_transaction_fault_point current_link_switched
+  adopt_current_release_sources
   install_mcp_adapter_shim
   install_shell_wrapper
+  install_transaction_fault_point launch_assets_installed
   stage_ok "staged $RELEASE_NAME"
 
   stage_begin "Starting Pairling services"
@@ -2872,12 +4925,19 @@ install_runtime() {
   ensure_ptybroker_agent
   start_user_agent
   start_connectd_agent
+  install_transaction_fault_point services_started
   verify_runtime_activation
+  install_transaction_fault_point activation_proved
   commit_install_transaction
   stage_ok "companiond, connectd, and ptybroker passed live activation checks"
 
   append_history "installed" "installed $RELEASE_NAME"
   log "Installed Pairling runtime $RELEASE_NAME"
+
+  if launchd_skipped; then
+    GUIDED_COMPLETE=1
+    return 0
+  fi
 
   if ! is_dry_run; then
     stage_begin "Pairling Connect sign-in (Mac)"

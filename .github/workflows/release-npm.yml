@@ -34,13 +34,24 @@ env:
 
 jobs:
   publish:
-    if: github.repository == 'mergimg0/pairling-helper'
     runs-on: macos-15
     environment: npm-publish
     permissions:
       id-token: write
       contents: read
     steps:
+      - name: Verify publishing repository identity
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, sys
+          expected = "33abebc9c629f9877e31b8c9f39670427ad5055d80ccdc8a51588101087a042a"
+          canonical = "github.com/" + os.environ["REPOSITORY"].strip().casefold()
+          if hashlib.sha256(canonical.encode()).hexdigest() != expected:
+              sys.exit("refusing to publish from a repository outside the allowlist")
+          PY
+
       - name: Check out release tag
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -54,7 +65,7 @@ jobs:
           registry-url: https://registry.npmjs.org
 
       - name: Update npm (OIDC trusted publishing support)
-        run: npm install -g npm@latest && npm --version
+        run: npm install -g npm@11.6.2 && npm --version
 
       - name: Download signed binaries from release assets
         env:
@@ -64,53 +75,22 @@ jobs:
           mkdir -p dist/assets
           gh release download "$TAG" --pattern 'pairling-connectd-*' --dir dist/assets
           gh release download "$TAG" --pattern 'pairling-python-*.tar.gz' --dir dist/assets
+          gh release download "$TAG" --pattern 'NOTARIZATION-RECEIPTS.json' --dir dist/assets
           chmod 755 dist/assets/pairling-connectd-arm64 dist/assets/pairling-connectd-x64
 
-      - name: Verify assets against committed digests and Team ID
+      - name: Verify assets against committed release evidence
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
-          python3 - <<'PY'
-          import hashlib, json, subprocess, sys, tarfile, tempfile
-          expected = json.load(open("RELEASE-BINARIES.json"))
-          team = "${{ env.PAIRLING_TEAM_ID }}"
-          def sha(path):
-              return hashlib.sha256(open(path, "rb").read()).hexdigest()
-          def codesign_fields(path):
-              info = subprocess.run(["/usr/bin/codesign", "-dvv", path], capture_output=True, text=True)
-              blob = (info.stdout or "") + (info.stderr or "")
-              out = {}
-              for line in blob.splitlines():
-                  if "=" in line:
-                      k, _, v = line.partition("=")
-                      out[k] = v
-              return out
-          # connectd binaries: digest + Developer ID signature + Team ID.
-          for arch in ("arm64", "x64"):
-              path = f"dist/assets/pairling-connectd-{arch}"
-              if sha(path) != expected["binaries"][arch]["sha256"]:
-                  sys.exit(f"{path}: sha256 mismatch")
-              subprocess.run(["/usr/bin/codesign", "--verify", "--strict", path], check=True)
-              f = codesign_fields(path)
-              if f.get("TeamIdentifier") != team:
-                  sys.exit(f"{path}: TeamIdentifier {f.get('TeamIdentifier')!r} != {team}")
-              print(f"verified {path}: sha256 + signature + TeamIdentifier={team}")
-          # python tarballs: digest, then unpack and verify the interpreter is a
-          # valid dev.pairling.python Developer ID build (CI must not re-sign).
-          for arch in ("arm64", "x64"):
-              path = f"dist/assets/pairling-python-{arch}.tar.gz"
-              if sha(path) != expected["python"][arch]["sha256"]:
-                  sys.exit(f"{path}: sha256 mismatch")
-              tmp = tempfile.mkdtemp()
-              with tarfile.open(path) as t:
-                  t.extractall(tmp)
-              py = f"{tmp}/python/bin/python3"
-              subprocess.run(["/usr/bin/codesign", "--verify", "--strict", py], check=True)
-              f = codesign_fields(py)
-              if f.get("TeamIdentifier") != team:
-                  sys.exit(f"{py}: TeamIdentifier {f.get('TeamIdentifier')!r} != {team}")
-              if f.get("Identifier") != "dev.pairling.python":
-                  sys.exit(f"{py}: Identifier {f.get('Identifier')!r} != dev.pairling.python")
-              print(f"verified {path}: sha256 + dev.pairling.python + TeamIdentifier={team}")
-          PY
+          python3 mac/packaging/npm-release-evidence.py verify \
+            --evidence RELEASE-BINARIES.json \
+            --version "${TAG#v}" \
+            --mirror-source-root "$PWD" \
+            --connectd-arm64 dist/assets/pairling-connectd-arm64 \
+            --connectd-x64 dist/assets/pairling-connectd-x64 \
+            --python-arm64 dist/assets/pairling-python-arm64.tar.gz \
+            --python-x64 dist/assets/pairling-python-x64.tar.gz \
+            --notarization-receipts dist/assets/NOTARIZATION-RECEIPTS.json
 
       - name: Assemble packages from mirrored sources
         env:
@@ -118,11 +98,10 @@ jobs:
         run: |
           # CI passes pre-signed connectd AND python as prebuilts; the build
           # never re-vendors or re-signs (no Developer ID cert in CI).
-          PRODUCT_SOURCE_REVISION="$(python3 -c 'import json; print(json.load(open("RELEASE-BINARIES.json"))["source_revision"])')"
-          export PAIRLING_SOURCE_REVISION="$PRODUCT_SOURCE_REVISION"
           bash mac/packaging/build-npm-packages.sh \
             --release \
             --version "${TAG#v}" \
+            --release-evidence RELEASE-BINARIES.json \
             --prebuilt-arm64 dist/assets/pairling-connectd-arm64 \
             --prebuilt-x64 dist/assets/pairling-connectd-x64 \
             --prebuilt-python-arm64 dist/assets/pairling-python-arm64.tar.gz \

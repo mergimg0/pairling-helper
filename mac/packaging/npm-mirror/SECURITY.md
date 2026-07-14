@@ -26,8 +26,11 @@ acknowledgement within 72 hours.
 - No lifecycle scripts in any published package, ever.
 - Releases publish only via npm Trusted Publishing (OIDC) from
   `.github/workflows/release-npm.yml` with provenance attestations.
-- Compiled binaries are Developer ID-signed (Team `965AVD34A3`), notarized,
-  hash-pinned in the tagged commit (`RELEASE-BINARIES.json`), and re-verified
-  on the consuming Mac before staging.
+- Every Mach-O must satisfy the Apple Developer ID Application certificate
+  requirement for Team `965AVD34A3`.
+- Accepted Apple notarization receipts are retained, hashed by schema 5 release
+  evidence, and bound to each exact connectd binary or verified Python tree.
+  The same evidence binds source stamps, architecture, the exact mirrored source
+  tree, and asset hashes to the tagged release.
 
 A regression against any of these is itself a reportable vulnerability.

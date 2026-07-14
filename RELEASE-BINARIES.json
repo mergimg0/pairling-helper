@@ -1,27 +1,78 @@
 {
   "binaries": {
     "arm64": {
-      "sha256": "bcb0f13eb043cf9dfbd90f303e01240277c075ac1e1be0b9133e5aee574b531f",
+      "architecture": "arm64",
+      "build_info": {
+        "schema_version": 1,
+        "source_dirty": false,
+        "source_revision": "8419fde1322759dbca5d809a92f6fb4ea2db7eea",
+        "version": "0.2.21"
+      },
+      "identifier": "dev.pairling.connectd",
+      "notarization": {
+        "status": "Accepted",
+        "subject_kind": "file-sha256",
+        "subject_sha256": "fd3860bc4bfa30d7b90ae9585761b76f44195d6928c1568a6b2be9da0444957e",
+        "submission_id": "7e2b9245-9348-4cb4-b04d-6c44db9aa920",
+        "submitted_sha256": "772fb1e36aa3967f95cf18f453e0cf7ce74d0b20844fc384bf2cd994d9403d05"
+      },
+      "sha256": "fd3860bc4bfa30d7b90ae9585761b76f44195d6928c1568a6b2be9da0444957e",
       "team_id": "965AVD34A3"
     },
     "x64": {
-      "sha256": "4efae21a388d836c7d06f1ad71eccdfb7a5c03648b2cde6f7d4ddca2ed621a7f",
+      "architecture": "x64",
+      "build_info": {
+        "schema_version": 1,
+        "source_dirty": false,
+        "source_revision": "8419fde1322759dbca5d809a92f6fb4ea2db7eea",
+        "version": "0.2.21"
+      },
+      "identifier": "dev.pairling.connectd",
+      "notarization": {
+        "status": "Accepted",
+        "subject_kind": "file-sha256",
+        "subject_sha256": "6da2b50a29f1998990e8a51f11490b8f4ae6a66f9ebdaf74d9d2d54e5f88f847",
+        "submission_id": "d91cb757-1afc-4bb1-aab7-6447ca2e3228",
+        "submitted_sha256": "5bedacb311b5f6af9ddb79eaed2e06103b4910cea79ec083227d653174c17603"
+      },
+      "sha256": "6da2b50a29f1998990e8a51f11490b8f4ae6a66f9ebdaf74d9d2d54e5f88f847",
       "team_id": "965AVD34A3"
     }
   },
+  "mirror_source_sha256": "6672ef9d20d591af4030d6aa7ab99fa060398d94dfe33e903b0ed7d99ad8d63e",
+  "notarization_receipts_sha256": "0b4cd56886ed5262e7809d6e3d5487332d0b510086825d6eef69cb9de06dbec2",
+  "product_repository_sha256": "59d2705328edc11607151f8602e184148bb2f90dd12a55ace53f96ccaf1da0cf",
   "python": {
     "arm64": {
+      "architecture": "arm64",
       "identifier": "dev.pairling.python",
-      "sha256": "b00042157e6cbf0942df7dc83a5fa0ca59dbb9b7d0a757c2b3bf4d7aca20baf2",
+      "notarization": {
+        "status": "Accepted",
+        "subject_kind": "tree-sha256",
+        "subject_sha256": "f494a1aa37deb0df7d7ceb42ebe2ed4f2d35651e05ab2e76c3c5f15e0a09d15b",
+        "submission_id": "46330179-609e-49f5-ab42-c1545598c46d",
+        "submitted_sha256": "e7e8ec7dfb166695aab6f8b9060e8ad380cfb853907b2b9c18ccacba99d6c9bc"
+      },
+      "sha256": "82424f004b00057cef9bcabea4a51b384c1e68139f1c1b637d1ad0f5e8dc32ca",
       "team_id": "965AVD34A3"
     },
     "x64": {
+      "architecture": "x64",
       "identifier": "dev.pairling.python",
-      "sha256": "e0b06ee2df9cb54df92ff8bc50f8184c9981deacec1865f2a750cc06101db54f",
+      "notarization": {
+        "status": "Accepted",
+        "subject_kind": "tree-sha256",
+        "subject_sha256": "1f3925b6379eeda6c5b5c109204ddf8a223b5adfae7e6eaf8130a82e75d39227",
+        "submission_id": "4891ff4f-033b-4ccc-9fb8-84799741249c",
+        "submitted_sha256": "3f1070729325c19ddc468a749e81dd279309e99490cf4da68def1943860658be"
+      },
+      "sha256": "c4acb36cb10be634cc08c0f2571c07fefa16fa96b303ef76c3de5c51910c045e",
       "team_id": "965AVD34A3"
     }
   },
-  "schema_version": 3,
-  "source_revision": "82464ddb09aa9ce8a3a60107a153800fb6303ba4",
-  "version": "0.2.20"
+  "schema_version": 5,
+  "source_dirty": false,
+  "source_revision": "8419fde1322759dbca5d809a92f6fb4ea2db7eea",
+  "tag": "v0.2.21",
+  "version": "0.2.21"
 }

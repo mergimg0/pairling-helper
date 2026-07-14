@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "python_build_standalone": {
+    "assets": {
+      "arm64": {
+        "filename": "cpython-3.12.13+20260610-aarch64-apple-darwin-install_only.tar.gz",
+        "sha256": "e18ddd4c1e8f4a1d6c4590b37f423d76aec734447edc20ed08e93983d95f2132"
+      },
+      "x64": {
+        "filename": "cpython-3.12.13+20260610-x86_64-apple-darwin-install_only.tar.gz",
+        "sha256": "ba02164e4db381af8c288c0bc1657584a835e9121a0fa2836b0f2e712ff8cdf5"
+      }
+    },
+    "tag": "20260610"
+  },
+  "python_version": "3.12.13",
+  "wheels": {
+    "cffi": {
+      "arm64": {
+        "filename": "cffi-1.17.1-cp312-cp312-macosx_11_0_arm64.whl",
+        "sha256": "733e99bc2df47476e3848417c5a4540522f234dfd4ef3ab7fafdf555b082ec0c"
+      },
+      "version": "1.17.1",
+      "x64": {
+        "filename": "cffi-1.17.1-cp312-cp312-macosx_10_9_x86_64.whl",
+        "sha256": "805b4371bf7197c329fcb3ead37e710d1bca9da5d583f5073b799d5c5bd1eee4"
+      }
+    },
+    "cryptography": {
+      "arm64": {
+        "filename": "cryptography-45.0.7-cp311-abi3-macosx_10_9_universal2.whl",
+        "sha256": "3be4f21c6245930688bd9e162829480de027f8bf962ede33d4f8ba7d67a00cee"
+      },
+      "version": "45.0.7",
+      "x64": {
+        "filename": "cryptography-45.0.7-cp311-abi3-macosx_10_9_universal2.whl",
+        "sha256": "3be4f21c6245930688bd9e162829480de027f8bf962ede33d4f8ba7d67a00cee"
+      }
+    },
+    "pycparser": {
+      "arm64": {
+        "filename": "pycparser-2.22-py3-none-any.whl",
+        "sha256": "c3702b6d3dd8c7abc1afa565d7e63d53a1d0bd86cdc24edd75470f4de499cfcc"
+      },
+      "version": "2.22",
+      "x64": {
+        "filename": "pycparser-2.22-py3-none-any.whl",
+        "sha256": "c3702b6d3dd8c7abc1afa565d7e63d53a1d0bd86cdc24edd75470f4de499cfcc"
+      }
+    }
+  }
+}
