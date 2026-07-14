@@ -3365,36 +3365,180 @@ def _permission_stale_screen_response(*, state: str, broker_id: str, code: str,
     return payload
 
 
-def _schedule_first_prompt_delivery(*, native_id: str, project: str, text: str) -> bool:
-    """Deliver a spawn's first prompt once the session is actually ready.
+FIRST_PROMPT_DELIVERY_TIMEOUT_SECONDS = 600.0
 
-    A freshly-opened terminal consumes keystrokes typed before claude
-    reaches its input loop (the bootstrap gap), so the wait is on the same
-    readiness event the register hook fires, then the AppleScript inject
-    path types the prompt with its established slash/paste discipline. Best
-    effort by design: on timeout the terminal simply opens without the
-    prompt, which is exactly what the spawn did before this existed."""
-    if not text:
+
+def _first_prompt_surface_is_ready(provider: str, snapshot: dict | None) -> bool:
+    """Return true only when the provider's normal composer is on screen."""
+    if not isinstance(snapshot, dict) or isinstance(snapshot.get("pending_input"), dict):
+        return False
+    rows = snapshot.get("rows")
+    if not isinstance(rows, list):
+        return False
+    prompt_glyph = "›" if provider == "codex" else "❯" if provider == "claude" else ""
+    if not prompt_glyph:
+        return False
+    choice = re.compile(rf"^{re.escape(prompt_glyph)}\s*\d+[.)](?:\s|$)")
+    for row in rows:
+        stripped = str(row or "").strip()
+        if stripped == prompt_glyph:
+            return True
+        if stripped.startswith(prompt_glyph + " ") and not choice.match(stripped):
+            return True
+    return False
+
+
+def _send_terminal_app_text_exact(tty: str, text: str) -> dict:
+    """Submit text to one Terminal tab without focus or title matching."""
+    if not re.match(r"^/dev/ttys[0-9]{3,}$", str(tty or "")):
+        return {"ok": False, "reason": "invalid terminal tty", "status": 400}
+    safe_tty = _as_escape(tty)
+    safe_text = _as_escape(text)
+    if _is_direct_slash_invocation_text(text):
+        payload_expr = f'"{safe_text}"'
+    else:
+        payload_expr = f'ESC & "[200~" & "{safe_text}" & ESC & "[201~"'
+    script = f'''
+    tell application "Terminal"
+        set targetTab to missing value
+        repeat with w in windows
+            repeat with t in tabs of w
+                if tty of t is "{safe_tty}" then
+                    set targetTab to t
+                    exit repeat
+                end if
+            end repeat
+            if targetTab is not missing value then exit repeat
+        end repeat
+        if targetTab is missing value then
+            return "no_window"
+        end if
+        set ESC to (ASCII character 27)
+        set wrapped to {payload_expr}
+        do script wrapped in targetTab
+        delay 0.45
+        do script "" in targetTab
+    end tell
+    return "ok"
+    '''
+    return _run_osascript(script)
+
+
+def _deliver_first_prompt_now(handler, *, provider: str, native_id: str, text: str) -> dict:
+    """Deliver to the exact broker session or Terminal tty created by spawn."""
+    raw_session = _qualified_session_id(provider, native_id)
+    broker_found = handler._broker_session_for(raw_session)
+    if broker_found and PTY_BROKER:
+        _public_id, session = broker_found
+        if not _broker_session_owns_identity(session, provider, native_id):
+            return {"ok": False, "reason": "broker identity changed", "status": 409}
+        broker_id = _broker_session_id(session)
+        result = PTY_BROKER.send_text(broker_id, text)
+        if result.get("ok"):
+            control_native_id = _agent_registry_resolve_native_alias(provider, native_id)
+            _agent_registry_update_control(
+                provider,
+                control_native_id,
+                pid=_broker_pid(session),
+                terminal_tty=_broker_slave_tty(session),
+                state="running",
+                reopen=True,
+            )
+            if provider == "codex":
+                _write_agent_turn_state(
+                    "codex", control_native_id, "thinking",
+                    started_at=_time.time(), event="first_prompt",
+                )
+        return result
+
+    control_native_id = _agent_registry_resolve_native_alias(provider, native_id)
+    reg = _agent_registry_get(provider, native_id) or _agent_registry_get(
+        provider, control_native_id
+    ) or {}
+    if provider == "claude":
+        tty = handler._lookup_terminal_tty(native_id)
+    else:
+        tty = str(reg.get("terminal_tty") or "")
+    result = _send_terminal_app_text_exact(tty, text)
+    if result.get("ok"):
+        _agent_registry_update_control(
+            provider,
+            control_native_id,
+            pid=int(reg.get("pid") or 0) or None,
+            terminal_tty=tty,
+            state="running",
+            reopen=True,
+        )
+        if provider == "codex":
+            _write_agent_turn_state(
+                "codex", control_native_id, "thinking",
+                started_at=_time.time(), event="first_prompt",
+            )
+    return result
+
+
+def _schedule_first_prompt_delivery(*, provider: str, native_id: str, text: str) -> bool:
+    """Keep a spawn prompt queued until its exact provider composer is ready."""
+    if not text or provider not in {"claude", "codex"}:
         return False
 
     def run() -> None:
+        handler = object.__new__(Handler)
+        deadline = _time.time() + FIRST_PROMPT_DELIVERY_TIMEOUT_SECONDS
+        last_reason = "provider composer not ready"
         try:
-            handler = object.__new__(Handler)
-            uuid = handler._wait_for_session_ready(native_id, timeout_s=30.0)
-            if not uuid:
-                print(f"[first-prompt] session {native_id} never became ready; prompt not delivered", file=sys.stderr, flush=True)
-                return
-            # A short settle after the first hook fire: the register hook
-            # runs at claude's input loop, but give the TUI one beat.
-            _time.sleep(1.0)
-            basename = os.path.basename(project.rstrip("/")) or project
-            result = handler._applescript_inject(basename, text)
-            if not result.get("ok"):
-                print(f"[first-prompt] inject failed for {native_id}: {str(result.get('reason'))[:120]}", file=sys.stderr, flush=True)
-        except Exception as exc:  # noqa: BLE001 - best effort, never crash the daemon
-            print(f"[first-prompt] delivery error for {native_id}: {type(exc).__name__}: {str(exc)[:120]}", file=sys.stderr, flush=True)
+            while _time.time() < deadline:
+                raw_session = _qualified_session_id(provider, native_id)
+                try:
+                    snapshot = (
+                        handler._broker_surface_snapshot(raw_session)
+                        or handler._terminal_app_surface_snapshot(
+                            raw_session, osascript_timeout=3.0,
+                        )
+                    )
+                except (FileNotFoundError, RuntimeError, ProcessIdentityDriftError) as exc:
+                    snapshot = None
+                    last_reason = str(exc)[:120]
+                if _first_prompt_surface_is_ready(provider, snapshot):
+                    result = _deliver_first_prompt_now(
+                        handler,
+                        provider=provider,
+                        native_id=native_id,
+                        text=text,
+                    )
+                    if result.get("ok"):
+                        return
+                    last_reason = str(result.get("reason") or "delivery failed")[:120]
+                    if int(result.get("status") or 0) in {400, 404, 409, 410}:
+                        break
+                elif isinstance((snapshot or {}).get("pending_input"), dict):
+                    pending = (snapshot or {}).get("pending_input") or {}
+                    last_reason = f"waiting for {pending.get('kind') or pending.get('state') or 'provider input'}"
 
-    threading.Thread(target=run, name=f"pairling-first-prompt-{native_id[:8]}", daemon=True).start()
+                control_native_id = _agent_registry_resolve_native_alias(provider, native_id)
+                reg = _agent_registry_get(provider, native_id) or _agent_registry_get(
+                    provider, control_native_id
+                )
+                if reg and reg.get("closed_at"):
+                    last_reason = "session closed before delivery"
+                    break
+                _time.sleep(0.25 if deadline - _time.time() > 570 else 1.0)
+        except Exception as exc:  # noqa: BLE001 - a delivery worker must not stop the daemon
+            last_reason = f"{type(exc).__name__}: {str(exc)[:100]}"
+        print(
+            f"[first-prompt] delivery stopped for {provider}:{native_id}: {last_reason}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    try:
+        threading.Thread(
+            target=run,
+            name=f"pairling-first-prompt-{provider}-{native_id[:8]}",
+            daemon=True,
+        ).start()
+    except Exception:
+        return False
     return True
 
 
@@ -22661,7 +22805,8 @@ Worker instructions:
         self._send_json(response, status=409 if identity_drift else 200)
 
     def _handle_spawn_session_broker(self, project: str, provider: str, launch_context: dict | None = None,
-                                     native_id_override: str | None = None) -> None:
+                                     native_id_override: str | None = None,
+                                     first_prompt: str = "") -> None:
         if PTY_BROKER is None:
             self._send_json({"ok": False, "error": "PTY broker unavailable"}, status=503)
             return
@@ -22807,8 +22952,16 @@ Worker instructions:
             self._send_json({"ok": False, "error": reason or "PTY broker spawn failed"}, status=502)
             return
 
+        first_prompt_scheduled = False
+        if first_prompt:
+            first_prompt_scheduled = _schedule_first_prompt_delivery(
+                provider=provider,
+                native_id=native_id,
+                text=first_prompt,
+            )
         self._send_json({
             "ok": True,
+            "first_prompt_scheduled": first_prompt_scheduled,
             "project": project,
             "provider": provider,
             "native_id": native_id,
@@ -23077,6 +23230,7 @@ Worker instructions:
                     if launch_strategy == "aperture_cli"
                     else (requested_native_id or None)
                 ),
+                first_prompt=first_prompt,
             )
             return
 
@@ -23191,10 +23345,10 @@ Worker instructions:
             return
 
         first_prompt_scheduled = False
-        if first_prompt and provider == "claude":
+        if first_prompt:
             first_prompt_scheduled = _schedule_first_prompt_delivery(
+                provider=provider,
                 native_id=native_id,
-                project=project,
                 text=first_prompt,
             )
         self._send_json({
