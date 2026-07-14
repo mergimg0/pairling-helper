@@ -3418,6 +3418,7 @@ copy_release() {
   cp "$REPO_ROOT/mac/companiond/runtime_contract.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/runtime_manifest.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/runtime_paths.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/pairdrop_cli.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairdrop_store.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/compose_recording_store.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairling_connectd_status.py" "$tmp/companiond/"
