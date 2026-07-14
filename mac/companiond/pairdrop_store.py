@@ -48,6 +48,7 @@ MAX_LIST_PAGE_SIZE = 200
 MAX_CREATE_IDEMPOTENCY_KEY_LENGTH = 200
 UPLOAD_LEASE_SECONDS = 24 * 60 * 60
 UPLOAD_PROGRESS_EVENT_BYTES = 64 * 1024 * 1024
+UPLOAD_TERMINAL_STATES = frozenset({"committed", "cancelled", "expired", "failed_terminal"})
 
 
 def _bounded_environment_bytes(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -577,7 +578,12 @@ class PairDropStore:
                     os.close(fd)
 
     @contextmanager
-    def _upload_operation_lock(self, upload_id: str) -> Iterator[None]:
+    def _upload_operation_lock(
+        self,
+        upload_id: str,
+        *,
+        remove_if_terminal: bool = False,
+    ) -> Iterator[None]:
         """Serialize one upload's file and database state across processes."""
 
         if not self._valid_upload_id(upload_id):
@@ -585,11 +591,13 @@ class PairDropStore:
         path = self.partials_dir / f".{upload_id}.lock"
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
         fd = -1
+        locked = False
         try:
             fd = os.open(str(path), flags, 0o600)
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise PairDropStoreError("unsafe_upload_lock")
             fcntl.flock(fd, fcntl.LOCK_EX)
+            locked = True
             yield
         except OSError as exc:
             if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR}:
@@ -598,9 +606,44 @@ class PairDropStore:
         finally:
             if fd >= 0:
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    if locked and remove_if_terminal:
+                        self._remove_terminal_upload_lock(upload_id, fd)
+                    if locked:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
                 finally:
                     os.close(fd)
+
+    def _remove_terminal_upload_lock(self, upload_id: str, lock_fd: int) -> None:
+        """Remove this lock inode once its upload can no longer mutate."""
+
+        try:
+            with self._connect() as conn:
+                self._ensure_schema(conn)
+                row = conn.execute(
+                    "SELECT state FROM upload_sessions WHERE upload_id = ?",
+                    (upload_id,),
+                ).fetchone()
+            if row is not None and str(row["state"] or "") not in UPLOAD_TERMINAL_STATES:
+                return
+            owned_stat = os.fstat(lock_fd)
+            name = f".{upload_id}.lock"
+            with self._owned_child_directory_fd(
+                "partials",
+                "unsafe_partial_path",
+            ) as partials_fd:
+                current_stat = os.stat(name, dir_fd=partials_fd, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(current_stat.st_mode)
+                    or current_stat.st_dev != owned_stat.st_dev
+                    or current_stat.st_ino != owned_stat.st_ino
+                ):
+                    return
+                os.unlink(name, dir_fd=partials_fd)
+                os.fsync(partials_fd)
+        except (OSError, PairDropStoreError, sqlite3.Error):
+            # Lock cleanup is best-effort. Keeping the lock inode is safe and
+            # cleanup_partials can collect it after the operation is terminal.
+            return
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -1759,7 +1802,7 @@ class PairDropStore:
             source_device_id=source_device_id,
             source_install_id=source_install_id,
         )
-        with self._upload_operation_lock(upload_id):
+        with self._upload_operation_lock(upload_id, remove_if_terminal=True):
             return self._complete_upload_session_locked(
                 upload_id,
                 source_device_id=source_device_id,
@@ -2594,7 +2637,7 @@ class PairDropStore:
         for row in rows:
             session = self._public_upload_row(row)
             upload_id = str(session["upload_id"])
-            with self._upload_operation_lock(upload_id):
+            with self._upload_operation_lock(upload_id, remove_if_terminal=True):
                 try:
                     self._complete_upload_session_locked(
                         upload_id,
@@ -2692,14 +2735,18 @@ class PairDropStore:
             conn.commit()
 
         removed = 0
+        removed_locks = 0
         preserved_active = 0
+        preserved_active_locks = 0
         skipped_symlinks = 0
         with self._owned_child_directory_fd(
             "partials",
             "unsafe_partial_path",
         ) as partials_fd:
             for name in os.listdir(partials_fd):
-                if not name.endswith(".partial"):
+                partial_match = name.endswith(".partial")
+                lock_match = re.fullmatch(r"\.(pu_[a-f0-9]{32})\.lock", name)
+                if not partial_match and lock_match is None:
                     continue
                 try:
                     path_stat = os.stat(
@@ -2712,20 +2759,70 @@ class PairDropStore:
                         continue
                     if not stat.S_ISREG(path_stat.st_mode):
                         continue
-                    upload_id = name.removesuffix(".partial")
+                    upload_id = (
+                        name.removesuffix(".partial")
+                        if partial_match
+                        else str(lock_match.group(1))
+                    )
                     if upload_id in active_upload_ids:
-                        preserved_active += 1
+                        if partial_match:
+                            preserved_active += 1
+                        else:
+                            preserved_active_locks += 1
                         continue
-                    if path_stat.st_mtime < cutoff:
+                    if path_stat.st_mtime >= cutoff:
+                        continue
+                    if partial_match:
                         os.unlink(name, dir_fd=partials_fd)
                         removed += 1
+                        continue
+
+                    lock_fd = -1
+                    locked = False
+                    try:
+                        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+                        lock_fd = os.open(name, flags, dir_fd=partials_fd)
+                        opened_stat = os.fstat(lock_fd)
+                        if (
+                            not stat.S_ISREG(opened_stat.st_mode)
+                            or opened_stat.st_dev != path_stat.st_dev
+                            or opened_stat.st_ino != path_stat.st_ino
+                        ):
+                            continue
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        locked = True
+                        current_stat = os.stat(
+                            name,
+                            dir_fd=partials_fd,
+                            follow_symlinks=False,
+                        )
+                        if (
+                            current_stat.st_dev == opened_stat.st_dev
+                            and current_stat.st_ino == opened_stat.st_ino
+                        ):
+                            os.unlink(name, dir_fd=partials_fd)
+                            removed_locks += 1
+                    except BlockingIOError:
+                        preserved_active_locks += 1
+                    except OSError as exc:
+                        if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR}:
+                            skipped_symlinks += 1
+                        else:
+                            raise
+                    finally:
+                        if lock_fd >= 0:
+                            if locked:
+                                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                            os.close(lock_fd)
                 except FileNotFoundError:
                     continue
-            if removed:
+            if removed or removed_locks:
                 os.fsync(partials_fd)
         self._audit("partials.cleaned", {
             "removed": removed,
+            "removed_locks": removed_locks,
             "preserved_active": preserved_active,
+            "preserved_active_locks": preserved_active_locks,
             "skipped_symlinks": skipped_symlinks,
             "expired_sessions": expired,
             "completion_recovery": completion_recovery,
@@ -2733,7 +2830,9 @@ class PairDropStore:
         return {
             "ok": True,
             "removed": removed,
+            "removed_locks": removed_locks,
             "preserved_active": preserved_active,
+            "preserved_active_locks": preserved_active_locks,
             "skipped_symlinks": skipped_symlinks,
             "expired_sessions": expired,
             "completion_recovery": completion_recovery,

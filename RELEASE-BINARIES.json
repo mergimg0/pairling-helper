@@ -1,27 +1,27 @@
 {
   "binaries": {
     "arm64": {
-      "sha256": "c595bc945966f9a8dae3d9c4601cf73485c7613f2b4815059c4241748d1e44d4",
+      "sha256": "7fce073888882a27f261ea82fa677787069662ac170573ad8e099aba62b315aa",
       "team_id": "965AVD34A3"
     },
     "x64": {
-      "sha256": "e828d06f08876fb6a3a8cbb6385e4671dcf24e50ba54a98d089b0a6058d5698c",
+      "sha256": "c7e568f5f6492d9efdea8d4d1c67a699882f21c6838a4374a47b35db10f02b43",
       "team_id": "965AVD34A3"
     }
   },
   "python": {
     "arm64": {
       "identifier": "dev.pairling.python",
-      "sha256": "bd6b0f44df82632ca58df0fe23bf008c752e213cdce448df61e408631613eb96",
+      "sha256": "056bcd517b8a4a0f3cecac560039c7640e91d668bce18f00d44d15ac236f5966",
       "team_id": "965AVD34A3"
     },
     "x64": {
       "identifier": "dev.pairling.python",
-      "sha256": "d2f3f759d84a3f4c6dc8ced0887ab855845f575e872291800390b6e5e5355f23",
+      "sha256": "86dd0e9d90076df5f26525a7dda9c6c9f21a201550bff63af419a534f6f8d90d",
       "team_id": "965AVD34A3"
     }
   },
   "schema_version": 3,
-  "source_revision": "c89fbe6a094900fe3ed9a66fa6a3e841e0aea53d",
-  "version": "0.2.18"
+  "source_revision": "c47e175905a6e7b589a50955425b869398a9331d",
+  "version": "0.2.19"
 }

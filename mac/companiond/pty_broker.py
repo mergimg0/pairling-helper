@@ -1794,7 +1794,14 @@ class PTYBrokerManager:
                 response = self._dispatch_rpc(request)
             except Exception as exc:
                 response = {"ok": False, "error": {"code": type(exc).__name__, "message": str(exc)[:300]}}
-            _write_rpc_frame(conn, response)
+            try:
+                _write_rpc_frame(conn, response)
+            except OSError:
+                # Read-only clients use a short deadline so a slow broker
+                # cannot stall the session viewer. The request can finish
+                # after that client has closed; this is a normal disconnect,
+                # not an unhandled broker-thread failure.
+                return
 
     def _dispatch_rpc(self, request: dict[str, Any]) -> dict[str, Any]:
         op = str(request.get("op") or "")
