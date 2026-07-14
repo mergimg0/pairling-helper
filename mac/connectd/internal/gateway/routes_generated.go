@@ -30,6 +30,7 @@ var getPaths = map[string]bool{
 	"/pairdrop/events":              true,
 	"/pairdrop/files":               true,
 	"/personal-context":             true,
+	"/phone-tools/activity":         true,
 	"/pickers/hooks":                true,
 	"/pickers/mcp":                  true,
 	"/pickers/memory":               true,

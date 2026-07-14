@@ -5,11 +5,13 @@ first drain backfills the whole existing transcript (that is the live and
 archive unification: history is just earlier seq values), then a shared
 FileWatcher wakes the single ingest thread on every append. Codex output is
 normalized to the Claude line shape first, so one adapter serves both
-providers; the raw column stores the normalized line.
+providers. Parsed records store that normalized line inline. Beyond-cap
+records preserve the exact source bytes outside SQLite.
 
-Oversized lines are never silently dropped here: a line larger than
-MAX_LINE_BYTES becomes an explicit lifecycle event naming its byte range,
-the same honesty rule the live plane follows.
+Lines up to MAX_LINE_BYTES become normal provider-neutral events. Larger
+records are never silently dropped: their exact source bytes are copied in
+bounded chunks to the event log's private raw store and linked to an explicit
+lifecycle event.
 """
 from __future__ import annotations
 
@@ -24,15 +26,30 @@ from session_event_log import (
     VISIBLE_BLOCK_TEXT_MAX,
     SessionEventLog,
     parse_claude_transcript_line,
+    source_file_version,
 )
 
 INGEST_TOPIC = "log-ingest"
-MAX_LINE_BYTES = 8 * 1024 * 1024
+MAX_LINE_BYTES = 32 * 1024 * 1024
 READ_CHUNK = 1024 * 1024
-CLAUDE_PARSER_VERSION = 2
-CODEX_PARSER_VERSION = 3
+CLAUDE_PARSER_VERSION = 3
+CODEX_PARSER_VERSION = 4
+SUPPORTED_TRANSCRIPT_PROVIDERS = frozenset({"claude", "codex"})
 
 _CODEX_TEXT_BLOCK_TYPES = {"text", "output_text", "input_text"}
+
+
+class UnsupportedTranscriptProviderError(ValueError):
+    """Raised when a non-deep provider reaches the transcript parser."""
+
+    code = "unsupported_provider"
+    capability = "session_transcript"
+
+    def __init__(self, provider: str) -> None:
+        self.provider = str(provider or "").strip().lower() or "unknown"
+        super().__init__(
+            f"Provider {self.provider} does not support deep transcript ingestion."
+        )
 
 
 def _bounded_text(value, limit: int = VISIBLE_BLOCK_TEXT_MAX) -> str:
@@ -203,7 +220,8 @@ class SessionLogIngestor:
     def __init__(self, log: SessionEventLog, hub, watcher, *, normalize_codex=None,
                  claude_parser_version: int = CLAUDE_PARSER_VERSION,
                  codex_parser_version: int = CODEX_PARSER_VERSION,
-                 max_sessions: int = 128) -> None:
+                 max_sessions: int = 128,
+                 max_line_bytes: int = MAX_LINE_BYTES) -> None:
         self._log = log
         self._hub = hub
         self._watcher = watcher
@@ -211,6 +229,7 @@ class SessionLogIngestor:
         self._claude_parser_version = max(1, int(claude_parser_version))
         self._codex_parser_version = max(1, int(codex_parser_version))
         self._max_sessions = max(1, int(max_sessions))
+        self._max_line_bytes = max(READ_CHUNK, int(max_line_bytes))
         self._lock = threading.RLock()
         self._sessions: dict[str, dict] = {}
         self._by_path: dict[str, set[str]] = {}
@@ -239,6 +258,9 @@ class SessionLogIngestor:
     def ensure(self, session_key: str, provider: str, native_id: str, transcript_path) -> bool:
         """Registers a session for ingestion. Returns True when registered
         (idempotent). The first drain backfills the whole file."""
+        provider = str(provider or "").strip().lower()
+        if provider not in SUPPORTED_TRANSCRIPT_PROVIDERS:
+            return False
         if transcript_path is None:
             return False
         path = str(Path(transcript_path).expanduser().resolve(strict=False))
@@ -276,6 +298,8 @@ class SessionLogIngestor:
         return result
 
     def _ensure_locked(self, entry: dict, provider: str, native_id: str, path: str) -> bool:
+        if provider not in SUPPORTED_TRANSCRIPT_PROVIDERS:
+            return False
         session_key = entry["session_key"]
         with self._lock:
             if self._sessions.get(session_key) is not entry:
@@ -308,10 +332,12 @@ class SessionLogIngestor:
             except Exception:
                 pass
 
-        parser_version = (
-            self._codex_parser_version if provider == "codex"
-            else self._claude_parser_version
-        )
+        if provider == "codex":
+            parser_version = self._codex_parser_version
+        elif provider == "claude":
+            parser_version = self._claude_parser_version
+        else:  # Defensive guard for a corrupted in-memory binding.
+            raise UnsupportedTranscriptProviderError(provider)
         reset_generation = None
         if binding_changed:
             # The same Pairling session can point at a new provider transcript
@@ -517,6 +543,11 @@ class SessionLogIngestor:
     def _drain_entry_locked(self, entry: dict, *, force_reset: bool = False,
                             publish: bool = True) -> bool:
         session_key = entry["session_key"]
+        provider = str(entry.get("provider") or "").strip().lower()
+        if provider not in SUPPORTED_TRANSCRIPT_PROVIDERS:
+            raise UnsupportedTranscriptProviderError(provider)
+        if provider == "codex" and self._normalize_codex is None:
+            raise RuntimeError("Codex transcript normalizer is unavailable")
         path = Path(entry["path"])
         try:
             handle = open(path, "rb")
@@ -529,6 +560,7 @@ class SessionLogIngestor:
                 raise OSError(f"cannot inspect transcript: {error}") from error
             size = int(stat.st_size)
             source_identity = (int(stat.st_dev), int(stat.st_ino))
+            source_version = source_file_version(stat)
             offset, reset_generation = self._log.reconcile_ingest_source(
                 session_key,
                 source_identity,
@@ -543,29 +575,38 @@ class SessionLogIngestor:
                 if newline < 0:
                     if len(data) < READ_CHUNK:
                         break
-                    # A single line larger than one read window. The log is
-                    # the archive, so lines up to MAX_LINE_BYTES ingest whole
-                    # (the WIRE truncates for delivery); only beyond that does
-                    # the line become an explicit oversized_line event.
+                    # The log is the archive, so ordinary large lines ingest
+                    # whole and become neutral events. A pathological record
+                    # beyond the parse cap is preserved exactly in the private
+                    # raw store without materializing it in this process.
                     end = self._scan_line_end(handle, offset + len(data), size)
                     if end is None:
                         break
-                    if end - offset <= MAX_LINE_BYTES:
+                    if end - offset <= self._max_line_bytes:
                         handle.seek(offset)
                         complete = handle.read(end - offset)
                     else:
-                        advanced = self._log.append_and_advance(session_key, [{
-                            "kind": "lifecycle",
-                            "subtype": "oversized_line",
-                            "source_uuid": None,
-                            "role": None,
-                            "ts": None,
-                            "start": offset,
-                            "end": end,
-                            "bytes": end - offset,
-                            "raw": None,
-                        }], end, expected_byte_offset=offset,
-                            expected_source_identity=source_identity)
+                        advanced = self._log.append_preserved_raw_and_advance(
+                            session_key,
+                            {
+                                "kind": "lifecycle",
+                                "subtype": "oversized_line",
+                                "source_uuid": None,
+                                "role": None,
+                                "ts": None,
+                                "start": offset,
+                                "end": end,
+                                "bytes": end - offset,
+                                "raw": None,
+                            },
+                            end,
+                            expected_byte_offset=offset,
+                            expected_source_identity=source_identity,
+                            source_handle=handle,
+                            source_start=offset,
+                            source_bytes=end - offset,
+                            expected_source_version=source_version,
+                        )
                         if advanced is None:
                             # Another reader moved the cursor after this drain
                             # opened the file. Resume at that durable cursor so
@@ -585,12 +626,14 @@ class SessionLogIngestor:
                 events: list[dict] = []
                 for line in text.splitlines():
                     if line.strip():
-                        if entry["provider"] == "codex" and self._normalize_codex is not None:
+                        if provider == "codex":
                             events.extend(parse_codex_transcript_line(
                                 line, entry["native_id"], self._normalize_codex
                             ))
-                        else:
+                        elif provider == "claude":
                             events.extend(parse_claude_transcript_line(line))
+                        else:  # Defensive guard for a corrupted in-memory binding.
+                            raise UnsupportedTranscriptProviderError(provider)
                 next_offset = offset + len(complete)
                 advanced = self._log.append_and_advance(
                     session_key,

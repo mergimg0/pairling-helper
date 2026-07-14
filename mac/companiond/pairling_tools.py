@@ -863,7 +863,7 @@ def run_pairling_tool(
 def audit_detail_for_tool_run(request_payload: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
     input_payload = request_payload.get("input") if isinstance(request_payload.get("input"), dict) else {}
     input_json = json.dumps(input_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return {
+    detail = {
         "tool": str(request_payload.get("tool") or result.get("tool") or "")[:80],
         "provider": result.get("provider"),
         "strategy": result.get("strategy"),
@@ -874,6 +874,30 @@ def audit_detail_for_tool_run(request_payload: dict[str, Any], result: dict[str,
         "ok": bool(result.get("ok")),
         "error_code": ((result.get("error") or {}) if isinstance(result.get("error"), dict) else {}).get("code"),
     }
+    agent_provider = _bounded_audit_identity(
+        request_payload.get("agent_provider"),
+        maximum=48,
+        pattern=r"[a-z0-9_-]+",
+    )
+    session_identity = _bounded_audit_identity(
+        request_payload.get("session_identity"),
+        maximum=160,
+        pattern=r"[A-Za-z0-9._:-]+",
+    )
+    if agent_provider:
+        detail["agent_provider"] = agent_provider
+    if session_identity:
+        detail["session_identity"] = session_identity
+    return detail
+
+
+def _bounded_audit_identity(value: Any, *, maximum: int, pattern: str) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized or len(normalized) > maximum or re.fullmatch(pattern, normalized) is None:
+        return None
+    return normalized
 
 
 def _success(

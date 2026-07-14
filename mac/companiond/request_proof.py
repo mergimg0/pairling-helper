@@ -121,6 +121,16 @@ class ReplayCache:
             self._last_write_probe_monotonic = None
             self._storage_failed = False
 
+    def __del__(self) -> None:
+        database = getattr(self, "_db", None)
+        if database is None:
+            return
+        self._db = None
+        try:
+            database.close()
+        except Exception:
+            pass
+
     def status(self, *, now: float | None = None) -> dict[str, Any]:
         """Return a non-consuming health check for request-proof storage."""
         with self._lock:
@@ -523,6 +533,15 @@ def verify_request_proof(
     replay_cache: ReplayCache,
     now_ms: int | None = None,
 ) -> ProofVerificationResult:
+    authenticated_install_id = str(getattr(auth_result, "install_id", "") or "").strip()
+    canonical_install_id = str(local_install_id or "").strip()
+    if (
+        not authenticated_install_id
+        or not canonical_install_id
+        or not hmac.compare_digest(authenticated_install_id, canonical_install_id)
+    ):
+        return ProofVerificationResult(False, 403, "install_id_mismatch", "Request proof was for a different Mac.")
+
     proof_secret = str(getattr(auth_result, "proof_secret", "") or "").strip()
     if not proof_secret:
         return ProofVerificationResult(False, 403, "missing_proof_secret", "Pair this Mac again to enable request proof.")

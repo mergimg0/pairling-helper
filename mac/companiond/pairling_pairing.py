@@ -28,6 +28,8 @@ from pairling_devices import (
     generate_device_id,
     generate_proof_secret,
     generate_token,
+    normalize_install_id,
+    resolve_install_id,
 )
 from runtime_contract import DEFAULT_DEVICE_SCOPES, PAIR_SERVICE_TYPE, PORT
 from runtime_paths import app_support_root
@@ -580,7 +582,12 @@ class PairingStore:
         self.pair_root = pair_root
         self.registry = registry
         self.runtime_port = runtime_port
-        self.install_id = install_id or self._load_install_id_from_config()
+        if install_id is None:
+            self.install_id = self._load_install_id_from_config()
+        else:
+            self.install_id = normalize_install_id(install_id)
+            if not self.install_id:
+                raise ValueError("install_id must be a valid Pairling install identity")
         self._claim_lock = threading.Lock()
         # P0-B: per-pair_id wrong-guess counter, pre-checked before secret
         # comparison so a racing attacker cannot brute the secret/nonce.
@@ -644,15 +651,7 @@ class PairingStore:
         return os.environ.get("COMPANION_RUNTIME_VERSION", RUNTIME_NAME)[:64]
 
     def _load_install_id_from_config(self) -> str:
-        config = self.pair_root.parent / "config.json"
-        try:
-            payload = json.loads(config.read_text())
-            value = payload.get("install_id")
-            if isinstance(value, str) and value:
-                return value
-        except Exception:
-            pass
-        return "inst_" + secrets.token_hex(16)
+        return resolve_install_id(self.pair_root.parent)
 
     @staticmethod
     def _raise_registry_error(exc: DeviceRegistryError) -> None:
@@ -1286,9 +1285,21 @@ class PairingStore:
 
     def _precheck_claim(self, pair_id: str) -> tuple[dict, Path, float]:
         """Shared front-matter for both claim paths (caller holds _claim_lock):
-        load the record, reject already-claimed/expired, and pre-increment the
-        per-pair_id attempt counter so wrong guesses lock out after 5 (P0-B)."""
+        load the record, verify its install identity, reject already-claimed or
+        expired records, and pre-increment the per-pair_id attempt counter so
+        wrong guesses lock out after 5 (P0-B)."""
         record, path = self._load_record(pair_id)
+        record_install_id = record.get("install_id")
+        if (
+            not isinstance(record_install_id, str)
+            or not record_install_id.strip()
+            or not secrets.compare_digest(record_install_id.strip(), self.install_id)
+        ):
+            raise PairingError(
+                "pair_install_id_mismatch",
+                409,
+                "pair record belongs to a different Pairling install",
+            )
         now = time.time()
         if record.get("claimed_at") is not None:
             raise PairingError("pair_already_claimed", 409, "pair record already claimed")
@@ -1989,7 +2000,11 @@ class PairingStore:
         with self._claim_lock:
             self._cleanup_pending_claims()
             try:
-                saved = self.registry.resumable_pair_claim(pair_id, request_hash)
+                saved = self.registry.resumable_pair_claim(
+                    pair_id,
+                    request_hash,
+                    install_id=self.install_id,
+                )
             except DeviceRegistryError as exc:
                 self._raise_registry_error(exc)
             if saved is not None:
@@ -2129,6 +2144,7 @@ class PairingStore:
                 return self.registry.activate_pending_claim(
                     pair_id=pair_id,
                     device_id=device_id,
+                    install_id=self.install_id,
                     activation_nonce=activation_nonce,
                     token_hash=token_hash,
                     activation_proof=activation_proof,

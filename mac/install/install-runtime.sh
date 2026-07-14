@@ -36,6 +36,7 @@ PACKAGED_SOURCE_PATHS=(
   "mac/install"
   "mac/mcp"
   "mac/packaging/bin/pairling"
+  "mac/packaging/pairling_attach.py"
   "relay/app_attest_validator.py"
 )
 SOURCE_DIRTY="${PAIRLING_SOURCE_DIRTY:-$(read_source_stamp "$REPO_ROOT/mac/SOURCE_DIRTY")}"
@@ -52,17 +53,30 @@ PAIRLING_DAEMON_LABEL="dev.pairling.companiond"
 PAIRLING_CONNECTD_LABEL="dev.pairling.connectd"
 PAIRLING_PTYBROKER_LABEL="dev.pairling.ptybroker"
 APP_SUPPORT="${PAIRLING_APP_SUPPORT_ROOT:-${COMPANION_APP_SUPPORT_ROOT:-$HOME/Library/Application Support/Pairling}}"
+while [[ "$APP_SUPPORT" != "/" && "$APP_SUPPORT" == */ ]]; do
+  APP_SUPPORT="${APP_SUPPORT%/}"
+done
 RUNTIME_ROOT="$APP_SUPPORT/runtime"
 RELEASES_ROOT="$RUNTIME_ROOT/releases"
 STATE_ROOT="$APP_SUPPORT/state"
 PAIR_ROOT="$APP_SUPPORT/pair"
 LOGS_ROOT="${PAIRLING_LOGS_ROOT:-${COMPANION_LOGS_ROOT:-$HOME/Library/Logs/Pairling}}"
-PAIRDROP_ROOT="${PAIRLING_PAIRDROP_ROOT:-$HOME/PairDrop}"
+while [[ "$LOGS_ROOT" != "/" && "$LOGS_ROOT" == */ ]]; do
+  LOGS_ROOT="${LOGS_ROOT%/}"
+done
+if [[ "${PAIRLING_PAIRDROP_ROOT+x}" == "x" ]]; then
+  PAIRDROP_ROOT_WAS_SET="1"
+  PAIRDROP_ROOT_INPUT="$PAIRLING_PAIRDROP_ROOT"
+else
+  PAIRDROP_ROOT_WAS_SET="0"
+  PAIRDROP_ROOT_INPUT=""
+fi
+PAIRDROP_ROOT="$PAIRDROP_ROOT_INPUT"
 PLIST_BUILD_DIR="$RUNTIME_ROOT/plists"
 CURRENT_LINK="$RUNTIME_ROOT/current"
 PREVIOUS_LINK="$RUNTIME_ROOT/previous"
 RELEASE_NAME="$VERSION-$REVISION"
-RELEASE_ROOT="$RELEASES_ROOT/$RELEASE_NAME"
+RELEASE_ROOT=""
 CONFIG_FILE="$APP_SUPPORT/config.json"
 DEVICES_DB="$APP_SUPPORT/devices.sqlite"
 MCP_CREDENTIAL="$APP_SUPPORT/mcp-bridge.json"
@@ -72,7 +86,78 @@ CONNECTD_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_CONNECTD_LABEL.plist"
 PTYBROKER_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_PTYBROKER_LABEL.plist"
 MCP_SERVER_DIR="$HOME/.claude/mcp-servers"
 MCP_SERVER_SHIM="$MCP_SERVER_DIR/phone-tools.py"
-PYTHON3_BIN="${PAIRLING_DAEMON_PYTHON:-${COMPANION_DAEMON_PYTHON:-$(command -v python3)}}"
+
+# Resolve no interpreter through installer-owned paths until their direct
+# directory boundary has passed the same symlink check used before mutation.
+if [[ -L "$APP_SUPPORT" ]]; then
+  printf 'ERROR: Pairling app support path must not be a symlink: %s\n' "$APP_SUPPORT" >&2
+  exit 1
+fi
+if [[ -L "$RUNTIME_ROOT" ]]; then
+  printf 'ERROR: Pairling runtime path must not be a symlink: %s\n' "$RUNTIME_ROOT" >&2
+  exit 1
+fi
+
+resolve_python_bin() {
+  local explicit="${PAIRLING_DAEMON_PYTHON:-${COMPANION_DAEMON_PYTHON:-}}"
+  local candidate marker current_python="" current_target=""
+  if [[ -n "$explicit" ]]; then
+    if [[ ! -x "$explicit" ]]; then
+      printf 'ERROR: configured Pairling Python is not executable: %s\n' "$explicit" >&2
+      return 1
+    fi
+    marker="$("$explicit" -c 'print("pairling-python-ready")' 2>/dev/null || true)"
+    if [[ "$marker" != "pairling-python-ready" ]]; then
+      printf 'ERROR: configured Pairling Python is not functional: %s\n' "$explicit" >&2
+      return 1
+    fi
+    printf '%s\n' "$explicit"
+    return 0
+  fi
+  if [[ -L "$CURRENT_LINK" ]]; then
+    current_target="$(readlink "$CURRENT_LINK" 2>/dev/null || true)"
+    case "$current_target" in
+      "$RELEASES_ROOT"/*) current_python="$CURRENT_LINK/python/bin/python3" ;;
+    esac
+  fi
+  for candidate in "$current_python" "$(command -v python3 2>/dev/null || true)" /usr/bin/python3; do
+    [[ -n "$candidate" && -x "$candidate" ]] || continue
+    marker="$("$candidate" -c 'print("pairling-python-ready")' 2>/dev/null || true)"
+    if [[ "$marker" == "pairling-python-ready" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  printf 'ERROR: Pairling could not resolve a Python 3 interpreter. Reinstall the Pairling runtime package.\n' >&2
+  return 1
+}
+
+PYTHON3_BIN="$(resolve_python_bin)"
+PAIRDROP_ROOT="$("$PYTHON3_BIN" - "$PAIRDROP_ROOT_WAS_SET" "$PAIRDROP_ROOT_INPUT" "$CONFIG_FILE" "$HOME/PairDrop" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+was_set, configured, config_path, default = sys.argv[1:]
+selected = configured
+if was_set != "1":
+    try:
+        payload = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        payload = None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Pairling config cannot resolve PairDrop storage: {type(exc).__name__}") from exc
+    paths = payload.get("paths") if isinstance(payload, dict) else None
+    selected = str(paths.get("pairdrop") or "") if isinstance(paths, dict) else ""
+    if not selected:
+        selected = default
+path = Path(selected).expanduser()
+if not path.is_absolute():
+    raise SystemExit("PAIRLING_PAIRDROP_ROOT must be an absolute path")
+print(path.resolve(strict=False))
+PY
+)"
+export PAIRLING_PAIRDROP_ROOT="$PAIRDROP_ROOT"
 # P3 Python custody: the npm shim points PAIRLING_DAEMON_PYTHON at the vendored
 # CPython inside the platform runtime package (…/python/bin/python3). When that
 # is in play we stage the whole interpreter into the release tree and run the
@@ -141,6 +226,141 @@ GUIDED_COMPLETE=0
 # stays 0 for every recoverable failure. Declared here so it is always defined
 # under set -u.
 WIZARD_FATAL=0
+INSTALL_TRANSACTION_ACTIVE=0
+INSTALL_TRANSACTION_DIR=""
+INSTALL_LOCK_DIR="$RUNTIME_ROOT/.install.lock"
+INSTALL_LOCK_HELD=0
+ACTIVE_STAGING_DIR=""
+
+validate_app_support_root() {
+  if [[ "$APP_SUPPORT" != /* || "$APP_SUPPORT" == "/" || "$APP_SUPPORT" == "$HOME" ]]; then
+    printf 'ERROR: Pairling app support path is unsafe: %s\n' "$APP_SUPPORT" >&2
+    return 1
+  fi
+  case "/$APP_SUPPORT/" in
+    */../*|*/./*)
+      printf 'ERROR: Pairling app support path is not canonical: %s\n' "$APP_SUPPORT" >&2
+      return 1
+      ;;
+  esac
+
+  local path label owner
+  while IFS='|' read -r path label; do
+    [[ -n "$path" ]] || continue
+    if [[ -L "$path" ]]; then
+      printf 'ERROR: Pairling %s path must not be a symlink: %s\n' "$label" "$path" >&2
+      return 1
+    fi
+    if [[ -e "$path" && ! -d "$path" ]]; then
+      printf 'ERROR: Pairling %s path must be a directory: %s\n' "$label" "$path" >&2
+      return 1
+    fi
+    if [[ -d "$path" ]]; then
+      owner="$(stat -f '%u' "$path" 2>/dev/null || printf 'unknown')"
+      if [[ "$owner" != "$(id -u)" ]]; then
+        printf 'ERROR: Pairling %s path must be owned by the current user: %s\n' "$label" "$path" >&2
+        return 1
+      fi
+    fi
+  done <<EOF
+$APP_SUPPORT|app support
+$RUNTIME_ROOT|runtime
+$RELEASES_ROOT|runtime releases
+$PLIST_BUILD_DIR|runtime plist staging
+$STATE_ROOT|state
+$PAIR_ROOT|pairing state
+$APP_SUPPORT/modules|modules
+$LOGS_ROOT|logs
+EOF
+}
+
+install_lock_wait_seconds() {
+  local raw="${PAIRLING_INSTALL_LOCK_WAIT_SECONDS:-30}"
+  if [[ ! "$raw" =~ ^[0-9]+$ ]]; then
+    printf 'ERROR: PAIRLING_INSTALL_LOCK_WAIT_SECONDS must be a whole number.\n' >&2
+    return 2
+  fi
+  printf '%s\n' "$raw"
+}
+
+install_lock_age_seconds() {
+  local modified now
+  modified="$(stat -f '%m' "$INSTALL_LOCK_DIR" 2>/dev/null || printf '0')"
+  now="$(date +%s)"
+  if [[ "$modified" =~ ^[0-9]+$ && "$modified" -le "$now" ]]; then
+    printf '%s\n' "$((now - modified))"
+  else
+    printf '0\n'
+  fi
+}
+
+remove_stale_install_lock() {
+  local owner="${1:-}"
+  [[ -d "$INSTALL_LOCK_DIR" && ! -L "$INSTALL_LOCK_DIR" ]] || return 1
+  if [[ -n "$owner" && "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+    return 1
+  fi
+  rm -f "$INSTALL_LOCK_DIR/pid" "$INSTALL_LOCK_DIR/started_at"
+  rmdir "$INSTALL_LOCK_DIR" 2>/dev/null
+}
+
+acquire_install_lock() {
+  local wait_seconds deadline owner age
+  validate_app_support_root
+  mkdir -p "$RUNTIME_ROOT"
+  wait_seconds="$(install_lock_wait_seconds)" || return $?
+  deadline="$(( $(date +%s) + wait_seconds ))"
+  while true; do
+    if mkdir "$INSTALL_LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$INSTALL_LOCK_DIR/pid"
+      date -u '+%Y-%m-%dT%H:%M:%SZ' > "$INSTALL_LOCK_DIR/started_at"
+      INSTALL_LOCK_HELD=1
+      return 0
+    fi
+    if [[ -L "$INSTALL_LOCK_DIR" || ! -d "$INSTALL_LOCK_DIR" ]]; then
+      printf 'ERROR: Pairling install lock is not a real directory: %s\n' "$INSTALL_LOCK_DIR" >&2
+      return 1
+    fi
+    owner="$(tr -dc '0-9' < "$INSTALL_LOCK_DIR/pid" 2>/dev/null || true)"
+    age="$(install_lock_age_seconds)"
+    if [[ -n "$owner" && "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+      remove_stale_install_lock "$owner" || true
+      continue
+    fi
+    if [[ -z "$owner" && "$age" -ge 5 ]]; then
+      remove_stale_install_lock || true
+      continue
+    fi
+    if [[ "$(date +%s)" -ge "$deadline" ]]; then
+      printf 'ERROR: another Pairling install operation owns %s (pid: %s).\n' "$INSTALL_LOCK_DIR" "${owner:-unknown}" >&2
+      return 1
+    fi
+    sleep 0.2
+  done
+}
+
+release_install_lock() {
+  [[ "$INSTALL_LOCK_HELD" == 1 ]] || return 0
+  local owner
+  owner="$(tr -dc '0-9' < "$INSTALL_LOCK_DIR/pid" 2>/dev/null || true)"
+  if [[ -n "$owner" && "$owner" != "$$" ]]; then
+    printf 'ERROR: Pairling install lock ownership changed from %s to %s.\n' "$$" "$owner" >&2
+    return 1
+  fi
+  rm -f "$INSTALL_LOCK_DIR/pid" "$INSTALL_LOCK_DIR/started_at"
+  if ! rmdir "$INSTALL_LOCK_DIR" 2>/dev/null; then
+    printf 'ERROR: Pairling could not release install lock %s.\n' "$INSTALL_LOCK_DIR" >&2
+    return 1
+  fi
+  INSTALL_LOCK_HELD=0
+}
+
+cleanup_active_staging() {
+  if [[ -n "$ACTIVE_STAGING_DIR" && -d "$ACTIVE_STAGING_DIR" ]]; then
+    rm -rf "$ACTIVE_STAGING_DIR"
+  fi
+  ACTIVE_STAGING_DIR=""
+}
 
 # _machine_path_blocks: returns success when a machine condition should keep the
 # polished screen off, so both gate functions share one authoritative guard list.
@@ -665,9 +885,8 @@ poll_evidence_test() {
 # two rows only when it is non-empty, which is today's not-installed path. The
 # panel does not print the argument text itself, it uses fixed rows that spell the
 # same wording, so the box math is exact and the argument stays the canonical
-# sentence safety_step also prints plain. The Local Network copy makes clear that
-# the permission and same-Wi-Fi requirement apply only to nearby pairing. It is
-# the same sentence a machine path prints, wrapped to fixed rows that fit the box so
+# sentence safety_step also prints plain. The connection copy states the normal
+# Pairling Connect requirement and is wrapped to fixed rows that fit the box so
 # the right border lines up. It gates on GUIDED_TTY, so a machine path draws
 # nothing.
 wizard_permissions_panel() {
@@ -682,9 +901,9 @@ wizard_permissions_panel() {
     wizard_box_row "$inner" "installed yet. Pairing works without it." "${WZ_GREY:-}installed yet. Pairing works without it.${r}"
     wizard_box_row "$inner" "" ""
   fi
-  wizard_box_row "$inner" "Your iPhone may ask for Local Network access. Allow it" "${WZ_PAPER:-}Your iPhone may ask for Local Network access. Allow it${r}"
-  wizard_box_row "$inner" "for nearby pairing. Local Network and the same Wi-Fi are" "${WZ_PAPER:-}for nearby pairing. Local Network and the same Wi-Fi are${r}"
-  wizard_box_row "$inner" "not required for Pairling Connect." "${WZ_PAPER:-}not required for Pairling Connect.${r}"
+  wizard_box_row "$inner" "Pairling Connect uses its private embedded route." "${WZ_PAPER:-}Pairling Connect uses its private embedded route.${r}"
+  wizard_box_row "$inner" "Local Network access and the same Wi-Fi are not" "${WZ_PAPER:-}Local Network access and the same Wi-Fi are not${r}"
+  wizard_box_row "$inner" "required for pairing." "${WZ_PAPER:-}required for pairing.${r}"
   wizard_box_bot "$inner"
 }
 
@@ -712,27 +931,27 @@ safety_step() {
       # until Full Disk Access is granted.
       wizard_recovery_menu recoverable "macOS permissions" || true
     fi
-    # The Local Network advisory. On the guided screen it renders as a rounded
+    # The Pairling Connect advisory. On the guided screen it renders as a rounded
     # panel. A machine path keeps the plain stage_note, byte identical.
     if [ "${GUIDED_TTY:-0}" = 1 ]; then
       wizard_permissions_panel ""
     else
-      stage_note "Your iPhone may ask for Local Network access. Allow it for nearby pairing. Local Network and the same Wi-Fi are not required for Pairling Connect."
+      stage_note "Pairling Connect uses its private embedded route. Local Network access and the same Wi-Fi are not required for pairing."
     fi
   else
     # The not-installed advisory. This is today's path. It states the truth: the
     # Safety Monitor is a future feature, it is not installed, and pairing works
     # without it. It never claims setup installed anything. On the guided screen the
-    # advisory and the Local Network copy render as one rounded panel. A machine
+    # advisory and the connection copy render as one rounded panel. A machine
     # path keeps the two plain stage_note lines, byte identical.
     if [ "${GUIDED_TTY:-0}" = 1 ]; then
       wizard_permissions_panel "Pairling Safety Monitor is a future feature and is not installed yet. Pairing works without it."
     else
       stage_note "Pairling Safety Monitor is a future feature and is not installed yet. Pairing works without it."
-      stage_note "Your iPhone may ask for Local Network access. Allow it for nearby pairing. Local Network and the same Wi-Fi are not required for Pairling Connect."
+      stage_note "Pairling Connect uses its private embedded route. Local Network access and the same Wi-Fi are not required for pairing."
     fi
   fi
-  stage_note "If pairing stalls, run pairling doctor --json. Check Local Network access and the same Wi-Fi only when using nearby pairing."
+  stage_note "If pairing stalls, run pairling doctor --json and confirm that Pairling Connect reports a ready route."
   stage_note "Accessibility and Automation are only needed later if you enable typing into Terminal from the phone. Run pairling doctor --json to see the exact Mac grantee path before enabling it."
   return 0
 }
@@ -743,6 +962,13 @@ safety_step() {
 # GUIDED_COMPLETE=1, so a clean run prints nothing here.
 guided_on_exit() {
   local code=$?
+  if [ "$code" != 0 ]; then
+    rollback_install_transaction || true
+  fi
+  cleanup_active_staging || true
+  if ! release_install_lock; then
+    code=1
+  fi
   if [ "$GUIDED_COMPLETE" != 1 ] && [ "$code" != 0 ]; then
     if [ "${WIZARD_TUI:-0}" = 1 ]; then
       # Show the bash recovery menu. The kind is recoverable by default. The
@@ -758,17 +984,29 @@ guided_on_exit() {
     printf 'Recovery: run `pairling doctor --json` to inspect, then re-run `pairling setup`.\n' >&2
     printf 'Retry pairing only: `pairling pair --qr`. If doctor says Pairling Connect needs sign-in: `pairling connect-auth-open`.\n' >&2
   fi
+  return "$code"
+}
+
+install_mutation_on_exit() {
+  local code=$?
+  if [[ "$code" != 0 ]]; then
+    rollback_install_transaction || true
+  fi
+  cleanup_active_staging || true
+  if ! release_install_lock; then
+    code=1
+  fi
+  return "$code"
 }
 
 # guided_permission_notice — advisory only. Surfaces ONLY the permissions the
-# code actually uses (verified against doctor.sh permission_readiness): the
-# iPhone shows a Local Network prompt on first pair, and this Mac needs no
-# privacy permission for basic pairing. It never reads or modifies any privacy
+# code actually uses (verified against doctor.sh permission_readiness). This Mac
+# needs no privacy permission for basic Pairling Connect pairing. It never reads or modifies any privacy
 # setting and never blocks setup.
 guided_permission_notice() {
   if [ "${GUIDED_TTY:-0}" = 1 ]; then
-    # The guided screen frames the no-permission line and the route-aware Local
-    # Network copy in a rounded panel, matching the safety_step panel. The copy is
+    # The guided screen frames the no-permission line and route requirement in a
+    # rounded panel, matching the safety_step panel. The copy is
     # wrapped to fixed rows so the right border lines up. The stall and
     # Accessibility lines stay plain notes below the box.
     wizard_palette_init
@@ -777,16 +1015,16 @@ guided_permission_notice() {
     wizard_box_row "$inner" "macOS permissions" "${b}${WZ_PAPER:-}macOS permissions${r}"
     wizard_box_row "$inner" "" ""
     wizard_box_row "$inner" "This Mac needs no special privacy permission to pair." "${WZ_GREY:-}This Mac needs no special privacy permission to pair.${r}"
-    wizard_box_row "$inner" "Your iPhone may ask for Local Network access. Allow it" "${WZ_PAPER:-}Your iPhone may ask for Local Network access. Allow it${r}"
-    wizard_box_row "$inner" "for nearby pairing. Local Network and the same Wi-Fi are" "${WZ_PAPER:-}for nearby pairing. Local Network and the same Wi-Fi are${r}"
-    wizard_box_row "$inner" "not required for Pairling Connect." "${WZ_PAPER:-}not required for Pairling Connect.${r}"
+    wizard_box_row "$inner" "Pairling Connect uses its private embedded route." "${WZ_PAPER:-}Pairling Connect uses its private embedded route.${r}"
+    wizard_box_row "$inner" "Local Network access and the same Wi-Fi are not" "${WZ_PAPER:-}Local Network access and the same Wi-Fi are not${r}"
+    wizard_box_row "$inner" "required for pairing." "${WZ_PAPER:-}required for pairing.${r}"
     wizard_box_bot "$inner"
-    stage_note "If pairing stalls, run pairling doctor --json. Check Local Network access and the same Wi-Fi only when using nearby pairing."
+    stage_note "If pairing stalls, run pairling doctor --json and confirm that Pairling Connect reports a ready route."
     stage_note "Accessibility and Automation are only needed if you later enable typing into Terminal from the phone, and macOS prompts then."
   else
     stage_note "This Mac needs no special privacy permission to pair."
-    stage_note "Your iPhone may ask for Local Network access. Allow it for nearby pairing. Local Network and the same Wi-Fi are not required for Pairling Connect."
-    stage_note "If pairing stalls, run pairling doctor --json. Check Local Network access and the same Wi-Fi only when using nearby pairing."
+    stage_note "Pairling Connect uses its private embedded route. Local Network access and the same Wi-Fi are not required for pairing."
+    stage_note "If pairing stalls, run pairling doctor --json and confirm that Pairling Connect reports a ready route."
     stage_note "Accessibility and Automation are only needed if you later enable typing into Terminal from the phone, and macOS prompts then."
   fi
 }
@@ -796,7 +1034,15 @@ guided_permission_notice() {
 # finish summary captures it once and passes the same value to both proofs, so
 # adjacent route and recovery messages cannot disagree.
 guided_connect_route_state() {
-  python3 - "$REPO_ROOT" 2>/dev/null <<'PY' || printf 'degraded\n'
+  local python_bin="${PYTHON3_BIN:-}"
+  if [[ -z "$python_bin" || ! -x "$python_bin" ]]; then
+    python_bin="$(command -v python3 2>/dev/null || true)"
+  fi
+  if [[ -z "$python_bin" ]]; then
+    printf 'degraded\n'
+    return 0
+  fi
+  "$python_bin" - "$REPO_ROOT" 2>/dev/null <<'PY' || printf 'degraded\n'
 import os
 import sys
 
@@ -827,9 +1073,8 @@ else:
 PY
 }
 
-# guided_route_proof renders the captured Pairling Connect state. Nearby pairing
-# remains available when the remote route is not ready, but same Wi-Fi is never
-# presented as a requirement for a ready Pairling Connect route.
+# guided_route_proof renders the captured Pairling Connect state. A missing
+# embedded route is always a repair state, never an implicit nearby fallback.
 guided_route_proof() {
   local route_state="${1:-degraded}"
   case "$route_state" in
@@ -840,10 +1085,10 @@ guided_route_proof() {
       printf '     Route check: Pairling Connect is signed in and the remote route is still starting.\n'
       ;;
     needs_auth)
-      printf '     Route check: Pairling Connect needs sign-in. Nearby pairing is available on the same Wi-Fi.\n'
+      printf '     Route check: Pairling Connect needs sign-in. Finish approval before using a new pairing code.\n'
       ;;
     degraded|*)
-      printf '     Route check: Pairling Connect needs attention. Run pairling doctor --json. Nearby pairing is available on the same Wi-Fi.\n'
+      printf '     Route check: Pairling Connect needs attention. Run pairling doctor --json before using a new pairing code.\n'
       ;;
   esac
 }
@@ -861,8 +1106,15 @@ guided_route_proof() {
 # setup.
 guided_pairing_seen_proof() {
   local since="${1:-0}" route_state="${2:-degraded}"
+  local python_bin="${PYTHON3_BIN:-}"
+  if [[ -z "$python_bin" || ! -x "$python_bin" ]]; then
+    python_bin="$(command -v python3 2>/dev/null || true)"
+  fi
+  if [[ -z "$python_bin" ]]; then
+    return 0
+  fi
   PAIRLING_PAIRING_SEEN_POLL_STEPS="${PAIRLING_PAIRING_SEEN_POLL_STEPS:-6}" \
-    python3 - "$DEVICES_DB" "$since" "$route_state" <<'PY' || true
+    "$python_bin" - "$DEVICES_DB" "$since" "$route_state" <<'PY' || true
 import os
 import sqlite3
 import sys
@@ -892,10 +1144,22 @@ def count_session_devices():
     # session start, so a device from an earlier run does not read as seen.
     con = sqlite3.connect("file:" + db_path + "?mode=ro", uri=True, timeout=0.5)
     try:
-        row = con.execute(
-            "SELECT COUNT(*) FROM devices WHERE revoked_at IS NULL AND created_at >= ?",
-            (since,),
-        ).fetchone()
+        columns = {
+            str(row[1])
+            for row in con.execute("PRAGMA table_info(devices)").fetchall()
+        }
+        if "purpose" in columns:
+            row = con.execute(
+                "SELECT COUNT(*) FROM devices WHERE revoked_at IS NULL "
+                "AND COALESCE(activation_state, 'active') = 'active' "
+                "AND COALESCE(purpose, '') NOT IN (?, ?) AND created_at >= ?",
+                ("runtime_truth_smoke", "local_mcp_bridge", since),
+            ).fetchone()
+        else:
+            row = con.execute(
+                "SELECT COUNT(*) FROM devices WHERE revoked_at IS NULL AND created_at >= ?",
+                (since,),
+            ).fetchone()
         return int(row[0]) if row else 0
     finally:
         con.close()
@@ -920,11 +1184,11 @@ try:
         if route_state == "ready":
             print("     Pairling Connect is ready, so same Wi-Fi is not required. Keep Pairling open on the iPhone and finish its sign-in if asked.")
         elif route_state == "starting":
-            print("     Pairling Connect is still starting. Wait a moment, then scan a fresh code. Nearby pairing still needs Local Network access and the same Wi-Fi.")
+            print("     Pairling Connect is still starting. Wait for a ready route, then scan a fresh code.")
         elif route_state == "needs_auth":
-            print("     Pairling Connect needs sign-in. Run pairling connect-auth-open, then scan a fresh code. Nearby pairing still needs Local Network access and the same Wi-Fi.")
+            print("     Pairling Connect needs sign-in. Run pairling connect-auth-open, finish approval, then scan a fresh code.")
         else:
-            print("     Pairling Connect needs attention. Run pairling doctor --json before scanning a fresh code, or use nearby pairing with Local Network access and the same Wi-Fi.")
+            print("     Pairling Connect needs attention. Run pairling doctor --json before scanning a fresh code.")
 except Exception:
     # Any unexpected error means not seen. Never raise, so setup continues.
     pass
@@ -987,7 +1251,7 @@ append_history() {
   local status="$1"
   local detail="$2"
   mkdir -p "$STATE_ROOT"
-  python3 - "$INSTALL_HISTORY" "$status" "$detail" "$VERSION" "$REVISION" "$RELEASE_ROOT" <<'PY'
+  "$PYTHON3_BIN" - "$INSTALL_HISTORY" "$status" "$detail" "$VERSION" "$REVISION" "$RELEASE_ROOT" <<'PY'
 import json
 import sys
 import time
@@ -1008,56 +1272,56 @@ PY
 run_compile_checks() {
   local pycache_root
   pycache_root="$(mktemp -d)"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pairlingd.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/runtime_contract.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/runtime_manifest.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/runtime_paths.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pairdrop_store.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/compose_recording_store.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pairling_connectd_status.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pairling_devices.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/local_mcp_bridge.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/llm_route.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pairling_tools.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pairling_pairing.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pairling_psk.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pairling_relay_claims.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/request_proof.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/codex_approval.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pty_broker.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pty_broker_client.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/pty_broker_service.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/terminal_screen_backend.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/session_events.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/session_event_log.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/session_event_ingest.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/terminal_text_sanitizer.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/push_dispatcher.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/push_event_catalog.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/live_activity_publisher.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/standard_push_publisher.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/fleet_tier.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/fleet_activity_publisher.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/fd_watchdog.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/safety_monitor.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/sentinel_notifications.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/workstate_feed_contract.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/model_status_contract.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/substrate_status_contract.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/integrations/__init__.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/integrations/aperture_cli/__init__.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/integrations/aperture_cli/launch.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/integrations/aperture_cli/status.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/providers/__init__.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/providers/base.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/providers/claude.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/providers/codex.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/providers/external.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/companiond/providers/registry.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/mcp/phone_tools.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/install/render-launchd.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/install/psk_dependency_check.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile "$REPO_ROOT/mac/install/ssh_gateway_setup.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pairlingd.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/runtime_contract.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/runtime_manifest.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/runtime_paths.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pairdrop_store.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/compose_recording_store.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pairling_connectd_status.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pairling_devices.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/local_mcp_bridge.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/llm_route.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pairling_tools.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pairling_pairing.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pairling_psk.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pairling_relay_claims.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/request_proof.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/codex_approval.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pty_broker.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pty_broker_client.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pty_broker_service.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/terminal_screen_backend.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/session_events.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/session_event_log.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/session_event_ingest.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/terminal_text_sanitizer.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/push_dispatcher.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/push_event_catalog.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/live_activity_publisher.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/standard_push_publisher.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/fleet_tier.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/fleet_activity_publisher.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/fd_watchdog.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/safety_monitor.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/sentinel_notifications.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/workstate_feed_contract.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/model_status_contract.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/substrate_status_contract.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/integrations/__init__.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/integrations/aperture_cli/__init__.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/integrations/aperture_cli/launch.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/integrations/aperture_cli/status.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/providers/__init__.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/providers/base.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/providers/claude.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/providers/codex.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/providers/external.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/providers/registry.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/mcp/phone_tools.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/install/render-launchd.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/install/psk_dependency_check.py"
+  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/install/ssh_gateway_setup.py"
   rm -rf "$pycache_root"
 }
 
@@ -1133,32 +1397,38 @@ run_staged_psk_dependency_checks() {
 }
 
 ensure_state() {
+  PAIRLING_APP_SUPPORT_ROOT="$APP_SUPPORT" PAIRLING_LOGS_ROOT="$LOGS_ROOT" \
+    "$PYTHON3_BIN" - "$REPO_ROOT" "$APP_SUPPORT" "$LOGS_ROOT" "$MCP_CREDENTIAL" "$PAIRLING_RUNTIME_PORT" <<'PY'
+import sys
+from pathlib import Path
+
+repo_root, app_support, logs_root, credential_path, port = sys.argv[1:]
+sys.path.insert(0, repo_root + "/mac/companiond")
+
+from local_mcp_bridge import migrate_legacy_local_mcp_bridge_identity
+from pairling_devices import (
+    DeviceRegistry,
+    InstallIdentityError,
+    ensure_install_identity,
+)
+
+registry = DeviceRegistry(
+    Path(app_support) / "devices.sqlite",
+    Path(logs_root) / "audit.jsonl",
+)
+migrate_legacy_local_mcp_bridge_identity(
+    registry=registry,
+    credential_path=Path(credential_path),
+)
+
+try:
+    ensure_install_identity(Path(app_support), runtime_port=int(port))
+except InstallIdentityError as exc:
+    raise SystemExit(f"{exc.code}: {exc}") from exc
+PY
   mkdir -p "$RELEASES_ROOT" "$STATE_ROOT" "$PAIR_ROOT" "$LOGS_ROOT" "$PLIST_BUILD_DIR" "$APP_SUPPORT/modules"
   chmod 700 "$APP_SUPPORT" "$PAIR_ROOT" 2>/dev/null || true
-  if [[ ! -f "$CONFIG_FILE" ]]; then
-    python3 - "$CONFIG_FILE" "$PAIRLING_RUNTIME_PORT" <<'PY'
-import json
-import secrets
-import sys
-from datetime import datetime, timezone
-path, port = sys.argv[1:]
-payload = {
-    "schema_version": 1,
-    "product": "Pairling",
-    "install_id": "inst_" + secrets.token_urlsafe(18),
-    "runtime": {
-        "label": "dev.pairling.companiond",
-        "port": int(port),
-    },
-    "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-}
-with open(path, "w") as fh:
-    json.dump(payload, fh, indent=2, sort_keys=True)
-    fh.write("\n")
-PY
-    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
-  fi
-  python3 - "$DEVICES_DB" <<'PY'
+  "$PYTHON3_BIN" - "$DEVICES_DB" <<'PY'
 import sqlite3
 import sys
 path = sys.argv[1]
@@ -1187,7 +1457,8 @@ with sqlite3.connect(path) as db:
     """)
 PY
   chmod 600 "$DEVICES_DB" 2>/dev/null || true
-  PAIRLING_APP_SUPPORT_ROOT="$APP_SUPPORT" PAIRLING_MCP_CREDENTIAL="$MCP_CREDENTIAL" python3 - "$REPO_ROOT" <<'PY'
+  PAIRLING_APP_SUPPORT_ROOT="$APP_SUPPORT" PAIRLING_MCP_CREDENTIAL="$MCP_CREDENTIAL" \
+    "$PYTHON3_BIN" - "$REPO_ROOT" <<'PY'
 import sys
 
 repo_root = sys.argv[1]
@@ -1231,16 +1502,230 @@ remove_python_bytecode() {
   fi
 }
 
+atomic_symlink_switch() {
+  local target="$1" destination="$2" directory base temporary="" attempts=0
+  directory="$(dirname "$destination")"
+  base="$(basename "$destination")"
+  mkdir -p "$directory"
+  while [[ "$attempts" -lt 32 ]]; do
+    attempts="$((attempts + 1))"
+    temporary="$directory/.${base}.pairling-$$-${RANDOM}"
+    if ln -s "$target" "$temporary" 2>/dev/null; then
+      break
+    fi
+    rm -f "$temporary"
+  done
+  if [[ ! -L "$temporary" ]]; then
+    printf 'ERROR: could not create a temporary symlink for %s after %s attempts.\n' "$destination" "$attempts" >&2
+    return 1
+  fi
+  if [[ "${PAIRLING_TEST_FAIL_ATOMIC_SYMLINK_BEFORE_RENAME:-}" == "$base" ]]; then
+    rm -f "$temporary"
+    return 1
+  fi
+  if ! mv -f "$temporary" "$destination"; then
+    rm -f "$temporary"
+    return 1
+  fi
+}
+
+snapshot_install_path() {
+  local source="$1" name="$2"
+  if [[ -L "$source" ]]; then
+    printf 'symlink\n' > "$INSTALL_TRANSACTION_DIR/$name.kind"
+    readlink "$source" > "$INSTALL_TRANSACTION_DIR/$name.target"
+  elif [[ -f "$source" ]]; then
+    printf 'file\n' > "$INSTALL_TRANSACTION_DIR/$name.kind"
+    cp -p "$source" "$INSTALL_TRANSACTION_DIR/$name.file"
+  else
+    printf 'absent\n' > "$INSTALL_TRANSACTION_DIR/$name.kind"
+  fi
+}
+
+restore_install_path() {
+  local destination="$1" name="$2" kind target temporary
+  kind="$(cat "$INSTALL_TRANSACTION_DIR/$name.kind" 2>/dev/null || printf 'absent')"
+  case "$kind" in
+    symlink)
+      target="$(cat "$INSTALL_TRANSACTION_DIR/$name.target")"
+      atomic_symlink_switch "$target" "$destination"
+      ;;
+    file)
+      mkdir -p "$(dirname "$destination")"
+      rm -f "$destination"
+      cp -p "$INSTALL_TRANSACTION_DIR/$name.file" "$destination"
+      ;;
+    *) rm -f "$destination" ;;
+  esac
+}
+
+verify_restored_install_path() {
+  local destination="$1" name="$2" kind expected
+  kind="$(cat "$INSTALL_TRANSACTION_DIR/$name.kind" 2>/dev/null || printf 'absent')"
+  case "$kind" in
+    symlink)
+      [[ -L "$destination" ]] || return 1
+      expected="$(cat "$INSTALL_TRANSACTION_DIR/$name.target")"
+      [[ "$(readlink "$destination")" == "$expected" ]]
+      ;;
+    file) [[ -f "$destination" && ! -L "$destination" ]] && cmp -s "$INSTALL_TRANSACTION_DIR/$name.file" "$destination" ;;
+    *) [[ ! -e "$destination" && ! -L "$destination" ]] ;;
+  esac
+}
+
+snapshot_launchd_loaded() {
+  local label="$1" name="$2"
+  if launchd_skipped || is_dry_run; then
+    printf 'skipped\n' > "$INSTALL_TRANSACTION_DIR/$name.loaded"
+  elif launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+    printf 'loaded\n' > "$INSTALL_TRANSACTION_DIR/$name.loaded"
+  else
+    printf 'absent\n' > "$INSTALL_TRANSACTION_DIR/$name.loaded"
+  fi
+}
+
+restore_ptybroker_launchd_state() {
+  local expected
+  expected="$(cat "$INSTALL_TRANSACTION_DIR/ptybroker.loaded" 2>/dev/null || printf 'skipped')"
+  [[ "$expected" != "skipped" ]] || return 0
+  if [[ "$expected" == "absent" ]]; then
+    launchctl bootout "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1 || true
+    launchctl bootout "gui/$(id -u)" "$PTYBROKER_USER_PLIST" >/dev/null 2>&1 || true
+    ! launchctl print "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1
+    return
+  fi
+  # Preserve an already-running broker. Restarting it here would destroy live
+  # PTYs, which is the state this rollback is meant to recover.
+  if launchctl print "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1; then
+    return 0
+  fi
+  [[ -f "$PTYBROKER_USER_PLIST" ]] || return 1
+  launchctl bootstrap "gui/$(id -u)" "$PTYBROKER_USER_PLIST" >/dev/null 2>&1 || true
+  launchctl kickstart "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1 || true
+  launchctl print "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1
+}
+
+begin_install_transaction() {
+  INSTALL_TRANSACTION_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pairling-install-transaction.XXXXXX")"
+  snapshot_install_path "$CONFIG_FILE" config
+  snapshot_install_path "$CURRENT_LINK" current
+  snapshot_install_path "$PREVIOUS_LINK" previous
+  snapshot_install_path "$USER_PLIST" companiond_plist
+  snapshot_install_path "$CONNECTD_USER_PLIST" connectd_plist
+  snapshot_install_path "$PTYBROKER_USER_PLIST" ptybroker_plist
+  snapshot_launchd_loaded "$PAIRLING_PTYBROKER_LABEL" ptybroker
+  INSTALL_TRANSACTION_ACTIVE=1
+}
+
+commit_install_transaction() {
+  if [[ "$INSTALL_TRANSACTION_ACTIVE" != 1 ]]; then
+    return
+  fi
+  rm -rf "$INSTALL_TRANSACTION_DIR"
+  INSTALL_TRANSACTION_ACTIVE=0
+  INSTALL_TRANSACTION_DIR=""
+}
+
+rollback_install_transaction() {
+  if [[ "$INSTALL_TRANSACTION_ACTIVE" != 1 || -z "$INSTALL_TRANSACTION_DIR" ]]; then
+    return
+  fi
+  INSTALL_TRANSACTION_ACTIVE=0
+  set +e
+  local rollback_failed=0
+  restore_install_path "$CONFIG_FILE" config || rollback_failed=1
+  restore_install_path "$CURRENT_LINK" current || rollback_failed=1
+  restore_install_path "$PREVIOUS_LINK" previous || rollback_failed=1
+  restore_install_path "$USER_PLIST" companiond_plist || rollback_failed=1
+  restore_install_path "$CONNECTD_USER_PLIST" connectd_plist || rollback_failed=1
+  restore_install_path "$PTYBROKER_USER_PLIST" ptybroker_plist || rollback_failed=1
+  verify_restored_install_path "$CONFIG_FILE" config || rollback_failed=1
+  verify_restored_install_path "$CURRENT_LINK" current || rollback_failed=1
+  verify_restored_install_path "$PREVIOUS_LINK" previous || rollback_failed=1
+  verify_restored_install_path "$USER_PLIST" companiond_plist || rollback_failed=1
+  verify_restored_install_path "$CONNECTD_USER_PLIST" connectd_plist || rollback_failed=1
+  verify_restored_install_path "$PTYBROKER_USER_PLIST" ptybroker_plist || rollback_failed=1
+  if ! launchd_skipped && ! is_dry_run; then
+    restore_ptybroker_launchd_state || rollback_failed=1
+  fi
+  if ! launchd_skipped && ! is_dry_run; then
+    launchctl bootout "gui/$(id -u)/$PAIRLING_DAEMON_LABEL" >/dev/null 2>&1 || true
+    launchctl bootout "gui/$(id -u)/$PAIRLING_CONNECTD_LABEL" >/dev/null 2>&1 || true
+    [[ -f "$USER_PLIST" ]] && launchctl bootstrap "gui/$(id -u)" "$USER_PLIST" >/dev/null 2>&1 || true
+    [[ -f "$CONNECTD_USER_PLIST" ]] && launchctl bootstrap "gui/$(id -u)" "$CONNECTD_USER_PLIST" >/dev/null 2>&1 || true
+    [[ -f "$USER_PLIST" ]] && launchctl kickstart -k "gui/$(id -u)/$PAIRLING_DAEMON_LABEL" >/dev/null 2>&1 || true
+    [[ -f "$CONNECTD_USER_PLIST" ]] && launchctl kickstart -k "gui/$(id -u)/$PAIRLING_CONNECTD_LABEL" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$INSTALL_TRANSACTION_DIR"
+  INSTALL_TRANSACTION_DIR=""
+  set -e
+  if [[ "$rollback_failed" == 1 ]]; then
+    log "ERROR: incomplete runtime activation rollback needs manual repair; run pairling doctor --json." >&2
+    return 1
+  fi
+  log "Rolled back the incomplete runtime activation and PairDrop configuration." >&2
+}
+
 ensure_pairdrop_folder() {
-  mkdir -p "$PAIRDROP_ROOT"
-  chmod 700 "$PAIRDROP_ROOT" 2>/dev/null || true
-  local probe="$PAIRDROP_ROOT/.pairling-write-test.$$"
-  if ! printf 'ok\n' > "$probe" 2>/dev/null; then
-    log "ERROR: PairDrop folder is not writable: $(display_path "$PAIRDROP_ROOT")" >&2
+  if ! "$PYTHON3_BIN" - "$PAIRDROP_ROOT" <<'PY'
+import os
+import secrets
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+root.mkdir(mode=0o700, parents=True, exist_ok=True)
+metadata = root.lstat()
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+    raise SystemExit("PairDrop storage must be a real directory, not a link or file")
+
+open_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+directory_fd = os.open(root, open_flags)
+probe_name = f".pairling-write-test-{secrets.token_hex(16)}"
+probe_fd = None
+try:
+    os.fchmod(directory_fd, 0o700)
+    metadata = os.fstat(directory_fd)
+    if metadata.st_uid != os.geteuid():
+        raise SystemExit("PairDrop storage must be owned by the current user")
+    if stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise SystemExit("PairDrop storage could not be secured to mode 0700")
+    probe_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    probe_fd = os.open(probe_name, probe_flags, 0o600, dir_fd=directory_fd)
+    os.write(probe_fd, b"ok\n")
+    os.fsync(probe_fd)
+finally:
+    if probe_fd is not None:
+        os.close(probe_fd)
+    try:
+        os.unlink(probe_name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        pass
+    os.close(directory_fd)
+PY
+  then
+    log "ERROR: PairDrop folder is not writable or cannot be secured: $PAIRDROP_ROOT" >&2
     exit 1
   fi
-  rm -f "$probe"
   log "PairDrop folder: $(display_path "$PAIRDROP_ROOT")"
+}
+
+persist_pairdrop_folder() {
+  PAIRLING_APP_SUPPORT_ROOT="$APP_SUPPORT" "$PYTHON3_BIN" - "$REPO_ROOT" "$APP_SUPPORT" "$PAIRDROP_ROOT" <<'PY'
+import sys
+from pathlib import Path
+
+repo_root, app_support, pairdrop_root = sys.argv[1:]
+sys.path.insert(0, repo_root + "/mac/companiond")
+
+from pairling_devices import InstallIdentityError, persist_pairdrop_root
+
+try:
+    persist_pairdrop_root(Path(app_support), Path(pairdrop_root))
+except InstallIdentityError as exc:
+    raise SystemExit(f"{exc.code}: {exc}") from exc
+PY
 }
 
 payload_manifest_path() {
@@ -1263,9 +1748,58 @@ verify_payload_manifest() {
   fi
 }
 
+release_content_digest() {
+  "$PYTHON3_BIN" - "$1" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+digest = hashlib.sha256()
+
+def file_digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            value.update(chunk)
+    return value.digest()
+
+for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+    relative = path.relative_to(root).as_posix()
+    if relative == "manifest.json":
+        continue
+    metadata = path.lstat()
+    if stat.S_ISDIR(metadata.st_mode):
+        kind = b"d"
+        payload = b""
+    elif stat.S_ISLNK(metadata.st_mode):
+        kind = b"l"
+        payload = os.readlink(path).encode("utf-8")
+    elif stat.S_ISREG(metadata.st_mode):
+        kind = b"f"
+        payload = None
+    else:
+        raise SystemExit(f"unsupported staged runtime entry: {relative}")
+    digest.update(kind + b"\0")
+    digest.update(f"{stat.S_IMODE(metadata.st_mode):04o}".encode("ascii") + b"\0")
+    digest.update(relative.encode("utf-8") + b"\0")
+    digest.update(file_digest(path) if payload is None else hashlib.sha256(payload).digest())
+print(digest.hexdigest())
+PY
+}
+
 copy_release() {
-  local tmp="$RELEASE_ROOT.tmp"
-  rm -rf "$tmp"
+  local tmp content_digest existing_digest
+  if [[ "$INSTALL_LOCK_HELD" != 1 ]]; then
+    log "ERROR: refusing to stage a runtime without the Pairling install lock." >&2
+    return 1
+  fi
+  mkdir -p "$RELEASES_ROOT"
+  find "$RELEASES_ROOT" -maxdepth 1 -type d -name ".${RELEASE_NAME}.staging.*" -exec rm -rf {} +
+  tmp="$(mktemp -d "$RELEASES_ROOT/.${RELEASE_NAME}.staging.XXXXXX")"
+  ACTIVE_STAGING_DIR="$tmp"
   verify_payload_manifest
   mkdir -p "$tmp/bin" "$tmp/companiond" "$tmp/companiond/providers" "$tmp/companiond/integrations/aperture_cli" "$tmp/connectd" "$tmp/mac" "$tmp/mcp"
   cp "$REPO_ROOT/mac/companiond/pairlingd.py" "$tmp/companiond/"
@@ -1330,9 +1864,28 @@ copy_release() {
   chmod 755 "$tmp/companiond/pairlingd.py" "$tmp/mcp/phone_tools.py"
   clear_release_quarantine "$tmp"
   remove_python_bytecode "$tmp"
-  rm -rf "$RELEASE_ROOT"
-  mv "$tmp" "$RELEASE_ROOT"
-  write_manifest "$RELEASE_ROOT"
+  content_digest="$(release_content_digest "$tmp")"
+  RELEASE_ROOT="$RELEASES_ROOT/$RELEASE_NAME-${content_digest:0:16}"
+  if [[ -e "$RELEASE_ROOT" ]]; then
+    existing_digest="$(release_content_digest "$RELEASE_ROOT")"
+    if [[ "$existing_digest" != "$content_digest" || ! -f "$RELEASE_ROOT/manifest.json" ]]; then
+      rm -rf "$tmp"
+      log "ERROR: immutable runtime release path is present with different or incomplete bytes: $RELEASE_ROOT" >&2
+      WIZARD_FATAL=1
+      exit 1
+    fi
+    rm -rf "$tmp"
+    ACTIVE_STAGING_DIR=""
+  else
+    write_manifest "$tmp" "$RELEASE_ROOT"
+    if [[ "${PAIRLING_TEST_FAIL_AFTER_STAGED_MANIFEST:-0}" == 1 ]]; then
+      log "ERROR: forced test failure after staged runtime manifest" >&2
+      return 1
+    fi
+    mv "$tmp" "$RELEASE_ROOT"
+    fsync_directory "$RELEASES_ROOT"
+    ACTIVE_STAGING_DIR=""
+  fi
 }
 
 copy_runtime_source_tree() {
@@ -1367,6 +1920,7 @@ copy_runtime_source_tree() {
   cp "$REPO_ROOT/mac/install/"*.py "$mac_root/install/"
   cp "$REPO_ROOT/mac/mcp/"*.py "$mac_root/mcp/"
   cp "$REPO_ROOT/mac/packaging/bin/pairling" "$mac_root/packaging/bin/"
+  cp "$REPO_ROOT/mac/packaging/pairling_attach.py" "$mac_root/packaging/"
   chmod 755 "$mac_root/connectd/bin/pairling-connectd" "$mac_root/install/"*.sh "$mac_root/mcp/phone_tools.py" "$mac_root/packaging/bin/pairling"
   chmod 644 "$mac_root/VERSION" "$mac_root/SOURCE_REVISION" "$mac_root/SOURCE_BRANCH" "$mac_root/SOURCE_DIRTY"
 }
@@ -1385,8 +1939,8 @@ SH
 # Stage the vendored CPython (P3 custody) into the release tree when the npm
 # shim provided one via PAIRLING_DAEMON_PYTHON pointing at …/python/bin/python3.
 # Fail-closed: the interpreter must carry a valid signature, the pinned Team ID,
-# and the dev.pairling.python identifier. On success, repoint PYTHON3_BIN at the
-# STAGED interpreter so the daemon plist never references the npm package path.
+# and the dev.pairling.python identifier. After runtime/current is switched,
+# the installer adopts that stable interpreter path for every remaining step.
 stage_vendored_python() {
   local dest="$1"
   local provided="${PAIRLING_DAEMON_PYTHON:-}"
@@ -1400,6 +1954,11 @@ stage_vendored_python() {
   src_tree="$(cd "$(dirname "$provided")/.." && pwd)"
   if [[ ! -x "$src_tree/bin/python3" ]]; then
     return 0
+  fi
+  if [[ "$("$src_tree/bin/python3" -c 'print("pairling-python-ready")' 2>/dev/null || true)" != "pairling-python-ready" ]]; then
+    log "ERROR: vendored python is not functional; refusing to stage: $src_tree/bin/python3" >&2
+    WIZARD_FATAL=1
+    exit 1
   fi
   local required_team="${PAIRLING_CONNECTD_TEAM_ID:-965AVD34A3}"
   # Always enforce signature integrity and the dev.pairling.python identity
@@ -1431,11 +1990,12 @@ stage_vendored_python() {
   mkdir -p "$(dirname "$dest")"
   cp -R "$src_tree" "$dest"
   chmod 755 "$dest/bin/python3" 2>/dev/null || true
-  # Point the daemon at the interpreter through the stable `current` symlink
-  # (not $dest, which is the pre-move temp path) so the plist resolves after the
-  # release is moved into place and after rollback — exactly like connectd.
-  PYTHON3_BIN="$CURRENT_LINK/python/bin/python3"
-  log "Staged vendored CPython (daemon will run under dev.pairling.python via $PYTHON3_BIN)"
+  if [[ "$("$dest/bin/python3" -c 'print("pairling-python-ready")' 2>/dev/null || true)" != "pairling-python-ready" ]]; then
+    log "ERROR: staged vendored python is not functional; refusing to activate: $dest/bin/python3" >&2
+    WIZARD_FATAL=1
+    exit 1
+  fi
+  log "Staged vendored CPython (daemon will run under dev.pairling.python via $CURRENT_LINK/python/bin/python3)"
 }
 
 build_connectd_binary() {
@@ -1496,9 +2056,23 @@ build_connectd_binary() {
   )
 }
 
+fsync_directory() {
+  "$PYTHON3_BIN" - "$1" <<'PY'
+import os
+import sys
+
+descriptor = os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+}
+
 write_manifest() {
-  local root="$1"
-  python3 - "$REPO_ROOT" "$root" "$VERSION" "$REVISION" "$BRANCH" "$SOURCE_DIRTY" "$APP_SUPPORT" "$LOGS_ROOT" "$DEVICES_DB" "$PAIRLING_RUNTIME_PORT" <<'PY'
+  local root="$1" recorded_install_root="${2:-$1}"
+  "$PYTHON3_BIN" - "$REPO_ROOT" "$root" "$recorded_install_root" "$VERSION" "$REVISION" "$BRANCH" "$SOURCE_DIRTY" "$APP_SUPPORT" "$LOGS_ROOT" "$DEVICES_DB" "$PAIRLING_RUNTIME_PORT" "$PAIRDROP_ROOT" <<'PY'
+import os
 import getpass
 import hashlib
 import json
@@ -1506,8 +2080,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-repo_root, install_root, version, revision, branch, dirty, app_support, logs_root, devices_db, port = sys.argv[1:]
-root = Path(install_root)
+repo_root, scan_root, install_root, version, revision, branch, dirty, app_support, logs_root, devices_db, port, pairdrop_root = sys.argv[1:]
+root = Path(scan_root)
 files = []
 
 def visit(directory: Path) -> None:
@@ -1549,8 +2123,8 @@ manifest = {
     "installed_at": now,
     "installed_by": getpass.getuser(),
     "repo_path": repo_root,
-    "install_root": str(root),
-    "current_symlink": str(root.parent.parent / "current"),
+    "install_root": install_root,
+    "current_symlink": str(Path(install_root).parent.parent / "current"),
     "runtime": {
         "port": int(port),
         "auth": "per-device-scoped-bearer",
@@ -1565,6 +2139,7 @@ manifest = {
         "app_support": app_support,
         "logs": logs_root,
         "pair_records": str(Path(app_support) / "pair"),
+        "pairdrop": pairdrop_root,
     },
     "migration": {
         "legacy_port": 7723,
@@ -1577,26 +2152,38 @@ manifest = {
     },
     "files": files,
 }
-(root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+manifest_path = root / "manifest.json"
+temporary_path = root / f".manifest.json.tmp-{os.getpid()}"
+with temporary_path.open("x", encoding="utf-8") as handle:
+    handle.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.replace(temporary_path, manifest_path)
+descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
 PY
 }
 
 switch_current() {
+  if [[ -L "$CURRENT_LINK" && "$(readlink "$CURRENT_LINK")" == "$RELEASE_ROOT" ]]; then
+    return
+  fi
   if [[ -L "$CURRENT_LINK" ]]; then
     local old
     old="$(readlink "$CURRENT_LINK")"
     if [[ -n "$old" ]]; then
-      rm -f "$PREVIOUS_LINK"
-      ln -s "$old" "$PREVIOUS_LINK"
+      atomic_symlink_switch "$old" "$PREVIOUS_LINK"
     fi
   fi
-  rm -f "$CURRENT_LINK"
-  ln -s "$RELEASE_ROOT" "$CURRENT_LINK"
+  atomic_symlink_switch "$RELEASE_ROOT" "$CURRENT_LINK"
 }
 
 install_mcp_adapter_shim() {
   mkdir -p "$MCP_SERVER_DIR"
-  python3 - "$MCP_SERVER_SHIM" "$CURRENT_LINK/mcp/phone_tools.py" <<'PY'
+  "$PYTHON3_BIN" - "$MCP_SERVER_SHIM" "$CURRENT_LINK/mcp/phone_tools.py" <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -1693,6 +2280,7 @@ render_plists() {
     --logs-root "$LOGS_ROOT"
     --output-dir "$PLIST_BUILD_DIR"
     --daemon-python "$daemon_python"
+    --pairdrop-root "$PAIRDROP_ROOT"
   )
   # SPEC-p5 §2.1: `pairling setup --ssh` (or a prior enable) renders connectd
   # with the loopback SSH-tunnel gateway on. The flag persists in the
@@ -1701,7 +2289,7 @@ render_plists() {
   if [ "${SSH_GATEWAY_ENABLED:-0}" = "1" ]; then
     render_args+=(--ssh-gateway)
   fi
-  python3 "$REPO_ROOT/mac/install/render-launchd.py" "${render_args[@]}"
+  "$PYTHON3_BIN" "$REPO_ROOT/mac/install/render-launchd.py" "${render_args[@]}"
 }
 
 start_user_agent() {
@@ -1735,7 +2323,7 @@ start_connectd_agent() {
 ptybroker_live_session_count() {
   local status_json
   if status_json="$(ptybroker_status_json 2>/dev/null)"; then
-    python3 - "$status_json" <<'PY'
+    "$PYTHON3_BIN" - "$status_json" <<'PY'
 import json
 import sys
 
@@ -1778,7 +2366,7 @@ PY
 }
 
 ptybroker_desired_revision() {
-  python3 - "$CURRENT_LINK" <<'PY'
+  "$PYTHON3_BIN" - "$CURRENT_LINK" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1800,7 +2388,7 @@ PY
 }
 
 ptybroker_live_revision() {
-  python3 - "${1:-{}}" <<'PY'
+  "$PYTHON3_BIN" - "${1:-{}}" <<'PY'
 import json
 import sys
 
@@ -1824,7 +2412,7 @@ PY
 }
 
 ptybroker_deployment_state_json() {
-  python3 - "$CURRENT_LINK" "${1:-{}}" <<'PY'
+  "$PYTHON3_BIN" - "$CURRENT_LINK" "${1:-{}}" <<'PY'
 import json
 import os
 import sys
@@ -1908,7 +2496,7 @@ PY
 ptybroker_report_deferred_restart() {
   local state_json
   state_json="$(ptybroker_deployment_state_json "$1")"
-  python3 - "$state_json" <<'PY'
+  "$PYTHON3_BIN" - "$state_json" <<'PY'
 import json
 import sys
 
@@ -1942,7 +2530,7 @@ PY
 }
 
 ptybroker_state_field() {
-  python3 - "$1" "$2" <<'PY'
+  "$PYTHON3_BIN" - "$1" "$2" <<'PY'
 import json
 import sys
 
@@ -2010,6 +2598,8 @@ ensure_ptybroker_agent() {
 }
 
 reconcile_ptybroker() {
+  trap install_mutation_on_exit EXIT
+  acquire_install_lock
   ensure_state
   render_plists
   mkdir -p "$HOME/Library/LaunchAgents"
@@ -2017,6 +2607,8 @@ reconcile_ptybroker() {
   chmod 644 "$PTYBROKER_USER_PLIST"
   if is_dry_run; then
     log "dry-run: would reconcile $PAIRLING_PTYBROKER_LABEL"
+    release_install_lock
+    trap - EXIT
     return
   fi
   if ! launchctl print "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1; then
@@ -2049,6 +2641,8 @@ reconcile_ptybroker() {
     exit 1
   fi
   log "Reconciled $PAIRLING_PTYBROKER_LABEL with current runtime"
+  release_install_lock
+  trap - EXIT
 }
 
 stop_user_agent() {
@@ -2070,7 +2664,93 @@ stop_connectd_agent() {
 }
 
 run_doctor() {
-  "$REPO_ROOT/mac/install/doctor.sh"
+  PAIRLING_DAEMON_PYTHON="$PYTHON3_BIN" "$REPO_ROOT/mac/install/doctor.sh"
+}
+
+verify_runtime_activation() {
+  local doctor_json doctor_error
+  if is_dry_run || launchd_skipped; then
+    log "Skipping live activation proof because launchd is disabled for this run."
+    return
+  fi
+  "$PYTHON3_BIN" - "$PAIRLING_RUNTIME_PORT" "${PAIRLING_CONNECTD_STATUS_PORT:-7774}" "${PAIRLING_ACTIVATION_WAIT_SECONDS:-20}" <<'PY'
+import json
+import sys
+import time
+import urllib.request
+
+runtime_port, connectd_port, wait_seconds = map(int, sys.argv[1:])
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+deadline = time.monotonic() + max(1, wait_seconds)
+last_error = "activation endpoints did not answer"
+
+def fetch(url):
+    with opener.open(url, timeout=2) as response:
+        if response.status != 200:
+            raise RuntimeError(f"{url} returned HTTP {response.status}")
+        return json.loads(response.read().decode("utf-8"))
+
+while time.monotonic() < deadline:
+    try:
+        ready = fetch(f"http://127.0.0.1:{runtime_port}/readyz")
+        health = fetch(f"http://127.0.0.1:{runtime_port}/health")
+        connectd = fetch(f"http://127.0.0.1:{connectd_port}/status")
+        if ready.get("ok") is not True or ready.get("contract_version") != "pairling-runtime-v1":
+            raise RuntimeError("/readyz did not report the Pairling runtime contract as ready")
+        if health.get("ok") is not True or health.get("contract_version") != "pairling-runtime-v1":
+            raise RuntimeError("/health did not report the Pairling runtime contract as healthy")
+        runtime = health.get("runtime") if isinstance(health.get("runtime"), dict) else {}
+        if runtime.get("verified") is not True:
+            raise RuntimeError("/health did not report a verified installed runtime")
+        if int(connectd.get("schema_version") or 0) < 2:
+            raise RuntimeError("connectd /status did not report schema v2")
+        if connectd.get("upstream_reachable") is not True:
+            raise RuntimeError("connectd /status did not prove the runtime upstream reachable")
+        raise SystemExit(0)
+    except Exception as exc:
+        last_error = f"{type(exc).__name__}: {exc}"
+        time.sleep(0.5)
+raise SystemExit(f"runtime activation proof failed: {last_error}")
+PY
+
+  doctor_json="$(mktemp "${TMPDIR:-/tmp}/pairling-doctor.XXXXXX")"
+  doctor_error="$doctor_json.err"
+  if ! PAIRLING_DAEMON_PYTHON="$PYTHON3_BIN" "$REPO_ROOT/mac/install/doctor.sh" --json >"$doctor_json" 2>"$doctor_error"; then
+    cat "$doctor_error" >&2
+    cat "$doctor_json" >&2
+    rm -f "$doctor_json" "$doctor_error"
+    log "ERROR: Pairling doctor rejected the activated runtime." >&2
+    return 1
+  fi
+  if ! "$PYTHON3_BIN" - "$doctor_json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if payload.get("ok") is not True or payload.get("contract_version") != "pairling-runtime-v1":
+    raise SystemExit("doctor did not report a healthy Pairling runtime contract")
+checks = {str(row.get("id")): row for row in payload.get("checks", []) if isinstance(row, dict)}
+required = {
+    "manifest_exists",
+    "manifest_contract",
+    "launchagent_loaded",
+    "launchagent_loaded_from_current",
+    "connectd_launchagent_loaded",
+    "connectd_loaded_from_current",
+    "health_endpoint",
+    "health_contract",
+    "connectd_status_schema_v2",
+}
+failed = sorted(name for name in required if checks.get(name, {}).get("status") != "ok")
+if failed:
+    raise SystemExit("doctor activation checks failed: " + ", ".join(failed))
+PY
+  then
+    rm -f "$doctor_json" "$doctor_error"
+    return 1
+  fi
+  rm -f "$doctor_json" "$doctor_error"
 }
 
 rollback() {
@@ -2081,18 +2761,25 @@ rollback() {
   local current_target previous_target
   current_target="$(readlink "$CURRENT_LINK" 2>/dev/null || true)"
   previous_target="$(readlink "$PREVIOUS_LINK")"
-  rm -f "$CURRENT_LINK"
-  ln -s "$previous_target" "$CURRENT_LINK"
-  rm -f "$PREVIOUS_LINK"
+  trap install_mutation_on_exit EXIT
+  acquire_install_lock
+  RELEASE_ROOT="$previous_target"
+  begin_install_transaction
+  atomic_symlink_switch "$previous_target" "$CURRENT_LINK"
   if [[ -n "$current_target" ]]; then
-    ln -s "$current_target" "$PREVIOUS_LINK"
+    atomic_symlink_switch "$current_target" "$PREVIOUS_LINK"
+  else
+    rm -f "$PREVIOUS_LINK"
   fi
   render_plists
   ensure_ptybroker_agent
   start_user_agent
   start_connectd_agent
+  verify_runtime_activation
+  commit_install_transaction
   append_history "rollback" "rolled back to $previous_target"
-  run_doctor
+  release_install_lock
+  trap - EXIT
 }
 
 install_runtime() {
@@ -2143,6 +2830,7 @@ install_runtime() {
   if [ "$GUIDED_TTY" = 1 ]; then wizard_palette_init; fi
   if is_dry_run; then GUIDED_STAGE_TOTAL=6; else GUIDED_STAGE_TOTAL=9; fi
   trap guided_on_exit EXIT
+  acquire_install_lock
   # When WIZARD_TUI is 1 the guided stages add the splash, the live safety step,
   # and the bash recovery menu, all behind a WIZARD_TUI check and the dry-run
   # guard. When it is 0 the existing plain printf flow runs unchanged.
@@ -2161,12 +2849,19 @@ install_runtime() {
   ensure_state
   stage_ok "checks passed and state is ready"
 
+  begin_install_transaction
+
   stage_begin "PairDrop folder"
   ensure_pairdrop_folder
   stage_ok "$(display_path "$PAIRDROP_ROOT") is ready (private, mode 0700)"
 
   stage_begin "Staging runtime"
   copy_release
+  persist_pairdrop_folder
+  if launchd_skipped && [[ "${PAIRLING_TEST_FAIL_AFTER_PAIRDROP_PERSIST:-0}" == 1 ]]; then
+    log "ERROR: forced test failure after PairDrop configuration persistence" >&2
+    false
+  fi
   switch_current
   install_mcp_adapter_shim
   install_shell_wrapper
@@ -2177,15 +2872,21 @@ install_runtime() {
   ensure_ptybroker_agent
   start_user_agent
   start_connectd_agent
-  stage_ok "companiond, connectd, and ptybroker are running"
+  verify_runtime_activation
+  commit_install_transaction
+  stage_ok "companiond, connectd, and ptybroker passed live activation checks"
 
   append_history "installed" "installed $RELEASE_NAME"
-  if is_dry_run; then
-    log "dry-run: skipping doctor gate"
-  else
-    run_doctor || true
-  fi
   log "Installed Pairling runtime $RELEASE_NAME"
+
+  if ! is_dry_run; then
+    stage_begin "Pairling Connect sign-in (Mac)"
+    if ! require_pairling_connect_route; then
+      log "Pairling installed, but its private Pairling Connect route is not ready. Finish browser approval, then rerun setup or run: pairling pair --qr" >&2
+      exit 1
+    fi
+    stage_ok "Pairling Connect route is ready"
+  fi
 
   stage_begin "macOS permissions"
   if [ "${WIZARD_TUI:-0}" = 1 ] && ! is_dry_run; then
@@ -2210,8 +2911,8 @@ install_runtime() {
     fi
     # Record when this pairing attempt started, so the seen probe in
     # guided_finish_summary counts only a device paired during this session.
-    export PAIRLING_PAIRING_STARTED_AT="$(python3 -c 'import time;print(time.time())')"
-    if ! PAIRLING_CONNECTD_ROUTE_WAIT_SECONDS="${PAIRLING_CONNECTD_ROUTE_WAIT_SECONDS:-0}" pair_runtime --qr; then
+    export PAIRLING_PAIRING_STARTED_AT="$("$PYTHON3_BIN" -c 'import time;print(time.time())')"
+    if ! PAIRLING_CONNECTD_ROUTE_WAIT_SECONDS="${PAIRLING_CONNECTD_ROUTE_WAIT_SECONDS:-5}" pair_runtime --qr; then
       log "Pairling installed, but setup could not generate a pairing invitation. Run: pairling doctor --json; pairling pair --qr" >&2
       exit 1
     fi
@@ -2227,22 +2928,16 @@ install_runtime() {
       read -r _ || true
       log ""
     fi
-    # Browser auth must not block or precede the first pairing code. The code may
-    # already carry a ready Pairling Connect route; this later handoff only opens
-    # approval when the Mac still needs it.
-    stage_begin "Pairling Connect sign-in (Mac)"
-    auto_open_connect_auth
-    stage_ok "Pairling Connect sign-in handled"
-
     stage_begin "Finish and next steps"
     guided_finish_summary
     stage_ok "setup complete"
   fi
+  release_install_lock
   GUIDED_COMPLETE=1
 }
 
 status_runtime() {
-  "$REPO_ROOT/mac/install/doctor.sh" --json || true
+  PAIRLING_DAEMON_PYTHON="$PYTHON3_BIN" "$REPO_ROOT/mac/install/doctor.sh" --json || true
 }
 
 start_runtime() {
@@ -2293,12 +2988,11 @@ pair_runtime() {
   done
   local payload_file
   payload_file="$(mktemp)"
-  if python3 - "$PAIRLING_RUNTIME_PORT" "$ttl" "$REPO_ROOT" >"$payload_file" <<'PY'
+  if "$PYTHON3_BIN" - "$PAIRLING_RUNTIME_PORT" "$ttl" "$REPO_ROOT" >"$payload_file" <<'PY'
 import json
 import ipaddress
 import os
 import socket
-import subprocess
 import sys
 import time
 import urllib.parse
@@ -2396,23 +3090,6 @@ def detected_lan_ip() -> str:
     except Exception:
         return ""
 
-def detected_tailnet_ip() -> str:
-    override = os.environ.get("PAIRLING_TEST_TAILSCALE_IP")
-    if override is not None:
-        value = override.strip()
-        return value if value.startswith("100.") else ""
-    try:
-        proc = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=3)
-    except Exception:
-        return ""
-    if proc.returncode != 0:
-        return ""
-    for line in (proc.stdout or "").splitlines():
-        ip = line.strip()
-        if ip.startswith("100."):
-            return ip
-    return ""
-
 def connectd_route_wait_seconds() -> float:
     try:
         return min(max(float(os.environ.get("PAIRLING_CONNECTD_ROUTE_WAIT_SECONDS") or "0"), 0.0), 60.0)
@@ -2437,7 +3114,7 @@ def ready_connectd_route():
     poll_seconds = connectd_route_poll_seconds()
     deadline = time.monotonic() + wait_seconds
     while True:
-        status = fetch_connectd_status(timeout_seconds=0.7)
+        status = fetch_connectd_status(timeout_seconds=0.7) or {}
         connect_routes = advertised_pairling_connect_routes(status)
         if connect_routes:
             return connect_routes[0]
@@ -2469,10 +3146,9 @@ def default_pair_route(port_number: int) -> dict:
         value = os.environ.get(key)
         if value:
             return {"base_url": value, "source": "explicit_override", "status": "override"}
-    # A ready embedded route is the preferred first-pair transport. Its route
-    # metadata lets iOS claim the QR through PrePairEmbeddedTailnetTransport,
-    # so the code remains usable away from the Mac's local network. Nearby LAN
-    # pairing is only the fallback while Pairling Connect is not ready.
+    # The embedded route is the product boundary. Normal setup never emits a
+    # nearby or standalone-Tailscale invitation when Pairling Connect is not
+    # ready, because that code cannot satisfy the iPhone's pre-pair transport.
     route = ready_connectd_route()
     if route:
         return {
@@ -2481,17 +3157,28 @@ def default_pair_route(port_number: int) -> dict:
             "status": route["status"],
             "kind": route["kind"],
         }
+    if os.environ.get("PAIRLING_ALLOW_LOCAL_PAIRING") != "1":
+        return {}
+    # Explicit recovery/testing only. This branch is never selected by normal
+    # setup and is visibly marked degraded in the pair URL.
     lan_ip = detected_lan_ip()
     if lan_ip and lan_base_serviceable(lan_ip, port_number):
         return {"base_url": f"http://{lan_ip}:{port_number}", "source": "lan", "status": "fallback", "kind": "lan"}
     if os.environ.get("PAIRLING_DISABLE_BONJOUR") != "1" and os.environ.get("PAIRLING_TEST_DISABLE_BONJOUR") != "1":
         return {"base_url": f"http://{socket.gethostname()}.local:{port_number}", "source": "bonjour", "status": "fallback", "kind": "bonjour"}
-    tailnet_ip = detected_tailnet_ip()
-    if tailnet_ip:
-        return {"base_url": f"http://{tailnet_ip}:{port_number}", "source": "standalone_tailnet", "status": "fallback", "kind": "standalone_tailnet"}
-    return {"base_url": f"http://{socket.gethostname()}.local:{port_number}", "source": "bonjour", "status": "fallback", "kind": "bonjour"}
+    return {}
 
 pair_route = default_pair_route(int(port))
+if not pair_route:
+    print(json.dumps({
+        "ok": False,
+        "error": {
+            "code": "pairling_connect_required",
+            "message": "Pairling Connect must be authenticated and advertising a ready embedded route before Pairling can create a pairing invitation.",
+        },
+        "repair": "Run `pairling connect-auth-open`, finish browser approval, check `pairling doctor --json`, then retry `pairling pair --qr`.",
+    }, indent=2, sort_keys=True), file=sys.stderr)
+    raise SystemExit(1)
 base_url = str(pair_route.get("base_url") or "")
 if pair_id and secret:
     pair_params = {
@@ -2548,7 +3235,7 @@ PY
   fi
 
   local pair_url
-  pair_url="$(python3 - "$payload_file" <<'PY'
+  pair_url="$("$PYTHON3_BIN" - "$payload_file" <<'PY'
 import json
 import sys
 payload = json.load(open(sys.argv[1]))
@@ -2556,7 +3243,7 @@ print(payload.get("pair_url", ""))
 PY
 )"
 
-  python3 - "$payload_file" <<'PY'
+  "$PYTHON3_BIN" - "$payload_file" <<'PY'
 import json
 import sys
 payload = json.load(open(sys.argv[1]))
@@ -2594,14 +3281,26 @@ PY
 }
 
 devices_runtime() {
-  python3 - "$DEVICES_DB" <<'PY'
+  "$PYTHON3_BIN" - "$DEVICES_DB" <<'PY'
 import json
 import sqlite3
 import sys
 path = sys.argv[1]
 try:
     with sqlite3.connect(path) as db:
-        rows = db.execute("SELECT device_id, device_name, scopes_json, created_at, last_seen_at, revoked_at FROM devices ORDER BY created_at").fetchall()
+        columns = {
+            str(row[1])
+            for row in db.execute("PRAGMA table_info(devices)").fetchall()
+        }
+        query = (
+            "SELECT device_id, device_name, scopes_json, created_at, last_seen_at, revoked_at "
+            "FROM devices"
+        )
+        params = ()
+        if "purpose" in columns:
+            query += " WHERE COALESCE(purpose, '') NOT IN (?, ?)"
+            params = ("runtime_truth_smoke", "local_mcp_bridge")
+        rows = db.execute(query + " ORDER BY created_at", params).fetchall()
 except Exception as exc:
     print(json.dumps({"ok": False, "error": str(exc)}))
     raise SystemExit(1)
@@ -2628,7 +3327,7 @@ unpair_runtime() {
     log "usage: pairling unpair <device_id>" >&2
     exit 2
   fi
-  python3 - "$REPO_ROOT" "$DEVICES_DB" "$LOGS_ROOT/audit.jsonl" "$device_id" <<'PY'
+  "$PYTHON3_BIN" - "$REPO_ROOT" "$DEVICES_DB" "$LOGS_ROOT/audit.jsonl" "$device_id" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -2653,7 +3352,7 @@ rotate_runtime() {
     log "usage: pairling rotate-token <device_id>" >&2
     exit 2
   fi
-  python3 - "$REPO_ROOT" "$DEVICES_DB" "$LOGS_ROOT/audit.jsonl" "$device_id" <<'PY'
+  "$PYTHON3_BIN" - "$REPO_ROOT" "$DEVICES_DB" "$LOGS_ROOT/audit.jsonl" "$device_id" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -2699,7 +3398,7 @@ connect_auth_open() {
   local output
   if output="$(/usr/bin/curl -sS --max-time 5 -X POST http://127.0.0.1:7774/auth/open 2>/dev/null)"; then
     local response_status
-    if python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("ok") else 1)' <<<"$output"; then
+    if "$PYTHON3_BIN" -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("ok") else 1)' <<<"$output"; then
       response_status=0
     else
       response_status=1
@@ -2707,7 +3406,7 @@ connect_auth_open() {
     if [[ "$json_mode" == "true" ]]; then
       printf '%s\n' "$output"
     else
-      python3 -c 'import json,sys; data=json.load(sys.stdin); print("Pairling Connect browser approval opened." if data.get("opened") else data.get("error", "Pairling Connect browser approval is not available."))' <<<"$output"
+      "$PYTHON3_BIN" -c 'import json,sys; data=json.load(sys.stdin); print("Pairling Connect browser approval opened." if data.get("opened") else data.get("error", "Pairling Connect browser approval is not available."))' <<<"$output"
     fi
     exit "$response_status"
   fi
@@ -2719,20 +3418,14 @@ connect_auth_open() {
   exit 1
 }
 
-# auto_open_connect_auth — kicked off by install_runtime after the first QR.
-# Polls connectd /status for readiness (reusing fetch_connectd_status, the same
-# helper pair_runtime imports). When connectd is in interactive mode and not yet
-# authenticated (auth_url_present == true AND auth_state != "authenticated"), it
-# POSTs http://127.0.0.1:7774/auth/open directly so connectd opens the browser
-# sign-in server-side. We POST directly (not via connect_auth_open, which ends in
-# `exit` and would terminate setup before the QR). Already-authenticated or
-# already-tagged connectd is skipped silently. This never fails setup and never
-# blocks indefinitely: the bounded poll falls through to pair_runtime regardless.
-auto_open_connect_auth() {
+# Normal setup must have an authenticated embedded route before it creates a
+# pairing invitation. This opens browser approval when needed, waits for the
+# advertised semantic route, and fails with a clear repair step on timeout.
+require_pairling_connect_route() {
   if is_dry_run; then
     return 0
   fi
-  python3 - "$REPO_ROOT" <<'PY' || true
+  "$PYTHON3_BIN" - "$REPO_ROOT" <<'PY'
 import json
 import os
 import sys
@@ -2742,16 +3435,16 @@ import urllib.request
 
 repo_root = sys.argv[1]
 sys.path.insert(0, os.path.join(repo_root, "mac", "companiond"))
-from pairling_connectd_status import fetch_connectd_status
+from pairling_connectd_status import advertised_pairling_connect_routes, fetch_connectd_status
 
 AUTH_OPEN_URL = "http://127.0.0.1:7774/auth/open"
 
 
 def readiness_wait_seconds() -> float:
     try:
-        return min(max(float(os.environ.get("PAIRLING_CONNECTD_AUTH_WAIT_SECONDS") or "20"), 0.0), 60.0)
+        return min(max(float(os.environ.get("PAIRLING_CONNECTD_AUTH_WAIT_SECONDS") or "180"), 0.0), 600.0)
     except ValueError:
-        return 20.0
+        return 180.0
 
 
 def readiness_poll_seconds() -> float:
@@ -2759,24 +3452,6 @@ def readiness_poll_seconds() -> float:
         return min(max(float(os.environ.get("PAIRLING_CONNECTD_AUTH_POLL_SECONDS") or "0.5"), 0.1), 2.0)
     except ValueError:
         return 0.5
-
-
-def decision(status: dict):
-    """Return one of: ("open",), ("skip", reason), ("wait",)."""
-    if not status:
-        # connectd not reachable yet — keep waiting until the deadline.
-        return ("wait",)
-    auth_state = str(status.get("auth_state") or "")
-    if auth_state == "authenticated":
-        return ("skip", "already authenticated")
-    tags = status.get("tags")
-    if isinstance(tags, list) and tags:
-        # Already-tagged connectd (machine identity established) — no browser step.
-        return ("skip", "already tagged")
-    if status.get("auth_url_present"):
-        return ("open",)
-    # Reachable but no interactive auth URL yet — give connectd a moment.
-    return ("wait",)
 
 
 def post_auth_open() -> bool:
@@ -2800,21 +3475,36 @@ def main() -> None:
     wait_seconds = readiness_wait_seconds()
     poll_seconds = readiness_poll_seconds()
     deadline = time.monotonic() + wait_seconds
+    auth_open_attempted = False
+    last_status = {}
     while True:
-        status = fetch_connectd_status(timeout_seconds=0.7)
-        action = decision(status)
-        if action[0] == "open":
+        status = fetch_connectd_status(timeout_seconds=0.7) or {}
+        if status:
+            last_status = status
+        routes = advertised_pairling_connect_routes(status)
+        if routes:
+            route = routes[0]
+            print(f"Pairling Connect is ready at {route.get('base_url', 'the embedded route')}.")
+            return
+        if status.get("auth_url_present") and not auth_open_attempted:
+            auth_open_attempted = True
             if post_auth_open():
-                print("Opened the Tailscale sign-in in your browser. Finish sign-in to bring Pairling Connect online. The pairing code is already shown above.")
+                print("Opened Pairling Connect approval in your browser. Finish sign-in while this setup waits for the private route.")
             else:
-                print("Pairling Connect sign-in is not ready yet. The pairing code above remains available for nearby pairing. Run pairling doctor --json for the next remote-access step.")
-            return
-        if action[0] == "skip":
-            # Already authenticated or tagged — no browser step needed.
-            return
+                print("Pairling Connect approval is available but could not be opened automatically. Run `pairling connect-auth-open` in another terminal.")
         if wait_seconds <= 0 or time.monotonic() >= deadline:
-            print("Pairling Connect was not ready in time. The pairing code above remains available for nearby pairing. Run pairling doctor --json for the remote-route status.")
-            return
+            auth_state = str(last_status.get("auth_state") or "unknown")
+            backend_state = str(last_status.get("backend_state") or last_status.get("state") or "unknown")
+            print(
+                "ERROR: Pairling Connect did not advertise a ready embedded route "
+                f"before setup timed out (auth_state={auth_state}, backend_state={backend_state}).",
+                file=sys.stderr,
+            )
+            print(
+                "Run `pairling connect-auth-open`, finish browser approval, then check `pairling doctor --json` before retrying.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
         time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
 
 
@@ -2913,7 +3603,8 @@ SWIFT
 }
 
 diagnose_runtime() {
-  "$REPO_ROOT/mac/install/doctor.sh" --json | python3 -c 'import json,sys; data=json.load(sys.stdin); print(json.dumps(data, indent=2, sort_keys=True))' || true
+  PAIRLING_DAEMON_PYTHON="$PYTHON3_BIN" "$REPO_ROOT/mac/install/doctor.sh" --json \
+    | "$PYTHON3_BIN" -c 'import json,sys; data=json.load(sys.stdin); print(json.dumps(data, indent=2, sort_keys=True))' || true
 }
 
 usage() {
@@ -2970,7 +3661,7 @@ case "$cmd" in
     status_runtime
     ;;
   doctor)
-    "$REPO_ROOT/mac/install/doctor.sh" "$@"
+    PAIRLING_DAEMON_PYTHON="$PYTHON3_BIN" "$REPO_ROOT/mac/install/doctor.sh" "$@"
     ;;
   reconcile-ptybroker|--reconcile-ptybroker|--restart-ptybroker-if-idle)
     reconcile_ptybroker

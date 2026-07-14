@@ -269,6 +269,17 @@ func TestComposeSyncHasTheSameTwoMiBBodyLimitAsThePhoneAndDaemon(t *testing.T) {
 	}
 }
 
+func TestLegacyUploadHasTheSameHundredMiBBodyLimitAsTheDaemon(t *testing.T) {
+	handler := &Handler{maxBodyBytes: defaultMaxBodyBytes}
+	const want int64 = 100 * 1024 * 1024
+	if got := handler.requestBodyLimit(http.MethodPost, "/upload"); got != want {
+		t.Fatalf("legacy upload body limit = %d, want %d", got, want)
+	}
+	if got := handler.requestBodyLimit(http.MethodGet, "/upload"); got != defaultMaxBodyBytes {
+		t.Fatalf("legacy upload GET body limit = %d, want default %d", got, defaultMaxBodyBytes)
+	}
+}
+
 func TestHandlerLogsMetadataWithoutSensitiveBodies(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)

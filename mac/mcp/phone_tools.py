@@ -8,6 +8,7 @@ import hmac
 import http.client
 import json
 import os
+import re
 import sys
 import time
 from urllib.parse import urlparse
@@ -36,6 +37,8 @@ REQUEST_ID_HEADER = "Pairling-Request-ID"
 TIMESTAMP_HEADER = "Pairling-Timestamp"
 BODY_SHA256_HEADER = "Pairling-Body-SHA256"
 PROOF_HEADER = "Pairling-Proof"
+AGENT_PROVIDER_PATTERN = re.compile(r"\A[a-z0-9_-]{1,48}\Z")
+SESSION_IDENTITY_PATTERN = re.compile(r"\A[A-Za-z0-9._:-]{1,160}\Z")
 
 
 class PairlingToolsClient:
@@ -53,11 +56,13 @@ class PairlingToolsClient:
     def run(self, tool: str, input_payload: dict[str, Any], *, strategy: str = "auto") -> str:
         if os.environ.get("PAIRLING_TOOLS_DIRECT_IPHONE") == "1":
             return _direct_iphone_diagnostic(tool, input_payload)
-        body = json.dumps({
+        request_payload: dict[str, Any] = {
             "tool": tool,
             "input": input_payload,
             "strategy": strategy,
-        }, separators=(",", ":")).encode("utf-8")
+        }
+        request_payload.update(_agent_context_from_environment())
+        body = json.dumps(request_payload, separators=(",", ":")).encode("utf-8")
         credential = self._load_credential()
         url = self.base_url + "/pairling-tools/run"
         headers = {
@@ -121,6 +126,38 @@ class PairlingToolsClient:
         if missing:
             raise RuntimeError("Pairling MCP bridge credential is incomplete: " + ", ".join(missing))
         return {key: str(payload[key]) for key in required}
+
+
+def _agent_context_from_environment(
+    environ: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Return only agent identity the launching MCP process states directly."""
+    values = os.environ if environ is None else environ
+    explicit_provider = str(values.get("PAIRLING_AGENT_PROVIDER") or "").strip().lower()
+    explicit_session = str(values.get("PAIRLING_AGENT_SESSION_ID") or "").strip()
+
+    provider = explicit_provider if AGENT_PROVIDER_PATTERN.fullmatch(explicit_provider) else ""
+    session_identity = explicit_session if SESSION_IDENTITY_PATTERN.fullmatch(explicit_session) else ""
+    if not provider and not session_identity:
+        codex_thread = str(values.get("CODEX_THREAD_ID") or "").strip()
+        claude_session = str(
+            values.get("CLAUDE_CODE_SESSION_ID")
+            or values.get("CLAUDE_SESSION_ID")
+            or ""
+        ).strip()
+        if SESSION_IDENTITY_PATTERN.fullmatch(codex_thread):
+            provider = "codex"
+            session_identity = codex_thread
+        elif SESSION_IDENTITY_PATTERN.fullmatch(claude_session):
+            provider = "claude"
+            session_identity = claude_session
+
+    context: dict[str, str] = {}
+    if provider:
+        context["agent_provider"] = provider
+    if session_identity:
+        context["session_identity"] = session_identity
+    return context
 
 
 def _proof_headers(*, credential: dict[str, str], method: str, path_and_query: str, body: bytes) -> dict[str, str]:

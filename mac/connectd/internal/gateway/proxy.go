@@ -43,8 +43,8 @@ const funnelOriginHeader = "X-Pairling-Funnel-Origin"
 const pairingActivationContract = "pairling.psk.activate.v1"
 
 // Chat attachment uploads (POST /upload) carry whole photos/short videos in
-// one shot — the 1MB default rejected most camera photos with 413.
-const chatUploadMaxBodyBytes int64 = 25 * 1024 * 1024
+// one shot. Keep this in parity with companiond's documented legacy cap.
+const chatUploadMaxBodyBytes int64 = 100 * 1024 * 1024
 
 type ExposureMode string
 

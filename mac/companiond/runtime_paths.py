@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -59,6 +60,51 @@ def install_id_path() -> Path:
 
 def devices_db_path() -> Path:
     return app_support_root() / "devices.sqlite"
+
+
+def _absolute_persisted_path(value: object, *, source: str) -> Path:
+    path = Path(str(value or "")).expanduser()
+    if not str(value or "").strip() or not path.is_absolute():
+        raise ValueError(f"{source} must be an absolute path")
+    return path.resolve(strict=False)
+
+
+def pairdrop_root() -> Path:
+    """Resolve the one setup-owned PairDrop vault used by the daemon and CLI."""
+    configured = os.environ.get("PAIRLING_PAIRDROP_ROOT")
+    if configured is not None:
+        return _absolute_persisted_path(configured, source="PAIRLING_PAIRDROP_ROOT")
+
+    support_root = app_support_root()
+    config_path = support_root / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        config = None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("Pairling config.json cannot resolve the PairDrop vault") from exc
+    if isinstance(config, dict):
+        paths = config.get("paths")
+        if isinstance(paths, dict) and paths.get("pairdrop") is not None:
+            return _absolute_persisted_path(
+                paths.get("pairdrop"),
+                source="config.json paths.pairdrop",
+            )
+
+    manifest_path = current_release() / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        manifest = None
+    if isinstance(manifest, dict):
+        paths = manifest.get("paths")
+        if isinstance(paths, dict) and paths.get("pairdrop") is not None:
+            return _absolute_persisted_path(
+                paths.get("pairdrop"),
+                source="runtime manifest paths.pairdrop",
+            )
+
+    return (home() / "PairDrop").resolve(strict=False)
 
 
 def audit_log_path() -> Path:

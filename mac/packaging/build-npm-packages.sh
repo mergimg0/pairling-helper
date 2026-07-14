@@ -91,6 +91,7 @@ PACKAGED_SOURCE_PATHS=(
   "mac/install"
   "mac/mcp"
   "mac/packaging/bin/pairling"
+  "mac/packaging/pairling_attach.py"
   "mac/packaging/build-npm-packages.sh"
   "mac/packaging/vendor-cpython.sh"
   "npm"
@@ -236,6 +237,7 @@ cp "$REPO_ROOT/mac/connectd/go.mod" "$REPO_ROOT/mac/connectd/go.sum" "$MACPAY/co
 cp -R "$REPO_ROOT/mac/connectd/cmd" "$MACPAY/connectd/"
 cp -R "$REPO_ROOT/mac/connectd/internal" "$MACPAY/connectd/"
 cp "$REPO_ROOT/mac/packaging/bin/pairling" "$MACPAY/packaging/bin/"
+cp "$REPO_ROOT/mac/packaging/pairling_attach.py" "$MACPAY/packaging/"
 
 chmod 755 "$MACPAY/packaging/bin/pairling" "$MACPAY/install/"*.sh "$MACPAY/mcp/phone_tools.py" \
   "$MACPAY/companiond/pairlingd.py"
@@ -248,6 +250,7 @@ PYTHONPYCACHEPREFIX="$PYCACHE" python3 -m py_compile \
   "$MACPAY/companiond/providers/"*.py \
   "$MACPAY/companiond/integrations/"*.py \
   "$MACPAY/companiond/integrations/aperture_cli/"*.py \
+  "$MACPAY/packaging/pairling_attach.py" \
   "$MACPAY/mcp/"*.py \
   "$MACPAY/install/"*.py
 rm -rf "$PYCACHE"

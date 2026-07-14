@@ -9,6 +9,38 @@ if [[ -z "${PYTHONPYCACHEPREFIX:-}" ]]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+DOCTOR_APP_SUPPORT="${PAIRLING_APP_SUPPORT_ROOT:-${COMPANION_APP_SUPPORT_ROOT:-$HOME/Library/Application Support/Pairling}}"
+
+resolve_python_bin() {
+  local explicit="${PAIRLING_DAEMON_PYTHON:-${COMPANION_DAEMON_PYTHON:-}}"
+  local candidate
+  if [[ -n "$explicit" ]]; then
+    if [[ ! -x "$explicit" ]]; then
+      printf 'ERROR: configured Pairling Python is not executable: %s\n' "$explicit" >&2
+      return 1
+    fi
+    printf '%s\n' "$explicit"
+    return 0
+  fi
+  candidate="$DOCTOR_APP_SUPPORT/runtime/current/python/bin/python3"
+  if [[ -x "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  candidate="$(command -v python3 2>/dev/null || true)"
+  if [[ -n "$candidate" && -x "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  if [[ -x /usr/bin/python3 ]]; then
+    printf '/usr/bin/python3\n'
+    return 0
+  fi
+  printf 'ERROR: Pairling could not resolve a Python 3 interpreter. Reinstall the Pairling runtime package.\n' >&2
+  return 1
+}
+
+PYTHON3_BIN="$(resolve_python_bin)"
 JSON_MODE="false"
 FIRST_RUN_MODE="false"
 while [[ $# -gt 0 ]]; do
@@ -23,7 +55,7 @@ while [[ $# -gt 0 ]]; do
       # SPEC-p5 §6: re-display the SSH host fingerprint the phone pins,
       # without re-running setup. The authorized_keys line for a generated
       # client key is printed by `setup --ssh`.
-      exec python3 "$REPO_ROOT/mac/install/ssh_gateway_setup.py" host-fingerprint
+      exec "$PYTHON3_BIN" "$REPO_ROOT/mac/install/ssh_gateway_setup.py" host-fingerprint
       ;;
     --help|-h)
       cat <<EOF
@@ -43,7 +75,7 @@ EOF
   shift
 done
 
-python3 - "$REPO_ROOT" "$JSON_MODE" "$FIRST_RUN_MODE" <<'PY'
+"$PYTHON3_BIN" - "$REPO_ROOT" "$JSON_MODE" "$FIRST_RUN_MODE" <<'PY'
 from __future__ import annotations
 
 import hashlib
@@ -53,11 +85,14 @@ import plistlib
 import re
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
+from contextlib import closing
 from pathlib import Path
 
 repo_root = Path(sys.argv[1])
@@ -69,6 +104,7 @@ PAIRLING_PORT = int(os.environ.get("PAIRLING_RUNTIME_PORT", "7773"))
 PAIRLING_LABEL = "dev.pairling.companiond"
 PAIRLING_CONNECTD_LABEL = "dev.pairling.connectd"
 PAIRLING_PTYBROKER_LABEL = "dev.pairling.ptybroker"
+INTERNAL_DEVICE_PURPOSES = ("runtime_truth_smoke", "local_mcp_bridge")
 TEAM_ID = os.environ.get("PAIRLING_TEAM_ID", os.environ.get("PAIRLING_CONNECTD_TEAM_ID", "965AVD34A3"))
 APP_SUPPORT = Path(os.environ.get("PAIRLING_APP_SUPPORT_ROOT", os.environ.get("COMPANION_APP_SUPPORT_ROOT", str(home / "Library" / "Application Support" / "Pairling"))))
 LOGS_ROOT = Path(os.environ.get("PAIRLING_LOGS_ROOT", os.environ.get("COMPANION_LOGS_ROOT", str(home / "Library" / "Logs" / "Pairling"))))
@@ -139,15 +175,191 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def valid_install_id(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if len(candidate) > 256 or re.fullmatch(r"inst_[A-Za-z0-9_-]+", candidate) is None:
+        return None
+    return candidate
+
+
+def read_identity_file(path: Path) -> str:
+    for directory in {APP_SUPPORT, path.parent}:
+        metadata = directory.lstat()
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError(f"unsafe identity directory: {directory}")
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise OSError(f"unsafe identity file: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(f"unsafe identity file: {path}")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            return handle.read()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def install_identity_coherence() -> tuple[bool, dict]:
+    """Read every local install identity source without repairing any of them."""
+    issues: list[str] = []
+
+    config_install_id = None
+    try:
+        payload = json.loads(read_identity_file(APP_SUPPORT / "config.json"))
+        candidate = valid_install_id(payload.get("install_id"))
+        if candidate:
+            config_install_id = candidate
+        else:
+            issues.append("config_install_id_invalid")
+    except FileNotFoundError:
+        issues.append("config_install_id_missing")
+    except Exception:
+        issues.append("config_install_id_unreadable")
+
+    state_install_id = None
+    try:
+        candidate = valid_install_id(
+            read_identity_file(APP_SUPPORT / "state" / "install-id")
+        )
+        if candidate:
+            state_install_id = candidate
+        else:
+            issues.append("state_install_id_invalid")
+    except FileNotFoundError:
+        issues.append("state_install_id_missing")
+    except Exception:
+        issues.append("state_install_id_unreadable")
+
+    active_install_ids: list[str] = []
+    revoked_install_ids: list[str] = []
+    invalid_active_install_id_count = 0
+    if DEVICES_DB.exists() and not DEVICES_DB.is_symlink() and stat.S_ISREG(DEVICES_DB.stat().st_mode):
+        try:
+            with closing(sqlite3.connect(f"file:{DEVICES_DB}?mode=ro", uri=True)) as db:
+                columns = {
+                    str(row[1])
+                    for row in db.execute("PRAGMA table_info(devices)").fetchall()
+                }
+                if "install_id" not in columns:
+                    issues.append("devices_install_id_column_missing")
+                else:
+                    active_where = ["revoked_at IS NULL"]
+                    active_params: list[object] = []
+                    if "activation_state" in columns:
+                        active_where.append("COALESCE(activation_state, 'active') = 'active'")
+                    if "purpose" in columns:
+                        active_where.append("COALESCE(purpose, '') NOT IN (?, ?)")
+                        active_params.extend(INTERNAL_DEVICE_PURPOSES)
+                    active_rows = db.execute(
+                        "SELECT DISTINCT install_id FROM devices WHERE "
+                        + " AND ".join(active_where),
+                        active_params,
+                    ).fetchall()
+                    normalized_active_install_ids = [valid_install_id(row[0]) for row in active_rows]
+                    invalid_active_install_id_count = sum(
+                        1 for install_id in normalized_active_install_ids if not install_id
+                    )
+                    active_install_ids = sorted({
+                        install_id
+                        for install_id in normalized_active_install_ids
+                        if install_id
+                    })
+                    if invalid_active_install_id_count:
+                        issues.append("active_install_id_invalid")
+                    revoked_where = ["revoked_at IS NOT NULL"]
+                    revoked_params: list[object] = []
+                    if "purpose" in columns:
+                        revoked_where.append("COALESCE(purpose, '') NOT IN (?, ?)")
+                        revoked_params.extend(INTERNAL_DEVICE_PURPOSES)
+                    revoked_rows = db.execute(
+                        "SELECT DISTINCT install_id FROM devices WHERE "
+                        + " AND ".join(revoked_where),
+                        revoked_params,
+                    ).fetchall()
+                    revoked_install_ids = sorted(
+                        install_id
+                        for row in revoked_rows
+                        if (install_id := valid_install_id(row[0])) is not None
+                    )
+        except Exception:
+            issues.append("devices_install_ids_unreadable")
+    else:
+        issues.append("devices_database_missing")
+
+    mcp_install_id = None
+    try:
+        payload = json.loads(read_identity_file(MCP_CREDENTIAL))
+        candidate = valid_install_id(payload.get("install_id"))
+        if candidate:
+            mcp_install_id = candidate
+        else:
+            issues.append("mcp_install_id_invalid")
+    except FileNotFoundError:
+        issues.append("mcp_install_id_missing")
+    except Exception:
+        issues.append("mcp_install_id_unreadable")
+
+    if config_install_id and state_install_id and state_install_id != config_install_id:
+        issues.append("state_install_id_mismatch")
+    if len(active_install_ids) > 1:
+        issues.append("multiple_active_install_ids")
+    elif config_install_id and active_install_ids and active_install_ids[0] != config_install_id:
+        issues.append("active_install_id_mismatch")
+    if config_install_id and mcp_install_id and mcp_install_id != config_install_id:
+        issues.append("mcp_install_id_mismatch")
+
+    other_revoked_install_ids = [
+        install_id
+        for install_id in revoked_install_ids
+        if not config_install_id or install_id != config_install_id
+    ]
+    evidence = {
+        "config_install_id": config_install_id,
+        "state_install_id": state_install_id,
+        "active_install_ids": active_install_ids,
+        "active_install_id_count": len(active_install_ids),
+        "invalid_active_install_id_count": invalid_active_install_id_count,
+        "mcp_install_id": mcp_install_id,
+        "revoked_other_install_ids": other_revoked_install_ids,
+        "revoked_other_install_id_count": len(other_revoked_install_ids),
+        "issue_codes": sorted(set(issues)),
+    }
+    return not issues, evidence
+
+
 def writable_dir(path: Path) -> tuple[bool, str]:
+    descriptor = -1
+    probe = None
     try:
         path.mkdir(parents=True, exist_ok=True)
-        probe = path / ".pairling-doctor-write-test"
-        probe.write_text("ok")
+        if not stat.S_ISDIR(path.lstat().st_mode):
+            raise OSError("path is not a real directory")
+        descriptor, raw_probe = tempfile.mkstemp(
+            prefix=".pairling-doctor-write-",
+            dir=path,
+        )
+        probe = Path(raw_probe)
+        os.write(descriptor, b"ok")
+        os.close(descriptor)
+        descriptor = -1
         probe.unlink()
         return True, str(path)
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if probe is not None:
+            try:
+                probe.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def port_listeners(port: int) -> list[str]:
@@ -460,7 +672,7 @@ compile_targets = [
 ]
 compile_errors = []
 for target in compile_targets:
-    code, out, err = run(["python3", "-m", "py_compile", str(target)])
+    code, out, err = run([sys.executable, "-m", "py_compile", str(target)])
     if code != 0:
         compile_errors.append(f"{target}: {err or out}")
 add("lifecycle_sources_compile", not compile_errors, "error", "Lifecycle sources compile." if not compile_errors else "Lifecycle compile failed.", compile_errors)
@@ -472,13 +684,26 @@ add("logs_writable", ok, "error", "Logs directory is writable.", evidence)
 
 if DEVICES_DB.exists():
     try:
-        with sqlite3.connect(f"file:{DEVICES_DB}?mode=ro", uri=True) as db:
+        with closing(sqlite3.connect(f"file:{DEVICES_DB}?mode=ro", uri=True)) as db:
             tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         add("devices_db", {"devices", "audit_events"}.issubset(tables), "error", "Devices database has required tables.", sorted(tables))
     except Exception as exc:
         add("devices_db", False, "error", f"Devices database is unreadable: {type(exc).__name__}: {exc}", str(DEVICES_DB))
 else:
     add("devices_db", False, "error", "Devices database is missing.", str(DEVICES_DB))
+
+identity_ok, identity_evidence = install_identity_coherence()
+add(
+    "install_identity_coherence",
+    identity_ok,
+    "error",
+    (
+        "Installer, state, active device, and MCP identities agree."
+        if identity_ok
+        else "Pairling install identities disagree or cannot be verified."
+    ),
+    identity_evidence,
+)
 
 try:
     sys.path.insert(0, str(repo_root / "mac" / "companiond"))
@@ -488,12 +713,17 @@ try:
     valid, evidence = validate_local_mcp_bridge_credential(
         registry=DeviceRegistry(DEVICES_DB, LOGS_ROOT / "audit.jsonl"),
         credential_path=MCP_CREDENTIAL,
+        install_id=str(identity_evidence.get("config_install_id") or ""),
     )
     add(
         "mcp_bridge_credential",
         valid,
         "error",
-        "Local Pairling MCP bridge credential is valid and scoped.",
+        (
+            "Local Pairling MCP bridge credential is valid and scoped."
+            if valid
+            else f"Local Pairling MCP bridge credential is invalid: {evidence}"
+        ),
         evidence,
     )
 except Exception as exc:
@@ -749,8 +979,8 @@ else:
 # P3 Python custody: when a vendored interpreter is staged, it must be a valid
 # Developer ID build from the expected team with the dev.pairling.python
 # identity — that scoping is the whole point (TCC grants attach to Pairling, not
-# a generic python3). When no vendored python is staged (the daemon runs under a
-# system python3), this check is informational, not a blocker.
+# a generic interpreter). When no vendored Python is staged, this check is
+# informational, not a blocker.
 expected_python_identifier = os.environ.get("PAIRLING_PYTHON_IDENTIFIER", "dev.pairling.python")
 staged_python = CURRENT / "python" / "bin" / "python3"
 if staged_python.exists():
@@ -778,7 +1008,7 @@ else:
         "python_runtime",
         True,
         "warning",
-        "No vendored CPython staged; daemon runs under a system python3 (acceptable pre-P3-rollout).",
+        "No vendored CPython staged; daemon uses the resolved Python 3 interpreter (acceptable pre-P3-rollout).",
         {"python": str(staged_python), "vendored": False},
     )
 

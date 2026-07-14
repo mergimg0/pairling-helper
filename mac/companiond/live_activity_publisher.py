@@ -13,8 +13,9 @@ import json
 import re
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from push_event_catalog import build_push_event, live_activity_content_state, live_activity_payload
 
@@ -45,6 +46,10 @@ class LiveActivityTurnStatePublisher:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_attempts: dict[tuple[str, str], dict[str, Any]] = {}
+        self._attempts_lock = threading.RLock()
+        self._key_locks_guard = threading.Lock()
+        self._key_locks: dict[tuple[str, str], threading.Lock] = {}
+        self._key_lock_refs: dict[tuple[str, str], int] = {}
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -72,12 +77,20 @@ class LiveActivityTurnStatePublisher:
         results: list[dict[str, Any]] = []
         active = self._active_live_activities()
         seen_keys = {(item["device_id"], item["session_id"]) for item in active}
-        for key in list(self._last_attempts):
-            if key not in seen_keys:
-                self._last_attempts.pop(key, None)
+        with self._attempts_lock:
+            for key in list(self._last_attempts):
+                if key not in seen_keys:
+                    self._last_attempts.pop(key, None)
 
         for item in active:
-            result = self._publish_for_activity(item)
+            try:
+                result = self._publish_for_activity(item)
+            except Exception as exc:  # noqa: BLE001 - one device must not starve the rest
+                self._log(
+                    f"live activity delivery failed for {item['device_id']}/{item['session_id']}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
             if result is not None:
                 results.append(result)
         return results
@@ -95,7 +108,14 @@ class LiveActivityTurnStatePublisher:
         for item in self._active_live_activities():
             if item["session_id"] != session_id:
                 continue
-            result = self._publish_state_to_activity(item, state_payload)
+            try:
+                result = self._publish_state_to_activity(item, state_payload)
+            except Exception as exc:  # noqa: BLE001 - one device must not starve the rest
+                self._log(
+                    f"live activity delivery failed for {item['device_id']}/{item['session_id']}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
             if result is not None:
                 results.append(result)
         return results
@@ -117,7 +137,8 @@ class LiveActivityTurnStatePublisher:
             device_id = str(device.get("device_id") or "").strip()
             if not device_id:
                 continue
-            for activity in device.get("live_activities") or []:
+            activities = device.get("live_activities") or []
+            for activity in reversed(activities if isinstance(activities, list) else []):
                 if not isinstance(activity, dict) or activity.get("invalidated_at"):
                     continue
                 session_id = str(activity.get("session_id") or "").strip()
@@ -127,7 +148,14 @@ class LiveActivityTurnStatePublisher:
                 if key in seen:
                     continue
                 seen.add(key)
-                out.append({"device_id": device_id, "session_id": session_id})
+                registration_id = str(
+                    activity.get("token_hash") or activity.get("activity_id") or "legacy"
+                ).strip()
+                out.append({
+                    "device_id": device_id,
+                    "session_id": session_id,
+                    "registration_id": registration_id,
+                })
         return out
 
     def _publish_for_activity(self, item: dict[str, str]) -> dict[str, Any] | None:
@@ -141,38 +169,78 @@ class LiveActivityTurnStatePublisher:
         session_id = item["session_id"]
         payload, signature_visible = self._event_payload_from_turn_state(session_id, state_payload)
         key = (item["device_id"], session_id)
-        signature = _stable_hash({
-            "session_id": session_id,
-            "event": payload["event"],
-            "visible": signature_visible,
-        })
-        now = float(self.now_fn())
-        previous = self._last_attempts.get(key)
-        if previous and previous.get("signature") == signature:
-            if previous.get("ok"):
-                return None
-            if now - float(previous.get("attempted_at") or 0) < self.failed_retry_interval:
-                return None
-        if previous and self._is_token_only_change(previous.get("visible"), signature_visible):
-            if now - float(previous.get("attempted_at") or 0) < self.token_update_interval:
-                return None
+        with self._key_lock(key):
+            signature = _stable_hash({
+                "session_id": session_id,
+                "registration_id": item.get("registration_id"),
+                "event": payload["event"],
+                "visible": signature_visible,
+            })
+            now = float(self.now_fn())
+            with self._attempts_lock:
+                previous = self._last_attempts.get(key)
+            if previous and previous.get("signature") == signature:
+                if previous.get("ok"):
+                    return None
+                if now - float(previous.get("attempted_at") or 0) < self.failed_retry_interval:
+                    return None
+            same_registration = bool(
+                previous
+                and previous.get("registration_id") == item.get("registration_id")
+            )
+            if same_registration and self._is_token_only_change(previous.get("visible"), signature_visible):
+                if now - float(previous.get("attempted_at") or 0) < self.token_update_interval:
+                    return None
 
-        event_id = "la_auto_" + signature[:32]
-        payload["event_id"] = event_id
-        payload["content_state"]["eventId"] = event_id
-        delivery = self.push_dispatcher.record_live_activity_event(
-            device_id=item["device_id"],
-            payload=payload,
-        )
-        ok = bool(delivery.get("ok"))
-        self._last_attempts[key] = {
-            "signature": signature,
-            "visible": signature_visible,
-            "attempted_at": now,
-            "ok": ok,
-            "event_id": event_id,
-        }
-        return delivery
+            event_id = "la_auto_" + signature[:32]
+            payload["event_id"] = event_id
+            payload["content_state"]["eventId"] = event_id
+            try:
+                delivery = self.push_dispatcher.record_live_activity_event(
+                    device_id=item["device_id"],
+                    payload=payload,
+                )
+            except Exception:
+                with self._attempts_lock:
+                    self._last_attempts[key] = {
+                        "signature": signature,
+                        "visible": signature_visible,
+                        "attempted_at": now,
+                        "ok": False,
+                        "event_id": event_id,
+                        "registration_id": item.get("registration_id"),
+                    }
+                raise
+            ok = bool(delivery.get("ok"))
+            with self._attempts_lock:
+                self._last_attempts[key] = {
+                    "signature": signature,
+                    "visible": signature_visible,
+                    "attempted_at": now,
+                    "ok": ok,
+                    "event_id": event_id,
+                    "registration_id": item.get("registration_id"),
+                }
+            return delivery
+
+    @contextmanager
+    def _key_lock(self, key: tuple[str, str]) -> Iterator[None]:
+        with self._key_locks_guard:
+            lock = self._key_locks.setdefault(key, threading.Lock())
+            self._key_lock_refs[key] = self._key_lock_refs.get(key, 0) + 1
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+            with self._key_locks_guard:
+                remaining = self._key_lock_refs.get(key, 1) - 1
+                if remaining <= 0:
+                    self._key_lock_refs.pop(key, None)
+                    if self._key_locks.get(key) is lock:
+                        self._key_locks.pop(key, None)
+                else:
+                    self._key_lock_refs[key] = remaining
 
     def _read_turn_state(self, session_id: str) -> dict[str, Any] | None:
         provider, native_id = _parse_session_ref(session_id)
@@ -205,7 +273,6 @@ class LiveActivityTurnStatePublisher:
         effort = _bounded_optional(payload.get("effort"), 40)
         tokens = _optional_int(payload.get("tokens", payload.get("total_tokens")))
         last_update = _optional_float(payload.get("last_update")) or float(self.now_fn())
-        started_at = _optional_float(payload.get("started_at"))
         freshness = max(0, int(float(self.now_fn()) - last_update))
         kind = _catalog_kind_for_state(state)
         current_step = _current_step_for_state(state, tool, payload)
@@ -250,20 +317,12 @@ class LiveActivityTurnStatePublisher:
             outgoing["content_state"]["currentStep"] = current_step or f"Running {tool}"
         outgoing["stale_seconds"] = 75
         outgoing["dismissal_seconds"] = 300 if state in {"attention", "failed"} else 120
-        visible = {
-            "state": state,
-            "phase": state,
-            "tool": tool,
-            "effort": effort,
-            "tokens": tokens,
-            "attentionLevel": _attention_level(state),
-            "started_at": started_at,
-            "currentStep": outgoing["content_state"].get("currentStep"),
-            "resultSummary": outgoing["content_state"].get("resultSummary"),
-            "requiredAction": outgoing["content_state"].get("requiredAction"),
-            "riskSummary": outgoing["content_state"].get("riskSummary"),
-        }
         outgoing["content_state"]["verb"] = _verb_for_state(state, tool)
+        visible = {
+            key: value
+            for key, value in outgoing["content_state"].items()
+            if key not in {"eventId", "updatedAtEpoch"}
+        }
         return outgoing, visible
 
     def _is_token_only_change(self, previous: Any, current: dict[str, Any]) -> bool:

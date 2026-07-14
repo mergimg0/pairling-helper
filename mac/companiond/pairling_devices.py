@@ -7,23 +7,36 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
+import stat
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from runtime_contract import DEFAULT_DEVICE_SCOPES
-from runtime_paths import audit_log_path, devices_db_path, install_id_path
+from runtime_paths import app_support_root, audit_log_path, devices_db_path
 
 
 SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("PAIRLING_SQLITE_BUSY_TIMEOUT_MS", "5000"))
 PAIR_ACTIVATION_PROOF_VERSION = "pairling.psk.activate.v1"
 PAIR_ACTIVATION_RESULT_CONTRACT = "pairling.psk.activate.result.v1"
 SMOKE_DEVICE_PURPOSE = "runtime_truth_smoke"
+LOCAL_MCP_DEVICE_PURPOSE = "local_mcp_bridge"
+INTERNAL_DEVICE_PURPOSES = (
+    SMOKE_DEVICE_PURPOSE,
+    LOCAL_MCP_DEVICE_PURPOSE,
+)
+INSTALL_ID_PATTERN = re.compile(r"\Ainst_[A-Za-z0-9_-]+\Z")
+INSTALL_ID_MAX_LENGTH = 256
+PHONE_TOOL_ACTIVITY_EVENT = "pairling_tools.run"
+PHONE_TOOL_ACTIVITY_MAX_ITEMS = 100
+PHONE_TOOL_ACTIVITY_READ_BYTES = 2 * 1024 * 1024
 
 
 def utc_epoch() -> float:
@@ -61,35 +74,426 @@ def _redact_for_audit(value: Any) -> Any:
     return value
 
 
-def _write_private_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(path.parent, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
-    except OSError:
-        pass
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w") as fh:
-        fh.write(text)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+class InstallIdentityError(RuntimeError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
 
 
-def load_or_create_install_id(path: Path | None = None) -> str:
-    target = path or install_id_path()
+def normalize_install_id(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized) > INSTALL_ID_MAX_LENGTH
+        or INSTALL_ID_PATTERN.fullmatch(normalized) is None
+    ):
+        return ""
+    return normalized
+
+
+def _require_identity_directory(
+    path: Path,
+    *,
+    create: bool,
+    error_code: str,
+    label: str,
+) -> bool:
     try:
-        value = target.read_text().strip()
-        if value:
-            return value
+        metadata = path.lstat()
     except FileNotFoundError:
+        if not create:
+            return False
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        metadata = path.lstat()
+    except OSError as exc:
+        raise InstallIdentityError(
+            error_code,
+            f"{label} could not be inspected.",
+        ) from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise InstallIdentityError(
+            error_code,
+            f"{label} must be a real directory, not a symlink or another file type.",
+        )
+    if create:
+        try:
+            os.chmod(path, 0o700, follow_symlinks=False)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+        except (NotImplementedError, OSError):
+            pass
+    return True
+
+
+def _read_identity_text(
+    support_root: Path,
+    path: Path,
+    *,
+    kind: str,
+) -> str | None:
+    error_prefix = f"install_identity_{kind}"
+    if not _require_identity_directory(
+        support_root,
+        create=False,
+        error_code=f"{error_prefix}_unsafe",
+        label="Pairling app support",
+    ):
+        return None
+    if path.parent != support_root and not _require_identity_directory(
+        path.parent,
+        create=False,
+        error_code=f"{error_prefix}_unsafe",
+        label=f"Pairling {kind} parent",
+    ):
+        return None
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise InstallIdentityError(
+            f"{error_prefix}_unreadable",
+            f"Pairling {kind} identity exists but could not be inspected.",
+        ) from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise InstallIdentityError(
+            f"{error_prefix}_unsafe",
+            f"Pairling {kind} identity must be a regular file, not a symlink or another file type.",
+        )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise InstallIdentityError(
+            f"{error_prefix}_unsafe",
+            f"Pairling {kind} identity exists but could not be opened safely.",
+        ) from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise InstallIdentityError(
+                f"{error_prefix}_unsafe",
+                f"Pairling {kind} identity must be a regular file.",
+            )
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            return handle.read()
+    except UnicodeError as exc:
+        raise InstallIdentityError(
+            f"{error_prefix}_invalid",
+            f"Pairling {kind} identity is not valid UTF-8 and was left unchanged.",
+        ) from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _write_private_text(
+    support_root: Path,
+    path: Path,
+    text: str,
+    *,
+    kind: str,
+    repair_invalid_regular: bool = False,
+) -> None:
+    error_prefix = f"install_identity_{kind}"
+    _require_identity_directory(
+        support_root,
+        create=True,
+        error_code=f"{error_prefix}_unsafe",
+        label="Pairling app support",
+    )
+    if path.parent != support_root:
+        _require_identity_directory(
+            path.parent,
+            create=True,
+            error_code=f"{error_prefix}_unsafe",
+            label=f"Pairling {kind} parent",
+        )
+    try:
+        current = _read_identity_text(support_root, path, kind=kind)
+    except InstallIdentityError as exc:
+        if not repair_invalid_regular or exc.code != f"{error_prefix}_invalid":
+            raise
+        current = None
+    if current == text:
+        try:
+            os.chmod(path, 0o600, follow_symlinks=False)
+        except (NotImplementedError, OSError):
+            pass
+        return
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        try:
+            directory_fd = os.open(
+                path.parent,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+    try:
+        os.chmod(path, 0o600, follow_symlinks=False)
+    except (NotImplementedError, OSError):
         pass
-    value = "inst_" + secrets.token_hex(16)
-    _write_private_text(target, value + "\n")
+
+
+def _read_install_config(root: Path) -> dict[str, Any]:
+    path = root / "config.json"
+    raw = _read_identity_text(root, path, kind="config")
+    if raw is None:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise InstallIdentityError(
+            "install_identity_config_invalid",
+            "Pairling config.json is malformed and was left unchanged.",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise InstallIdentityError(
+            "install_identity_config_invalid",
+            "Pairling config.json must contain a JSON object and was left unchanged.",
+        )
+    return payload
+
+
+def _config_install_id(root: Path) -> str:
+    payload = _read_install_config(root)
+    raw_value = payload.get("install_id")
+    if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
+        return ""
+    value = normalize_install_id(raw_value)
+    if not value:
+        raise InstallIdentityError(
+            "install_identity_config_invalid",
+            "Pairling config.json contains an invalid install identity and was left unchanged.",
+        )
     return value
+
+
+def _state_install_id(path: Path) -> str:
+    support_root = path.parent.parent
+    raw = _read_identity_text(support_root, path, kind="state")
+    if raw is None:
+        return ""
+    value = normalize_install_id(raw)
+    if not value:
+        raise InstallIdentityError(
+            "install_identity_state_invalid",
+            "Pairling state/install-id is invalid and was left unchanged.",
+        )
+    return value
+
+
+def _active_external_install_ids(path: Path) -> tuple[str, ...]:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return ()
+    except OSError as exc:
+        raise InstallIdentityError(
+            "install_identity_registry_unavailable",
+            "Pairling could not inspect the device registry while recovering its install identity.",
+        ) from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise InstallIdentityError(
+            "install_identity_registry_invalid",
+            "Pairling devices.sqlite must be a regular file, not a symlink or another file type.",
+        )
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as conn:
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            if "devices" not in tables:
+                return ()
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(devices)").fetchall()
+            }
+            has_activation_state = "activation_state" in columns
+            has_purpose = "purpose" in columns
+            if has_activation_state and has_purpose:
+                rows = conn.execute(
+                    "SELECT DISTINCT install_id FROM devices "
+                    "WHERE revoked_at IS NULL "
+                    "AND COALESCE(activation_state, 'active') = 'active' "
+                    "AND COALESCE(purpose, '') NOT IN (?, ?)",
+                    INTERNAL_DEVICE_PURPOSES,
+                ).fetchall()
+            elif has_activation_state:
+                rows = conn.execute(
+                    "SELECT DISTINCT install_id FROM devices "
+                    "WHERE revoked_at IS NULL "
+                    "AND COALESCE(activation_state, 'active') = 'active'"
+                ).fetchall()
+            elif has_purpose:
+                rows = conn.execute(
+                    "SELECT DISTINCT install_id FROM devices "
+                    "WHERE revoked_at IS NULL "
+                    "AND COALESCE(purpose, '') NOT IN (?, ?)",
+                    INTERNAL_DEVICE_PURPOSES,
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT DISTINCT install_id FROM devices WHERE revoked_at IS NULL"
+                ).fetchall()
+    except sqlite3.Error as exc:
+        raise InstallIdentityError(
+            "install_identity_registry_unavailable",
+            "Pairling could not read the device registry while recovering its install identity.",
+        ) from exc
+    values = tuple(sorted({normalize_install_id(row[0]) for row in rows}))
+    if any(not value for value in values):
+        raise InstallIdentityError(
+            "install_identity_registry_invalid",
+            "An active Pairling device has no install identity.",
+        )
+    return values
+
+
+def resolve_install_id(
+    root: Path | None = None,
+    *,
+    allow_generate: bool = False,
+) -> str:
+    """Resolve one Mac identity and keep the state mirror in sync.
+
+    A valid config is authoritative. Recovery without config prefers one
+    unambiguous active external device identity, then the state mirror. Only
+    setup passes allow_generate=True.
+    """
+    support_root = root or app_support_root()
+    state_path = support_root / "state" / "install-id"
+    config_value = _config_install_id(support_root)
+    active_values = _active_external_install_ids(support_root / "devices.sqlite")
+    if len(active_values) > 1:
+        raise InstallIdentityError(
+            "install_identity_ambiguous",
+            "Pairling found multiple active install identities and will not choose one.",
+        )
+    if (
+        config_value
+        and active_values
+        and not secrets.compare_digest(config_value, active_values[0])
+    ):
+        raise InstallIdentityError(
+            "install_identity_mismatch",
+            "Pairling config.json does not match the active device registry identity.",
+        )
+    if config_value:
+        _write_private_text(
+            support_root,
+            state_path,
+            config_value + "\n",
+            kind="state",
+            repair_invalid_regular=True,
+        )
+        return config_value
+    if active_values:
+        value = active_values[0]
+        _write_private_text(support_root, state_path, value + "\n", kind="state")
+        return value
+
+    state_value = _state_install_id(state_path)
+    if state_value:
+        _write_private_text(support_root, state_path, state_value + "\n", kind="state")
+        return state_value
+    if not allow_generate:
+        raise InstallIdentityError(
+            "install_identity_missing",
+            "Pairling setup must create this Mac's install identity before the runtime starts.",
+        )
+    value = "inst_" + secrets.token_urlsafe(18)
+    _write_private_text(support_root, state_path, value + "\n", kind="state")
+    return value
+
+
+def ensure_install_identity(
+    root: Path | None = None,
+    *,
+    runtime_port: int,
+) -> str:
+    """Create or recover setup-owned config and its private state mirror."""
+    support_root = root or app_support_root()
+    config_path = support_root / "config.json"
+    existing_payload = _read_install_config(support_root)
+    existing_value = normalize_install_id(existing_payload.get("install_id"))
+    value = resolve_install_id(support_root, allow_generate=True)
+    if existing_value:
+        try:
+            os.chmod(config_path, 0o600, follow_symlinks=False)
+        except (NotImplementedError, OSError):
+            pass
+        return value
+
+    payload = existing_payload
+    payload["schema_version"] = 1
+    payload["product"] = "Pairling"
+    payload["install_id"] = value
+    runtime = payload.get("runtime") if isinstance(payload.get("runtime"), dict) else {}
+    runtime["label"] = "dev.pairling.companiond"
+    runtime["port"] = int(runtime_port)
+    payload["runtime"] = runtime
+    payload.setdefault(
+        "created_at",
+        datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    )
+    _write_private_text(
+        support_root,
+        config_path,
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        kind="config",
+    )
+    return value
+
+
+def persist_pairdrop_root(root: Path, pairdrop_path: Path) -> Path:
+    """Persist the setup-selected PairDrop vault without replacing config identity."""
+    support_root = Path(root)
+    canonical = Path(pairdrop_path).expanduser()
+    if not canonical.is_absolute():
+        raise InstallIdentityError(
+            "pairdrop_root_invalid",
+            "PairDrop storage must use an absolute path.",
+        )
+    canonical = canonical.resolve(strict=False)
+    payload = _read_install_config(support_root)
+    if not normalize_install_id(payload.get("install_id")):
+        raise InstallIdentityError(
+            "install_identity_config_invalid",
+            "Pairling config.json must contain an install identity before PairDrop is configured.",
+        )
+    paths = payload.get("paths") if isinstance(payload.get("paths"), dict) else {}
+    paths["pairdrop"] = str(canonical)
+    payload["paths"] = paths
+    _write_private_text(
+        support_root,
+        support_root / "config.json",
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        kind="config",
+        repair_invalid_regular=True,
+    )
+    return canonical
 
 
 @dataclass(frozen=True)
@@ -387,8 +791,8 @@ class DeviceRegistry:
         self,
         *,
         device_name: str,
+        install_id: str,
         scopes: Iterable[str] | None = None,
-        install_id: str | None = None,
         token: str | None = None,
         proof_secret: str | None = None,
         device_id: str | None = None,
@@ -404,7 +808,9 @@ class DeviceRegistry:
         token_value = token or generate_token()
         proof_secret_value = proof_secret or generate_proof_secret()
         device_id_value = device_id or generate_device_id()
-        install_id_value = install_id or load_or_create_install_id()
+        install_id_value = normalize_install_id(install_id)
+        if not install_id_value:
+            raise ValueError("install_id must be a nonblank string")
         attestation_value = attestation_status if attestation_status in {
             "none",
             "development",
@@ -526,6 +932,9 @@ class DeviceRegistry:
         lease_expires_at: float | None = None,
     ) -> CreatedDevice:
         """Atomically persist a non-authoritative device and its sealed reply."""
+        install_id_value = normalize_install_id(install_id)
+        if not install_id_value:
+            raise ValueError("install_id must be a nonblank string")
         normalized_scopes = tuple(sorted(set(scopes)))
         if not normalized_scopes:
             raise DeviceRegistryError("invalid_scopes", 400, "pending device scopes are empty")
@@ -582,7 +991,7 @@ class DeviceRegistry:
                     device_name,
                     hash_token(token),
                     json.dumps(normalized_scopes),
-                    install_id,
+                    install_id_value,
                     now,
                     relay_device_id,
                     attestation_value,
@@ -633,19 +1042,40 @@ class DeviceRegistry:
             token,
             proof_secret,
             normalized_scopes,
-            install_id,
+            install_id_value,
             relay_device_id,
             attestation_value,
         )
 
-    def resumable_pair_claim(self, pair_id: str, request_hash: str) -> PendingClaimRecord | None:
+    def resumable_pair_claim(
+        self,
+        pair_id: str,
+        request_hash: str,
+        *,
+        install_id: str,
+    ) -> PendingClaimRecord | None:
+        expected_install_id = normalize_install_id(install_id)
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT * FROM pending_pair_claims WHERE pair_id = ?",
+                "SELECT c.*, d.install_id AS device_install_id "
+                "FROM pending_pair_claims AS c "
+                "LEFT JOIN devices AS d ON d.device_id = c.device_id "
+                "WHERE c.pair_id = ?",
                 (pair_id,),
             ).fetchone()
         if row is None:
             return None
+        saved_install_id = normalize_install_id(row["device_install_id"])
+        if (
+            not expected_install_id
+            or not saved_install_id
+            or not secrets.compare_digest(saved_install_id, expected_install_id)
+        ):
+            raise DeviceRegistryError(
+                "pair_install_id_mismatch",
+                409,
+                "saved pairing claim belongs to a different Pairling install",
+            )
         if not secrets.compare_digest(str(row["request_hash"]), request_hash):
             raise DeviceRegistryError(
                 "pair_claim_conflict", 409, "pairing claim does not match the saved claim"
@@ -764,6 +1194,7 @@ class DeviceRegistry:
         *,
         pair_id: str,
         device_id: str,
+        install_id: str,
         activation_nonce: str,
         token_hash: str,
         activation_proof: str,
@@ -771,6 +1202,7 @@ class DeviceRegistry:
         now: float | None = None,
     ) -> PairActivationResult:
         current = utc_epoch() if now is None else float(now)
+        expected_install_id = normalize_install_id(install_id)
         with self.connect(immediate=True) as conn:
             claim = conn.execute(
                 "SELECT * FROM pending_pair_claims WHERE pair_id = ?",
@@ -819,6 +1251,21 @@ class DeviceRegistry:
                     activation_result=activation_result,
                 )
 
+            if device is None:
+                raise activation_error(
+                    "pair_activation_invalid", 403, "pairing activation was rejected"
+                )
+            saved_install_id = normalize_install_id(device["install_id"])
+            if (
+                not expected_install_id
+                or not saved_install_id
+                or not secrets.compare_digest(saved_install_id, expected_install_id)
+            ):
+                raise activation_error(
+                    "pair_install_id_mismatch",
+                    409,
+                    "saved pairing claim belongs to a different Pairling install",
+                )
             if claim is not None and claim["state"] in {"expired", "superseded"}:
                 code = (
                     "pair_activation_superseded"
@@ -829,10 +1276,6 @@ class DeviceRegistry:
                     code,
                     409 if code == "pair_activation_superseded" else 410,
                     "pairing activation is no longer usable",
-                )
-            if device is None:
-                raise activation_error(
-                    "pair_activation_invalid", 403, "pairing activation was rejected"
                 )
             if claim is None and (
                 str(device["activation_state"] or "") != "active"
@@ -1377,10 +1820,10 @@ class DeviceRegistry:
                 "SELECT COUNT(*) AS n FROM devices "
                 "WHERE revoked_at IS NULL "
                 "AND activation_state = 'active' "
-                "AND COALESCE(purpose, '') != ? "
+                "AND COALESCE(purpose, '') NOT IN (?, ?) "
                 "AND (lease_expires_at IS NULL OR lease_expires_at > ?) "
                 "AND (COALESCE(last_seen_at, 0) >= ? OR COALESCE(created_at, 0) >= ?)",
-                (SMOKE_DEVICE_PURPOSE, time.time(), cutoff, cutoff),
+                (*INTERNAL_DEVICE_PURPOSES, time.time(), cutoff, cutoff),
             ).fetchone()
             return bool(row["n"])
 
@@ -1410,6 +1853,309 @@ class DeviceRegistry:
                 conn=conn,
             )
             return changed
+
+    def revoke_device_if_named(
+        self,
+        device_id: str,
+        device_name: str,
+        *,
+        reason: str = "revoked",
+    ) -> bool:
+        now = utc_epoch()
+        with self.connect() as conn:
+            changed = conn.execute(
+                "UPDATE devices SET revoked_at = ? "
+                "WHERE device_id = ? AND device_name = ? AND revoked_at IS NULL",
+                (now, device_id, device_name),
+            ).rowcount
+            if changed:
+                self.record_audit(
+                    "device.revoked",
+                    device_id=device_id,
+                    outcome="ok",
+                    detail={"reason": reason, "device_name": device_name},
+                    conn=conn,
+                )
+            return changed > 0
+
+    def canonicalize_legacy_device_for_credential(
+        self,
+        *,
+        token: str,
+        credential_device_id: str,
+        credential_install_id: str,
+        device_name: str,
+        accepted_scope_sets: Iterable[Iterable[str]],
+        purpose: str,
+        reason: str,
+    ) -> bool:
+        """Bind one credential-proven legacy device and retire exact duplicates.
+
+        The first pass is read-only. A corrupt or forged credential therefore
+        cannot trigger schema migration or any other database write. The second
+        pass repeats every proof inside one immediate transaction before it tags
+        the canonical row and revokes only existing purpose-tagged rows or
+        untagged rows with the exact legacy name and one accepted scope set.
+        """
+        install_id = normalize_install_id(credential_install_id)
+        accepted = frozenset(
+            frozenset(str(scope) for scope in scopes)
+            for scopes in accepted_scope_sets
+        )
+        if (
+            not token
+            or not credential_device_id
+            or not install_id
+            or not device_name
+            or not accepted
+            or not purpose
+        ):
+            return False
+        token_digest = hash_token(token)
+
+        def decoded_scopes(raw: Any) -> frozenset[str] | None:
+            try:
+                value = json.loads(str(raw or ""))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return None
+            if not isinstance(value, list) or any(
+                not isinstance(scope, str) for scope in value
+            ):
+                return None
+            return frozenset(value)
+
+        def row_matches(row: sqlite3.Row, columns: set[str]) -> bool:
+            if not secrets.compare_digest(
+                str(row["device_id"] or ""),
+                credential_device_id,
+            ):
+                return False
+            if not secrets.compare_digest(
+                str(row["token_hash"] or ""),
+                token_digest,
+            ):
+                return False
+            if str(row["device_name"] or "") != device_name:
+                return False
+            if normalize_install_id(row["install_id"]) != install_id:
+                return False
+            if row["revoked_at"] is not None:
+                return False
+            if (
+                "activation_state" in columns
+                and str(row["activation_state"] or "active") != "active"
+            ):
+                return False
+            existing_purpose = (
+                str(row["purpose"] or "") if "purpose" in columns else ""
+            )
+            if existing_purpose not in {"", purpose}:
+                return False
+            if decoded_scopes(row["scopes_json"]) not in accepted:
+                return False
+            return True
+
+        try:
+            metadata = self.db_path.lstat()
+            if not stat.S_ISREG(metadata.st_mode):
+                return False
+            with closing(
+                sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+            ) as read_only:
+                read_only.row_factory = sqlite3.Row
+                columns = {
+                    str(row[1])
+                    for row in read_only.execute("PRAGMA table_info(devices)").fetchall()
+                }
+                required_columns = {
+                    "device_id",
+                    "device_name",
+                    "token_hash",
+                    "scopes_json",
+                    "install_id",
+                    "revoked_at",
+                }
+                if not required_columns.issubset(columns):
+                    return False
+                row = read_only.execute(
+                    "SELECT * FROM devices WHERE token_hash = ?",
+                    (token_digest,),
+                ).fetchone()
+                if row is None or not row_matches(row, columns):
+                    return False
+        except (OSError, sqlite3.Error):
+            return False
+
+        with self.connect(immediate=True) as conn:
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(devices)").fetchall()
+            }
+            canonical = conn.execute(
+                "SELECT * FROM devices WHERE token_hash = ?",
+                (token_digest,),
+            ).fetchone()
+            if canonical is None or not row_matches(canonical, columns):
+                return False
+
+            if not str(canonical["purpose"] or ""):
+                conn.execute(
+                    "UPDATE devices SET purpose = ? WHERE device_id = ?",
+                    (purpose, credential_device_id),
+                )
+                self.record_audit(
+                    "device.purpose_bound",
+                    device_id=credential_device_id,
+                    outcome="ok",
+                    detail={"purpose": purpose, "proof": "credential_token"},
+                    conn=conn,
+                )
+
+            candidates = conn.execute(
+                "SELECT device_id, device_name, scopes_json, purpose "
+                "FROM devices WHERE device_id != ? AND revoked_at IS NULL "
+                "AND COALESCE(activation_state, 'active') = 'active'",
+                (credential_device_id,),
+            ).fetchall()
+            now = utc_epoch()
+            for candidate in candidates:
+                candidate_purpose = str(candidate["purpose"] or "")
+                is_tagged_duplicate = candidate_purpose == purpose
+                is_exact_legacy_duplicate = (
+                    not candidate_purpose
+                    and str(candidate["device_name"] or "") == device_name
+                    and decoded_scopes(candidate["scopes_json"]) in accepted
+                )
+                if not is_tagged_duplicate and not is_exact_legacy_duplicate:
+                    continue
+                candidate_id = str(candidate["device_id"])
+                conn.execute(
+                    "UPDATE devices SET revoked_at = ? WHERE device_id = ?",
+                    (now, candidate_id),
+                )
+                self.record_audit(
+                    "device.revoked",
+                    device_id=candidate_id,
+                    outcome="ok",
+                    detail={"reason": reason, "purpose": purpose},
+                    conn=conn,
+                )
+        return True
+
+    def bind_device_purpose_if_named(
+        self,
+        device_id: str,
+        device_name: str,
+        purpose: str,
+    ) -> bool:
+        """Tag a token-proven legacy device so interrupted cleanup is retryable."""
+        with self.connect(immediate=True) as conn:
+            row = conn.execute(
+                "SELECT purpose FROM devices "
+                "WHERE device_id = ? AND device_name = ? AND revoked_at IS NULL",
+                (device_id, device_name),
+            ).fetchone()
+            if row is None:
+                return False
+            existing_purpose = str(row["purpose"] or "")
+            if existing_purpose == purpose:
+                return True
+            if existing_purpose:
+                return False
+            changed = conn.execute(
+                "UPDATE devices SET purpose = ? "
+                "WHERE device_id = ? AND device_name = ? AND revoked_at IS NULL "
+                "AND COALESCE(purpose, '') = ''",
+                (purpose, device_id, device_name),
+            ).rowcount
+            if not changed:
+                return False
+            self.record_audit(
+                "device.purpose_bound",
+                device_id=device_id,
+                outcome="ok",
+                detail={"purpose": purpose},
+                conn=conn,
+            )
+            return True
+
+    def revoke_devices_by_purpose_except(
+        self,
+        purpose: str,
+        keep_device_id: str,
+        *,
+        reason: str = "revoked",
+    ) -> int:
+        now = utc_epoch()
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT device_id FROM devices "
+                "WHERE purpose = ? AND device_id != ? AND revoked_at IS NULL",
+                (purpose, keep_device_id),
+            ).fetchall()
+            for row in rows:
+                device_id = str(row["device_id"])
+                conn.execute(
+                    "UPDATE devices SET revoked_at = ? WHERE device_id = ?",
+                    (now, device_id),
+                )
+                self.record_audit(
+                    "device.revoked",
+                    device_id=device_id,
+                    outcome="ok",
+                    detail={"reason": reason, "purpose": purpose},
+                    conn=conn,
+                )
+            return len(rows)
+
+    def active_device_ids_for_purpose(self, purpose: str) -> tuple[str, ...]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT device_id FROM devices "
+                "WHERE purpose = ? AND revoked_at IS NULL "
+                "AND COALESCE(activation_state, 'active') = 'active' "
+                "ORDER BY created_at, device_id",
+                (purpose,),
+            ).fetchall()
+        return tuple(str(row["device_id"]) for row in rows)
+
+    def active_device_ids_for_purpose_or_legacy_shape(
+        self,
+        *,
+        purpose: str,
+        device_name: str,
+        accepted_scope_sets: Iterable[Iterable[str]],
+    ) -> tuple[str, ...]:
+        """Return tagged internal rows plus exact untagged legacy rows."""
+        accepted = frozenset(
+            frozenset(str(scope) for scope in scopes)
+            for scopes in accepted_scope_sets
+        )
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT device_id, device_name, scopes_json, purpose "
+                "FROM devices WHERE revoked_at IS NULL "
+                "AND COALESCE(activation_state, 'active') = 'active' "
+                "AND (purpose = ? OR (COALESCE(purpose, '') = '' AND device_name = ?)) "
+                "ORDER BY created_at, device_id",
+                (purpose, device_name),
+            ).fetchall()
+        matched: list[str] = []
+        for row in rows:
+            if str(row["purpose"] or "") == purpose:
+                matched.append(str(row["device_id"]))
+                continue
+            try:
+                scopes = json.loads(str(row["scopes_json"] or ""))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if (
+                isinstance(scopes, list)
+                and all(isinstance(scope, str) for scope in scopes)
+                and frozenset(scopes) in accepted
+            ):
+                matched.append(str(row["device_id"]))
+        return tuple(matched)
 
     def revoke_devices_named(self, device_name: str, *, reason: str = "revoked") -> int:
         now = utc_epoch()
@@ -1528,3 +2274,149 @@ class DeviceRegistry:
             os.chmod(self.audit_path, 0o600)
         except OSError:
             pass
+
+    def recent_phone_tool_activity(
+        self,
+        *,
+        limit: int = 50,
+        agent_provider: str | None = None,
+        session_identity: str | None = None,
+    ) -> dict[str, Any]:
+        """Return a bounded, display-only view of durable Phone Tools runs."""
+        bounded_limit = max(1, min(int(limit), PHONE_TOOL_ACTIVITY_MAX_ITEMS))
+        filtered = agent_provider is not None or session_identity is not None
+        if filtered and (agent_provider is None or session_identity is None):
+            raise ValueError("Phone Tools activity requires provider and session together")
+        try:
+            descriptor = os.open(
+                self.audit_path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except FileNotFoundError:
+            return {
+                "items": [],
+                "filtered": filtered,
+                "unbound_count": 0,
+            }
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("Pairling audit history must be a regular file")
+            if metadata.st_uid != os.getuid():
+                raise ValueError("Pairling audit history must be owned by the current user")
+            if metadata.st_mode & 0o022:
+                raise ValueError("Pairling audit history must not be group or world writable")
+            path_metadata = os.stat(self.audit_path, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(path_metadata.st_mode)
+                or path_metadata.st_dev != metadata.st_dev
+                or path_metadata.st_ino != metadata.st_ino
+            ):
+                raise ValueError("Pairling audit history changed while it was opened")
+            offset = max(0, metadata.st_size - PHONE_TOOL_ACTIVITY_READ_BYTES)
+            raw = os.pread(descriptor, min(metadata.st_size, PHONE_TOOL_ACTIVITY_READ_BYTES), offset)
+        finally:
+            os.close(descriptor)
+
+        lines = raw.splitlines()
+        if offset > 0 and lines:
+            lines = lines[1:]
+
+        items: list[dict[str, Any]] = []
+        unbound_count = 0
+        for line in reversed(lines):
+            try:
+                event = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            projected = _phone_tool_activity_projection(event)
+            if projected is None:
+                continue
+            if filtered:
+                projected_provider = projected.get("agent_provider")
+                projected_session = projected.get("session_identity")
+                if not projected_provider or not projected_session:
+                    unbound_count += 1
+                    continue
+                if (
+                    projected_provider != agent_provider
+                    or projected_session != session_identity
+                ):
+                    continue
+            if len(items) < bounded_limit:
+                items.append(projected)
+        return {
+            "items": items,
+            "filtered": filtered,
+            "unbound_count": unbound_count,
+        }
+
+
+def _bounded_audit_label(value: Any, *, maximum: int, pattern: str) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized or len(normalized) > maximum or re.fullmatch(pattern, normalized) is None:
+        return None
+    return normalized
+
+
+def _phone_tool_activity_projection(event: Any) -> dict[str, Any] | None:
+    if not isinstance(event, dict) or event.get("event") != PHONE_TOOL_ACTIVITY_EVENT:
+        return None
+    detail = event.get("detail")
+    if not isinstance(detail, dict):
+        return None
+    tool = _bounded_audit_label(
+        detail.get("tool"),
+        maximum=80,
+        pattern=r"[A-Za-z0-9_.-]+",
+    )
+    if tool is None:
+        return None
+    try:
+        timestamp = float(event.get("ts"))
+        latency_ms = max(0, min(int(detail.get("latency_ms") or 0), 86_400_000))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (timestamp > 0 and timestamp < float("inf")):
+        return None
+
+    outcome = _bounded_audit_label(
+        event.get("outcome"),
+        maximum=80,
+        pattern=r"[A-Za-z0-9_.-]+",
+    ) or "error"
+    provider = detail.get("provider")
+    if provider not in {"iphone", "mac_fallback"}:
+        provider = None
+    fallback_reason = _bounded_audit_label(
+        detail.get("fallback_reason"),
+        maximum=160,
+        pattern=r"[A-Za-z0-9_.:-]+",
+    )
+    agent_provider = _bounded_audit_label(
+        detail.get("agent_provider"),
+        maximum=48,
+        pattern=r"[a-z0-9_-]+",
+    )
+    session_identity = _bounded_audit_label(
+        detail.get("session_identity"),
+        maximum=160,
+        pattern=r"[A-Za-z0-9._:-]+",
+    )
+    identity_payload = json.dumps(
+        [timestamp, tool, outcome, provider, fallback_reason, latency_ms, agent_provider, session_identity],
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "id": hashlib.sha256(identity_payload).hexdigest(),
+        "tool": tool,
+        "outcome": outcome,
+        "provider": provider,
+        "fallback_reason": fallback_reason,
+        "latency_ms": latency_ms,
+        "timestamp": timestamp,
+        "agent_provider": agent_provider,
+        "session_identity": session_identity,
+    }

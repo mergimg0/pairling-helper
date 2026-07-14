@@ -5,7 +5,14 @@ PAIRLING_DAEMON_LABEL="dev.pairling.companiond"
 PAIRLING_CONNECTD_LABEL="dev.pairling.connectd"
 PAIRLING_PTYBROKER_LABEL="dev.pairling.ptybroker"
 APP_SUPPORT="${PAIRLING_APP_SUPPORT_ROOT:-${COMPANION_APP_SUPPORT_ROOT:-$HOME/Library/Application Support/Pairling}}"
+while [[ "$APP_SUPPORT" != "/" && "$APP_SUPPORT" == */ ]]; do
+  APP_SUPPORT="${APP_SUPPORT%/}"
+done
+RUNTIME_ROOT="$APP_SUPPORT/runtime"
 LOGS_ROOT="${PAIRLING_LOGS_ROOT:-${COMPANION_LOGS_ROOT:-$HOME/Library/Logs/Pairling}}"
+while [[ "$LOGS_ROOT" != "/" && "$LOGS_ROOT" == */ ]]; do
+  LOGS_ROOT="${LOGS_ROOT%/}"
+done
 USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_DAEMON_LABEL.plist"
 CONNECTD_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_CONNECTD_LABEL.plist"
 PTYBROKER_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_PTYBROKER_LABEL.plist"
@@ -18,6 +25,10 @@ YES="false"
 DELETE_STATE="false"
 DELETE_LOGS="false"
 DRY_RUN="${PAIRLING_DRY_RUN:-0}"
+INSTALL_LOCK_DIR="$RUNTIME_ROOT/.install.lock"
+INSTALL_LOCK_HELD=0
+APP_SUPPORT_PREEXISTED=0
+RUNTIME_ROOT_PREEXISTED=0
 
 usage() {
   cat <<EOF
@@ -53,6 +64,196 @@ done
 
 is_dry_run() {
   [[ "$DRY_RUN" == "1" || "$DRY_RUN" == "true" || "$DRY_RUN" == "TRUE" ]]
+}
+
+install_lock_wait_seconds() {
+  local raw="${PAIRLING_INSTALL_LOCK_WAIT_SECONDS:-30}"
+  if [[ ! "$raw" =~ ^[0-9]+$ ]]; then
+    printf 'ERROR: PAIRLING_INSTALL_LOCK_WAIT_SECONDS must be a whole number.\n' >&2
+    return 2
+  fi
+  printf '%s\n' "$raw"
+}
+
+install_lock_age_seconds() {
+  local modified now
+  modified="$(stat -f '%m' "$INSTALL_LOCK_DIR" 2>/dev/null || printf '0')"
+  now="$(date +%s)"
+  if [[ "$modified" =~ ^[0-9]+$ && "$modified" -le "$now" ]]; then
+    printf '%s\n' "$((now - modified))"
+  else
+    printf '0\n'
+  fi
+}
+
+remove_stale_install_lock() {
+  local owner="${1:-}"
+  [[ -d "$INSTALL_LOCK_DIR" && ! -L "$INSTALL_LOCK_DIR" ]] || return 1
+  if [[ -n "$owner" && "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+    return 1
+  fi
+  rm -f "$INSTALL_LOCK_DIR/pid" "$INSTALL_LOCK_DIR/started_at"
+  rmdir "$INSTALL_LOCK_DIR" 2>/dev/null
+}
+
+acquire_install_lock() {
+  local wait_seconds deadline owner age
+  mkdir -p "$RUNTIME_ROOT"
+  wait_seconds="$(install_lock_wait_seconds)" || return $?
+  deadline="$(( $(date +%s) + wait_seconds ))"
+  while true; do
+    if mkdir "$INSTALL_LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$INSTALL_LOCK_DIR/pid"
+      date -u '+%Y-%m-%dT%H:%M:%SZ' > "$INSTALL_LOCK_DIR/started_at"
+      INSTALL_LOCK_HELD=1
+      return 0
+    fi
+    if [[ -L "$INSTALL_LOCK_DIR" || ! -d "$INSTALL_LOCK_DIR" ]]; then
+      printf 'ERROR: Pairling install lock is not a real directory: %s\n' "$INSTALL_LOCK_DIR" >&2
+      return 1
+    fi
+    owner="$(tr -dc '0-9' < "$INSTALL_LOCK_DIR/pid" 2>/dev/null || true)"
+    age="$(install_lock_age_seconds)"
+    if [[ -n "$owner" && "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+      remove_stale_install_lock "$owner" || true
+      continue
+    fi
+    if [[ -z "$owner" && "$age" -ge 5 ]]; then
+      remove_stale_install_lock || true
+      continue
+    fi
+    if [[ "$(date +%s)" -ge "$deadline" ]]; then
+      printf 'ERROR: another Pairling install operation owns %s (pid: %s).\n' "$INSTALL_LOCK_DIR" "${owner:-unknown}" >&2
+      return 1
+    fi
+    sleep 0.2
+  done
+}
+
+release_install_lock() {
+  [[ "$INSTALL_LOCK_HELD" == 1 ]] || return 0
+  local owner
+  owner="$(tr -dc '0-9' < "$INSTALL_LOCK_DIR/pid" 2>/dev/null || true)"
+  if [[ -n "$owner" && "$owner" != "$$" ]]; then
+    printf 'ERROR: Pairling install lock ownership changed from %s to %s.\n' "$$" "$owner" >&2
+    return 1
+  fi
+  rm -f "$INSTALL_LOCK_DIR/pid" "$INSTALL_LOCK_DIR/started_at"
+  if ! rmdir "$INSTALL_LOCK_DIR" 2>/dev/null; then
+    printf 'ERROR: Pairling could not release install lock %s.\n' "$INSTALL_LOCK_DIR" >&2
+    return 1
+  fi
+  INSTALL_LOCK_HELD=0
+}
+
+cleanup_created_lock_parents() {
+  if [[ "$RUNTIME_ROOT_PREEXISTED" == 0 ]]; then
+    rmdir "$RUNTIME_ROOT" 2>/dev/null || true
+  fi
+  if [[ "$APP_SUPPORT_PREEXISTED" == 0 ]]; then
+    rmdir "$APP_SUPPORT" 2>/dev/null || true
+  fi
+}
+
+uninstall_on_exit() {
+  local code=$?
+  if ! release_install_lock; then
+    code=1
+  fi
+  cleanup_created_lock_parents
+  return "$code"
+}
+
+validate_state_target() {
+  if [[ -L "$APP_SUPPORT" ]]; then
+    if [[ "$DELETE_STATE" == "true" ]]; then
+      printf 'ERROR: refusing to delete unsafe Pairling state path: %s\n' "$APP_SUPPORT" >&2
+    else
+      printf 'ERROR: Pairling app support path must not be a symlink: %s\n' "$APP_SUPPORT" >&2
+    fi
+    return 1
+  fi
+  if [[ "$APP_SUPPORT" != /* || "$APP_SUPPORT" == "/" || "$APP_SUPPORT" == "$HOME" ]]; then
+    if [[ "$DELETE_STATE" == "true" ]]; then
+      printf 'ERROR: refusing to delete unsafe Pairling state path: %s\n' "$APP_SUPPORT" >&2
+    else
+      printf 'ERROR: Pairling app support path is unsafe: %s\n' "$APP_SUPPORT" >&2
+    fi
+    return 1
+  fi
+  case "/$APP_SUPPORT/" in
+    */../*|*/./*)
+      printf 'ERROR: refusing to delete non-canonical Pairling state path: %s\n' "$APP_SUPPORT" >&2
+      return 1
+      ;;
+  esac
+  if [[ -L "$RUNTIME_ROOT" ]]; then
+    printf 'ERROR: Pairling runtime path must not be a symlink: %s\n' "$RUNTIME_ROOT" >&2
+    return 1
+  fi
+  if [[ -e "$RUNTIME_ROOT" && ! -d "$RUNTIME_ROOT" ]]; then
+    printf 'ERROR: Pairling runtime path must be a directory: %s\n' "$RUNTIME_ROOT" >&2
+    return 1
+  fi
+}
+
+validate_logs_target() {
+  [[ "$DELETE_LOGS" == "true" ]] || return 0
+  if [[ "$LOGS_ROOT" != /* || "$LOGS_ROOT" == "/" || "$LOGS_ROOT" == "$HOME" ]]; then
+    printf 'ERROR: refusing to delete unsafe Pairling logs path: %s\n' "$LOGS_ROOT" >&2
+    return 1
+  fi
+  case "/$LOGS_ROOT/" in
+    */../*|*/./*)
+      printf 'ERROR: refusing to delete non-canonical Pairling logs path: %s\n' "$LOGS_ROOT" >&2
+      return 1
+      ;;
+  esac
+  if [[ -L "$LOGS_ROOT" ]]; then
+    printf 'ERROR: refusing to delete a symlinked Pairling logs path: %s\n' "$LOGS_ROOT" >&2
+    return 1
+  fi
+  case "$APP_SUPPORT/" in
+    "$LOGS_ROOT/"*)
+      printf 'ERROR: refusing to delete Pairling logs path containing app state: %s\n' "$LOGS_ROOT" >&2
+      return 1
+      ;;
+  esac
+  case "$HOME/" in
+    "$LOGS_ROOT/"*)
+      printf 'ERROR: refusing to delete Pairling logs path containing the home directory: %s\n' "$LOGS_ROOT" >&2
+      return 1
+      ;;
+  esac
+}
+
+delete_state_under_lock() {
+  [[ "$INSTALL_LOCK_HELD" == 1 ]] || {
+    printf 'ERROR: refusing to delete Pairling state without the install lock.\n' >&2
+    return 1
+  }
+  [[ -d "$APP_SUPPORT" && ! -L "$APP_SUPPORT" ]] || {
+    printf 'ERROR: Pairling state path is not a real directory: %s\n' "$APP_SUPPORT" >&2
+    return 1
+  }
+
+  local parent base tombstone
+  parent="$(dirname "$APP_SUPPORT")"
+  base="$(basename "$APP_SUPPORT")"
+  tombstone="$parent/.${base}.uninstalling.$$"
+  if ! mkdir "$tombstone" 2>/dev/null; then
+    printf 'ERROR: Pairling could not reserve uninstall staging path: %s\n' "$tombstone" >&2
+    return 1
+  fi
+  if ! mv "$APP_SUPPORT" "$tombstone/state"; then
+    rmdir "$tombstone" 2>/dev/null || true
+    printf 'ERROR: Pairling could not isolate state for deletion: %s\n' "$APP_SUPPORT" >&2
+    return 1
+  fi
+
+  INSTALL_LOCK_DIR="$tombstone/state/runtime/.install.lock"
+  release_install_lock
+  rm -rf "$tombstone"
 }
 
 confirm() {
@@ -128,6 +329,16 @@ teardown_legacy_mintd() {
 }
 
 confirm
+validate_state_target
+validate_logs_target
+if [[ -e "$APP_SUPPORT" || -L "$APP_SUPPORT" ]]; then
+  APP_SUPPORT_PREEXISTED=1
+fi
+if [[ -e "$RUNTIME_ROOT" || -L "$RUNTIME_ROOT" ]]; then
+  RUNTIME_ROOT_PREEXISTED=1
+fi
+trap uninstall_on_exit EXIT
+acquire_install_lock
 
 bootout_user "$PAIRLING_DAEMON_LABEL" "$USER_PLIST"
 bootout_user "$PAIRLING_CONNECTD_LABEL" "$CONNECTD_USER_PLIST"
@@ -139,19 +350,23 @@ teardown_legacy_mintd
 
 rm -rf "$APP_SUPPORT/pair" 2>/dev/null || true
 
-if [[ "$DELETE_STATE" == "true" ]]; then
-  rm -rf "$APP_SUPPORT"
-  printf 'Deleted Pairling state: %s\n' "$APP_SUPPORT"
-else
-  printf 'Preserved Pairling state and devices: %s\n' "$APP_SUPPORT"
-fi
-
 if [[ "$DELETE_LOGS" == "true" ]]; then
   rm -rf "$LOGS_ROOT"
   printf 'Deleted Pairling logs: %s\n' "$LOGS_ROOT"
 else
   printf 'Preserved Pairling logs: %s\n' "$LOGS_ROOT"
 fi
+
+if [[ "$DELETE_STATE" == "true" ]]; then
+  delete_state_under_lock
+  printf 'Deleted Pairling state: %s\n' "$APP_SUPPORT"
+else
+  printf 'Preserved Pairling state and devices: %s\n' "$APP_SUPPORT"
+  release_install_lock
+fi
+
+cleanup_created_lock_parents
+trap - EXIT
 
 printf 'Provider transcripts and user projects were not removed.\n'
 printf 'Reinstall with: pairling setup\n'

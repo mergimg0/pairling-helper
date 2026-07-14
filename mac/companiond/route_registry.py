@@ -38,6 +38,7 @@ GET_ROUTES = [
     "/orchestrations",
     "/pairdrop/events",
     "/pairdrop/files",
+    "/phone-tools/activity",
     "/personal-context",
     "/pickers/hooks",
     "/pickers/mcp",

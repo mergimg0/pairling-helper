@@ -34,13 +34,46 @@ if [[ -z "${PYTHONPYCACHEPREFIX:-}" ]]; then
   export PYTHONPYCACHEPREFIX
 fi
 
+resolve_pairling_python() {
+  local candidate marker
+  for candidate in \
+    "${PAIRLING_DAEMON_PYTHON:-}" \
+    "$REPO_ROOT/python/bin/python3" \
+    "$(command -v python3 2>/dev/null || true)"; do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      marker="$("$candidate" -c 'print("pairling-python-ready")' 2>/dev/null || true)"
+      [[ "$marker" == "pairling-python-ready" ]] || continue
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 if [[ "${1:-}" == "attach" ]]; then
   shift
-  exec python3 "$REPO_ROOT/mac/packaging/pairling_attach.py" "$@"
+  if ! pairling_python="$(resolve_pairling_python)"; then
+    printf 'Pairling could not find its runtime Python. Re-run pairling setup.\n' >&2
+    exit 127
+  fi
+  exec "$pairling_python" "$REPO_ROOT/mac/packaging/pairling_attach.py" "$@"
+fi
+
+if [[ "${1:-}" == "pairdrop" ]]; then
+  shift
+  if ! pairling_python="$(resolve_pairling_python)"; then
+    printf 'Pairling could not find its runtime Python. Re-run pairling setup.\n' >&2
+    exit 127
+  fi
+  exec "$pairling_python" "$REPO_ROOT/mac/companiond/pairdrop_cli.py" "$@"
 fi
 
 if [[ "${1:-}" == "connect-auth-open" ]]; then
   shift || true
+  if ! pairling_python="$(resolve_pairling_python)"; then
+    printf 'Pairling could not find its runtime Python. Re-run pairling setup.\n' >&2
+    exit 127
+  fi
   json_mode="false"
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -59,7 +92,7 @@ if [[ "${1:-}" == "connect-auth-open" ]]; then
     esac
   done
   if output="$(/usr/bin/curl -sS --max-time 5 -X POST http://127.0.0.1:7774/auth/open 2>/dev/null)"; then
-    if python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("ok") else 1)' <<<"$output"; then
+    if "$pairling_python" -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("ok") else 1)' <<<"$output"; then
       response_status=0
     else
       response_status=1
@@ -67,7 +100,7 @@ if [[ "${1:-}" == "connect-auth-open" ]]; then
     if [[ "$json_mode" == "true" ]]; then
       printf '%s\n' "$output"
     else
-      python3 -c 'import json,sys; data=json.load(sys.stdin); print("Pairling Connect browser approval opened." if data.get("opened") else data.get("error", "Pairling Connect browser approval is not available."))' <<<"$output"
+      "$pairling_python" -c 'import json,sys; data=json.load(sys.stdin); print("Pairling Connect browser approval opened." if data.get("opened") else data.get("error", "Pairling Connect browser approval is not available."))' <<<"$output"
     fi
     exit "$response_status"
   fi

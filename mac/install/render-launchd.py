@@ -13,19 +13,33 @@ PAIRLING_PTYBROKER_LABEL = "dev.pairling.ptybroker"
 PAIRLING_RUNTIME_PORT = "7773"
 
 
+def canonical_pairdrop_root(value: Path | str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ValueError("PairDrop root must be an absolute path")
+    return path.resolve(strict=False)
+
+
 def write_plist(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as fh:
         plistlib.dump(payload, fh, sort_keys=False)
 
 
-def daemon_plist(current: Path, logs: Path, python_bin: str) -> dict:
+def daemon_plist(
+    current: Path,
+    logs: Path,
+    python_bin: str,
+    pairdrop_root: Path | None = None,
+) -> dict:
+    pairdrop_root = canonical_pairdrop_root(pairdrop_root or (Path.home() / "PairDrop"))
     env = {
         "PAIRLING_RUNTIME_PORT": PAIRLING_RUNTIME_PORT,
         "COMPANION_DAEMON_PORT": PAIRLING_RUNTIME_PORT,
         "PAIRLING_BIND_MODE": "loopback",
         "PAIRLING_APP_SUPPORT_ROOT": str(current.parent.parent),
         "PAIRLING_LOGS_ROOT": str(logs),
+        "PAIRLING_PAIRDROP_ROOT": str(pairdrop_root),
         "PYTHONDONTWRITEBYTECODE": "1",
         "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
     }
@@ -107,6 +121,7 @@ def main() -> int:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--daemon-python", default="/usr/local/bin/python3")
     parser.add_argument("--mirror-python", default="/usr/local/bin/python3", help=argparse.SUPPRESS)
+    parser.add_argument("--pairdrop-root")
     parser.add_argument("--ssh-gateway", action="store_true",
                         help="render connectd with the loopback SSH-tunnel gateway enabled (SPEC-p5)")
     args = parser.parse_args()
@@ -115,7 +130,14 @@ def main() -> int:
     logs = Path(args.logs_root)
     out = Path(args.output_dir)
 
-    write_plist(out / f"{PAIRLING_DAEMON_LABEL}.plist", daemon_plist(current, logs, args.daemon_python))
+    try:
+        pairdrop_root = canonical_pairdrop_root(args.pairdrop_root or (Path.home() / "PairDrop"))
+    except ValueError as exc:
+        parser.error(str(exc))
+    write_plist(
+        out / f"{PAIRLING_DAEMON_LABEL}.plist",
+        daemon_plist(current, logs, args.daemon_python, pairdrop_root),
+    )
     write_plist(out / f"{PAIRLING_PTYBROKER_LABEL}.plist", ptybroker_plist(current, logs, args.daemon_python))
     write_plist(out / f"{PAIRLING_CONNECTD_LABEL}.plist", connectd_plist(current, logs, ssh_gateway=args.ssh_gateway))
     return 0

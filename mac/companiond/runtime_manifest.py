@@ -23,7 +23,7 @@ from runtime_contract import (
     RUNTIME_NAME,
     TAILSCALE_VARIANT,
 )
-from runtime_paths import release_root_for
+from runtime_paths import pairdrop_root, release_root_for
 
 
 def sha256_file(path: Path) -> str:
@@ -273,6 +273,12 @@ def build_runtime_info(
         if "source_dirty" in manifest:
             source_dirty = bool(manifest.get("source_dirty"))
         installed_at = str(manifest.get("installed_at") or installed_at or "")
+    try:
+        resolved_pairdrop_root = str(pairdrop_root())
+    except (OSError, ValueError):
+        resolved_pairdrop_root = None
+
+    if manifest is not None:
         expected_hash = _manifest_file_hash(manifest, relative_path)
         if not expected_hash:
             verification_error = f"manifest missing hash for {relative_path}"
@@ -302,6 +308,7 @@ def build_runtime_info(
         "source_hash": source_hash,
         "manifest_path": str(manifest_path) if manifest_path else None,
         "manifest_error": verification_error,
+        "pairdrop_root": resolved_pairdrop_root,
     }
 
 
@@ -374,6 +381,7 @@ def build_manifest_payload(
                 "/inject-now",
                 "/worker-kill",
                 "/pairling-tools/run",
+                "/phone-tools/activity",
                 "/phone-tools/availability",
                 "/phone-tools/next",
                 "/phone-tools/result",

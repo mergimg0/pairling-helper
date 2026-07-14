@@ -43,6 +43,7 @@ Runtime endpoints use per-device scoped Authorization: Bearer tokens:
   GET  /substrate-feed?run=<path>&since=<iso>&limit=<n> read-only operational substrate feed
   POST /worker-kill body:JSON                    SIGTERM workers by id or filter:"stale"
   POST /pairling-tools/run body:JSON             daemon-first MCP tool router
+  GET  /phone-tools/activity?limit=N             durable, privacy-bounded tool history
   POST /phone-tools/availability body:JSON       foreground iPhone tool-listener availability
 
 Listens on PAIRLING_WEBHOOK_HOST, loopback by default unless explicitly configured.
@@ -51,6 +52,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import codecs
 import errno
 import hashlib
 import html
@@ -90,7 +92,7 @@ try:
         RUNTIME_NAME as RUNTIME_NAME,
         TAILSCALE_VARIANT as RUNTIME_TAILSCALE_VARIANT,
     )
-    from runtime_paths import app_support_root, devices_db_path
+    from runtime_paths import app_support_root, devices_db_path, pairdrop_root
     from pairling_devices import DeviceAuthResult, DeviceRegistry
     from pairling_connectd_status import (
         advertised_pairling_connect_routes,
@@ -137,10 +139,16 @@ except Exception:
     PairingError = None
     PairingStore = None
     ReauthStore = None
+    try:
+        from runtime_paths import app_support_root, devices_db_path, pairdrop_root
+    except Exception:
+        app_support_root = None
+        devices_db_path = None
+        pairdrop_root = lambda: Path(
+            os.environ.get("PAIRLING_PAIRDROP_ROOT", str(Path.home() / "PairDrop"))
+        ).expanduser().resolve(strict=False)
     PairDropStore = None
     PairDropStoreError = ValueError
-    app_support_root = None
-    devices_db_path = None
 
 PAIRING_ACTIVATION_CONTRACT = PAIR_ACTIVATION_CONTRACT
 
@@ -260,10 +268,25 @@ except Exception:
 
 try:
     from session_event_log import SessionEventLog as _SessionEventLog
-    from session_event_ingest import SessionLogIngestor as _SessionLogIngestor
+    from session_event_ingest import (
+        SUPPORTED_TRANSCRIPT_PROVIDERS as _SUPPORTED_TRANSCRIPT_PROVIDERS,
+        SessionLogIngestor as _SessionLogIngestor,
+        UnsupportedTranscriptProviderError as _UnsupportedTranscriptProviderError,
+    )
 except Exception:
     _SessionEventLog = None
     _SessionLogIngestor = None
+    _SUPPORTED_TRANSCRIPT_PROVIDERS = frozenset({"claude", "codex"})
+
+    class _UnsupportedTranscriptProviderError(ValueError):
+        code = "unsupported_provider"
+        capability = "session_transcript"
+
+        def __init__(self, provider: str) -> None:
+            self.provider = str(provider or "").strip().lower() or "unknown"
+            super().__init__(
+                f"Provider {self.provider} does not support deep transcript ingestion."
+            )
 
 try:
     from codex_approval import classify_codex_approval
@@ -537,6 +560,7 @@ _SESSION_LOG_INGESTOR = None
 _SESSION_LOG_INGESTOR_LOCK = threading.Lock()
 SESSION_EVENTS_V2_SCHEMA_VERSION = 2
 SESSION_EVENTS_V2_RAW_INLINE_MAX = 32 * 1024
+SESSION_EVENTS_V2_RAW_STREAM_CHUNK = 1024 * 1024
 # Payload text/content fields cap here on the wire (full value on the
 # content endpoint); keeps any single SSE event under the transcript cap.
 SESSION_EVENTS_V2_CONTENT_INLINE_MAX = 64 * 1024
@@ -633,6 +657,11 @@ def _session_event_v2_wire_row(session_key: str, row: dict) -> dict:
     raw = row.get("raw")
     if raw is None:
         wire["raw"] = None
+        if payload.get("raw_preserved") is True:
+            wire["raw_elided"] = True
+            wire["raw_bytes"] = max(0, int(payload.get("raw_bytes") or 0))
+            if payload.get("raw_sha256"):
+                wire["raw_sha256"] = str(payload["raw_sha256"])
     elif len(raw.encode("utf-8", errors="replace")) <= SESSION_EVENTS_V2_RAW_INLINE_MAX:
         wire["raw"] = raw
     else:
@@ -715,6 +744,11 @@ def _bounded_session_event_cursor(cursor: int, last_seq: int) -> tuple[int, dict
     return bounded, {"from_seq": cursor, "to_seq": bounded}
 
 
+def _session_live_event_wait_timeout(terminal_silent_streak: int) -> float:
+    """Stay eager during activity, then align wakeups with the 1s fallback."""
+    return 0.25 if int(terminal_silent_streak or 0) < 3 else 1.0
+
+
 # ----- Shared runtime-truth workers ----------------------------------------
 # One truth probe thread per (session, expected revision), shared by every
 # live stream on that session. Three viewers of one session used to run
@@ -722,6 +756,146 @@ def _bounded_session_event_cursor(cursor: int, last_seq: int) -> tuple[int, dict
 # cost, so sharing it makes extra viewers nearly free.
 _TRUTH_WORKERS_LOCK = threading.Lock()
 _TRUTH_WORKERS: dict = {}
+SESSION_TRUTH_KEEPER_INTERVAL_SECONDS = 10.0
+
+
+def _session_event_identity_keys(handler, raw_session: str) -> set[str]:
+    """Return every exact identity that may publish events for one session.
+
+    A broker-backed session can be requested through its bootstrap id after the
+    registry has promoted it to a canonical id. The broker still publishes PTY
+    output under its original id, while hooks publish turn state under the
+    canonical id. Subscribe to all proven identities so neither side goes deaf
+    during or after that promotion.
+    """
+    provider, native_id = _parse_agent_session_ref(raw_session)
+    if not native_id:
+        return set()
+    requested = _qualified_session_id(provider, native_id)
+    identities = {requested}
+    try:
+        canonical_native_id = _agent_registry_resolve_native_alias(provider, native_id)
+    except Exception:
+        canonical_native_id = native_id
+    canonical = _qualified_session_id(provider, canonical_native_id)
+    identities.add(canonical)
+
+    broker_lookup = getattr(handler, "_broker_session_for", None)
+    if callable(broker_lookup):
+        try:
+            broker_found = broker_lookup(canonical)
+        except Exception:
+            broker_found = None
+        if broker_found:
+            public_id, broker_session = broker_found
+            public_provider, public_native_id = _parse_agent_session_ref(str(public_id or ""))
+            if public_provider == provider and public_native_id:
+                identities.add(_qualified_session_id(provider, public_native_id))
+            broker_id = _broker_session_id(broker_session)
+            broker_provider, broker_native_id = _parse_agent_session_ref(broker_id)
+            if broker_provider == provider and broker_native_id:
+                identities.add(_qualified_session_id(provider, broker_native_id))
+    return identities
+
+
+def _session_truth_event_requires_probe(wake: dict | None, current_truth: dict | None) -> bool:
+    """Filter noisy transcript appends from expensive terminal truth probes."""
+    if not isinstance(wake, dict):
+        return False
+    kind = str(wake.get("type") or "")
+    if kind not in {"file_changed", "file_rotated", "transcript_resolved"}:
+        return True
+    if kind in {"file_rotated", "transcript_resolved"}:
+        return True
+    transcript = (current_truth or {}).get("transcript") or {}
+    current_path = str(transcript.get("path") or "")
+    event_path = str(wake.get("path") or "")
+    # An append on the already-known file rides the dedicated transcript tail.
+    # Missing/new paths alter runtime truth and need one full reconciliation.
+    return not current_path or (bool(event_path) and event_path != current_path)
+
+
+def _session_truth_fast_v2_result(handler, raw_session: str, current_result):
+    """Refresh terminal v2 state without rebuilding unrelated session truth.
+
+    Broker output is the hot path. The full truth builder also resolves the
+    transcript, reopens the registry several times, samples the process, and
+    reads both terminal surfaces. None of that is needed to surface a newly
+    rendered prompt or advance the terminal generation. Return None when the
+    compact refresh cannot be proven so the worker falls back to a full probe.
+    """
+    if not isinstance(current_result, tuple) or len(current_result) != 3:
+        return None
+    current_truth, slim_truth, digest = current_result
+    if not isinstance(current_truth, dict):
+        return None
+    try:
+        v2 = handler._broker_surface_v2_snapshot(raw_session)
+    except Exception:
+        return None
+    if not isinstance(v2, dict):
+        return None
+    terminal = current_truth.get("terminal")
+    required_dicts = (
+        current_truth.get("registry"),
+        current_truth.get("turn"),
+        current_truth.get("transcript"),
+        current_truth.get("runtime"),
+        current_truth.get("process"),
+        terminal,
+    )
+    if not all(isinstance(value, dict) for value in required_dicts):
+        return None
+    stream = terminal.get("stream")
+    capabilities = set(v2.get("capabilities") or [])
+    if (
+        not isinstance(stream, dict)
+        or v2.get("source") == "unavailable"
+        or not ({"cells", "text_snapshot"} & capabilities)
+    ):
+        return None
+    # Rebuild only derived truth from cached facts and the fresh v2 surface.
+    # v1 is omitted on this hot path because its cached screen is older than
+    # v2 by construction and comparing them could invent a contradiction.
+    refreshed_turn = dict(current_truth["turn"])
+    refreshed_turn.pop("reconciled_role", None)
+    refreshed_truth = _session_runtime_truth_from_parts(
+        session_id=str(current_truth.get("session_id") or raw_session),
+        registry=current_truth["registry"],
+        turn=refreshed_turn,
+        transcript=current_truth["transcript"],
+        v1_surface=None,
+        v2_surface=v2,
+        runtime=current_truth["runtime"],
+        stream=stream,
+        process=current_truth["process"],
+    )
+    # Only the v2 surface was sampled. Preserve the full probe's timestamp so
+    # terminal traffic cannot make cached registry, process, transcript, turn,
+    # and runtime facts look newly verified.
+    refreshed_truth["checked_at"] = current_truth.get("checked_at")
+    refreshed_slim = _session_runtime_truth_stream_payload(refreshed_truth)
+    refreshed_digest = _session_runtime_truth_stream_digest(refreshed_slim)
+    return refreshed_truth, refreshed_slim, refreshed_digest
+
+
+def _session_truth_worker_topics(handler, raw_session: str) -> tuple[set[str], set[str]]:
+    identities = _session_event_identity_keys(handler, raw_session)
+    # A broker disconnect or output gap invalidates every session's terminal
+    # control truth. Subscribe each shared worker to that low-volume global
+    # topic so it reconciles immediately instead of waiting for the keeper.
+    topics = {BROKER_GLOBAL_TOPIC}
+    for identity in identities:
+        provider_key, native_key = _parse_agent_session_ref(identity)
+        topics.update({
+            f"terminal:{identity}",
+            f"transcript:{identity}",
+            f"turn:{identity}",
+            f"turn:{provider_key}:{native_key}",
+            f"approvals:{provider_key}:{native_key}",
+            f"approvals:{provider_key}:{identity}",
+        })
+    return identities, topics
 
 
 def _acquire_shared_truth_worker(handler, session_id: str, expected_source_revision) -> tuple[dict, object]:
@@ -742,49 +916,75 @@ def _acquire_shared_truth_worker(handler, session_id: str, expected_source_revis
         # slow keeper for fields with no event source, instead of a fixed
         # 1 Hz clock per session. The keeper is the self-healing reconciler.
         subscription = None
+        subscribed_identities: set[str] = set()
         if SESSION_EVENT_HUB is not None:
-            provider_key, _, native_key = session_id.partition(":")
-            topics = {
-                f"terminal:{session_id}",
-                f"transcript:{session_id}",
-                f"turn:{session_id}",
-                f"turn:{provider_key}:{native_key}",
-                f"approvals:{provider_key}:{native_key}",
-                f"approvals:{provider_key}:{session_id}",
-            }
+            subscribed_identities, topics = _session_truth_worker_topics(
+                handler,
+                session_id,
+            )
             subscription = SESSION_EVENT_HUB.subscribe_many(sorted(topics))
-        keeper_interval = 10.0
+        keeper_interval = SESSION_TRUTH_KEEPER_INTERVAL_SECONDS
         last_probe = 0.0
         try:
             while not stop.is_set():
                 now = _time.time()
-                if now - last_probe >= 0.2:
-                    last_probe = now
-                    try:
-                        truth = handler._session_runtime_truth(session_id, expected_source_revision=expected_source_revision)
-                        slim = _session_runtime_truth_stream_payload(truth)
-                        recovered = slot.get("error") is not None
-                        slot["result"] = (truth, slim, _session_runtime_truth_stream_digest(slim))
-                        slot["error"] = None
-                        if recovered:
-                            slot["recovery_seq"] = int(slot.get("recovery_seq") or 0) + 1
-                    except ValueError as e:
-                        slot["error"] = ("bad_session", str(e)[:200])
-                        slot["fatal"] = True
-                        return
-                    except Exception as e:
-                        slot["error"] = ("session_runtime_truth_unavailable", str(e)[:200])
+                debounce_remaining = max(0.0, 0.2 - (now - last_probe))
+                if debounce_remaining and stop.wait(debounce_remaining):
+                    return
+                last_probe = _time.time()
+                try:
+                    truth = handler._session_runtime_truth(session_id, expected_source_revision=expected_source_revision)
+                    slim = _session_runtime_truth_stream_payload(truth)
+                    recovered = slot.get("error") is not None
+                    slot["result"] = (truth, slim, _session_runtime_truth_stream_digest(slim))
+                    slot["error"] = None
+                    if recovered:
+                        slot["recovery_seq"] = int(slot.get("recovery_seq") or 0) + 1
+                except ValueError as e:
+                    slot["error"] = ("bad_session", str(e)[:200])
+                    slot["fatal"] = True
+                    return
+                except Exception as e:
+                    slot["error"] = ("session_runtime_truth_unavailable", str(e)[:200])
+                if SESSION_EVENT_HUB is not None:
+                    refreshed_identities, refreshed_topics = _session_truth_worker_topics(
+                        handler,
+                        session_id,
+                    )
+                    if refreshed_identities != subscribed_identities:
+                        if subscription is not None:
+                            subscription.close()
+                        subscription = SESSION_EVENT_HUB.subscribe_many(
+                            sorted(refreshed_topics)
+                        )
+                        subscribed_identities = refreshed_identities
                 if subscription is None:
                     stop.wait(1.0)
                     continue
-                waited = 0.0
-                while not stop.is_set() and waited < keeper_interval:
-                    wake = subscription.get(timeout=2.0)
-                    waited += 2.0
-                    if wake is not None:
-                        while subscription.get(timeout=0) is not None:
-                            pass
+                keeper_deadline = _time.monotonic() + keeper_interval
+                should_probe = False
+                while not stop.is_set() and _time.monotonic() < keeper_deadline:
+                    remaining = max(0.0, keeper_deadline - _time.monotonic())
+                    wake = subscription.get(timeout=min(2.0, remaining))
+                    fast_v2_due = False
+                    while wake is not None:
+                        if str(wake.get("type") or "") == "broker_output":
+                            fast_v2_due = True
+                        elif _session_truth_event_requires_probe(wake, slot.get("result", (None,))[0] if slot.get("result") else None):
+                            should_probe = True
+                        wake = subscription.get(timeout=0)
+                    if should_probe:
                         break
+                    if fast_v2_due:
+                        refreshed = _session_truth_fast_v2_result(
+                            handler,
+                            session_id,
+                            slot.get("result"),
+                        )
+                        if refreshed is None:
+                            should_probe = True
+                            break
+                        slot["result"] = refreshed
         finally:
             if subscription is not None:
                 subscription.close()
@@ -806,6 +1006,47 @@ def _release_shared_truth_worker(key) -> None:
         _TRUTH_WORKERS.pop(key, None)
     entry["stop"].set()
 PTY_BROKER = PTYBrokerClient(PTY_BROKER_SOCKET, PTY_BROKER_TOKEN) if PTYBrokerClient and PTY_BROKER_TOKEN else None
+_SESSION_LIVE_BROKER_TAIL_CACHE_LOCK = threading.Lock()
+_SESSION_LIVE_BROKER_TAIL_CACHE: dict[tuple[int, str, int], tuple[float, object]] = {}
+SESSION_LIVE_BROKER_TAIL_CACHE_TTL_SECONDS = 0.05
+SESSION_LIVE_BROKER_TAIL_CACHE_LIMIT = 512
+
+
+def _session_live_broker_raw_tail(broker_id: str, since: int):
+    """Collapse simultaneous readers asking for the same broker byte range."""
+    broker = PTY_BROKER
+    if broker is None:
+        return None
+    key = (id(broker), str(broker_id), max(0, int(since or 0)))
+    now = _time.monotonic()
+    with _SESSION_LIVE_BROKER_TAIL_CACHE_LOCK:
+        cached = _SESSION_LIVE_BROKER_TAIL_CACHE.get(key)
+        if cached is not None and now - cached[0] <= SESSION_LIVE_BROKER_TAIL_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        # Keep the broker request under the same lock. This is a short local
+        # Unix-socket call and makes the cache single-flight: readers arriving
+        # together cannot all miss and repeat the same request.
+        tail = broker.raw_tail(str(broker_id), since=key[2])
+        _SESSION_LIVE_BROKER_TAIL_CACHE[key] = (_time.monotonic(), tail)
+        if len(_SESSION_LIVE_BROKER_TAIL_CACHE) > SESSION_LIVE_BROKER_TAIL_CACHE_LIMIT:
+            cutoff = _time.monotonic() - SESSION_LIVE_BROKER_TAIL_CACHE_TTL_SECONDS
+            stale = [
+                cache_key
+                for cache_key, (stored_at, _) in _SESSION_LIVE_BROKER_TAIL_CACHE.items()
+                if stored_at < cutoff
+            ]
+            for cache_key in stale:
+                _SESSION_LIVE_BROKER_TAIL_CACHE.pop(cache_key, None)
+            while len(_SESSION_LIVE_BROKER_TAIL_CACHE) > SESSION_LIVE_BROKER_TAIL_CACHE_LIMIT:
+                oldest = min(
+                    _SESSION_LIVE_BROKER_TAIL_CACHE,
+                    key=lambda cache_key: _SESSION_LIVE_BROKER_TAIL_CACHE[cache_key][0],
+                )
+                _SESSION_LIVE_BROKER_TAIL_CACHE.pop(oldest, None)
+        return tail
+
+
 APP_SUPPORT_ROOT = app_support_root() if app_support_root else Path(os.environ.get(
     "PAIRLING_APP_SUPPORT_ROOT",
     str(HOME / "Library" / "Application Support" / "Pairling"),
@@ -989,9 +1230,18 @@ def _filter_tombstoned_session_rows(rows: list[dict]) -> list[dict]:
     try:
         tombstones = _session_tombstone_keys()
     except SessionTombstoneStoreError:
-        # Failing open would resurrect every session the user removed. Keep the
-        # list empty until the durable receipt store is readable again.
-        return []
+        # Do not resurrect archives whose removal state cannot be proven, but
+        # do not erase live work from the dashboard either. An explicit
+        # closed_at=None comes from the runtime registry and is the only state
+        # strong enough to survive an unreadable removal ledger.
+        return [
+            row for row in rows
+            if (
+                "closed_at" in row
+                and row.get("closed_at") is None
+                and not row.get("virtual_transcript_record")
+            )
+        ]
     if not tombstones:
         return rows
     visible: list[dict] = []
@@ -1179,6 +1429,7 @@ AUTH_RESULT_CACHE_SECONDS = max(0.0, float(os.environ.get("PAIRLING_AUTH_RESULT_
 AUTH_RESULT_CACHE_MAX = max(16, int(os.environ.get("PAIRLING_AUTH_RESULT_CACHE_MAX", "512")))
 RUNTIME_MAX_ACTIVE_FAST_REQUESTS = max(2, int(os.environ.get("PAIRLING_RUNTIME_MAX_ACTIVE_FAST_REQUESTS", "4")))
 RUNTIME_MAX_ACTIVE_REQUESTS = max(4, int(os.environ.get("PAIRLING_RUNTIME_MAX_ACTIVE_REQUESTS", "12")))
+RUNTIME_MAX_ACTIVE_UPLOADS = max(1, int(os.environ.get("PAIRLING_RUNTIME_MAX_ACTIVE_UPLOADS", "2")))
 RUNTIME_MAX_ACTIVE_DASHBOARD_STREAMS = max(2, int(os.environ.get("PAIRLING_RUNTIME_MAX_ACTIVE_DASHBOARD_STREAMS", "8")))
 # Default raised 6 -> 24 with load-test evidence (mac/tools/stream_load_test.py,
 # 2026-07-06): 24 concurrent live-events streams across 8 busy sessions held
@@ -1197,7 +1448,7 @@ RUNTIME_MAX_ACTIVE_CONNECTIONS = max(
         + RUNTIME_MAX_ACTIVE_DASHBOARD_STREAMS
         + RUNTIME_MAX_ACTIVE_STREAMS
         + RUNTIME_MAX_ACTIVE_AUX_STREAMS
-        + 2
+        + RUNTIME_MAX_ACTIVE_UPLOADS
     ),
     int(os.environ.get("PAIRLING_RUNTIME_MAX_ACTIVE_CONNECTIONS", "28")),
 )
@@ -1336,21 +1587,40 @@ def _bounded_terminal_stream_chunk(
 ) -> tuple[bytes, dict]:
     max_len = min(len(data), SSE_TERMINAL_CHUNK_BYTES)
     while max_len > 0:
-        send_data = data[:max_len]
+        candidate = data[:max_len]
+        leading_gap = 0
+        while leading_gap < len(candidate) and 0x80 <= candidate[leading_gap] <= 0xBF:
+            leading_gap += 1
+        decodable = candidate[leading_gap:]
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        decoder.decode(decodable, final=False)
+        pending, _ = decoder.getstate()
+        complete_len = len(decodable) - len(pending) if pending else len(decodable)
+        consumed_len = leading_gap + complete_len
+        if consumed_len <= 0:
+            max_len = max_len // 2
+            continue
+        send_data = candidate[:consumed_len]
+        text_data = candidate[leading_gap:consumed_len]
         payload = {
             "next_since": last_offset + len(send_data),
             "total_bytes": total_bytes,
-            "text": clean_text(send_data),
+            "text": clean_text(text_data),
         }
+        if leading_gap:
+            # A broker ring gap or a legacy cursor can resume inside a UTF-8
+            # scalar. The missing lead byte cannot be recovered, so advance
+            # over its continuation bytes and surface the loss as a gap.
+            payload["gap_bytes"] = leading_gap
         _, diagnostic = _sse_json_event("chunk", payload, max_bytes=SSE_MAX_EVENT_BYTES)
         if diagnostic is None:
             return send_data, payload
         max_len = max_len // 2
-    send_data = data[:1]
+    send_data = b""
     return send_data, {
-        "next_since": last_offset + len(send_data),
+        "next_since": last_offset,
         "total_bytes": total_bytes,
-        "text": clean_text(send_data),
+        "text": "",
     }
 
 
@@ -1370,6 +1640,20 @@ def _clean_terminal_display_text(text: str) -> str:
     text = _TERMINAL_SINGLE_ESC_RE.sub("", text)
     text = _TERMINAL_C0_DISPLAY_RE.sub("", text)
     return "\n".join(line.rstrip() for line in text.split("\n"))
+
+
+def _terminal_display_lines(buffer: str, payload: dict) -> tuple[str, list[str]]:
+    if payload.get("reset") or int(payload.get("gap_bytes") or 0) > 0:
+        buffer = ""
+    text = _clean_terminal_display_text(str(payload.get("text") or ""))
+    if not text:
+        return buffer, []
+    buffer += text
+    lines: list[str] = []
+    while "\n" in buffer:
+        line, buffer = buffer.split("\n", 1)
+        lines.append(line)
+    return buffer, lines
 
 
 _HEALTH_PROBE_CACHE_SECONDS = 30.0
@@ -1394,6 +1678,7 @@ _CLIENT_SOURCE_REVISION_HEADER = "X-Pairling-App-Source-Revision"
 _LAST_LEGACY_POSTURE_APP_BUILD = 210
 _FAST_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_FAST_REQUESTS)
 _REQUEST_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_REQUESTS)
+_UPLOAD_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_UPLOADS)
 _DASHBOARD_STREAM_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_DASHBOARD_STREAMS)
 _STREAM_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_STREAMS)
 _AUX_STREAM_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_AUX_STREAMS)
@@ -1882,7 +2167,7 @@ def _required_scopes_for_request(path: str, method: str) -> set[str]:
         return {"session:spawn"}
     if path.startswith("/sessions/race/"):
         return {"sessions:read"}
-    if path in {"/sessions", "/sessions-visible", "/sessions-stream", "/recent-projects", "/filesystem/directories", "/session-meta", "/activity", "/activity-stream", "/fleet/digest"}:
+    if path in {"/sessions", "/sessions-visible", "/sessions-stream", "/recent-projects", "/filesystem/directories", "/session-meta", "/activity", "/activity-stream", "/fleet/digest", "/phone-tools/activity"}:
         return {"sessions:read"}
     if path in {"/transcript", "/transcript-stream", "/session-live-events", "/session-events-v2", "/session-events-v2-raw", "/session-events-v2-content", "/device-events", "/terminal-stream", "/terminal-stream-diagnostics", "/terminal-surface", "/terminal-surface-stream", "/terminal-surface-v2", "/terminal-surface-stream-v2", "/session-runtime-truth", "/session-runtime-truth-stream", "/terminal-workspace", "/terminal-workspace-stream", "/corpus"}:
         return {"transcript:read"}
@@ -2102,6 +2387,33 @@ def _auth_cache_key(token: str, *, method: str, path: str, required_scopes: set[
     return (token_hash, method.upper(), path, tuple(sorted(required_scopes)))
 
 
+def _bind_auth_result_to_local_install(auth_result):
+    if auth_result is None or not getattr(auth_result, "ok", False):
+        return auth_result
+    local_install_id = str(getattr(PAIRING_STORE, "install_id", "") or "").strip()
+    if not local_install_id:
+        return DeviceAuthResult(
+            ok=False,
+            status=503,
+            reason="server_identity_unavailable",
+            device_id=getattr(auth_result, "device_id", None),
+            install_id=getattr(auth_result, "install_id", None),
+        )
+    authenticated_install_id = str(getattr(auth_result, "install_id", "") or "").strip()
+    if authenticated_install_id and secrets.compare_digest(
+        authenticated_install_id,
+        local_install_id,
+    ):
+        return auth_result
+    return DeviceAuthResult(
+        ok=False,
+        status=403,
+        reason="install_id_mismatch",
+        device_id=getattr(auth_result, "device_id", None),
+        install_id=authenticated_install_id or None,
+    )
+
+
 def _authenticate_device(token: str, *, required_scopes: set[str], path: str, method: str):
     if DEVICE_REGISTRY is None:
         return None
@@ -2115,7 +2427,11 @@ def _authenticate_device(token: str, *, required_scopes: set[str], path: str, me
             if cached is not None and now - cached[0] < AUTH_RESULT_CACHE_SECONDS:
                 credential_expires_at = getattr(cached[1], "credential_expires_at", None)
                 if credential_expires_at is None or now < float(credential_expires_at):
-                    return cached[1]
+                    bound_result = _bind_auth_result_to_local_install(cached[1])
+                    if getattr(bound_result, "ok", False):
+                        return bound_result
+                    _auth_result_cache.pop(cache_key, None)
+                    return bound_result
                 _auth_result_cache.pop(cache_key, None)
 
     auth_kwargs = {
@@ -2128,6 +2444,7 @@ def _authenticate_device(token: str, *, required_scopes: set[str], path: str, me
     if path == "/routez" and method.upper() == "GET":
         auth_kwargs["allow_pending"] = True
     auth_result = DEVICE_REGISTRY.authenticate(token, **auth_kwargs)
+    auth_result = _bind_auth_result_to_local_install(auth_result)
     if cache_key is not None and getattr(auth_result, "ok", False):
         with _auth_result_cache_lock:
             if cache_generation == _auth_result_cache_generation:
@@ -3898,14 +4215,21 @@ def _agent_registry_link_claude_broker_registration(
         return {"state": "error", "reason": type(exc).__name__}
 
     _invalidate_session_list_caches()
-    _publish_session_event(SESSION_SUMMARIES_TOPIC, {
+    identity_event = {
         "type": "session_identity_linked",
         "provider": "claude",
         "native_id": canonical_native_id,
         "broker_id": result.get("broker_id"),
         "project": project,
         "heartbeat_at": now,
-    })
+    }
+    _publish_session_event(SESSION_SUMMARIES_TOPIC, identity_event)
+    broker_id = str(result.get("broker_id") or "")
+    if broker_id:
+        # Viewers opened against the temporary broker identity do not listen
+        # to the summaries topic. Wake that exact terminal topic so their
+        # truth worker can discover the canonical identity immediately.
+        _publish_session_event(f"terminal:{broker_id}", dict(identity_event))
     return result
 
 
@@ -4142,6 +4466,77 @@ def _process_alive(pid: int) -> bool:
         return False
 
 
+SESSION_TERMINATE_GRACE_SECONDS = 2.0
+SESSION_TERMINATE_KILL_SECONDS = 1.0
+SESSION_TERMINATE_POLL_SECONDS = 0.05
+
+
+def _wait_for_process_exit(pid: int, timeout: float) -> bool:
+    """Return true only after the exact PID no longer exists."""
+    deadline = _time.monotonic() + max(0.0, float(timeout or 0))
+    while True:
+        if not _process_alive(pid):
+            return True
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            return False
+        _time.sleep(min(SESSION_TERMINATE_POLL_SECONDS, remaining))
+
+
+def _signal_process_group(pid: int, sig: int) -> None:
+    try:
+        os.killpg(os.getpgid(pid), sig)
+    except ProcessLookupError:
+        raise
+    except Exception:
+        os.kill(pid, sig)
+
+
+def _terminate_direct_session_process(row: dict, provider: str, pid: int) -> dict:
+    """Terminate a non-broker provider process and prove that it exited."""
+    try:
+        _signal_process_group(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return {"ok": True, "error": None, "error_code": None}
+    except (PermissionError, OSError) as error:
+        return {
+            "ok": False,
+            "error": f"{type(error).__name__}: {error}",
+            "error_code": "signal_failed",
+        }
+
+    if _wait_for_process_exit(pid, SESSION_TERMINATE_GRACE_SECONDS):
+        return {"ok": True, "error": None, "error_code": None}
+
+    # Do not escalate if the PID no longer proves as this session. It may have
+    # been reused, and killing a replacement process would cross identities.
+    if not _session_signal_target_is_verified(row, provider, pid):
+        return {
+            "ok": False,
+            "error": f"{provider.title()} process identity changed while termination was pending",
+            "error_code": "process_identity_unverified",
+        }
+
+    try:
+        _signal_process_group(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return {"ok": True, "error": None, "error_code": None}
+    except (PermissionError, OSError) as error:
+        return {
+            "ok": False,
+            "error": f"{type(error).__name__}: {error}",
+            "error_code": "signal_failed",
+        }
+
+    if _wait_for_process_exit(pid, SESSION_TERMINATE_KILL_SECONDS):
+        return {"ok": True, "error": None, "error_code": None}
+    return {
+        "ok": False,
+        "error": f"{provider.title()} process exit could not be confirmed",
+        "error_code": "process_exit_unconfirmed",
+    }
+
+
 # --- Fleet Live Activity: independent-freshness row cache ----------------
 # The fleet publisher needs the fleet's tier composition even while the phone
 # is locked and polling nothing. Every /sessions read passes its fully enriched
@@ -4215,6 +4610,10 @@ def _runtime_admission_for_path(path: str) -> _RuntimeAdmission:
         if _STREAM_ADMISSION_SEMAPHORE.acquire(blocking=False):
             return _RuntimeAdmission(_STREAM_ADMISSION_SEMAPHORE, True)
         return _RuntimeAdmission(None, False, "stream_capacity_exceeded")
+    if path == "/upload":
+        if _UPLOAD_ADMISSION_SEMAPHORE.acquire(blocking=False):
+            return _RuntimeAdmission(_UPLOAD_ADMISSION_SEMAPHORE, True)
+        return _RuntimeAdmission(None, False, "upload_capacity_exceeded")
     if _REQUEST_ADMISSION_SEMAPHORE.acquire(blocking=False):
         return _RuntimeAdmission(_REQUEST_ADMISSION_SEMAPHORE, True)
     return _RuntimeAdmission(None, False, "request_capacity_exceeded")
@@ -6585,7 +6984,13 @@ def _large_transcript_line_block_types(
     text. It follows the provider message/payload content array so nested tool
     input objects cannot masquerade as provider-authored text blocks.
     """
-    target_container = "payload" if provider == "codex" else "message"
+    provider = str(provider or "").strip().lower()
+    if provider == "codex":
+        target_container = "payload"
+    elif provider == "claude":
+        target_container = "message"
+    else:
+        raise _UnsupportedTranscriptProviderError(provider)
     frames: list[dict] = []
     block_types: set[str] = set()
     candidate_key: str | None = None
@@ -6699,6 +7104,7 @@ def _large_transcript_line_meaningful_at(
     timestamp = _timestamp_from_json_prefix(prefix)
     if timestamp is None:
         return None
+    provider = str(provider or "").strip().lower()
     if provider == "codex":
         if '"type":"response_item"' not in compact:
             return None
@@ -6713,7 +7119,7 @@ def _large_transcript_line_meaningful_at(
         ))
         if not block_types.intersection({"text", "input_text", "output_text"}):
             return None
-    else:
+    elif provider == "claude":
         if '"type":"assistant"' not in compact:
             return None
         message_at = compact.find('"message":')
@@ -6729,6 +7135,8 @@ def _large_transcript_line_meaningful_at(
             not block_types.intersection({"text", "input_text", "output_text"})
         ):
             return None
+    else:
+        raise _UnsupportedTranscriptProviderError(provider)
     lowered = prefix.lower()
     if any(f"<{tag}>" in lowered for tag in TRANSCRIPT_HARNESS_BLOCK_TAGS):
         return None
@@ -6740,6 +7148,9 @@ def _last_meaningful_transcript_turn_at(
     provider: str,
     native_id: str,
 ) -> float | None:
+    provider = str(provider or "").strip().lower()
+    if provider not in _SUPPORTED_TRANSCRIPT_PROVIDERS:
+        raise _UnsupportedTranscriptProviderError(provider)
     try:
         with path.open("rb") as handle:
             for start, end in _reverse_jsonl_line_spans(path):
@@ -6766,7 +7177,7 @@ def _last_meaningful_transcript_turn_at(
                         meaningful = _meaningful_transcript_turn_at(row)
                         if meaningful is not None:
                             return meaningful
-                else:
+                elif provider == "claude":
                     try:
                         row = json.loads(raw)
                     except (ValueError, json.JSONDecodeError):
@@ -6774,6 +7185,8 @@ def _last_meaningful_transcript_turn_at(
                     meaningful = _meaningful_transcript_turn_at(row)
                     if meaningful is not None:
                         return meaningful
+                else:
+                    raise _UnsupportedTranscriptProviderError(provider)
     except OSError:
         return None
     return None
@@ -6837,6 +7250,16 @@ def _bounded_transcript_stream_start(*, since: int, size: int) -> int:
 
 
 def _session_transcript_stats(path: Path | str | None, provider: str, native_id: str) -> dict:
+    provider = str(provider or "").strip().lower()
+    if provider not in _SUPPORTED_TRANSCRIPT_PROVIDERS:
+        return {
+            "turn_count": None,
+            "bytes": None,
+            "mtime": None,
+            "last_meaningful_turn_at": None,
+            "reason": "unsupported_provider",
+            "provider": provider or "unknown",
+        }
     if path is None:
         return {
             "turn_count": None,
@@ -6879,9 +7302,11 @@ def _session_transcript_stats(path: Path | str | None, provider: str, native_id:
         elif provider == "codex":
             with target.open(encoding="utf-8", errors="replace") as f:
                 iterable = list(f)
-        else:
+        elif provider == "claude":
             with target.open("rb") as f:
                 iterable = list(f)
+        else:
+            raise _UnsupportedTranscriptProviderError(provider)
         if provider == "codex":
             for raw in iterable:
                 if not raw.strip():
@@ -6896,7 +7321,7 @@ def _session_transcript_stats(path: Path | str | None, provider: str, native_id:
                             last_meaningful_turn_at or meaningful_at,
                             meaningful_at,
                         )
-        else:
+        elif provider == "claude":
             for raw in iterable:
                 if not raw.strip():
                     continue
@@ -6913,6 +7338,8 @@ def _session_transcript_stats(path: Path | str | None, provider: str, native_id:
                         last_meaningful_turn_at or meaningful_at,
                         meaningful_at,
                     )
+        else:
+            raise _UnsupportedTranscriptProviderError(provider)
     except OSError:
         return {
             "turn_count": None,
@@ -7650,6 +8077,42 @@ def _fleet_session_rows() -> list[dict]:
     return _fleet_rows_recompute(now)
 
 
+def _fleet_activity_target_signature() -> tuple[str, ...]:
+    """Cheap identity of fleet activities that can receive an APNs update."""
+    dispatcher = PUSH_DISPATCHER
+    if dispatcher is None:
+        return ()
+    try:
+        status = dispatcher.status()
+    except Exception as exc:
+        raise RuntimeError("fleet push status unavailable") from exc
+    if not isinstance(status, dict):
+        raise RuntimeError("fleet push status is malformed")
+    provider = status.get("provider")
+    if isinstance(provider, dict) and not provider.get("configured"):
+        return ()
+    devices = status.get("devices") if isinstance(status, dict) else []
+    targets: set[str] = set()
+    for device in devices if isinstance(devices, list) else []:
+        if not isinstance(device, dict) or not device.get("live_activity_enabled"):
+            continue
+        device_id = str(device.get("device_id") or "").strip()
+        if not device_id:
+            continue
+        for activity in device.get("live_activities") or []:
+            if (
+                not isinstance(activity, dict)
+                or activity.get("invalidated_at")
+                or str(activity.get("session_id") or "").strip() != FLEET_ACTIVITY_SESSION_ID
+            ):
+                continue
+            registration_id = str(
+                activity.get("token_hash") or activity.get("activity_id") or "legacy"
+            ).strip()
+            targets.add(f"{device_id}:{registration_id}")
+    return tuple(sorted(targets))
+
+
 def _emit_fleet_activity(payload: dict) -> None:
     """Deliver one fleet-summary Live Activity event to every device that has a
     live 'fleet' activity registered. Mirrors the per-session publisher's device
@@ -7657,14 +8120,18 @@ def _emit_fleet_activity(payload: dict) -> None:
     the fleet push token. active_total == 0 ends the activity; otherwise updates."""
     dispatcher = PUSH_DISPATCHER
     if dispatcher is None:
-        return
+        raise RuntimeError("fleet push dispatcher unavailable")
     try:
         status = dispatcher.status()
-    except Exception:
-        return
-    devices = status.get("devices") if isinstance(status, dict) else []
+    except Exception as exc:
+        raise RuntimeError("fleet push status unavailable during delivery") from exc
+    if not isinstance(status, dict):
+        raise RuntimeError("fleet push status is malformed during delivery")
+    devices = status.get("devices")
     content_state = payload.get("content_state") or {}
     event = "end" if int(payload.get("active_total") or 0) <= 0 else "update"
+    attempted = 0
+    failures: list[str] = []
     for device in devices if isinstance(devices, list) else []:
         if not isinstance(device, dict) or not device.get("live_activity_enabled"):
             continue
@@ -7685,10 +8152,18 @@ def _emit_fleet_activity(payload: dict) -> None:
             "event_id": content_state.get("eventId"),
             "stale_seconds": payload.get("stale_seconds"),
         }
+        attempted += 1
         try:
-            dispatcher.record_live_activity_event(device_id=device_id, payload=event_payload)
+            result = dispatcher.record_live_activity_event(device_id=device_id, payload=event_payload)
+            if not isinstance(result, dict) or not result.get("ok"):
+                outcome = ((result or {}).get("delivery") or {}).get("outcome") if isinstance(result, dict) else None
+                failures.append(f"{device_id[:8]}:{outcome or 'delivery_failed'}")
         except Exception as exc:
-            print(f"[fleet-activity-publisher] emit to {device_id[:8]} failed: {type(exc).__name__}: {str(exc)[:120]}", file=sys.stderr, flush=True)
+            failures.append(f"{device_id[:8]}:{type(exc).__name__}")
+    if attempted == 0:
+        raise RuntimeError("fleet targets changed before delivery")
+    if failures:
+        raise RuntimeError("fleet delivery failed: " + ",".join(failures))
 
 
 def _start_fd_watchdog():
@@ -7707,6 +8182,7 @@ def _start_fleet_activity_publisher():
     except Exception:
         interval = 4.0
     publisher = FleetActivityPublisher(
+        targets_provider=_fleet_activity_target_signature,
         rows_provider=_fleet_session_rows,
         emit=_emit_fleet_activity,
         logger=lambda msg: print(f"[fleet-activity-publisher] {msg}", file=sys.stderr, flush=True),
@@ -8227,10 +8703,40 @@ def _terminal_attention_from_snapshot(snapshot: dict | None) -> dict | None:
 
 
 def _session_terminal_title(row: dict) -> str | None:
-    existing = str(row.get("terminal_title") or "").strip()
+    def cleaned(value) -> str | None:
+        title = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
+        title = " ".join(title.split()).strip()
+        return title[:240] or None
+
+    existing = cleaned(row.get("terminal_title"))
     if existing:
-        return existing[:240]
+        return existing
+    row_metadata_title = cleaned(
+        _registry_metadata_from_row(row).get("terminal_title")
+    )
+    if row_metadata_title:
+        return row_metadata_title
     session_id = str(row.get("id") or "").strip()
+    provider = str(row.get("provider") or "").strip().lower()
+    native_id = str(row.get("native_id") or "").strip()
+    if session_id and (not provider or not native_id):
+        parsed_provider, parsed_native_id = _parse_agent_session_ref(session_id)
+        provider = provider or parsed_provider
+        native_id = native_id or parsed_native_id
+    registry_row = (
+        _agent_registry_get(provider, native_id)
+        if provider in {"claude", "codex"} and native_id
+        else None
+    )
+    if registry_row is None:
+        tty = str(row.get("terminal_tty") or "").strip()
+        if provider in {"claude", "codex"} and tty:
+            registry_row = _agent_registry_get_by_tty(provider, tty)
+    metadata_title = cleaned(
+        _registry_metadata_from_row(registry_row).get("terminal_title")
+    )
+    if metadata_title:
+        return metadata_title
     if not session_id or PTY_BROKER is None:
         return None
     source = _terminal_surface_capabilities(session_id)
@@ -8241,8 +8747,7 @@ def _session_terminal_title(row: dict) -> str | None:
         snapshot = PTY_BROKER.snapshot(broker_id)
     except Exception:
         return None
-    title = str((snapshot or {}).get("title") or "").strip()
-    return title[:240] or None
+    return cleaned((snapshot or {}).get("title"))
 
 
 def _truth_issue(code: str, severity: str, user_message: str, *, detail: str | None = None,
@@ -8372,6 +8877,12 @@ def _session_runtime_truth_from_parts(
     transcript = dict(transcript or {})
     runtime = dict(runtime or {})
     stream = dict(stream or {})
+    if registry.get("readable_state") == "closed" or registry.get("state") == "terminated":
+        turn.update({
+            "state": "terminated",
+            "source": "registry-closed",
+            "observed_at": registry.get("last_seen_at") or turn.get("observed_at"),
+        })
     contradictions: list[dict] = []
     degradations: list[dict] = []
 
@@ -8556,6 +9067,13 @@ def _session_runtime_truth_from_parts(
             "Process truth unavailable",
             sources=["process"],
         ))
+    elif process.get("state") == "identity_unverified":
+        degradations.append(_truth_issue(
+            "process_identity_unverified",
+            "warning",
+            "The recorded process no longer matches this provider session.",
+            sources=["process"],
+        ))
 
     if selected_surface == "v2" and terminal_state in {"live", "needs_input"}:
         control_state = "eligible" if "control_receipts" in v2_capabilities and selected.get("screen_hash") and selected.get("nonce") else "read_only"
@@ -8573,6 +9091,18 @@ def _session_runtime_truth_from_parts(
         control_state = "unavailable"
         blocked_reason = "terminal_surface_unavailable"
 
+    registry_control_state = str(registry.get("control_state") or "")
+    if control_state == "eligible" and registry_control_state in {"read_only", "unavailable"}:
+        control_state = "read_only"
+        blocked_reason = "session_control_identity_unverified"
+        degradations.append(_truth_issue(
+            "session_control_identity_unverified",
+            "warning",
+            "Session control identity is not verified on this Mac.",
+            sources=["registry", "process"],
+            blocks_control=True,
+        ))
+
     supported_actions: list[str] = []
     if control_state == "eligible":
         supported_actions = (
@@ -8584,6 +9114,7 @@ def _session_runtime_truth_from_parts(
             process.get("state") == "alive"
             and process.get("pid")
             and process.get("process_alive") is True
+            and process.get("identity_verified") is True
         )
         if process_can_terminate:
             supported_actions.append("terminate")
@@ -8702,9 +9233,14 @@ def _session_runtime_truth_from_parts(
 
 
 def _session_runtime_truth_stream_digest(truth: dict) -> str:
+    turn = dict(truth.get("turn") or {})
+    # Age is derived from wall time. Hash the observed transition itself so a
+    # quiet session does not emit a fake state change on every keeper probe.
+    turn.pop("age_seconds", None)
     material = {
         "schema_version": truth.get("schema_version"),
         "session_id": truth.get("session_id"),
+        "turn": turn,
         "terminal": truth.get("terminal") or {},
         "transcript": truth.get("transcript") or {},
         "runtime": truth.get("runtime") or {},
@@ -8730,6 +9266,15 @@ def _session_runtime_truth_stream_payload(truth: dict) -> dict:
     slim = dict(truth)
     slim["terminal"] = {k: v for k, v in terminal.items() if k not in ("v1", "v2")}
     return slim
+
+
+def _session_live_truth_events(truth: dict, slim_truth: dict) -> list[tuple[str, dict, str]]:
+    """Build the ordered truth events written by the multiplexed live stream."""
+    events = [("truth", slim_truth, "session-runtime-truth")]
+    turn = truth.get("turn") if isinstance(truth.get("turn"), dict) else {}
+    if turn:
+        events.append(("turn_state", turn, "turn-state"))
+    return events
 
 
 def _terminal_stream_diagnostics_from_truth(truth: dict) -> dict:
@@ -9016,13 +9561,29 @@ def _session_live_pending_approval(provider: str, native_id: str) -> dict | None
         return None
     qualified = _qualified_session_id(provider, native_id)
     try:
+        canonical_native_id = str(
+            _agent_registry_resolve_native_alias(provider, native_id) or native_id
+        ).strip()
+    except Exception:
+        canonical_native_id = native_id
+    canonical_qualified = _qualified_session_id(provider, canonical_native_id)
+    try:
         with _agent_registry_conn() as conn:
             row = conn.execute(
                 "SELECT * FROM pending_approvals "
                 "WHERE provider=? AND state IN ('pending', 'attention') "
-                "AND (native_id=? OR session_id=? OR session_id=?) "
+                "AND (native_id IN (?, ?) "
+                "OR session_id IN (?, ?, ?, ?)) "
                 "ORDER BY created_at ASC LIMIT 1",
-                (provider, native_id, qualified, native_id),
+                (
+                    provider,
+                    native_id,
+                    canonical_native_id,
+                    native_id,
+                    qualified,
+                    canonical_native_id,
+                    canonical_qualified,
+                ),
             ).fetchone()
     except Exception:
         return None
@@ -10067,6 +10628,8 @@ def _codex_control_overlay(row: dict, observed_mtime: float | None = None, *, ve
     if not reg:
         return row
     metadata = _registry_metadata_from_row(reg)
+    if metadata.get("terminal_title") and not row.get("terminal_title"):
+        row["terminal_title"] = metadata.get("terminal_title")
     _apply_launch_context_to_session_row(row, metadata)
     if reg.get("closed_at"):
         row["closed_at"] = int(float(reg.get("closed_at") or _time.time()))
@@ -10167,6 +10730,7 @@ def _codex_pending_registry_rows(seen: set[str], live_only: bool, active_within_
             "source_freshness": "registry_stale_process_alive" if heartbeat < cutoff and process_alive else "registry_live",
             "terminal_tty": tty,
             "pid": pid,
+            "terminal_title": metadata.get("terminal_title"),
             "first_prompt": None,
             "state": "running",
             "tool": None,
@@ -10228,6 +10792,7 @@ def _codex_recent_closed_registry_rows(seen: set[str], active_within_min: int) -
             "closed_at": closed_at,
             "stale_seconds": max(0, int(_time.time() - last_heartbeat)) if last_heartbeat else 0,
             "source_freshness": "registry_closed",
+            "terminal_title": metadata.get("terminal_title"),
             "first_prompt": first_prompt,
             "state": "terminated",
             "tool": None,
@@ -11717,47 +12282,92 @@ class ClientDisconnected(Exception):
     pass
 
 
+class RequestBodyRejected(Exception):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _validated_request_content_length(headers) -> int:
+    def values(name: str) -> list[str]:
+        get_all = getattr(headers, "get_all", None)
+        if callable(get_all):
+            return list(get_all(name) or [])
+        value = headers.get(name) if hasattr(headers, "get") else None
+        return [] if value is None else [value]
+
+    transfer_encodings = values("Transfer-Encoding")
+    if transfer_encodings:
+        raise RequestBodyRejected(
+            "unsupported_transfer_encoding",
+            "Transfer-Encoding is not supported",
+        )
+    content_lengths = values("Content-Length")
+    if not content_lengths:
+        return 0
+    if len(content_lengths) != 1:
+        raise RequestBodyRejected("bad_content_length", "exactly one Content-Length is required")
+    raw = str(content_lengths[0]).strip()
+    if len(raw) > 20 or re.fullmatch(r"[0-9]+", raw) is None:
+        raise RequestBodyRejected("bad_content_length", "Content-Length must be a nonnegative integer")
+    try:
+        return int(raw)
+    except ValueError as error:
+        raise RequestBodyRejected("bad_content_length", "Content-Length is invalid") from error
+
+
 class Handler(BaseHTTPRequestHandler):
     timeout = REQUEST_READ_TIMEOUT_SECONDS
 
-    def do_GET(self):
+    def _release_runtime_admission(self) -> None:
+        admission = getattr(self, "_runtime_admission", None)
+        if admission is not None:
+            admission.release()
+            self._runtime_admission = None
+
+    def _run_dispatch(self):
+        self._runtime_admission = None
         try:
             return self._dispatch()
         except socket.timeout:
+            self._release_runtime_admission()
             self._send_json({"ok": False, "error": {"code": "request_timeout"}}, status=408)
+        except RequestBodyRejected as error:
+            self._release_runtime_admission()
+            self.close_connection = True
+            self._send_json({
+                "ok": False,
+                "error": {"code": error.code, "message": error.message},
+            }, status=400)
         except ClientDisconnected:
             return
+
+    def do_GET(self):
+        return self._run_dispatch()
 
     def do_POST(self):
-        try:
-            return self._dispatch()
-        except socket.timeout:
-            self._send_json({"ok": False, "error": {"code": "request_timeout"}}, status=408)
-        except ClientDisconnected:
-            return
+        return self._run_dispatch()
 
     def do_PUT(self):
-        try:
-            return self._dispatch()
-        except socket.timeout:
-            self._send_json({"ok": False, "error": {"code": "request_timeout"}}, status=408)
-        except ClientDisconnected:
-            return
+        return self._run_dispatch()
 
     def do_DELETE(self):
-        try:
-            return self._dispatch()
-        except socket.timeout:
-            self._send_json({"ok": False, "error": {"code": "request_timeout"}}, status=408)
-        except ClientDisconnected:
-            return
+        return self._run_dispatch()
 
     def _read_body(self) -> bytes:
         cached = getattr(self, "_cached_body", None)
         if cached is not None:
             return cached
-        n = int(self.headers.get("Content-Length", 0))
+        n = getattr(self, "_expected_body_length", None)
+        if n is None:
+            n = _validated_request_content_length(self.headers)
         body = self.rfile.read(n) if n > 0 else b""
+        if len(body) != n:
+            raise RequestBodyRejected(
+                "truncated_body",
+                f"request body ended after {len(body)} of {n} bytes",
+            )
         self._cached_body = body
         return body
 
@@ -11766,10 +12376,15 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         self._cached_body = None
         try:
-            content_length = int(self.headers.get("Content-Length", "0") or "0")
-        except ValueError:
-            self._send_json({"ok": False, "error": {"code": "bad_content_length"}}, status=400)
+            content_length = _validated_request_content_length(self.headers)
+        except RequestBodyRejected as error:
+            self.close_connection = True
+            self._send_json({
+                "ok": False,
+                "error": {"code": error.code, "message": error.message},
+            }, status=400)
             return
+        self._expected_body_length = content_length
         if u.path == "/upload":
             max_body = MAX_UPLOAD_BODY_BYTES
         elif u.path == "/compose/recordings/sync" and self.command == "POST":
@@ -11791,6 +12406,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         admission = _runtime_admission_for_path(u.path)
+        self._runtime_admission = admission
         if not admission.allowed:
             self._send_json({
                 "ok": False,
@@ -11799,7 +12415,7 @@ class Handler(BaseHTTPRequestHandler):
                     "message": "Pairling runtime is busy; retry shortly",
                 },
                 "retry_after": 1,
-            }, status=503)
+            }, status=503, headers={"Retry-After": "1"})
             return
 
         self.pairling_auth = None
@@ -12154,6 +12770,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_llm_route_stream(q)
             elif u.path == "/pairling-tools/run":
                 self._handle_pairling_tools_run(q)
+            elif u.path == "/phone-tools/activity":
+                self._handle_phone_tools_activity(q)
             elif u.path == "/phone-tools/availability":
                 self._handle_phone_tools_availability(q)
             elif u.path == "/phone-tools/next":
@@ -12316,6 +12934,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_session_export(q, sid)
             else:
                 self.send_error(404, "unknown path")
+        except RequestBodyRejected:
+            raise
         except (ClientDisconnected, BrokenPipeError, ConnectionResetError):
             return
         except Exception as e:
@@ -12346,9 +12966,23 @@ class Handler(BaseHTTPRequestHandler):
         uuid = str(payload.get("claude_uuid") or "").strip()
         return uuid if self._CLAUDE_UUID_RE.match(uuid) else ""
 
-    def _internal_provider(self, payload: dict) -> str:
-        provider = str(payload.get("provider") or "claude").strip().lower()
-        return provider if provider in {"claude", "codex"} else "claude"
+    def _internal_provider(self, payload: dict) -> str | None:
+        raw_provider = payload.get("provider")
+        if raw_provider is None or not str(raw_provider).strip():
+            return "claude"
+        provider = str(raw_provider).strip().lower()
+        return provider if provider in {"claude", "codex"} else None
+
+    def _send_internal_unsupported_provider(self, raw_provider) -> None:
+        provider = str(raw_provider or "unknown").strip().lower() or "unknown"
+        self._send_json({
+            "ok": False,
+            "error": {
+                "code": "unsupported_provider",
+                "message": f"Provider {provider} is not supported by this internal route.",
+                "provider": provider,
+            },
+        }, status=422)
 
     def _internal_terminal_tty(self, payload: dict) -> str:
         tty = str(payload.get("terminal_tty") or "").strip()
@@ -12383,6 +13017,9 @@ class Handler(BaseHTTPRequestHandler):
         if payload is None:
             return
         provider = self._internal_provider(payload)
+        if provider is None:
+            self._send_internal_unsupported_provider(payload.get("provider"))
+            return
         session_id = str(payload.get("id") or "").strip()
         project = str(payload.get("project") or "").strip()
         if not _safe_session_id(session_id) or not project:
@@ -12463,6 +13100,9 @@ class Handler(BaseHTTPRequestHandler):
         if payload is None:
             return
         provider = self._internal_provider(payload)
+        if provider is None:
+            self._send_internal_unsupported_provider(payload.get("provider"))
+            return
         if provider == "codex":
             session_id = str(payload.get("id") or "").strip()
             if not _safe_session_id(session_id):
@@ -12500,6 +13140,9 @@ class Handler(BaseHTTPRequestHandler):
         if payload is None:
             return
         provider = self._internal_provider(payload)
+        if provider is None:
+            self._send_internal_unsupported_provider(payload.get("provider"))
+            return
         if provider == "codex":
             session_id = str(payload.get("id") or "").strip()
             if not _safe_session_id(session_id):
@@ -12524,7 +13167,10 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_internal_active_sessions(self, q):
         project = q.get("project", [""])[0].strip()
         provider_filter = str(q.get("provider", ["claude"])[0] or "claude").strip().lower()
-        providers = ["claude", "codex"] if provider_filter == "all" else [provider_filter if provider_filter in {"claude", "codex"} else "claude"]
+        if provider_filter not in {"all", "claude", "codex"}:
+            self._send_internal_unsupported_provider(provider_filter)
+            return
+        providers = ["claude", "codex"] if provider_filter == "all" else [provider_filter]
         cutoff = _time.time() - 300
         items = []
         for provider in providers:
@@ -12551,9 +13197,10 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._read_internal_json()
         if payload is None:
             return
-        provider = str(payload.get("provider") or "claude").strip().lower()
-        if provider not in ("claude", "codex"):
-            provider = "claude"
+        provider = self._internal_provider(payload)
+        if provider is None:
+            self._send_internal_unsupported_provider(payload.get("provider"))
+            return
         session_id = str(payload.get("session_id") or "").strip()
         tool_name = str(payload.get("tool_name") or "").strip()
         tool_input = payload.get("tool_input")
@@ -12705,6 +13352,72 @@ class Handler(BaseHTTPRequestHandler):
         if not result.get("ok"):
             status = 400 if error_payload.get("code") in {"bad_request", "invalid_tool", "invalid_strategy", "missing_input"} else 502
         self._send_json(result, status=status)
+
+    def _handle_phone_tools_activity(self, q):
+        if self.command != "GET":
+            self.send_error(405, "GET required")
+            return
+        if DEVICE_REGISTRY is None:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "phone_tools_activity_unavailable",
+                    "message": "Phone Tools activity history is unavailable",
+                },
+            }, status=503)
+            return
+        try:
+            limit = int(q.get("limit", ["50"])[0])
+        except (TypeError, ValueError):
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "bad_request",
+                    "message": "limit must be an integer",
+                },
+            }, status=400)
+            return
+        agent_provider = str(q.get("agent_provider", [""])[0] or "").strip().lower() or None
+        session_identity = str(q.get("session_identity", [""])[0] or "").strip() or None
+        if (agent_provider is None) != (session_identity is None) or (
+            agent_provider is not None
+            and re.fullmatch(r"[a-z0-9_-]{1,48}", agent_provider) is None
+        ) or (
+            session_identity is not None
+            and re.fullmatch(r"[A-Za-z0-9._:-]{1,160}", session_identity) is None
+        ):
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "bad_request",
+                    "message": "agent_provider and session_identity must be valid and supplied together",
+                },
+            }, status=400)
+            return
+        try:
+            page = DEVICE_REGISTRY.recent_phone_tool_activity(
+                limit=limit,
+                agent_provider=agent_provider,
+                session_identity=session_identity,
+            )
+        except (OSError, ValueError) as exc:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "phone_tools_activity_unavailable",
+                    "message": f"Phone Tools activity history could not be read: {type(exc).__name__}",
+                },
+            }, status=503)
+            return
+        items = page["items"]
+        self._send_json({
+            "ok": True,
+            "schema_version": 1,
+            "count": len(items),
+            "items": items,
+            "filtered": bool(page.get("filtered")),
+            "unbound_count": max(0, int(page.get("unbound_count") or 0)),
+        })
 
     def _handle_phone_tools_availability(self, q):
         if PHONE_TOOL_AVAILABILITY is None:
@@ -14193,7 +14906,7 @@ class Handler(BaseHTTPRequestHandler):
         transcript_path = None
         if provider == "codex" and native_id:
             transcript_path = _resolve_codex_transcript(native_id)
-        elif row.get("project") and row.get("claude_uuid"):
+        elif provider == "claude" and row.get("project") and row.get("claude_uuid"):
             transcript_path = HOME / ".claude" / "projects" / _encode_project_dir(row["project"]) / f"{row['claude_uuid']}.jsonl"
         stats = _session_transcript_stats(transcript_path, provider, native_id)
         row.setdefault("turn_count", stats.get("turn_count"))
@@ -14288,6 +15001,18 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if provider_filter == "codex":
+            try:
+                _session_tombstone_keys()
+            except SessionTombstoneStoreError:
+                self._send_json({
+                    "count": 0,
+                    "items": [],
+                    "degraded": {
+                        "reason": "session_tombstone_store_unavailable",
+                        "detail": "Durable session removals are unreadable on the Mac.",
+                    },
+                }, status=503)
+                return
             rows = [
                 self._decorate_session_lifecycle_row(row)
                 for row in _list_codex_sessions(live_only=live_only, active_within_min=within_min)
@@ -14662,10 +15387,20 @@ class Handler(BaseHTTPRequestHandler):
         launch_context = _session_launch_context_from_metadata(
             _registry_metadata_from_row(_agent_registry_get(provider, native_id))
         ) if native_id else None
-        if provider == "codex":
-            path = _resolve_codex_transcript(native_id)
-        else:
-            path = self._resolve_transcript(session_id)
+        try:
+            path = self._resolve_session_transcript_path(
+                provider,
+                native_id,
+                session_id,
+            )
+        except _UnsupportedTranscriptProviderError as error:
+            _send_unsupported_provider(
+                self,
+                error.provider,
+                error.capability,
+                status=422,
+            )
+            return
         if path is None or not path.exists():
             self.send_error(404, f"no transcript resolvable for session={session_id}")
             return
@@ -14740,10 +15475,20 @@ class Handler(BaseHTTPRequestHandler):
             since = 0
 
         provider, native_id = _parse_agent_session_ref(session_id)
-        if provider == "codex":
-            path = _resolve_codex_transcript(native_id)
-        else:
-            path = self._resolve_transcript(session_id)
+        try:
+            path = self._resolve_session_transcript_path(
+                provider,
+                native_id,
+                session_id,
+            )
+        except _UnsupportedTranscriptProviderError as error:
+            _send_unsupported_provider(
+                self,
+                error.provider,
+                error.capability,
+                status=422,
+            )
+            return
         if path is None or not path.exists():
             self.send_error(404, f"no transcript resolvable for session={session_id}")
             return
@@ -14970,6 +15715,7 @@ class Handler(BaseHTTPRequestHandler):
         process = truth.get("process") if isinstance(truth.get("process"), dict) else {}
         terminal = truth.get("terminal") if isinstance(truth.get("terminal"), dict) else {}
         v2 = terminal.get("v2") if isinstance(terminal.get("v2"), dict) else {}
+        stream = terminal.get("stream") if isinstance(terminal.get("stream"), dict) else {}
         return {
             "schema_version": 1,
             "event_seq": event_seq,
@@ -14980,9 +15726,9 @@ class Handler(BaseHTTPRequestHandler):
             "session_id": session_id,
             "provider": provider,
             "native_id": native_id,
-            "broker_id": v2.get("broker_id") or process.get("broker_id"),
+            "broker_id": v2.get("broker_id") or stream.get("broker_id") or process.get("broker_id"),
             "pid": process.get("pid"),
-            "tty": process.get("terminal_tty") or v2.get("tty"),
+            "tty": process.get("terminal_tty") or v2.get("tty") or stream.get("tty"),
             "terminal_generation": v2.get("generation"),
             "terminal_offset": terminal_offset,
             "transcript_offset": transcript_offset,
@@ -14992,7 +15738,11 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def _session_live_transcript_tail(self, provider: str, native_id: str, raw_session: str, since: int) -> dict | None:
-        path = _resolve_codex_transcript(native_id) if provider == "codex" else self._resolve_transcript(raw_session)
+        path = self._resolve_session_transcript_path(
+            provider,
+            native_id,
+            raw_session,
+        )
         if path is None or not path.exists():
             return None
         try:
@@ -15113,7 +15863,7 @@ class Handler(BaseHTTPRequestHandler):
         if broker_found and PTY_BROKER:
             broker_id, _ = broker_found
             try:
-                tail = PTY_BROKER.raw_tail(broker_id, since=since)
+                tail = _session_live_broker_raw_tail(broker_id, since)
             except Exception as e:
                 self.log_message("session-live broker tail failed for %s: %s", raw_session, str(e)[:200])
                 tail = None
@@ -15140,11 +15890,14 @@ class Handler(BaseHTTPRequestHandler):
                 total_bytes=total_bytes,
                 clean_text=lambda chunk: chunk.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n"),
             )
+            if not send_data:
+                return None
             payload["backend"] = "pty_broker"
             payload["broker_id"] = broker_id
             payload["raw_byte_count"] = len(send_data)
-            if gap_bytes > 0:
-                payload["gap_bytes"] = gap_bytes
+            combined_gap = gap_bytes + int(payload.get("gap_bytes") or 0)
+            if combined_gap > 0:
+                payload["gap_bytes"] = combined_gap
             if feed_at is not None:
                 payload["feed_at"] = feed_at
             return payload
@@ -15184,6 +15937,8 @@ class Handler(BaseHTTPRequestHandler):
                 .replace("\r\n", "\n")
                 .replace("\r", "\n"),
         )
+        if not send_data:
+            return None
         payload["backend"] = "script_capture"
         payload["raw_byte_count"] = len(send_data)
         return payload
@@ -15193,6 +15948,14 @@ class Handler(BaseHTTPRequestHandler):
         provider, native_id = _parse_agent_session_ref(raw_session)
         if not native_id:
             self.send_error(400, "session required")
+            return
+        if provider not in _SUPPORTED_TRANSCRIPT_PROVIDERS:
+            _send_unsupported_provider(
+                self,
+                provider,
+                "session_transcript",
+                status=422,
+            )
             return
         session_id = _qualified_session_id(provider, native_id)
         expected_source_revision = self._expected_source_revision_for_request(q)
@@ -15220,7 +15983,6 @@ class Handler(BaseHTTPRequestHandler):
         last_truth_hash = ""
         last_truth: dict | None = None
         last_pending_input: dict | None = None
-        last_pending_check = 0.0
         last_approval: dict | None = None
         last_approval_check = 0.0
         last_transcript_check = 0.0
@@ -15278,7 +16040,28 @@ class Handler(BaseHTTPRequestHandler):
             # unchanged; only WHEN it runs changed. Cadence guards remain as
             # degraded fallbacks so behavior fails open to the old timings
             # when a wakeup source is unavailable.
-            transcript_topic = f"transcript:{session_id}"
+            identity_keys = _session_event_identity_keys(self, session_id)
+            canonical_native_id = _agent_registry_resolve_native_alias(provider, native_id)
+            canonical_session_id = _qualified_session_id(provider, canonical_native_id)
+            identity_keys.add(canonical_session_id)
+            transcript_topic = f"transcript:{canonical_session_id}"
+
+            def live_watch_topics(identities: set[str]) -> set[str]:
+                topics = {BROKER_GLOBAL_TOPIC}
+                for identity in identities:
+                    identity_provider, identity_native_id = _parse_agent_session_ref(identity)
+                    topics.update({
+                        f"terminal:{identity}",
+                        f"transcript:{identity}",
+                        f"turn:{identity}",
+                        f"turn:{identity_provider}:{identity_native_id}",
+                        f"approvals:{identity_provider}:{identity_native_id}",
+                        f"approvals:{identity_provider}:{identity}",
+                    })
+                for alias in _session_live_receipt_aliases(session_id):
+                    topics.add(f"receipts:{alias}")
+                return topics
+
             last_terminal_push_at = 0.0
             last_terminal_check = 0.0
             last_receipt_check = 0.0
@@ -15288,26 +16071,31 @@ class Handler(BaseHTTPRequestHandler):
             terminal_silent_streak = 0
             if SESSION_EVENT_HUB is not None:
                 _ensure_broker_output_listener()
-                watch_topics = {f"terminal:{session_id}", BROKER_GLOBAL_TOPIC, transcript_topic}
-                for alias in _session_live_receipt_aliases(session_id):
-                    watch_topics.add(f"receipts:{alias}")
-                for approval_key in {native_id, session_id}:
-                    if approval_key:
-                        watch_topics.add(f"approvals:{provider}:{approval_key}")
+                watch_topics = live_watch_topics(identity_keys)
                 merged_events = SESSION_EVENT_HUB.subscribe_many(sorted(watch_topics))
                 watcher = _ensure_session_file_watcher()
                 if watcher is not None:
                     try:
-                        transcript_path = _resolve_codex_transcript(native_id) if provider == "codex" else self._resolve_transcript(session_id)
+                        transcript_path = self._resolve_session_transcript_path(
+                            provider,
+                            native_id,
+                            session_id,
+                        )
                     except Exception:
                         transcript_path = None
                     if transcript_path is not None:
                         transcript_watch = watcher.watch(transcript_path, transcript_topic)
+                        _publish_session_event(transcript_topic, {
+                            "type": "transcript_resolved",
+                            "path": str(transcript_path),
+                        })
 
             while _time.time() < deadline:
                 want_terminal = want_transcript = want_receipts = want_approval = False
                 if merged_events is not None:
-                    wake = merged_events.get(timeout=0.25)
+                    wake = merged_events.get(
+                        timeout=_session_live_event_wait_timeout(terminal_silent_streak)
+                    )
                     while wake is not None:
                         wake_kind = str(wake.get("type") or "")
                         if wake_kind == "broker_output":
@@ -15319,6 +16107,13 @@ class Handler(BaseHTTPRequestHandler):
                             want_receipts = True
                         elif wake_kind == "approval_changed":
                             want_approval = True
+                        elif wake_kind == "session_identity_linked":
+                            # Refresh the broker and canonical topic set in
+                            # this pass. Waiting for the normal five-second
+                            # broker hint refresh leaves a newly linked Claude
+                            # viewer attached only to its temporary identity.
+                            want_terminal = want_transcript = want_receipts = want_approval = True
+                            broker_hint_at = -10.0
                         else:
                             # queue_gap and broker transitions: unknown scope,
                             # so drain every plane once.
@@ -15335,11 +16130,19 @@ class Handler(BaseHTTPRequestHandler):
                     watcher = _ensure_session_file_watcher()
                     if watcher is not None:
                         try:
-                            transcript_path = _resolve_codex_transcript(native_id) if provider == "codex" else self._resolve_transcript(session_id)
+                            transcript_path = self._resolve_session_transcript_path(
+                                provider,
+                                native_id,
+                                session_id,
+                            )
                         except Exception:
                             transcript_path = None
                         if transcript_path is not None:
                             transcript_watch = watcher.watch(transcript_path, transcript_topic)
+                            _publish_session_event(transcript_topic, {
+                                "type": "transcript_resolved",
+                                "path": str(transcript_path),
+                            })
                             want_transcript = True
 
                 slot_result = truth_slot.get("result")
@@ -15367,35 +16170,20 @@ class Handler(BaseHTTPRequestHandler):
                         truth_updated = True
                         if not emit("truth", slim_truth, source="session-runtime-truth"):
                             return
-                        turn = truth.get("turn") if isinstance(truth.get("turn"), dict) else {}
-                        if turn:
-                            if not emit("turn_state", turn, source="turn-state"):
+                        for event_type, payload, source in _session_live_truth_events(truth, slim_truth)[1:]:
+                            if not emit(event_type, payload, source=source):
                                 return
 
-                # SPEC-p3 §2.1: pending input rides the multiplex. Acceptance
-                # wants the card < 1s after the CLI renders, and the truth
-                # worker's 1s cadence (AppleScript probing can block) alone
-                # eats that budget — so broker sessions get their own cheap
-                # in-process snapshot poll at 0.25s, and non-broker sessions
-                # diff the latest truth. Never inside the slim-digest gate:
-                # a wizard's next step must re-emit even when the slimmed
-                # truth digest is stable.
-                # A prompt cannot render without output or a truth change, so
-                # the broker snapshot probe runs on activity (or once at
-                # start), with a slow safety cadence instead of 4 Hz per
-                # stream; 24 silent streams cost ~nothing instead of a core.
-                pending_due = want_terminal or truth_updated or last_pending_check == 0.0
-                if (pending_due and now - last_pending_check >= 0.1) or now - last_pending_check >= 2.0:
-                    last_pending_check = now
-                    current_pending = None
-                    try:
-                        broker_v2 = self._broker_surface_v2_snapshot(session_id)
-                    except Exception:
-                        broker_v2 = None
-                    if broker_v2 is not None:
-                        current_pending = _session_live_pending_input({"terminal": {"v2": broker_v2}})
-                    elif last_truth is not None:
-                        current_pending = _session_live_pending_input(last_truth)
+                # Pending input rides the same shared per-session truth probe
+                # as the rest of the control basis. Terminal output wakes that
+                # worker immediately and its debounce keeps the card inside the
+                # one-second product budget. Compare the raw truth whenever a
+                # worker result is present, even when the slim truth digest did
+                # not change: v2 pending-input fields are intentionally removed
+                # from the slim truth payload. Do not ask the broker for another
+                # surface snapshot in every attached SSE writer.
+                if slot_result is not None and last_truth is not None:
+                    current_pending = _session_live_pending_input(last_truth)
                     if current_pending != last_pending_input:
                         if current_pending is not None:
                             if not emit("pending_input", current_pending):
@@ -15456,6 +16244,18 @@ class Handler(BaseHTTPRequestHandler):
                         broker_hint = self._broker_session_for(session_id) or ""
                     except Exception:
                         broker_hint = ""
+                    if SESSION_EVENT_HUB is not None:
+                        refreshed_identities = _session_event_identity_keys(
+                            self,
+                            session_id,
+                        )
+                        if refreshed_identities != identity_keys:
+                            identity_keys = refreshed_identities
+                            if merged_events is not None:
+                                merged_events.close()
+                            merged_events = SESSION_EVENT_HUB.subscribe_many(
+                                sorted(live_watch_topics(identity_keys))
+                            )
                 silent_fallback_interval = 0.25 if terminal_silent_streak < 3 else 1.0
                 if want_terminal or (now - last_terminal_push_at >= 0.5 and now - last_terminal_check >= silent_fallback_interval):
                     last_terminal_check = now
@@ -15475,17 +16275,17 @@ class Handler(BaseHTTPRequestHandler):
                             terminal_offset = int(terminal_payload.get("next_since") or terminal_offset)
                         if not emit("terminal_chunk", terminal_payload, source=str(terminal_payload.get("backend") or "terminal")):
                             return
-                        text = _clean_terminal_display_text(str(terminal_payload.get("text") or ""))
-                        if text:
-                            terminal_line_buffer += text
-                            while "\n" in terminal_line_buffer:
-                                line, terminal_line_buffer = terminal_line_buffer.split("\n", 1)
-                                if not emit("terminal_line", {
-                                    "text": line,
-                                    "line_id": f"{session_id}:{terminal_offset}:{event_seq}",
-                                    "terminal_offset": terminal_offset,
-                                }, source=str(terminal_payload.get("backend") or "terminal")):
-                                    return
+                        terminal_line_buffer, display_lines = _terminal_display_lines(
+                            terminal_line_buffer,
+                            terminal_payload,
+                        )
+                        for line in display_lines:
+                            if not emit("terminal_line", {
+                                "text": line,
+                                "line_id": f"{session_id}:{terminal_offset}:{event_seq}",
+                                "terminal_offset": terminal_offset,
+                            }, source=str(terminal_payload.get("backend") or "terminal")):
+                                return
                         if terminal_payload.get("reset"):
                             break
                     terminal_silent_streak = 0 if saw_terminal_data else terminal_silent_streak + 1
@@ -15561,11 +16361,17 @@ class Handler(BaseHTTPRequestHandler):
         provider, native_id = _parse_agent_session_ref(raw_session)
         if not native_id:
             return None
+        if provider not in _SUPPORTED_TRANSCRIPT_PROVIDERS:
+            raise _UnsupportedTranscriptProviderError(provider)
         session_key = _qualified_session_id(provider, native_id)
         ingestor = _ensure_session_log_ingestor()
         if ingestor is not None and not _session_transcript_delete_is_pending_or_done(provider, native_id):
             try:
-                transcript_path = _resolve_codex_transcript(native_id) if provider == "codex" else self._resolve_transcript(raw_session)
+                transcript_path = self._resolve_session_transcript_path(
+                    provider,
+                    native_id,
+                    raw_session,
+                )
             except Exception:
                 transcript_path = None
             if transcript_path is not None:
@@ -15574,7 +16380,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_session_events_v2(self, q):
         raw_session = q.get("session", [""])[0]
-        resolved = self._v2_session_key_and_ensure(raw_session)
+        try:
+            resolved = self._v2_session_key_and_ensure(raw_session)
+        except _UnsupportedTranscriptProviderError as error:
+            _send_unsupported_provider(
+                self,
+                error.provider,
+                error.capability,
+                status=422,
+            )
+            return
         if resolved is None:
             self.send_error(400, "session required")
             return
@@ -15851,7 +16666,16 @@ class Handler(BaseHTTPRequestHandler):
         caps content and text fields inline; this serves the whole value so
         the phone never re-parses provider formats to recover it."""
         raw_session = q.get("session", [""])[0]
-        resolved = self._v2_session_key_and_ensure(raw_session)
+        try:
+            resolved = self._v2_session_key_and_ensure(raw_session)
+        except _UnsupportedTranscriptProviderError as error:
+            _send_unsupported_provider(
+                self,
+                error.provider,
+                error.capability,
+                status=422,
+            )
+            return
         if resolved is None:
             self.send_error(400, "session required")
             return
@@ -15904,7 +16728,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_session_events_v2_raw(self, q):
         raw_session = q.get("session", [""])[0]
-        resolved = self._v2_session_key_and_ensure(raw_session)
+        try:
+            resolved = self._v2_session_key_and_ensure(raw_session)
+        except _UnsupportedTranscriptProviderError as error:
+            _send_unsupported_provider(
+                self,
+                error.provider,
+                error.capability,
+                status=422,
+            )
+            return
         if resolved is None:
             self.send_error(400, "session required")
             return
@@ -15923,28 +16756,42 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             self.send_error(400, "generation must be int")
             return
-        server_generation, rows = log.read_at_generation(
-            session_key, client_generation, since_seq=seq - 1, limit=1
-        )
-        if client_generation != server_generation:
-            self._send_json({
-                "ok": False,
-                "error": {"code": "log_generation_mismatch"},
-                "generation": server_generation,
-                "client_generation": client_generation,
-                "reset_required": True,
-            }, status=409)
+        response_started = False
+        try:
+            with log.open_raw_at_generation(
+                session_key, client_generation, seq
+            ) as (server_generation, stream, byte_count, checksum):
+                if client_generation != server_generation:
+                    self._send_json({
+                        "ok": False,
+                        "error": {"code": "log_generation_mismatch"},
+                        "generation": server_generation,
+                        "client_generation": client_generation,
+                        "reset_required": True,
+                    }, status=409)
+                    return
+                if stream is None:
+                    self.send_error(404, f"no raw content for seq={seq}")
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.send_header("X-Seq", str(seq))
+                self.send_header("X-Generation", str(server_generation))
+                if checksum:
+                    self.send_header("X-Content-SHA256", checksum)
+                self.send_header("Content-Length", str(byte_count))
+                self.end_headers()
+                response_started = True
+                while True:
+                    chunk = stream.read(SESSION_EVENTS_V2_RAW_STREAM_CHUNK)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
             return
-        if not rows or rows[0]["seq"] != seq or rows[0].get("raw") is None:
-            self.send_error(404, f"no raw content for seq={seq}")
-            return
-        body = rows[0]["raw"].encode("utf-8", errors="replace")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/x-ndjson")
-        self.send_header("X-Seq", str(seq))
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        except (OSError, ValueError):
+            if not response_started:
+                self.send_error(503, "raw content is temporarily unavailable")
 
     def _handle_device_events(self, q):
         """One connection per device carrying every subscribed session, so a
@@ -15979,7 +16826,16 @@ class Handler(BaseHTTPRequestHandler):
                     cursor = 0
             else:
                 raw_session, cursor = part, 0
-            resolved = self._v2_session_key_and_ensure(raw_session)
+            try:
+                resolved = self._v2_session_key_and_ensure(raw_session)
+            except _UnsupportedTranscriptProviderError as error:
+                _send_unsupported_provider(
+                    self,
+                    error.provider,
+                    error.capability,
+                    status=422,
+                )
+                return
             if resolved is None:
                 continue
             session_key = resolved[2]
@@ -16195,11 +17051,47 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             subscription.close()
 
-    def _transcript_truth_for_session(self, provider: str, native_id: str, raw_session: str) -> dict:
+    def _resolve_session_transcript_path(
+        self,
+        provider: str,
+        native_id: str,
+        raw_session: str,
+    ) -> Path | None:
         if provider == "codex":
-            path = _resolve_codex_transcript(native_id)
-        else:
-            path = self._resolve_transcript(raw_session)
+            return _resolve_codex_transcript(native_id)
+        if provider == "claude":
+            return self._resolve_transcript(raw_session)
+        raise _UnsupportedTranscriptProviderError(provider)
+
+    def _transcript_truth_for_session(
+        self,
+        provider: str,
+        native_id: str,
+        raw_session: str,
+        *,
+        resolved_path: Path | None = None,
+        path_is_resolved: bool = False,
+    ) -> dict:
+        if provider not in _SUPPORTED_TRANSCRIPT_PROVIDERS:
+            return {
+                "state": "unsupported",
+                "http_status": 422,
+                "reason": "unsupported_provider",
+                "provider": provider,
+                "capability": "session_transcript",
+                "durable": False,
+                "searchable": False,
+                "latest_offset": None,
+                "path": None,
+                "user_message": (
+                    f"Provider {provider} does not support deep transcript ingestion."
+                ),
+            }
+        path = (
+            resolved_path
+            if path_is_resolved
+            else self._resolve_session_transcript_path(provider, native_id, raw_session)
+        )
         if path is None or not path.exists():
             return {
                 "state": "missing",
@@ -16227,30 +17119,8 @@ class Handler(BaseHTTPRequestHandler):
             "user_message": None,
         }
 
-    def _registry_truth_for_session(self, raw_session: str) -> dict:
-        provider, native_id = _parse_agent_session_ref(raw_session)
-        registry_native_id = _agent_registry_resolve_native_alias(
-            provider, native_id
-        )
-        try:
-            rows = self._collect_visible_session_rows(provider, active_within_min=60 * 24 * 14, limit=300)
-            for row in rows:
-                if (
-                    row.get("id") == raw_session
-                    or row.get("native_id") in {native_id, registry_native_id}
-                ):
-                    return {
-                        "state": row.get("state"),
-                        "readable_state": row.get("readable_state"),
-                        "control_state": row.get("control_state"),
-                        "working_on": row.get("working_on"),
-                        "stale_seconds": row.get("stale_seconds"),
-                        "source_freshness": row.get("source_freshness"),
-                        "last_seen_at": row.get("last_heartbeat"),
-                        "project": row.get("project"),
-                    }
-        except Exception:
-            pass
+    @staticmethod
+    def _unknown_registry_truth() -> dict:
         return {
             "state": "unknown",
             "readable_state": "stale",
@@ -16258,6 +17128,220 @@ class Handler(BaseHTTPRequestHandler):
             "working_on": None,
             "source_freshness": "unknown",
         }
+
+    def _target_registry_row_for_session(
+        self,
+        provider: str,
+        native_id: str,
+        *,
+        transcript_path: Path | None = None,
+        transcript_path_is_resolved: bool = False,
+    ) -> tuple[dict | None, Path | None]:
+        """Resolve one session without invoking the fleet-wide collector.
+
+        The live viewer runs this path for every open session. A global
+        provider scan here multiplies transcript discovery and process probes
+        by the number of viewed sessions. Keep the normal registry fast path,
+        then use one provider-specific fallback for records that predate the
+        registry.
+        """
+        row = _agent_registry_get(provider, native_id)
+        if row is None and provider == "claude":
+            try:
+                row = _claude_sessions_backend().session_record(native_id)
+            except Exception:
+                row = None
+
+        if provider == "codex":
+            if not transcript_path_is_resolved:
+                transcript_path = _resolve_codex_transcript(native_id)
+            if row is None and transcript_path is not None:
+                try:
+                    stat = transcript_path.stat()
+                    meta = _codex_rollout_meta(transcript_path)
+                except OSError:
+                    stat = None
+                    meta = None
+                if (
+                    stat is not None
+                    and meta is not None
+                    and meta.get("id") == native_id
+                    and stat.st_mtime >= _time.time() - (14 * 24 * 60 * 60)
+                ):
+                    first_prompt = _codex_first_prompt(transcript_path, native_id, {})
+                    row = {
+                        "provider": "codex",
+                        "native_id": native_id,
+                        "project": meta.get("cwd") or "",
+                        "working_on": first_prompt,
+                        "started_at": int(_iso_to_epoch(meta.get("timestamp")) or stat.st_mtime),
+                        "last_heartbeat": int(stat.st_mtime),
+                        "closed_at": None,
+                        "state": None,
+                        "pid": 0,
+                        "terminal_tty": "",
+                        "source_freshness": "transcript_live",
+                        "virtual_transcript_record": True,
+                    }
+
+        if row is None:
+            return None, transcript_path
+        resolved = dict(row)
+        resolved.setdefault("provider", provider)
+        resolved.setdefault("native_id", native_id)
+        resolved.setdefault("closed_at", None)
+        return resolved, transcript_path
+
+    def _registry_row_has_verified_control(
+        self,
+        row: dict,
+        *,
+        provider: str,
+        native_id: str,
+    ) -> bool:
+        if row.get("closed_at") is not None:
+            return False
+        try:
+            broker_found = self._broker_session_for(
+                _qualified_session_id(provider, native_id)
+            )
+        except Exception:
+            broker_found = None
+        if broker_found:
+            _public_id, broker_session = broker_found
+            if _broker_session_owns_identity(broker_session, provider, native_id):
+                return True
+        try:
+            return _session_has_verified_provider_process(row, provider)
+        except Exception:
+            return False
+
+    def _registry_truth_projection(
+        self,
+        row: dict,
+        *,
+        provider: str,
+        native_id: str,
+        transcript_path: Path | None,
+    ) -> dict:
+        now = _time.time()
+        original_heartbeat = float(row.get("last_heartbeat") or 0)
+        observed_heartbeat = original_heartbeat
+        state = row.get("state")
+        closed_at = row.get("closed_at")
+
+        if provider == "codex" and not closed_at:
+            try:
+                turn = _codex_turn_state_payload(native_id, apply_boundary=False) or {}
+            except Exception:
+                turn = {}
+            if turn.get("state"):
+                state = turn.get("state")
+            observed_heartbeat = max(
+                observed_heartbeat,
+                float(turn.get("last_update") or turn.get("turn_state_updated_at") or 0),
+            )
+        elif provider == "claude" and not closed_at:
+            claude_uuid = str(row.get("claude_uuid") or "")
+            try:
+                turn = self._turn_state_summary(claude_uuid) if claude_uuid else {}
+            except Exception:
+                turn = {}
+            if turn.get("state"):
+                state = turn.get("state")
+            observed_heartbeat = max(
+                observed_heartbeat,
+                float(turn.get("last_update") or turn.get("turn_state_updated_at") or 0),
+            )
+            if transcript_path is None and row.get("project") and claude_uuid:
+                transcript_path = (
+                    HOME
+                    / ".claude"
+                    / "projects"
+                    / _encode_project_dir(str(row["project"]))
+                    / f"{claude_uuid}.jsonl"
+                )
+
+        transcript_available = False
+        if transcript_path is not None:
+            try:
+                stat = transcript_path.stat()
+                transcript_available = transcript_path.is_file()
+                observed_heartbeat = max(observed_heartbeat, float(stat.st_mtime))
+            except OSError:
+                transcript_available = False
+
+        stale_seconds = max(0, int(now - observed_heartbeat)) if observed_heartbeat else 0
+        has_live_control = self._registry_row_has_verified_control(
+            row,
+            provider=provider,
+            native_id=native_id,
+        )
+
+        if closed_at:
+            readable_state = "closed"
+        elif stale_seconds <= 60 * 60:
+            readable_state = "live"
+        elif has_live_control or stale_seconds <= 60 * 24 * 60:
+            readable_state = "stale"
+        else:
+            readable_state = "offline"
+
+        if has_live_control:
+            control_state = "controllable"
+        elif readable_state == "closed" or transcript_available:
+            control_state = "read_only"
+        else:
+            control_state = "unavailable"
+
+        source_freshness = str(row.get("source_freshness") or "")
+        if closed_at:
+            source_freshness = "registry_closed"
+        elif observed_heartbeat > original_heartbeat:
+            source_freshness = "provider_observed_live"
+        elif not source_freshness:
+            source_freshness = "registry_live"
+
+        return {
+            "state": "terminated" if closed_at else state,
+            "readable_state": readable_state,
+            "control_state": control_state,
+            "working_on": row.get("working_on"),
+            "stale_seconds": stale_seconds,
+            "source_freshness": source_freshness,
+            "last_seen_at": observed_heartbeat or None,
+            "project": row.get("project"),
+        }
+
+    def _registry_truth_for_session(
+        self,
+        raw_session: str,
+        *,
+        transcript_path: Path | None = None,
+        transcript_path_is_resolved: bool = False,
+    ) -> dict:
+        provider, native_id = _parse_agent_session_ref(raw_session)
+        registry_native_id = _agent_registry_resolve_native_alias(
+            provider, native_id
+        )
+        try:
+            row, transcript_path = self._target_registry_row_for_session(
+                provider,
+                registry_native_id,
+                transcript_path=transcript_path,
+                transcript_path_is_resolved=transcript_path_is_resolved,
+            )
+            visible = _filter_tombstoned_session_rows([row]) if row is not None else []
+            if visible:
+                return self._registry_truth_projection(
+                    visible[0],
+                    provider=provider,
+                    native_id=registry_native_id,
+                    transcript_path=transcript_path,
+                )
+        except Exception:
+            pass
+        return self._unknown_registry_truth()
 
     def _turn_truth_for_session(self, provider: str, native_id: str) -> dict:
         try:
@@ -16274,7 +17358,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {"state": "unknown", "source": "error"}
 
-    def _terminal_stream_truth_for_session(self, raw_session: str) -> dict:
+    def _terminal_stream_truth_for_session(
+        self,
+        raw_session: str,
+        *,
+        transcript_truth: dict | None = None,
+    ) -> dict:
         provider, native_id = _parse_agent_session_ref(raw_session)
         try:
             source = _terminal_surface_source(raw_session)
@@ -16286,10 +17375,11 @@ class Handler(BaseHTTPRequestHandler):
             }
         backend = source.get("source")
         byte_stream_available = bool(source.get("available")) and backend in {"broker_vt", "script_capture"}
-        try:
-            transcript_truth = self._transcript_truth_for_session(provider, native_id, raw_session)
-        except Exception:
-            transcript_truth = {"state": "unknown", "path": None}
+        if transcript_truth is None:
+            try:
+                transcript_truth = self._transcript_truth_for_session(provider, native_id, raw_session)
+            except Exception:
+                transcript_truth = {"state": "unknown", "path": None}
         transcript_stream_available = bool(
             transcript_truth.get("state") in {"live", "archived", "stale"}
             and transcript_truth.get("path")
@@ -16324,10 +17414,17 @@ class Handler(BaseHTTPRequestHandler):
             pid = int(reg.get("pid") or 0)
             closed_at = reg.get("closed_at")
             process_alive = bool(pid and _process_alive(pid))
+            identity_verified = bool(
+                pid
+                and process_alive
+                and _session_signal_target_is_verified(reg, "codex", pid)
+            )
             if closed_at:
                 state = "closed"
-            elif pid and process_alive:
+            elif identity_verified:
                 state = "alive"
+            elif pid and process_alive:
+                state = "identity_unverified"
             elif pid:
                 state = "stale_pid"
             else:
@@ -16337,6 +17434,7 @@ class Handler(BaseHTTPRequestHandler):
                 "source": "agent_registry",
                 "pid": pid or None,
                 "process_alive": process_alive if pid else None,
+                "identity_verified": identity_verified if pid else None,
                 "registry_state": reg.get("state"),
                 "last_heartbeat": reg.get("last_heartbeat"),
                 "closed_at": closed_at,
@@ -16345,19 +17443,43 @@ class Handler(BaseHTTPRequestHandler):
         if provider == "claude":
             native_id = _agent_registry_resolve_native_alias("claude", native_id)
             try:
-                pid = int(self._lookup_claude_pid(native_id) or 0)
+                record = _agent_registry_get("claude", native_id)
+                if record is None:
+                    record = _claude_sessions_backend().session_record(native_id)
+                record = dict(record or {})
+                record.setdefault("provider", "claude")
+                pid = int(record.get("pid") or record.get("claude_pid") or 0)
             except Exception as exc:
                 return {
                     "state": "unknown",
                     "source": "claude_sessions",
                     "reason": f"pid_lookup_failed:{type(exc).__name__}",
                 }
+            closed_at = record.get("closed_at")
             process_alive = bool(pid and _process_alive(pid))
+            identity_verified = bool(
+                pid
+                and process_alive
+                and _session_signal_target_is_verified(record, "claude", pid)
+            )
+            if closed_at:
+                state = "closed"
+            elif identity_verified:
+                state = "alive"
+            elif pid and process_alive:
+                state = "identity_unverified"
+            elif pid:
+                state = "stale_pid"
+            else:
+                state = "session_only"
             return {
-                "state": "alive" if process_alive else ("stale_pid" if pid else "session_only"),
+                "state": state,
                 "source": "claude_sessions",
                 "pid": pid or None,
                 "process_alive": process_alive if pid else None,
+                "identity_verified": identity_verified if pid else None,
+                "closed_at": closed_at,
+                "terminal_tty": record.get("terminal_tty") or None,
             }
         return {
             "state": "unknown",
@@ -16385,6 +17507,21 @@ class Handler(BaseHTTPRequestHandler):
         if provider not in _agent_provider_ids():
             raise ValueError(f"unsupported provider: {provider}")
         session_id = _qualified_session_id(provider, native_id)
+        try:
+            transcript_path = self._resolve_session_transcript_path(
+                provider,
+                native_id,
+                session_id,
+            )
+        except Exception:
+            transcript_path = None
+        transcript_truth = self._transcript_truth_for_session(
+            provider,
+            native_id,
+            session_id,
+            resolved_path=transcript_path,
+            path_is_resolved=True,
+        )
         v1 = None
         v2 = None
         terminal_probe_error = None
@@ -16415,15 +17552,23 @@ class Handler(BaseHTTPRequestHandler):
                     native_id=native_id,
                     reason=terminal_probe_error or "terminal surface unavailable",
                 )
+        registry_truth = self._registry_truth_for_session(
+            session_id,
+            transcript_path=transcript_path,
+            transcript_path_is_resolved=True,
+        )
         return _session_runtime_truth_from_parts(
             session_id=session_id,
-            registry=self._registry_truth_for_session(session_id),
+            registry=registry_truth,
             turn=self._turn_truth_for_session(provider, native_id),
-            transcript=self._transcript_truth_for_session(provider, native_id, session_id),
+            transcript=transcript_truth,
             v1_surface=v1,
             v2_surface=v2,
             runtime=_runtime_freshness_truth(expected_source_revision=expected_source_revision),
-            stream=self._terminal_stream_truth_for_session(session_id),
+            stream=self._terminal_stream_truth_for_session(
+                session_id,
+                transcript_truth=transcript_truth,
+            ),
             process=self._process_truth_for_session(provider, native_id),
         )
 
@@ -16636,9 +17781,10 @@ class Handler(BaseHTTPRequestHandler):
                             total_bytes=total_bytes,
                             clean_text=lambda chunk: chunk.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n"),
                         )
-                        if gap_bytes > 0:
-                            payload["gap_bytes"] = gap_bytes
-                    if data or reset:
+                        combined_gap = gap_bytes + int(payload.get("gap_bytes") or 0)
+                        if combined_gap > 0:
+                            payload["gap_bytes"] = combined_gap
+                    if send_data or reset:
                         if not _sse_write_json_event(self.wfile, "chunk", payload, max_bytes=SSE_MAX_EVENT_BYTES):
                             return
                         if data and not reset:
@@ -16725,6 +17871,8 @@ class Handler(BaseHTTPRequestHandler):
                 total_bytes=total_bytes,
                 clean_text=_clean_terminal_bytes,
             )
+            if not send_data:
+                return 0
             if not _sse_write_json_event(self.wfile, "chunk", payload, max_bytes=SSE_MAX_EVENT_BYTES):
                 return None
             return len(send_data)
@@ -22001,6 +23149,7 @@ Worker instructions:
                     "spawned_by": "pairling",
                     "launch_strategy": "direct_pairling",
                     "launch_visibility": "visible_terminal",
+                    "terminal_title": title,
                     "terminal_log": str(capture_log_path) if capture_log_path else None,
                     "capture_backend": "script" if capture_log_path else None,
                     "terminal_source": "terminal_app_contents",
@@ -22152,7 +23301,11 @@ Worker instructions:
             _time.sleep(0.75)
             pid = _pid_for_tty_command(tty, "codex") if tty else 0
             reg_meta = dict(metadata)
-            reg_meta.update({"spawned_by": "phone-companion", "prompt_path": str(prompt_path)})
+            reg_meta.update({
+                "spawned_by": "phone-companion",
+                "prompt_path": str(prompt_path),
+                "terminal_title": f"{provider}:{title_suffix}",
+            })
             _agent_registry_upsert("codex", native_id, project, pid=pid, terminal_tty=tty, metadata=reg_meta)
             _write_agent_turn_state("codex", native_id, "thinking", event="cross_provider")
         return {
@@ -22486,6 +23639,7 @@ Worker instructions:
                 metadata={
                     "spawned_by": "phone-companion",
                     "resume_target": native_id,
+                    "terminal_title": title,
                     "terminal_log": str(capture_log_path),
                     "capture_backend": "script",
                     "terminal_source": "terminal_app_contents",
@@ -23269,24 +24423,24 @@ Worker instructions:
                 return
             ok = True
             err: str | None = None
-            try:
-                if sig == signal.SIGTERM:
-                    try:
-                        os.killpg(os.getpgid(pid), sig)
-                    except ProcessLookupError:
-                        raise
-                    except Exception:
-                        os.kill(pid, sig)
-                else:
+            error_code: str | None = None
+            if sig == signal.SIGTERM:
+                termination = _terminate_direct_session_process(reg, "codex", pid)
+                ok = bool(termination.get("ok"))
+                err = termination.get("error")
+                error_code = termination.get("error_code")
+            else:
+                try:
                     os.kill(pid, sig)
-            except (ProcessLookupError, PermissionError, OSError) as e:
-                ok = False
-                err = f"{type(e).__name__}: {e}"
+                except (ProcessLookupError, PermissionError, OSError) as e:
+                    ok = False
+                    err = f"{type(e).__name__}: {e}"
             if ok:
                 _write_agent_turn_state("codex", native_id, "idle", event=sig_name.lower())
             if ok and sig == signal.SIGTERM:
                 _agent_registry_mark_closed("codex", native_id)
-            send_signal_result(ok, pid, err, 200 if ok else 502)
+            status = 409 if error_code == "process_identity_unverified" else (200 if ok else 502)
+            send_signal_result(ok, pid, err, status, error_code=error_code)
             return
 
         session_id = _claude_native_session_id(raw_session)
@@ -23344,30 +24498,23 @@ Worker instructions:
 
         ok = True
         err: str | None = None
-        try:
-            if sig == signal.SIGTERM:
-                try:
-                    os.killpg(os.getpgid(pid), sig)
-                except ProcessLookupError:
-                    raise
-                except Exception:
-                    os.kill(pid, sig)
-            else:
+        error_code: str | None = None
+        if sig == signal.SIGTERM:
+            termination = _terminate_direct_session_process(record, "claude", pid)
+            ok = bool(termination.get("ok"))
+            err = termination.get("error")
+            error_code = termination.get("error_code")
+        else:
+            try:
                 os.kill(pid, sig)
-        except ProcessLookupError as e:
-            self._mark_session_closed(session_id)
-            if sig == signal.SIGTERM:
-                err = None
-            else:
+            except (ProcessLookupError, PermissionError, OSError) as e:
                 ok = False
                 err = f"{type(e).__name__}: {e}"
-        except (PermissionError, OSError) as e:
-            ok = False
-            err = f"{type(e).__name__}: {e}"
         if ok and sig == signal.SIGTERM:
             self._mark_session_closed(session_id)
 
-        send_signal_result(ok, pid, err, 200 if ok else 502)
+        status = 409 if error_code == "process_identity_unverified" else (200 if ok else 502)
+        send_signal_result(ok, pid, err, status, error_code=error_code)
 
     # ----- /commands: snapshot catalog of slash commands across all sources -----
     def _handle_commands(self, q):
@@ -25295,10 +26442,20 @@ Worker instructions:
             verbosity = "clean"
 
         provider, native_id = _parse_agent_session_ref(session_id)
-        if provider == "codex":
-            path = _resolve_codex_transcript(native_id)
-        else:
-            path = self._resolve_transcript(session_id)
+        try:
+            path = self._resolve_session_transcript_path(
+                provider,
+                native_id,
+                session_id,
+            )
+        except _UnsupportedTranscriptProviderError as error:
+            _send_unsupported_provider(
+                self,
+                error.provider,
+                error.capability,
+                status=422,
+            )
+            return
         if path is None or not path.exists():
             self.send_error(404, "no transcript")
             return
@@ -25915,7 +27072,7 @@ Worker instructions:
         if _PAIRDROP_STORE_SINGLETON is None:
             with _PAIRDROP_STORE_SINGLETON_LOCK:
                 if _PAIRDROP_STORE_SINGLETON is None:
-                    _PAIRDROP_STORE_SINGLETON = PairDropStore(HOME / "PairDrop")
+                    _PAIRDROP_STORE_SINGLETON = PairDropStore(pairdrop_root())
         return _PAIRDROP_STORE_SINGLETON
 
     def _pairdrop_source(self) -> tuple[str, str]:
@@ -26261,7 +27418,7 @@ Worker instructions:
         self._send_json({
             "ok": True,
             "schema_version": 2,
-            "mac_location": "~/PairDrop",
+            "mac_location": str(self._pairdrop_store().root),
             "files": files,
             "page": {
                 "limit": page["limit"],
@@ -26404,7 +27561,7 @@ Worker instructions:
                 safe_name = safe_name[:80]
 
         body = self._read_body()
-        if len(body) > 100 * 1024 * 1024:
+        if len(body) > MAX_UPLOAD_BODY_BYTES:
             self.send_error(413, "file too large (max 100MB)")
             return
         if not body:
@@ -27105,6 +28262,7 @@ class _PairlingThreadingHTTPServer(ThreadingHTTPServer):
                 request.sendall(
                     b"HTTP/1.1 503 Service Unavailable\r\n"
                     b"Content-Type: application/json\r\n"
+                    b"Retry-After: 1\r\n"
                     b"Connection: close\r\n"
                     + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
                     + body
