@@ -4489,15 +4489,19 @@ def _codex_spawn_pending_registry_rows(project: str, observed_started_at: float)
 
 
 def _agent_registry_mark_closed(provider: str, native_id: str) -> None:
+    changed = False
     try:
         with _agent_registry_conn() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE agent_sessions SET closed_at = ?, state = 'terminated' "
                 "WHERE provider = ? AND native_id = ? AND closed_at IS NULL",
                 (_time.time(), provider, native_id),
             )
+            changed = bool(cursor.rowcount)
     except Exception:
         pass
+    if changed:
+        _invalidate_session_list_caches()
 
 
 def _agent_registry_update_control(provider: str, native_id: str, *,
@@ -11046,7 +11050,15 @@ def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> li
             row["tool"] = state_payload.get("tool")
             row["turn_started_at"] = state_payload.get("started_at")
             row["effort"] = state_payload.get("effort")
-        rows.append(_codex_control_overlay(row, st.st_mtime, verify_process=True))
+        row = _codex_control_overlay(row, st.st_mtime, verify_process=True)
+        if live_only:
+            control = row.get("controllability") or {}
+            if row.get("closed_at") is not None or not any(
+                control.get(key)
+                for key in ("can_send_text", "can_interrupt", "can_terminate")
+            ):
+                continue
+        rows.append(row)
     _codex_register_terminal_only_rows(seen)
     rows.extend(_codex_pending_registry_rows(seen, live_only, active_within_min))
     if not live_only:
@@ -24505,6 +24517,7 @@ Worker instructions:
             status: int,
             broker_id: str | None = None,
             error_code: str | None = None,
+            already_closed: bool = False,
         ) -> None:
             receipt = _make_action_receipt(
                 client_action_id=client_action_id or None,
@@ -24534,9 +24547,15 @@ Worker instructions:
                 body["broker_id"] = broker_id
             if error_code:
                 body["error_code"] = error_code
+            if already_closed:
+                body["already_closed"] = True
             self._send_json(body, status=status)
 
         if provider == "codex":
+            reg = _agent_registry_get("codex", native_id)
+            if sig == signal.SIGTERM and reg and reg.get("closed_at") is not None:
+                send_signal_result(True, None, None, 200, already_closed=True)
+                return
             broker_found = self._broker_session_for(_qualified_session_id("codex", native_id))
             if broker_found and PTY_BROKER:
                 _, broker_session = broker_found
@@ -24569,8 +24588,7 @@ Worker instructions:
                 )
                 return
 
-            reg = _agent_registry_get("codex", native_id)
-            if not reg or reg.get("closed_at"):
+            if not reg:
                 send_signal_result(False, None, "no Codex control registry row for session", 404)
                 return
             pid = int(reg.get("pid") or 0)
@@ -24622,6 +24640,10 @@ Worker instructions:
             self.send_error(400, "session required")
             return
 
+        record = _claude_sessions_backend().session_record(session_id)
+        if sig == signal.SIGTERM and record and record.get("closed_at") is not None:
+            send_signal_result(True, None, None, 200, already_closed=True)
+            return
         broker_found = self._broker_session_for(_qualified_session_id("claude", session_id))
         if broker_found and PTY_BROKER:
             _, broker_session = broker_found
@@ -24652,8 +24674,7 @@ Worker instructions:
             )
             return
 
-        record = _claude_sessions_backend().session_record(session_id)
-        if not record or record.get("closed_at") is not None:
+        if not record:
             send_signal_result(False, None, "no claude_pid for session", 404)
             return
         pid = int(record.get("pid") or record.get("claude_pid") or 0)
