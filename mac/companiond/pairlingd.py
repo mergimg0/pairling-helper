@@ -10738,12 +10738,22 @@ def _codex_turn_state_payload(native_id: str, *, apply_boundary: bool = True) ->
 
 def _codex_first_prompt(path: Path, session_id: str, history: dict[str, dict]) -> str | None:
     hist = history.get(session_id) or {}
-    text = hist.get("text")
-    if isinstance(text, str) and text.strip():
-        return text.strip()[:500]
+    history_text = hist.get("text")
+    first_transcript_user: str | None = None
     try:
         with path.open(encoding="utf-8", errors="replace") as f:
             for _, line in zip(range(200), f):
+                try:
+                    obj = json.loads(line)
+                except (ValueError, json.JSONDecodeError):
+                    obj = {}
+                payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+                if obj.get("type") == "event_msg" and payload.get("type") == "user_message":
+                    text = _text_from_codex_value(
+                        payload.get("message") or payload.get("text") or payload.get("content")
+                    ).strip()
+                    if text:
+                        return text[:500]
                 rows = _normalize_codex_line(line, session_id)
                 for row in rows:
                     msg = row.get("message") or {}
@@ -10754,9 +10764,19 @@ def _codex_first_prompt(path: Path, session_id: str, history: dict[str, dict]) -
                             if isinstance(first, dict):
                                 t = first.get("text")
                                 if isinstance(t, str) and t.strip():
-                                    return t.strip()[:500]
+                                    candidate = t.strip()
+                                    is_injected_context = (
+                                        candidate.startswith("# AGENTS.md instructions for ")
+                                        and "\n\n<INSTRUCTIONS>\n" in candidate
+                                    )
+                                    if not is_injected_context and first_transcript_user is None:
+                                        first_transcript_user = candidate
     except OSError:
         pass
+    if first_transcript_user:
+        return first_transcript_user[:500]
+    if isinstance(history_text, str) and history_text.strip():
+        return history_text.strip()[:500]
     return None
 
 
