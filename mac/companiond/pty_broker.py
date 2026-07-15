@@ -503,6 +503,7 @@ class VTScreen:
             "dimensions": dimensions,
             "rows": rows,
             "cursor": cursor,
+            "title": self.title,
         }
         screen_hash = hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
         payload = {
@@ -514,6 +515,7 @@ class VTScreen:
             "dimensions": dimensions,
             "rows": rows,
             "cursor": cursor,
+            "title": self.title,
             "changed_at": time.time(),
         }
         pending = _pending_input(rows)
