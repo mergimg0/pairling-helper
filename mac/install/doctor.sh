@@ -129,6 +129,9 @@ from runtime_manifest import (
 
 checks = []
 
+READ_ONLY_DB_ATTEMPTS = 4
+READ_ONLY_DB_INITIAL_DELAY_SECONDS = 0.05
+
 
 def add(identifier, ok, severity, summary, evidence=None):
     checks.append({
@@ -138,6 +141,18 @@ def add(identifier, ok, severity, summary, evidence=None):
         "summary": summary,
         "evidence": evidence,
     })
+
+
+def connect_read_only_database(path: Path) -> sqlite3.Connection:
+    uri = path.resolve(strict=False).as_uri() + "?mode=ro"
+    for attempt in range(READ_ONLY_DB_ATTEMPTS):
+        try:
+            return sqlite3.connect(uri, uri=True, timeout=1.0)
+        except sqlite3.OperationalError:
+            if attempt + 1 >= READ_ONLY_DB_ATTEMPTS:
+                raise
+            time.sleep(READ_ONLY_DB_INITIAL_DELAY_SECONDS * (2**attempt))
+    raise AssertionError("read-only database retry loop exhausted")
 
 
 def codesigning_identity_summary(output: str) -> dict:
@@ -244,7 +259,7 @@ def install_identity_coherence() -> tuple[bool, dict]:
     invalid_active_install_id_count = 0
     if DEVICES_DB.exists() and not DEVICES_DB.is_symlink() and stat.S_ISREG(DEVICES_DB.stat().st_mode):
         try:
-            with closing(sqlite3.connect(f"file:{DEVICES_DB}?mode=ro", uri=True)) as db:
+            with closing(connect_read_only_database(DEVICES_DB)) as db:
                 columns = {
                     str(row[1])
                     for row in db.execute("PRAGMA table_info(devices)").fetchall()
@@ -723,7 +738,7 @@ add("logs_writable", ok, "error", "Logs directory is writable.", evidence)
 
 if DEVICES_DB.exists():
     try:
-        with closing(sqlite3.connect(f"file:{DEVICES_DB}?mode=ro", uri=True)) as db:
+        with closing(connect_read_only_database(DEVICES_DB)) as db:
             tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         add("devices_db", {"devices", "audit_events"}.issubset(tables), "error", "Devices database has required tables.", sorted(tables))
     except Exception as exc:
