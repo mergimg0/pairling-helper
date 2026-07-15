@@ -129,8 +129,8 @@ from runtime_manifest import (
 
 checks = []
 
-READ_ONLY_DB_ATTEMPTS = 4
-READ_ONLY_DB_INITIAL_DELAY_SECONDS = 0.05
+QUERY_ONLY_DB_ATTEMPTS = 4
+QUERY_ONLY_DB_INITIAL_DELAY_SECONDS = 0.05
 
 
 def add(identifier, ok, severity, summary, evidence=None):
@@ -143,16 +143,20 @@ def add(identifier, ok, severity, summary, evidence=None):
     })
 
 
-def connect_read_only_database(path: Path) -> sqlite3.Connection:
-    uri = path.resolve(strict=False).as_uri() + "?mode=ro"
-    for attempt in range(READ_ONLY_DB_ATTEMPTS):
+def connect_query_only_database(path: Path) -> sqlite3.Connection:
+    for attempt in range(QUERY_ONLY_DB_ATTEMPTS):
+        connection = None
         try:
-            return sqlite3.connect(uri, uri=True, timeout=1.0)
+            connection = sqlite3.connect(str(path), timeout=1.0)
+            connection.execute("PRAGMA query_only=ON")
+            return connection
         except sqlite3.OperationalError:
-            if attempt + 1 >= READ_ONLY_DB_ATTEMPTS:
+            if connection is not None:
+                connection.close()
+            if attempt + 1 >= QUERY_ONLY_DB_ATTEMPTS:
                 raise
-            time.sleep(READ_ONLY_DB_INITIAL_DELAY_SECONDS * (2**attempt))
-    raise AssertionError("read-only database retry loop exhausted")
+            time.sleep(QUERY_ONLY_DB_INITIAL_DELAY_SECONDS * (2**attempt))
+    raise AssertionError("query-only database retry loop exhausted")
 
 
 def codesigning_identity_summary(output: str) -> dict:
@@ -259,7 +263,7 @@ def install_identity_coherence() -> tuple[bool, dict]:
     invalid_active_install_id_count = 0
     if DEVICES_DB.exists() and not DEVICES_DB.is_symlink() and stat.S_ISREG(DEVICES_DB.stat().st_mode):
         try:
-            with closing(connect_read_only_database(DEVICES_DB)) as db:
+            with closing(connect_query_only_database(DEVICES_DB)) as db:
                 columns = {
                     str(row[1])
                     for row in db.execute("PRAGMA table_info(devices)").fetchall()
@@ -738,7 +742,7 @@ add("logs_writable", ok, "error", "Logs directory is writable.", evidence)
 
 if DEVICES_DB.exists():
     try:
-        with closing(connect_read_only_database(DEVICES_DB)) as db:
+        with closing(connect_query_only_database(DEVICES_DB)) as db:
             tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         add("devices_db", {"devices", "audit_events"}.issubset(tables), "error", "Devices database has required tables.", sorted(tables))
     except Exception as exc:
