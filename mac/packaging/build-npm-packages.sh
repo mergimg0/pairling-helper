@@ -350,12 +350,15 @@ APP_ATTEST_VALIDATOR="$SOURCE_ROOT/relay/app_attest_validator.py"
 if [[ ! -f "$APP_ATTEST_VALIDATOR" ]]; then
   APP_ATTEST_VALIDATOR="$SOURCE_ROOT/mac/companiond/app_attest_validator.py"
 fi
-if [[ ! -f "$APP_ATTEST_VALIDATOR" || ! -f "$SOURCE_ROOT/mac/companiond/apple-app-attest-root-ca.pem" ]]; then
-  echo "ERROR: App Attest validator or Apple root certificate is missing" >&2
+if [[ ! -f "$APP_ATTEST_VALIDATOR" || \
+      ! -f "$SOURCE_ROOT/mac/companiond/apple-app-attest-root-ca.pem" || \
+      ! -f "$SOURCE_ROOT/mac/companiond/relay-claim-2026-07-v1.pem" ]]; then
+  echo "ERROR: Pairling runtime trust assets are missing" >&2
   exit 1
 fi
 cp "$APP_ATTEST_VALIDATOR" "$MACPAY/companiond/app_attest_validator.py"
 cp "$SOURCE_ROOT/mac/companiond/apple-app-attest-root-ca.pem" "$MACPAY/companiond/"
+cp "$SOURCE_ROOT/mac/companiond/relay-claim-2026-07-v1.pem" "$MACPAY/companiond/"
 cp "$SOURCE_ROOT/mac/companiond/providers/"*.py "$MACPAY/companiond/providers/"
 cp "$SOURCE_ROOT/mac/companiond/providers/"*.json "$MACPAY/companiond/providers/"
 cp "$SOURCE_ROOT/mac/companiond/integrations/__init__.py" "$MACPAY/companiond/integrations/"

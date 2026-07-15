@@ -1599,13 +1599,15 @@ stage_app_attest_assets() {
     WIZARD_FATAL=1
     exit 1
   }
-  if [[ ! -f "$REPO_ROOT/mac/companiond/apple-app-attest-root-ca.pem" ]]; then
-    log "ERROR: Apple App Attest root certificate is missing; refusing to stage an incomplete runtime." >&2
+  if [[ ! -f "$REPO_ROOT/mac/companiond/apple-app-attest-root-ca.pem" || \
+        ! -f "$REPO_ROOT/mac/companiond/relay-claim-2026-07-v1.pem" ]]; then
+    log "ERROR: Pairling trust assets are missing; refusing to stage an incomplete runtime." >&2
     WIZARD_FATAL=1
     exit 1
   fi
   cp "$validator" "$destination/app_attest_validator.py"
   cp "$REPO_ROOT/mac/companiond/apple-app-attest-root-ca.pem" "$destination/"
+  cp "$REPO_ROOT/mac/companiond/relay-claim-2026-07-v1.pem" "$destination/"
 }
 
 run_app_attest_import_check() {
@@ -1618,7 +1620,12 @@ from pathlib import Path
 
 companiond_path, label = sys.argv[1:]
 root = Path(companiond_path)
-for name in ("app_attest_lan.py", "app_attest_validator.py", "apple-app-attest-root-ca.pem"):
+for name in (
+    "app_attest_lan.py",
+    "app_attest_validator.py",
+    "apple-app-attest-root-ca.pem",
+    "relay-claim-2026-07-v1.pem",
+):
     if not (root / name).is_file():
         raise SystemExit(f"{label}: missing {name}")
 import app_attest_lan
@@ -3709,7 +3716,9 @@ build_connectd_binary() {
   fi
   (
     cd "$REPO_ROOT/mac/connectd"
-    "$go_bin" build -o "$out" ./cmd/pairling-connectd
+    "$go_bin" build -buildvcs=false -trimpath \
+      -ldflags "-s -w -buildid= -X main.buildVersion=$VERSION -X main.buildSourceRevision=$REVISION -X main.buildSourceDirty=$SOURCE_DIRTY" \
+      -o "$out" ./cmd/pairling-connectd
   )
 }
 

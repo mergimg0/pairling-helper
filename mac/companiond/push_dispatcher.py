@@ -1669,9 +1669,27 @@ class PairlingPushDispatcher:
         secret_updates: dict[str, Any] = {}
         if apns_token:
             _validate_apns_token(apns_token, "apns_token")
+            invalidated_reason = device.get("apns_invalidated_reason")
             device["apns_token_hash"] = _sha256_hex(apns_token)
             device["apns_environment"] = apns_environment
             device["apns_registered_at"] = now
+            device.pop("apns_invalidated_at", None)
+            device.pop("apns_invalidated_by_event_id", None)
+            device.pop("apns_invalidated_reason", None)
+            if device.get("last_delivery_error") in {invalidated_reason, "missing_token"}:
+                device["last_delivery_error"] = None
+
+            for row in data.get("delivery_outbox", []):
+                if (
+                    isinstance(row, dict)
+                    and row.get("device_id") == device_id
+                    and row.get("push_type") == "alert"
+                    and row.get("state") == "credential_blocked"
+                    and row.get("last_outcome") == "missing_token"
+                ):
+                    row["state"] = "pending"
+                    row["next_attempt_at"] = now
+                    row["updated_at"] = now
             secret_updates.update({
                 "apns_token": apns_token,
                 "apns_token_hash": device["apns_token_hash"],
@@ -1698,7 +1716,11 @@ class PairlingPushDispatcher:
             def update_device_secrets(current: dict[str, Any]) -> None:
                 if device_id in current["revoked_device_ids"]:
                     raise PushDispatcherError("push_device_revoked", "push device is revoked", 403)
-                current["devices"].setdefault(device_id, {}).update(secret_updates)
+                secret_device = current["devices"].setdefault(device_id, {})
+                secret_device.update(secret_updates)
+                if apns_token:
+                    secret_device.pop("apns_invalidated_at", None)
+                    secret_device.pop("apns_invalidated_reason", None)
 
             mutate_push_secrets(self.secret_path, update_device_secrets)
 

@@ -11,6 +11,7 @@ PAIRLING_DAEMON_LABEL = "dev.pairling.companiond"
 PAIRLING_CONNECTD_LABEL = "dev.pairling.connectd"
 PAIRLING_PTYBROKER_LABEL = "dev.pairling.ptybroker"
 PAIRLING_RUNTIME_PORT = "7773"
+PAIRLING_RELAY_CLAIM_PUBLIC_KEY = "relay-claim-2026-07-v1.pem"
 
 
 def canonical_pairdrop_root(value: Path | str) -> Path:
@@ -40,6 +41,9 @@ def daemon_plist(
         "PAIRLING_APP_SUPPORT_ROOT": str(current.parent.parent),
         "PAIRLING_LOGS_ROOT": str(logs),
         "PAIRLING_PAIRDROP_ROOT": str(pairdrop_root),
+        "PAIRLING_RELAY_PUBLIC_KEYS": str(
+            current / "companiond" / PAIRLING_RELAY_CLAIM_PUBLIC_KEY
+        ),
         "PYTHONDONTWRITEBYTECODE": "1",
         "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
     }
