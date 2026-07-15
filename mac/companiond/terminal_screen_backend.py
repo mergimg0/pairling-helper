@@ -237,7 +237,7 @@ class VTScreenBackend:
         cursor = TerminalCursor(
             row=getattr(self.screen, "cursor_row", None),
             column=getattr(self.screen, "cursor_col", None),
-            visible=True,
+            visible=bool(getattr(self.screen, "cursor_visible", True)),
         )
         pending_input = detect_terminal_pending_input(text_rows)
         pending_detection = {

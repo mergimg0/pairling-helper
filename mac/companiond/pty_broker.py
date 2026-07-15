@@ -414,6 +414,7 @@ class VTScreen:
         self.wrapped = [False for _ in range(self.rows)]
         self.cursor_row = 0
         self.cursor_col = 0
+        self.cursor_visible = True
         self._state = "normal"
         self._csi = ""
         self._osc = ""
@@ -424,6 +425,7 @@ class VTScreen:
         self.scroll_bottom = self.rows - 1
         self.current_attr = self._default_attr()
         self.current_link_id: str | None = None
+        self._saved_cursor: dict | None = None
         self.links: dict[str, str] = {}
         self._primary_state: dict | None = None
         # SPEC-p4 §2.3: rows that scroll off the top of the PRIMARY screen are
@@ -489,7 +491,11 @@ class VTScreen:
     def snapshot(self, session_id: str, generation: int, source: str = "broker_vt") -> dict:
         rows = self.text_rows()
         dimensions = {"columns": self.columns, "rows": self.rows}
-        cursor = {"row": self.cursor_row, "column": self.cursor_col, "visible": True}
+        cursor = {
+            "row": self.cursor_row,
+            "column": self.cursor_col,
+            "visible": self.cursor_visible,
+        }
         material = {
             "session_id": session_id,
             "source": source,
@@ -548,6 +554,9 @@ class VTScreen:
                 self._osc += "\x1b" + ch
                 self._state = "osc"
             return
+        if self._state == "esc_intermediate":
+            self._state = "normal"
+            return
         if self._state == "esc":
             if ch == "[":
                 self._state = "csi"
@@ -558,6 +567,24 @@ class VTScreen:
             elif ch == "c":
                 self._reset()
                 self._state = "normal"
+            elif ch == "7":
+                self._save_cursor()
+                self._state = "normal"
+            elif ch == "8":
+                self._restore_cursor()
+                self._state = "normal"
+            elif ch == "D":
+                self._linefeed()
+                self._state = "normal"
+            elif ch == "E":
+                self.cursor_col = 0
+                self._linefeed()
+                self._state = "normal"
+            elif ch == "M":
+                self._reverse_index()
+                self._state = "normal"
+            elif ch in {"(", ")", "*", "+", "-", ".", "/", "#", "%"}:
+                self._state = "esc_intermediate"
             else:
                 self._state = "normal"
             return
@@ -630,6 +657,16 @@ class VTScreen:
             self.cursor_col = min(self.columns - 1, self.cursor_col + value(0, 1))
         elif final == "D":
             self.cursor_col = max(0, self.cursor_col - value(0, 1))
+        elif final in {"G", "`"}:
+            self.cursor_col = max(0, min(self.columns - 1, value(0, 1) - 1))
+        elif final == "E":
+            self.cursor_row = min(self.rows - 1, self.cursor_row + value(0, 1))
+            self.cursor_col = 0
+        elif final == "F":
+            self.cursor_row = max(0, self.cursor_row - value(0, 1))
+            self.cursor_col = 0
+        elif final == "d":
+            self.cursor_row = max(0, min(self.rows - 1, value(0, 1) - 1))
         elif final in {"H", "f"}:
             self.cursor_row = max(0, min(self.rows - 1, value(0, 1) - 1))
             self.cursor_col = max(0, min(self.columns - 1, value(1, 1) - 1))
@@ -674,6 +711,8 @@ class VTScreen:
             self._insert_characters(value(0, 1))
         elif final == "P":
             self._delete_characters(value(0, 1))
+        elif final == "X":
+            self._erase_characters(value(0, 1))
         elif final == "L":
             self._insert_lines(value(0, 1))
         elif final == "M":
@@ -689,10 +728,20 @@ class VTScreen:
             self._scroll_up(self.scroll_top, self.scroll_bottom, value(0, 1))
         elif final == "T":
             self._scroll_down(self.scroll_top, self.scroll_bottom, value(0, 1))
-        elif final == "h" and private and 1049 in [value(i, 0) for i in range(len(parts) or 1)]:
-            self._enter_alternate_screen()
-        elif final == "l" and private and 1049 in [value(i, 0) for i in range(len(parts) or 1)]:
-            self._exit_alternate_screen()
+        elif final in {"h", "l"} and private:
+            modes = [value(i, 0) for i in range(len(parts) or 1)]
+            enabled = final == "h"
+            if 25 in modes:
+                self.cursor_visible = enabled
+            if any(mode in {47, 1047, 1049} for mode in modes):
+                if enabled:
+                    self._enter_alternate_screen()
+                else:
+                    self._exit_alternate_screen()
+        elif final == "s" and not private and not clean:
+            self._save_cursor()
+        elif final == "u" and not private and not clean:
+            self._restore_cursor()
 
     @staticmethod
     def _char_width(ch: str) -> int:
@@ -780,6 +829,36 @@ class VTScreen:
             row.append(" ")
             attrs.append(self._default_attr().copy())
         self._touch(self.cursor_row)
+
+    def _erase_characters(self, count: int) -> None:
+        count = max(1, min(count, self.columns - self.cursor_col))
+        for col in range(self.cursor_col, self.cursor_col + count):
+            self.grid[self.cursor_row][col] = " "
+            self.attrs[self.cursor_row][col] = self._default_attr().copy()
+        self._touch(self.cursor_row)
+
+    def _save_cursor(self) -> None:
+        self._saved_cursor = {
+            "row": self.cursor_row,
+            "column": self.cursor_col,
+            "attr": self.current_attr.copy(),
+            "link_id": self.current_link_id,
+        }
+
+    def _restore_cursor(self) -> None:
+        if self._saved_cursor is None:
+            return
+        self.cursor_row = max(0, min(self.rows - 1, int(self._saved_cursor["row"])))
+        self.cursor_col = max(0, min(self.columns - 1, int(self._saved_cursor["column"])))
+        self.current_attr = dict(self._saved_cursor["attr"])
+        self.current_link_id = self._saved_cursor["link_id"]
+
+    def _reverse_index(self) -> None:
+        if self.cursor_row <= self.scroll_top:
+            self._scroll_down(self.scroll_top, self.scroll_bottom, 1)
+            self.cursor_row = self.scroll_top
+        else:
+            self.cursor_row -= 1
 
     def _insert_lines(self, count: int) -> None:
         if not (self.scroll_top <= self.cursor_row <= self.scroll_bottom):
@@ -879,6 +958,7 @@ class VTScreen:
         self.wrapped = [False for _ in range(self.rows)]
         self.cursor_row = 0
         self.cursor_col = 0
+        self.cursor_visible = True
         self.scroll_top = 0
         self.scroll_bottom = self.rows - 1
         self.current_attr = self._default_attr()
@@ -894,6 +974,7 @@ class VTScreen:
             "wrapped": self.wrapped[:],
             "cursor_row": self.cursor_row,
             "cursor_col": self.cursor_col,
+            "cursor_visible": self.cursor_visible,
         }
         self._reset()
         self.alternate_screen = True
@@ -907,6 +988,7 @@ class VTScreen:
             self.wrapped = self._primary_state["wrapped"][:]
             self.cursor_row = self._primary_state["cursor_row"]
             self.cursor_col = self._primary_state["cursor_col"]
+            self.cursor_visible = self._primary_state["cursor_visible"]
         self.alternate_screen = False
         self._primary_state = None
         self._touch_all()
