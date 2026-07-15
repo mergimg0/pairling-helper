@@ -1222,7 +1222,12 @@ class PairlingPushDispatcher:
             if len(claims) >= limit or not isinstance(row, dict):
                 break
             state = str(row.get("state") or "")
-            due = state in {"pending", "credential_blocked"} and float(row.get("next_attempt_at") or 0) <= now
+            next_attempt_at = row.get("next_attempt_at")
+            due = (
+                state in {"pending", "credential_blocked"}
+                and next_attempt_at is not None
+                and float(next_attempt_at) <= now
+            )
             stale = (
                 state == "sending"
                 and float(row.get("locked_at") or 0) <= now - OUTBOX_SENDING_LEASE_SECONDS
@@ -2735,7 +2740,12 @@ class PairlingPushDispatcher:
         if not row:
             return None
         state = row.get("state")
-        if state in {"pending", "credential_blocked"} and float(row.get("next_attempt_at") or 0) <= self.now_fn():
+        next_attempt_at = row.get("next_attempt_at")
+        if (
+            state in {"pending", "credential_blocked"}
+            and next_attempt_at is not None
+            and float(next_attempt_at) <= self.now_fn()
+        ):
             return None
         if state == "sending":
             locked_at = float(row.get("locked_at") or 0)
