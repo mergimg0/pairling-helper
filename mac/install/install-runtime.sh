@@ -1325,13 +1325,13 @@ guided_route_proof() {
 # devices database that tells the user whether this Mac has recorded the iPhone
 # finishing pairing in this session. It takes the session-start epoch as its
 # first argument, so a device paired in an earlier run does not read as seen on a
-# re-run. It opens the database read-only with mode=ro, so it never locks the
-# file the daemon is writing, and it treats a missing or empty database or any
-# sqlite error as "not seen". It polls up to about 6 seconds at 1 second steps
-# and exits early the moment a matching device appears, so a scanned phone is
-# confirmed within about a second and only an unscanned run waits the full
-# window. The whole probe is wrapped in `|| true`, so it never blocks or fails
-# setup.
+# re-run. It checks that the database already exists, then uses SQLite query-only
+# mode so WAL coordination remains reliable without permitting SQL writes. A
+# missing or empty database or any sqlite error means "not seen". It polls up to
+# about 6 seconds at 1 second steps and exits early the moment a matching device
+# appears, so a scanned phone is confirmed within about a second and only an
+# unscanned run waits the full window. The whole probe is wrapped in `|| true`,
+# so it never blocks or fails setup.
 guided_pairing_seen_proof() {
   local since="${1:-0}" route_state="${2:-degraded}"
   local python_bin="${PYTHON3_BIN:-}"
@@ -1345,6 +1345,7 @@ guided_pairing_seen_proof() {
     "$python_bin" - "$DEVICES_DB" "$since" "$route_state" <<'PY' || true
 import os
 import sqlite3
+import stat
 import sys
 import time
 
@@ -1367,11 +1368,14 @@ if steps < 1:
     steps = 1
 
 def count_session_devices():
-    # Open read-only with mode=ro so this never locks or creates the database the
-    # daemon is writing. Count only non-revoked rows created at or after the
-    # session start, so a device from an earlier run does not read as seen.
-    con = sqlite3.connect("file:" + db_path + "?mode=ro", uri=True, timeout=0.5)
+    # Refuse a missing, linked, or non-file path before opening normally. Query
+    # only mode lets SQLite coordinate WAL side files without allowing writes.
+    metadata = os.lstat(db_path)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise OSError("devices database is not a regular file")
+    con = sqlite3.connect(db_path, timeout=0.5)
     try:
+        con.execute("PRAGMA query_only=ON")
         columns = {
             str(row[1])
             for row in con.execute("PRAGMA table_info(devices)").fetchall()

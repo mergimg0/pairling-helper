@@ -24,6 +24,8 @@ from runtime_paths import app_support_root, audit_log_path, devices_db_path
 
 
 SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("PAIRLING_SQLITE_BUSY_TIMEOUT_MS", "5000"))
+QUERY_ONLY_DB_ATTEMPTS = 4
+QUERY_ONLY_DB_INITIAL_DELAY_SECONDS = 0.05
 PAIR_ACTIVATION_PROOF_VERSION = "pairling.psk.activate.v1"
 PAIR_ACTIVATION_RESULT_CONTRACT = "pairling.psk.activate.result.v1"
 SMOKE_DEVICE_PURPOSE = "runtime_truth_smoke"
@@ -57,6 +59,25 @@ def generate_device_id() -> str:
 
 def generate_proof_secret() -> str:
     return "prf_" + secrets.token_urlsafe(32)
+
+
+def _connect_query_only_database(path: Path) -> sqlite3.Connection:
+    for attempt in range(QUERY_ONLY_DB_ATTEMPTS):
+        connection = None
+        try:
+            connection = sqlite3.connect(
+                str(path),
+                timeout=max(SQLITE_BUSY_TIMEOUT_MS, 1) / 1000,
+            )
+            connection.execute("PRAGMA query_only=ON")
+            return connection
+        except sqlite3.Error:
+            if connection is not None:
+                connection.close()
+            if attempt + 1 >= QUERY_ONLY_DB_ATTEMPTS:
+                raise
+            time.sleep(QUERY_ONLY_DB_INITIAL_DELAY_SECONDS * (2**attempt))
+    raise AssertionError("query-only database retry loop exhausted")
 
 
 def _redact_for_audit(value: Any) -> Any:
@@ -317,7 +338,7 @@ def _active_external_install_ids(path: Path) -> tuple[str, ...]:
             "Pairling devices.sqlite must be a regular file, not a symlink or another file type.",
         )
     try:
-        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as conn:
+        with closing(_connect_query_only_database(path)) as conn:
             tables = {
                 str(row[0])
                 for row in conn.execute(
@@ -1959,9 +1980,7 @@ class DeviceRegistry:
             metadata = self.db_path.lstat()
             if not stat.S_ISREG(metadata.st_mode):
                 return False
-            with closing(
-                sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
-            ) as read_only:
+            with closing(_connect_query_only_database(self.db_path)) as read_only:
                 read_only.row_factory = sqlite3.Row
                 columns = {
                     str(row[1])
