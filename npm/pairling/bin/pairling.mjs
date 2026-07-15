@@ -887,7 +887,7 @@ function main() {
           "This usually means npm skipped optional dependencies (network hiccup",
           "or --no-optional / --omit=optional). Fix with:",
           "",
-          "  npm install -g pairling",
+          "  npm install -g pairling --include=optional",
           "",
         ].join("\n"),
       );

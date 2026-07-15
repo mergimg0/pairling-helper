@@ -1367,7 +1367,7 @@ except ValueError:
 if steps < 1:
     steps = 1
 
-def count_session_devices():
+def count_session_devices(created_since=None):
     # Refuse a missing, linked, or non-file path before opening normally. Query
     # only mode lets SQLite coordinate WAL side files without allowing writes.
     metadata = os.lstat(db_path)
@@ -1380,18 +1380,21 @@ def count_session_devices():
             str(row[1])
             for row in con.execute("PRAGMA table_info(devices)").fetchall()
         }
+        where = ["revoked_at IS NULL"]
+        params = []
         if "purpose" in columns:
-            row = con.execute(
-                "SELECT COUNT(*) FROM devices WHERE revoked_at IS NULL "
-                "AND COALESCE(activation_state, 'active') = 'active' "
-                "AND COALESCE(purpose, '') NOT IN (?, ?) AND created_at >= ?",
-                ("runtime_truth_smoke", "local_mcp_bridge", since),
-            ).fetchone()
-        else:
-            row = con.execute(
-                "SELECT COUNT(*) FROM devices WHERE revoked_at IS NULL AND created_at >= ?",
-                (since,),
-            ).fetchone()
+            where.extend([
+                "COALESCE(activation_state, 'active') = 'active'",
+                "COALESCE(purpose, '') NOT IN (?, ?)",
+            ])
+            params.extend(["runtime_truth_smoke", "local_mcp_bridge"])
+        if created_since is not None:
+            where.append("created_at >= ?")
+            params.append(created_since)
+        row = con.execute(
+            "SELECT COUNT(*) FROM devices WHERE " + " AND ".join(where),
+            tuple(params),
+        ).fetchone()
         return int(row[0]) if row else 0
     finally:
         con.close()
@@ -1400,7 +1403,7 @@ seen = 0
 try:
     for step in range(steps):
         try:
-            seen = count_session_devices()
+            seen = count_session_devices(since)
         except Exception:
             # A missing or empty database, or any sqlite error, means not seen.
             seen = 0
@@ -1408,8 +1411,15 @@ try:
             break
         if step < steps - 1:
             time.sleep(1)
+    try:
+        existing = count_session_devices()
+    except Exception:
+        existing = 0
     if seen > 0:
         print("     Pairing check: this Mac saw your iPhone connect and finish pairing.")
+    elif existing > 0:
+        print("     Pairing check: your existing paired iPhone remains registered.")
+        print("     This new invitation has not been used. Use it only to add another iPhone or replace the saved pairing.")
     else:
         print("     Pairing check: this Mac has not recorded your iPhone finishing pairing yet.")
         print("     If you just scanned the code, give it a moment and it should appear.")
