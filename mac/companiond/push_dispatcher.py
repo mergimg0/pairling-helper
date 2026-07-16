@@ -10,6 +10,7 @@ through status/audit responses.
 from __future__ import annotations
 
 import json
+import math
 import os
 import stat
 import base64
@@ -63,6 +64,7 @@ PUSH_HEALTH_NEUTRAL_OUTCOMES = {"disabled", "snoozed"}
 OUTBOX_SENDING_LEASE_SECONDS = 60.0
 OUTBOX_TERMINAL_LIMIT = 200
 OUTBOX_RETRY_PAYLOAD_CONTRACT = "pairling-push-retry-payload-v1"
+OUTBOX_RETRY_REQUEST_CONTRACT_VERSION = 2
 OUTBOX_RETRY_PAYLOAD_MAX_BYTES = 256 * 1024
 OUTBOX_RETRY_DRAIN_LIMIT = 50
 OUTBOX_ACTIVE_STATES = {"pending", "sending", "credential_blocked"}
@@ -815,67 +817,136 @@ class PairlingPushDispatcher:
     ) -> dict[str, Any]:
         """Store the replay input before a public outbox row can be claimed."""
         try:
-            encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+            payload_copy = json.loads(json.dumps(
+                payload,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ))
         except (TypeError, ValueError) as exc:
             raise PushDispatcherError(
                 "push_retry_payload_invalid",
                 "push retry payload is not JSON serializable",
                 400,
             ) from exc
-        if len(encoded.encode("utf-8")) > OUTBOX_RETRY_PAYLOAD_MAX_BYTES:
-            raise PushDispatcherError(
-                "push_retry_payload_too_large",
-                "push retry payload is too large",
-                413,
-            )
-        payload_copy = json.loads(encoded)
-        payload_sha256 = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
         key = self._retry_payload_key(
             device_id=device_id,
             event_id=event_id,
             push_type=push_type,
         )
-        record = {
-            "contract_version": OUTBOX_RETRY_PAYLOAD_CONTRACT,
-            "key": key,
-            "device_id": device_id,
-            "event_id": event_id,
-            "push_type": push_type,
-            "audit_event": audit_event,
-            "payload": payload_copy,
-            "payload_sha256": payload_sha256,
-            "created_at": self.now_fn(),
-            "updated_at": self.now_fn(),
-        }
+        created_at = self.now_fn()
+
+        def encoded_payload(
+            candidate: dict[str, Any],
+            *,
+            stable_time: float,
+            existing_payload: dict[str, Any] | None,
+        ) -> tuple[dict[str, Any], str, str]:
+            normalized = _normalize_retry_payload_timing(
+                candidate,
+                push_type=push_type,
+                stable_time=stable_time,
+                existing_payload=existing_payload,
+            )
+            encoded = json.dumps(
+                normalized,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            if len(encoded.encode("utf-8")) > OUTBOX_RETRY_PAYLOAD_MAX_BYTES:
+                raise PushDispatcherError(
+                    "push_retry_payload_too_large",
+                    "push retry payload is too large",
+                    413,
+                )
+            return normalized, encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
         def persist(current: dict[str, Any]) -> dict[str, Any]:
             existing = current["delivery_payloads"].get(key)
             if existing is not None:
-                try:
-                    existing_payload = json.dumps(
-                        existing.get("payload"),
-                        ensure_ascii=True,
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    ) if isinstance(existing, dict) else ""
-                except (TypeError, ValueError):
-                    existing_payload = ""
-                existing_hash = str(existing.get("payload_sha256") or "") if isinstance(existing, dict) else ""
-                if not existing_hash and existing_payload:
-                    existing_hash = hashlib.sha256(existing_payload.encode("utf-8")).hexdigest()
                 if not isinstance(existing, dict) or any(
-                    existing.get(field) != record[field]
-                    for field in ("device_id", "event_id", "push_type", "audit_event")
-                ) or not hmac.compare_digest(existing_hash, payload_sha256):
+                    existing.get(field) != expected
+                    for field, expected in (
+                        ("device_id", device_id),
+                        ("event_id", event_id),
+                        ("push_type", push_type),
+                        ("audit_event", audit_event),
+                    )
+                ):
                     raise PushDispatcherError(
                         "push_retry_payload_conflict",
                         "push retry payload identity or content conflicts with stored state",
                         409,
                     )
-                if not existing.get("payload_sha256"):
-                    existing["payload_sha256"] = payload_sha256
+                stored_payload = existing.get("payload")
+                if not isinstance(stored_payload, dict):
+                    raise PushDispatcherError(
+                        "push_retry_payload_conflict",
+                        "push retry payload identity or content conflicts with stored state",
+                        409,
+                    )
+                stored_encoded = json.dumps(
+                    stored_payload,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                stored_hash = str(existing.get("payload_sha256") or "")
+                computed_stored_hash = hashlib.sha256(stored_encoded.encode("utf-8")).hexdigest()
+                if stored_hash and not hmac.compare_digest(stored_hash, computed_stored_hash):
+                    raise PushDispatcherError(
+                        "push_retry_payload_corrupt",
+                        "stored push retry payload failed its integrity check",
+                        500,
+                    )
+                stable_time = (
+                    _positive_finite_float(existing.get("created_at"))
+                    or created_at
+                )
+                normalized_stored, _, normalized_stored_hash = encoded_payload(
+                    stored_payload,
+                    stable_time=stable_time,
+                    existing_payload=None,
+                )
+                normalized_candidate, _, candidate_hash = encoded_payload(
+                    payload_copy,
+                    stable_time=stable_time,
+                    existing_payload=normalized_stored,
+                )
+                if not hmac.compare_digest(normalized_stored_hash, candidate_hash):
+                    raise PushDispatcherError(
+                        "push_retry_payload_conflict",
+                        "push retry payload identity or content conflicts with stored state",
+                        409,
+                    )
+                if (
+                    existing.get("payload") != normalized_candidate
+                    or existing.get("payload_sha256") != candidate_hash
+                ):
+                    existing["payload"] = normalized_candidate
+                    existing["payload_sha256"] = candidate_hash
                     existing["updated_at"] = self.now_fn()
                 return dict(existing)
+
+            normalized_payload, _, payload_sha256 = encoded_payload(
+                payload_copy,
+                stable_time=created_at,
+                existing_payload=None,
+            )
+            record = {
+                "contract_version": OUTBOX_RETRY_PAYLOAD_CONTRACT,
+                "request_contract_version": OUTBOX_RETRY_REQUEST_CONTRACT_VERSION,
+                "key": key,
+                "device_id": device_id,
+                "event_id": event_id,
+                "push_type": push_type,
+                "audit_event": audit_event,
+                "payload": normalized_payload,
+                "payload_sha256": payload_sha256,
+                "created_at": created_at,
+                "updated_at": created_at,
+            }
             current["delivery_payloads"][key] = record
             return dict(record)
 
@@ -987,6 +1058,109 @@ class PairlingPushDispatcher:
 
         return mutate_push_secrets(self.secret_path, bind)
 
+    def _bound_retry_relay_target(
+        self,
+        *,
+        retry_payload_key: str,
+        device_id: str,
+        device: dict[str, Any],
+        allow_create: bool,
+    ) -> dict[str, Any]:
+        secret = self._secret_for_device(device_id)
+        relay_pair_secret = str(secret.get("relay_pair_secret") or "").strip()
+        candidate = {
+            "relay_device_id": str(
+                device.get("relay_device_id") or secret.get("relay_device_id") or ""
+            ).strip(),
+            "mac_install_id": str(
+                secret.get("mac_install_id")
+                or device.get("mac_install_id")
+                or os.environ.get("PAIRLING_MAC_INSTALL_ID")
+                or ""
+            ).strip(),
+            "relay_pair_secret_hash": _sha256_hex(relay_pair_secret) if relay_pair_secret else "",
+        }
+
+        def bind(current: dict[str, Any]) -> dict[str, Any]:
+            record = current["delivery_payloads"].get(retry_payload_key)
+            if not isinstance(record, dict):
+                raise PushDispatcherError(
+                    "push_retry_payload_missing",
+                    "push retry payload is missing before relay target binding",
+                    500,
+                )
+            existing = record.get("relay_target")
+            if isinstance(existing, dict) and all(
+                str(existing.get(field) or "").strip()
+                for field in ("relay_device_id", "mac_install_id", "relay_pair_secret_hash")
+            ):
+                return dict(existing)
+            if not allow_create:
+                return {"unbound": True}
+            if not all(candidate.values()):
+                return {}
+            target = {**candidate, "bound_at": self.now_fn()}
+            record["relay_target"] = target
+            record["updated_at"] = self.now_fn()
+            return dict(target)
+
+        return mutate_push_secrets(self.secret_path, bind)
+
+    def _bound_retry_provider_target(
+        self,
+        *,
+        retry_payload_key: str,
+        provider: dict[str, Any],
+        allow_create: bool,
+    ) -> dict[str, Any]:
+        mode = str(provider.get("mode") or "").strip()
+        candidate = {
+            "mode": mode,
+            "relay_url": str(provider.get("relay_url") or "").strip() if mode == "relay" else "",
+        }
+
+        def bind(current: dict[str, Any]) -> dict[str, Any]:
+            record = current["delivery_payloads"].get(retry_payload_key)
+            if not isinstance(record, dict):
+                raise PushDispatcherError(
+                    "push_retry_payload_missing",
+                    "push retry payload is missing before provider binding",
+                    500,
+                )
+            existing = record.get("provider_target")
+            if isinstance(existing, dict) and str(existing.get("mode") or "").strip():
+                return dict(existing)
+            if not allow_create:
+                return {"unbound": True}
+            if not candidate["mode"]:
+                return {}
+            target = {**candidate, "bound_at": self.now_fn()}
+            record["provider_target"] = target
+            record["updated_at"] = self.now_fn()
+            return dict(target)
+
+        return mutate_push_secrets(self.secret_path, bind)
+
+    @staticmethod
+    def _provider_target_conflict(
+        *,
+        target: dict[str, Any],
+        provider: dict[str, Any],
+    ) -> str | None:
+        if target.get("unbound") is True:
+            return "push_retry_provider_unbound"
+        target_mode = str(target.get("mode") or "").strip()
+        current_mode = str(provider.get("mode") or "").strip()
+        if not target_mode:
+            return "push_retry_provider_unbound"
+        if current_mode != target_mode:
+            return "push_retry_provider_changed"
+        if target_mode == "relay" and str(provider.get("relay_url") or "").strip() != str(
+            target.get("relay_url") or ""
+        ).strip():
+            return "relay_endpoint_changed"
+        return None
+
     def _align_claimed_outbox_target(
         self,
         *,
@@ -1066,7 +1240,24 @@ class PairlingPushDispatcher:
     def _valid_retry_payloads(self) -> dict[str, dict[str, Any]]:
         records = self._read_secrets().get("delivery_payloads", {})
         valid: dict[str, dict[str, Any]] = {}
+        invalid: dict[str, Any] = {}
         for key, record in records.items():
+            payload_hash_valid = False
+            if isinstance(record, dict) and isinstance(record.get("payload"), dict):
+                try:
+                    encoded = json.dumps(
+                        record["payload"],
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    expected_hash = str(record.get("payload_sha256") or "")
+                    payload_hash_valid = bool(expected_hash) and hmac.compare_digest(
+                        expected_hash,
+                        hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+                    )
+                except (TypeError, ValueError):
+                    payload_hash_valid = False
             if (
                 isinstance(key, str)
                 and isinstance(record, dict)
@@ -1074,6 +1265,7 @@ class PairlingPushDispatcher:
                 and isinstance(record.get("payload"), dict)
                 and record.get("key") == key
                 and record.get("push_type") in {"alert", "liveactivity"}
+                and payload_hash_valid
                 and key == self._retry_payload_key(
                     device_id=str(record.get("device_id") or ""),
                     event_id=str(record.get("event_id") or ""),
@@ -1081,6 +1273,15 @@ class PairlingPushDispatcher:
                 )
             ):
                 valid[key] = dict(record)
+            elif isinstance(key, str):
+                invalid[key] = record
+        if invalid:
+            def remove_unchanged_invalid(current: dict[str, Any]) -> None:
+                for key, expected in invalid.items():
+                    if current["delivery_payloads"].get(key) == expected:
+                        del current["delivery_payloads"][key]
+
+            mutate_push_secrets(self.secret_path, remove_unchanged_invalid)
         return valid
 
     def _reconcile_terminal_retry_payloads(self) -> int:
@@ -1285,6 +1486,103 @@ class PairlingPushDispatcher:
         if push_type == "liveactivity":
             return self._record_live_activity_delivery(**kwargs)
         raise PushDispatcherError("push_retry_payload_invalid", "unsupported retry payload type", 500)
+
+    def _retire_legacy_relay_retry(
+        self,
+        *,
+        record: dict[str, Any],
+        claimed_lock_id: str | None,
+    ) -> dict[str, Any] | None:
+        request_version = _bounded_int(
+            record.get("request_contract_version"),
+            default=0,
+            minimum=0,
+            maximum=OUTBOX_RETRY_REQUEST_CONTRACT_VERSION,
+        )
+        if request_version >= OUTBOX_RETRY_REQUEST_CONTRACT_VERSION:
+            return None
+        device_id = str(record.get("device_id") or "")
+        event_id = str(record.get("event_id") or "")
+        push_type = str(record.get("push_type") or "")
+        audit_event = str(record.get("audit_event") or "push.event")
+        retry_payload_key = str(record.get("key") or "")
+        provider = self._provider_status()
+        snapshot = self._read()
+        row = self._find_outbox(
+            snapshot,
+            device_id=device_id,
+            event_id=event_id,
+            push_type=push_type,
+        )
+        provider_mode = str((row or {}).get("provider_mode") or provider.get("mode") or "")
+        if provider_mode != "relay":
+            return None
+        if row is None:
+            self._delete_retry_payload(retry_payload_key)
+            return {
+                "ok": False,
+                "delivery": {
+                    "event": audit_event,
+                    "event_id": event_id,
+                    "device_id": device_id,
+                    "outcome": "relay_retry_contract_upgraded",
+                    "sent": False,
+                },
+                "provider": provider,
+            }
+
+        def retire(data: dict[str, Any]) -> dict[str, Any]:
+            current = self._find_outbox(
+                data,
+                device_id=device_id,
+                event_id=event_id,
+                push_type=push_type,
+            )
+            if current is None:
+                return {
+                    "ok": False,
+                    "delivery": {"outcome": "superseded_delivery"},
+                    "provider": provider,
+                }
+            if claimed_lock_id is not None and current.get("lock_id") != claimed_lock_id:
+                return self._idempotent_delivery(
+                    data,
+                    device_id=device_id,
+                    event_id=event_id,
+                    push_type=push_type,
+                    provider=provider,
+                    audit_event=audit_event,
+                ) or {
+                    "ok": False,
+                    "delivery": {"outcome": "superseded_delivery"},
+                    "provider": provider,
+                }
+            self._complete_outbox(
+                data,
+                current,
+                sent=False,
+                outcome="relay_retry_contract_upgraded",
+                delivery_extra={"retryable": False, "invalid_token": False},
+            )
+            event = {
+                "event": audit_event,
+                "event_id": event_id,
+                "device_id": device_id,
+                "sent": False,
+                "outcome": "relay_retry_contract_upgraded",
+                "provider_mode": "relay",
+            }
+            self._append_event(data, event)
+            return {"ok": False, "delivery": event, "provider": provider}
+
+        response = self._mutate_registry(retire)
+        self._cleanup_retry_payload_if_terminal(
+            device_id=device_id,
+            event_id=event_id,
+            push_type=push_type,
+            retry_payload_key=retry_payload_key,
+        )
+        return response
 
     def _complete_claim_exception(self, claim: dict[str, Any], exc: Exception) -> None:
         def complete(data: dict[str, Any]) -> None:
@@ -1802,6 +2100,12 @@ class PairlingPushDispatcher:
                 audit_event=audit_event,
                 payload=payload,
             )
+        retired = self._retire_legacy_relay_retry(
+            record=retry_record,
+            claimed_lock_id=claimed_lock_id,
+        )
+        if retired is not None:
+            return retired
         retry_payload_key = str(retry_record.get("key") or "")
         payload = dict(retry_record.get("payload") or payload)
         audit_event = str(retry_record.get("audit_event") or audit_event)
@@ -1843,7 +2147,22 @@ class PairlingPushDispatcher:
         outcome = "not_configured"
         delivery_extra: dict[str, Any] = {}
         try:
-            if context["dispatch_mode"] == "local_apns":
+            provider_target = self._bound_retry_provider_target(
+                retry_payload_key=retry_payload_key,
+                provider=provider,
+                allow_create=(
+                    int(context.get("attempt_count") or 0) <= 1
+                    or not str(context.get("last_outcome") or "")
+                ),
+            )
+            provider_conflict = self._provider_target_conflict(
+                target=provider_target,
+                provider=provider,
+            )
+            if provider_conflict:
+                outcome = provider_conflict
+                delivery_extra = {"retryable": False, "invalid_token": False}
+            elif context["dispatch_mode"] == "local_apns":
                 result = self.apns_sender.send_alert(
                     token=context["token"],
                     event_id=event_id,
@@ -1859,6 +2178,15 @@ class PairlingPushDispatcher:
                 outcome = str(result.get("outcome") or ("sent" if sent else "failed"))
                 delivery_extra = {key: value for key, value in result.items() if key != "sent"}
             else:
+                relay_target = self._bound_retry_relay_target(
+                    retry_payload_key=retry_payload_key,
+                    device_id=device_id,
+                    device=context["device"],
+                    allow_create=(
+                        int(context.get("attempt_count") or 0) <= 1
+                        or not str(context.get("last_outcome") or "")
+                    ),
+                )
                 relay_extra = self._submit_relay_event(
                     device_id=device_id,
                     device=context["device"],
@@ -1866,7 +2194,8 @@ class PairlingPushDispatcher:
                     kind=context["kind"],
                     route=context["route"],
                     push_type="alert",
-                    provider=provider,
+                    provider_target=provider_target,
+                    relay_target=relay_target,
                     extra_body={
                         "title": context["title"],
                         "body": context["body"],
@@ -2092,6 +2421,8 @@ class PairlingPushDispatcher:
             outbox_row["key_environment"] = provider.get("key_environment")
             outbox_row["retry_payload_key"] = retry_payload_key
             outbox_row["retry_payload_present"] = True
+        context["attempt_count"] = int(outbox_row.get("attempt_count") or 0)
+        context["last_outcome"] = outbox_row.get("last_outcome")
         data["updated_at"] = self.now_fn()
         return {"context": context}
 
@@ -2184,6 +2515,7 @@ class PairlingPushDispatcher:
             outcome=outcome,
             delivery_extra=delivery_extra,
         )
+        _refresh_outbox_attempt_freshness(outbox_row)
         event = {
             "event": context["audit_event"],
             "event_id": context["event_id"],
@@ -2322,6 +2654,12 @@ class PairlingPushDispatcher:
                 audit_event=audit_event,
                 payload=payload,
             )
+        retired = self._retire_legacy_relay_retry(
+            record=retry_record,
+            claimed_lock_id=claimed_lock_id,
+        )
+        if retired is not None:
+            return retired
         retry_payload_key = str(retry_record.get("key") or "")
         payload = dict(retry_record.get("payload") or payload)
         audit_event = str(retry_record.get("audit_event") or audit_event)
@@ -2378,7 +2716,22 @@ class PairlingPushDispatcher:
         outcome = "not_configured"
         delivery_extra: dict[str, Any] = {}
         try:
-            if context["dispatch_mode"] == "local_apns":
+            provider_target = self._bound_retry_provider_target(
+                retry_payload_key=retry_payload_key,
+                provider=provider,
+                allow_create=(
+                    int(context.get("attempt_count") or 0) <= 1
+                    or not str(context.get("last_outcome") or "")
+                ),
+            )
+            provider_conflict = self._provider_target_conflict(
+                target=provider_target,
+                provider=provider,
+            )
+            if provider_conflict:
+                outcome = provider_conflict
+                delivery_extra = {"retryable": False, "invalid_token": False}
+            elif context["dispatch_mode"] == "local_apns":
                 result = self.apns_sender.send_live_activity(
                     token=context["token"],
                     event_id=event_id,
@@ -2391,6 +2744,15 @@ class PairlingPushDispatcher:
                 outcome = str(result.get("outcome") or ("sent" if sent else "failed"))
                 delivery_extra = {key: value for key, value in result.items() if key != "sent"}
             else:
+                relay_target = self._bound_retry_relay_target(
+                    retry_payload_key=retry_payload_key,
+                    device_id=device_id,
+                    device=context["device"],
+                    allow_create=(
+                        int(context.get("attempt_count") or 0) <= 1
+                        or not str(context.get("last_outcome") or "")
+                    ),
+                )
                 relay_extra = self._submit_relay_event(
                     device_id=device_id,
                     device=context["device"],
@@ -2398,7 +2760,8 @@ class PairlingPushDispatcher:
                     kind=context["kind"],
                     route=context["route"],
                     push_type="liveactivity",
-                    provider=provider,
+                    provider_target=provider_target,
+                    relay_target=relay_target,
                     extra_body={
                         "session_id": session_id,
                         "activity_event": activity_event,
@@ -2635,6 +2998,8 @@ class PairlingPushDispatcher:
             outbox_row["key_environment"] = provider.get("key_environment")
             outbox_row["retry_payload_key"] = retry_payload_key
             outbox_row["retry_payload_present"] = True
+        context["attempt_count"] = int(outbox_row.get("attempt_count") or 0)
+        context["last_outcome"] = outbox_row.get("last_outcome")
         data["updated_at"] = self.now_fn()
         return {"context": context}
 
@@ -2738,15 +3103,18 @@ class PairlingPushDispatcher:
             outcome=outcome,
             delivery_extra=delivery_extra,
         )
+        completed_at = float(self.now_fn())
         _apply_outbox_metadata(
             outbox_row,
             _live_activity_outbox_metadata(
                 context["payload"],
                 content_state=context["content_state"],
-                sent_at=float(self.now_fn()),
+                sent_at=completed_at,
                 apns_outcome=outcome,
             ),
         )
+        outbox_row["sent_at"] = completed_at
+        _refresh_outbox_attempt_freshness(outbox_row)
         event = {
             "event": context["audit_event"],
             "event_id": context["event_id"],
@@ -3076,17 +3444,46 @@ class PairlingPushDispatcher:
         kind: str,
         route: str,
         push_type: str,
-        provider: dict[str, Any],
+        provider_target: dict[str, Any],
+        relay_target: dict[str, Any],
         extra_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if relay_target.get("unbound") is True:
+            return {
+                "accepted": False,
+                "outcome": "relay_retry_identity_unbound",
+                "retryable": False,
+                "invalid_token": False,
+            }
         secret = self._secret_for_device(device_id)
         relay_pair_secret = str(secret.get("relay_pair_secret") or "").strip()
-        relay_device_id = str(device.get("relay_device_id") or secret.get("relay_device_id") or "").strip()
-        mac_install_id = str(secret.get("mac_install_id") or device.get("mac_install_id") or os.environ.get("PAIRLING_MAC_INSTALL_ID") or "").strip()
-        if not relay_pair_secret or not relay_device_id or not mac_install_id:
+        current_relay_device_id = str(
+            device.get("relay_device_id") or secret.get("relay_device_id") or ""
+        ).strip()
+        current_mac_install_id = str(
+            secret.get("mac_install_id")
+            or device.get("mac_install_id")
+            or os.environ.get("PAIRLING_MAC_INSTALL_ID")
+            or ""
+        ).strip()
+        relay_device_id = str(relay_target.get("relay_device_id") or "").strip()
+        mac_install_id = str(relay_target.get("mac_install_id") or "").strip()
+        expected_secret_hash = str(relay_target.get("relay_pair_secret_hash") or "").strip()
+        if not relay_pair_secret or not relay_device_id or not mac_install_id or not expected_secret_hash:
             return {
                 "accepted": False,
                 "outcome": "relay_pair_secret_missing",
+                "retryable": False,
+                "invalid_token": False,
+            }
+        if (
+            current_relay_device_id != relay_device_id
+            or current_mac_install_id != mac_install_id
+            or not hmac.compare_digest(_sha256_hex(relay_pair_secret), expected_secret_hash)
+        ):
+            return {
+                "accepted": False,
+                "outcome": "relay_identity_changed",
                 "retryable": False,
                 "invalid_token": False,
             }
@@ -3111,7 +3508,7 @@ class PairlingPushDispatcher:
         }
         if extra_body:
             body.update(extra_body)
-        relay_url = str(provider.get("relay_url") or "").strip()
+        relay_url = str(provider_target.get("relay_url") or "").strip()
         if not relay_url:
             return {
                 "accepted": False,
@@ -3780,7 +4177,7 @@ def _bounded_content_state(content_state: dict[str, Any], *, event_id: str, now:
         "tokens": parsed_tokens,
         "verb": str(content_state.get("verb") or "Working")[:40],
         "attentionLevel": attention,
-        "updatedAtEpoch": float(content_state.get("updatedAtEpoch") or now),
+        "updatedAtEpoch": _positive_finite_float(content_state.get("updatedAtEpoch")) or float(now),
         "eventId": str(content_state.get("eventId") or event_id)[:120],
         "sessionTitle": _bounded_optional(content_state.get("sessionTitle"), 60),
         "provider": _bounded_optional(content_state.get("provider"), 32),
@@ -3812,7 +4209,7 @@ def _live_activity_content_state(payload: dict[str, Any], *, activity_event: str
         "tokens": payload.get("tokens"),
         "verb": str(payload.get("verb") or ("Done" if activity_event == "end" else "Using")),
         "attentionLevel": payload.get("attentionLevel"),
-        "updatedAtEpoch": payload.get("updatedAtEpoch") or now,
+        "updatedAtEpoch": _positive_finite_float(payload.get("updatedAtEpoch")) or float(now),
         "eventId": event_id,
     }
 
@@ -3832,6 +4229,60 @@ def _optional_float(value: Any) -> float | None:
         return None
 
 
+def _positive_finite_float(value: Any) -> float | None:
+    parsed = _optional_float(value)
+    if parsed is None or not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
+
+
+def _normalize_retry_payload_timing(
+    payload: dict[str, Any],
+    *,
+    push_type: str,
+    stable_time: float,
+    existing_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    normalized = dict(payload)
+    existing = existing_payload if isinstance(existing_payload, dict) else {}
+    fallback_sent_at = (
+        _positive_finite_float(existing.get("sent_at"))
+        or _positive_finite_float(stable_time)
+        or 1.0
+    )
+    sent_at = _positive_finite_float(normalized.get("sent_at")) or fallback_sent_at
+    fallback_observed_at = _positive_finite_float(existing.get("observed_at")) or sent_at
+    observed_at = _positive_finite_float(normalized.get("observed_at")) or fallback_observed_at
+    normalized["sent_at"] = sent_at
+    normalized["observed_at"] = observed_at
+
+    if push_type != "liveactivity":
+        return normalized
+
+    content_state = normalized.get("content_state")
+    existing_content_state = existing.get("content_state")
+    if isinstance(content_state, dict):
+        bounded_state = dict(content_state)
+        existing_updated_at = (
+            _positive_finite_float(existing_content_state.get("updatedAtEpoch"))
+            if isinstance(existing_content_state, dict)
+            else None
+        )
+        bounded_state["updatedAtEpoch"] = (
+            _positive_finite_float(bounded_state.get("updatedAtEpoch"))
+            or existing_updated_at
+            or sent_at
+        )
+        normalized["content_state"] = bounded_state
+    else:
+        normalized["updatedAtEpoch"] = (
+            _positive_finite_float(normalized.get("updatedAtEpoch"))
+            or _positive_finite_float(existing.get("updatedAtEpoch"))
+            or sent_at
+        )
+    return normalized
+
+
 def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
     try:
         parsed = int(value)
@@ -3847,15 +4298,16 @@ def _outbox_metadata_from_payload(
     content_state: dict[str, Any] | None = None,
     apns_outcome: str | None = None,
 ) -> dict[str, Any]:
-    observed = _optional_float(payload.get("observed_at")) or sent_at
+    effective_sent_at = _positive_finite_float(payload.get("sent_at")) or sent_at
+    observed = _positive_finite_float(payload.get("observed_at")) or effective_sent_at
     freshness = payload.get("freshness_seconds_at_send", payload.get("freshness_seconds"))
     if freshness is None:
-        freshness_at_send = max(0.0, float(sent_at) - float(observed))
+        freshness_at_send = max(0.0, float(effective_sent_at) - float(observed))
     else:
         try:
             freshness_at_send = max(0.0, float(freshness))
         except (TypeError, ValueError):
-            freshness_at_send = max(0.0, float(sent_at) - float(observed))
+            freshness_at_send = max(0.0, float(effective_sent_at) - float(observed))
     content_hash = None
     if isinstance(content_state, dict):
         content_hash = _sha256_hex(_json_dump(content_state))
@@ -3864,7 +4316,7 @@ def _outbox_metadata_from_payload(
         "phase": _bounded_optional(payload.get("phase"), 32),
         "project": _bounded_optional(payload.get("project"), 60),
         "observed_at": observed,
-        "sent_at": float(sent_at),
+        "sent_at": float(effective_sent_at),
         "collapse_id": _bounded_optional(payload.get("collapse_id"), 160),
         "freshness_seconds_at_send": freshness_at_send,
         "content_state_hash": _bounded_optional(payload.get("content_state_hash"), 80) or content_hash,
@@ -3879,22 +4331,23 @@ def _live_activity_outbox_metadata(
     sent_at: float,
     apns_outcome: str | None = None,
 ) -> dict[str, Any]:
-    observed = _optional_float(payload.get("observed_at")) or sent_at
+    effective_sent_at = _positive_finite_float(payload.get("sent_at")) or sent_at
+    observed = _positive_finite_float(payload.get("observed_at")) or effective_sent_at
     freshness = payload.get("freshness_seconds")
     if freshness is None:
-        freshness_at_send = max(0.0, float(sent_at) - float(observed))
+        freshness_at_send = max(0.0, float(effective_sent_at) - float(observed))
     else:
         try:
             freshness_at_send = float(freshness)
         except (TypeError, ValueError):
-            freshness_at_send = max(0.0, float(sent_at) - float(observed))
+            freshness_at_send = max(0.0, float(effective_sent_at) - float(observed))
     bounded = _bounded_content_state(content_state, event_id=str(payload.get("event_id") or ""), now=int(sent_at))
     return {
         "source": _bounded_optional(payload.get("source"), 80),
         "phase": _bounded_optional(payload.get("phase") or bounded.get("phase"), 32),
         "project": _bounded_optional(payload.get("project") or bounded.get("project"), 60),
         "observed_at": observed,
-        "sent_at": float(sent_at),
+        "sent_at": float(effective_sent_at),
         "collapse_id": _bounded_optional(payload.get("collapse_id"), 160),
         "freshness_seconds_at_send": freshness_at_send,
         "content_state_hash": _sha256_hex(_json_dump(bounded)),
@@ -3906,6 +4359,13 @@ def _apply_outbox_metadata(row: dict[str, Any], metadata: dict[str, Any]) -> Non
     for key, value in metadata.items():
         if value is not None:
             row[key] = value
+
+
+def _refresh_outbox_attempt_freshness(row: dict[str, Any]) -> None:
+    sent_at = _positive_finite_float(row.get("sent_at"))
+    observed_at = _positive_finite_float(row.get("observed_at"))
+    if sent_at is not None and observed_at is not None:
+        row["freshness_seconds_at_send"] = max(0.0, sent_at - observed_at)
 
 
 def _live_activity_alert_body(content: dict[str, Any]) -> str:
