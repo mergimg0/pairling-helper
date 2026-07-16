@@ -68,7 +68,7 @@ OUTBOX_RETRY_DRAIN_LIMIT = 50
 OUTBOX_ACTIVE_STATES = {"pending", "sending", "credential_blocked"}
 OUTBOX_ACTIVE_GLOBAL_LIMIT = 256
 OUTBOX_ACTIVE_DEVICE_LIMIT = 128
-OUTBOX_RELAY_RETENTION_SECONDS = 24 * 60 * 60
+OUTBOX_ACTIVE_RETENTION_SECONDS = 24 * 60 * 60
 RELAY_RESPONSE_MAX_BYTES = 64 * 1024
 RELAY_NONTERMINAL_STATES = frozenset({"queued", "pending", "sending", "credential_blocked"})
 
@@ -1105,13 +1105,12 @@ class PairlingPushDispatcher:
                 cleaned += 1
         return cleaned
 
-    def _expire_relay_outbox_current(self, data: dict[str, Any], *, now: float | None = None) -> int:
+    def _expire_active_outbox_current(self, data: dict[str, Any], *, now: float | None = None) -> int:
         current = self.now_fn() if now is None else float(now)
         expired = 0
         for row in data.setdefault("delivery_outbox", []):
             if (
                 not isinstance(row, dict)
-                or row.get("provider_mode") != "relay"
                 or row.get("state") not in OUTBOX_ACTIVE_STATES
             ):
                 continue
@@ -1119,10 +1118,14 @@ class PairlingPushDispatcher:
                 created_at = float(row.get("created_at"))
             except (TypeError, ValueError):
                 continue
-            if current < created_at + OUTBOX_RELAY_RETENTION_SECONDS:
+            if current < created_at + OUTBOX_ACTIVE_RETENTION_SECONDS:
                 continue
             row["state"] = "dead_letter"
-            row["last_outcome"] = "relay_delivery_expired"
+            row["last_outcome"] = (
+                "relay_delivery_expired"
+                if row.get("provider_mode") == "relay"
+                else "credential_delivery_expired"
+            )
             row["next_attempt_at"] = None
             row["locked_at"] = None
             row["lock_id"] = None
@@ -1133,9 +1136,9 @@ class PairlingPushDispatcher:
             self._prune_terminal_outbox(data)
         return expired
 
-    def _expire_relay_deliveries(self) -> tuple[int, int]:
+    def _expire_active_deliveries(self) -> tuple[int, int]:
         expired = self._mutate_registry(
-            lambda data: self._expire_relay_outbox_current(data, now=self.now_fn())
+            lambda data: self._expire_active_outbox_current(data, now=self.now_fn())
         )
         cleaned = self._reconcile_terminal_retry_payloads() if expired else 0
         return expired, cleaned
@@ -1143,7 +1146,7 @@ class PairlingPushDispatcher:
     def drain_due_deliveries(self, *, limit: int = OUTBOX_RETRY_DRAIN_LIMIT) -> dict[str, Any]:
         """Replay persisted jobs after restart without holding a file lock during I/O."""
         bounded_limit = max(1, min(int(limit), OUTBOX_RETRY_DRAIN_LIMIT))
-        _, cleaned = self._expire_relay_deliveries()
+        _, cleaned = self._expire_active_deliveries()
         cleaned += self._reconcile_terminal_retry_payloads()
         retry_payloads = self._valid_retry_payloads()
 
@@ -1216,7 +1219,7 @@ class PairlingPushDispatcher:
         limit: int,
     ) -> list[dict[str, Any]]:
         now = self.now_fn()
-        self._expire_relay_outbox_current(data, now=now)
+        self._expire_active_outbox_current(data, now=now)
         claims: list[dict[str, Any]] = []
         for row in data.setdefault("delivery_outbox", []):
             if len(claims) >= limit or not isinstance(row, dict):
@@ -1791,7 +1794,7 @@ class PairlingPushDispatcher:
         event_id = str(payload.get("event_id") or f"{default_event_prefix}_{int(self.now_fn() * 1000)}")[:120]
         payload["event_id"] = event_id
         if retry_record is None:
-            self._expire_relay_deliveries()
+            self._expire_active_deliveries()
             retry_record = self._persist_retry_payload(
                 device_id=device_id,
                 event_id=event_id,
@@ -2311,7 +2314,7 @@ class PairlingPushDispatcher:
         event_id = str(payload.get("event_id") or f"{default_event_prefix}_{int(self.now_fn() * 1000)}")[:120]
         payload["event_id"] = event_id
         if retry_record is None:
-            self._expire_relay_deliveries()
+            self._expire_active_deliveries()
             retry_record = self._persist_retry_payload(
                 device_id=device_id,
                 event_id=event_id,
@@ -2770,7 +2773,7 @@ class PairlingPushDispatcher:
         provider: dict[str, Any],
         audit_event: str | None = None,
     ) -> dict[str, Any] | None:
-        self._expire_relay_outbox_current(data, now=self.now_fn())
+        self._expire_active_outbox_current(data, now=self.now_fn())
         row = self._find_outbox(
             data,
             device_id=device_id,
@@ -2862,7 +2865,7 @@ class PairlingPushDispatcher:
         target_activity_id: str | None = None,
     ) -> dict[str, Any]:
         now = self.now_fn()
-        self._expire_relay_outbox_current(data, now=now)
+        self._expire_active_outbox_current(data, now=now)
         row = self._find_outbox(
             data,
             device_id=device_id,
@@ -3037,12 +3040,12 @@ class PairlingPushDispatcher:
         if outcome == "credential_blocked":
             if delivery_extra.get("provider_mode") == "relay":
                 created_at = float(delivery_extra.get("created_at") or self.now_fn())
-                if self.now_fn() >= created_at + OUTBOX_RELAY_RETENTION_SECONDS:
+                if self.now_fn() >= created_at + OUTBOX_ACTIVE_RETENTION_SECONDS:
                     return "dead_letter"
             return "credential_blocked"
         if outcome in RELAY_NONTERMINAL_STATES:
             created_at = float(delivery_extra.get("created_at") or self.now_fn())
-            if self.now_fn() < created_at + OUTBOX_RELAY_RETENTION_SECONDS:
+            if self.now_fn() < created_at + OUTBOX_ACTIVE_RETENTION_SECONDS:
                 return "pending"
             return "dead_letter"
         if delivery_extra.get("retryable"):

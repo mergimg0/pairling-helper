@@ -44,6 +44,7 @@ def daemon_plist(
         "PAIRLING_RELAY_PUBLIC_KEYS": str(
             current / "companiond" / PAIRLING_RELAY_CLAIM_PUBLIC_KEY
         ),
+        "PAIRLING_RELAY_CLAIMS_REQUIRED": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
         "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
     }

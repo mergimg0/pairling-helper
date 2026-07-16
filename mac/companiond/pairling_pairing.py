@@ -1414,7 +1414,11 @@ class PairingStore:
             runtime_port = int(record.get("runtime_port") or self.runtime_port)
         except (TypeError, ValueError, OverflowError) as exc:
             raise PairingError("pair_corrupt", 500, "pair record has an invalid runtime port") from exc
-        if relay_required or attested_claim_ticket:
+        relay_ticket_required = (
+            relay_required
+            and str(record.get("purpose") or "").strip() != SMOKE_DEVICE_PURPOSE
+        )
+        if relay_ticket_required or attested_claim_ticket:
             if not attested_claim_ticket:
                 raise PairingError("attested_claim_required", 403, "relay claim ticket required")
             if relay_claim_verifier is None:
@@ -1711,7 +1715,8 @@ class PairingStore:
         relay_pair_secret = None
         relay_pair_secret_ref = None
         verification = None
-        if relay_required or attested_claim_ticket:
+        relay_ticket_required = relay_required and record_purpose != SMOKE_DEVICE_PURPOSE
+        if relay_ticket_required or attested_claim_ticket:
             if not attested_claim_ticket:
                 raise PairingError("attested_claim_required", 403, "relay claim ticket required")
             if relay_claim_verifier is None:
