@@ -3257,6 +3257,23 @@ except InstallIdentityError as exc:
 PY
 }
 
+persist_push_provider_defaults() {
+  PAIRLING_APP_SUPPORT_ROOT="$APP_SUPPORT" "$PYTHON3_BIN" - "$REPO_ROOT" "$APP_SUPPORT" <<'PY'
+import sys
+from pathlib import Path
+
+repo_root, app_support = sys.argv[1:]
+sys.path.insert(0, repo_root + "/mac/companiond")
+
+from pairling_devices import InstallIdentityError, persist_push_provider_defaults
+
+try:
+    persist_push_provider_defaults(Path(app_support))
+except InstallIdentityError as exc:
+    raise SystemExit(f"{exc.code}: {exc}") from exc
+PY
+}
+
 payload_manifest_path() {
   local candidate="$REPO_ROOT/../payload-manifest.json"
   if [[ -f "$candidate" ]]; then
@@ -4932,6 +4949,8 @@ install_runtime() {
   install_transaction_fault_point release_published
   persist_pairdrop_folder
   install_transaction_fault_point pairdrop_config_persisted
+  persist_push_provider_defaults
+  install_transaction_fault_point push_config_persisted
   if launchd_skipped && [[ "${PAIRLING_TEST_FAIL_AFTER_PAIRDROP_PERSIST:-0}" == 1 ]]; then
     log "ERROR: forced test failure after PairDrop configuration persistence" >&2
     false

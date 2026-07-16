@@ -517,6 +517,46 @@ def persist_pairdrop_root(root: Path, pairdrop_path: Path) -> Path:
     return canonical
 
 
+def persist_push_provider_defaults(
+    root: Path,
+    relay_url: str = "https://relay.pairling.dev",
+) -> dict[str, str]:
+    """Give new installs a managed push route without replacing explicit choices."""
+    support_root = Path(root)
+    payload = _read_install_config(support_root)
+    if not normalize_install_id(payload.get("install_id")):
+        raise InstallIdentityError(
+            "install_identity_config_invalid",
+            "Pairling config.json must contain an install identity before push is configured.",
+        )
+    normalized_relay_url = str(relay_url or "").strip().rstrip("/")
+    if not normalized_relay_url.startswith("https://"):
+        raise InstallIdentityError(
+            "push_relay_url_invalid",
+            "Pairling's managed relay must use an HTTPS URL.",
+        )
+
+    push = payload.get("push") if isinstance(payload.get("push"), dict) else {}
+    provider_mode = str(push.get("provider_mode") or "").strip()
+    if not provider_mode:
+        provider_mode = "relay"
+        push["provider_mode"] = provider_mode
+    if provider_mode == "relay" and not str(push.get("relay_url") or "").strip():
+        push["relay_url"] = normalized_relay_url
+    payload["push"] = push
+    _write_private_text(
+        support_root,
+        support_root / "config.json",
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        kind="config",
+        repair_invalid_regular=True,
+    )
+    return {
+        "provider_mode": provider_mode,
+        "relay_url": str(push.get("relay_url") or ""),
+    }
+
+
 @dataclass(frozen=True)
 class DeviceAuthResult:
     ok: bool

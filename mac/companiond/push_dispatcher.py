@@ -1453,7 +1453,7 @@ class PairlingPushDispatcher:
             "ok": True,
             "contract_version": CONTRACT_VERSION,
             "provider": self._provider_status(),
-            "devices": devices,
+            "devices": [_public_push_device(item) for item in devices],
             "delivery_outbox": outbox[-50:],
             "deliveries": deliveries[-100:],
             "events": payload.get("events", [])[-20:],
@@ -1496,9 +1496,27 @@ class PairlingPushDispatcher:
         last = attempts[-1] if attempts else None
         degraded = False
         reason = None
+        relay_credentials_missing = (
+            provider.get("mode") == "relay"
+            and any(
+                isinstance(device, dict)
+                and (
+                    bool(device.get("standard_push_enabled"))
+                    or bool(device.get("live_activity_enabled"))
+                )
+                and (
+                    not str(device.get("relay_device_id") or "").strip()
+                    or not str(device.get("relay_pair_secret_ref") or "").strip()
+                )
+                for device in data.get("devices", [])
+            )
+        )
         if not configured:
             degraded = True
             reason = "provider_not_configured"
+        elif relay_credentials_missing:
+            degraded = True
+            reason = "relay_credentials_missing"
         elif last is not None and last.get("outcome") not in PUSH_HEALTH_OK_OUTCOMES:
             degraded = True
             reason = "deliveries_failing"
@@ -1739,7 +1757,7 @@ class PairlingPushDispatcher:
             "device_id": device_id,
             "outcome": "ok",
         })
-        return {"ok": True, "device": device, "provider": provider}
+        return {"ok": True, "device": _public_push_device(device), "provider": provider}
 
     def record_event(self, *, device_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Record and dispatch a production standard APNs alert event."""
@@ -3574,6 +3592,15 @@ class PairlingPushDispatcher:
                 tmp.unlink()
             except FileNotFoundError:
                 pass
+
+
+def _public_push_device(device: dict[str, Any]) -> dict[str, Any]:
+    public = dict(device)
+    public["relay_pair_secret_configured"] = bool(
+        str(public.pop("relay_pair_secret_ref", "") or "").strip()
+    )
+    return public
+
 
 def _nonempty(value: str | None, field: str) -> str:
     text = str(value or "").strip()
