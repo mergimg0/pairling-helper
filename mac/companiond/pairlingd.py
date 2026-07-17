@@ -4934,15 +4934,47 @@ def _agent_registry_heartbeat_by_claude_uuid(provider: str, claude_uuid: str, *,
     if not claude_uuid:
         return False
     try:
-        with _agent_registry_conn() as conn:
-            cur = conn.execute(
-                "UPDATE agent_sessions SET last_heartbeat = ?, "
-                "terminal_tty = COALESCE(NULLIF(terminal_tty, ''), NULLIF(?, ''), ''), "
-                "pid = COALESCE(NULLIF(pid, 0), NULLIF(?, 0), 0) "
-                "WHERE provider = ? AND claude_uuid = ?",
-                (_time.time(), terminal_tty or "", int(pid or 0), provider, claude_uuid),
-            )
-            return cur.rowcount > 0
+        matched_native_ids: list[str] = []
+        with _SESSION_TOMBSTONES_LOCK:
+            with _agent_registry_conn() as conn:
+                matched = [dict(row) for row in conn.execute(
+                    "SELECT * FROM agent_sessions WHERE provider = ? AND claude_uuid = ?",
+                    (provider, claude_uuid),
+                ).fetchall()]
+                if not matched:
+                    return False
+                now = _time.time()
+                cur = conn.execute(
+                    "UPDATE agent_sessions SET last_heartbeat = ?, state = 'running', closed_at = NULL, "
+                    "terminal_tty = COALESCE(NULLIF(terminal_tty, ''), NULLIF(?, ''), ''), "
+                    "pid = COALESCE(NULLIF(pid, 0), NULLIF(?, 0), 0) "
+                    "WHERE provider = ? AND claude_uuid = ?",
+                    (now, terminal_tty or "", int(pid or 0), provider, claude_uuid),
+                )
+                for row in matched:
+                    native_id = str(row.get("native_id") or "")
+                    if not native_id:
+                        continue
+                    matched_native_ids.append(native_id)
+                    effective_tty = str(row.get("terminal_tty") or terminal_tty or "")
+                    effective_pid = int(row.get("pid") or pid or 0)
+                    if effective_tty:
+                        conn.execute(
+                            "UPDATE agent_sessions SET closed_at = ?, state = 'superseded' "
+                            "WHERE provider = ? AND native_id LIKE 'terminal-%' "
+                            "AND native_id != ? AND terminal_tty = ? AND closed_at IS NULL",
+                            (now, provider, native_id, effective_tty),
+                        )
+                    elif effective_pid:
+                        conn.execute(
+                            "UPDATE agent_sessions SET closed_at = ?, state = 'superseded' "
+                            "WHERE provider = ? AND native_id LIKE 'terminal-%' "
+                            "AND native_id != ? AND pid = ? AND closed_at IS NULL",
+                            (now, provider, native_id, effective_pid),
+                        )
+            for native_id in matched_native_ids:
+                _clear_session_tombstone_for_reopen(provider, native_id)
+        return cur.rowcount > 0
     except Exception:
         return False
 
@@ -16638,27 +16670,62 @@ class Handler(BaseHTTPRequestHandler):
                 _decorate_claude_session_row(row, native_id, claude_pid, terminal_tty)
                 row.update(self._turn_state_summary(claude_uuid))
                 _refresh_claude_observed_activity(row, row.get("project"), claude_uuid)
-                signal = self._recent_session_signal(native_id, project=row.get("project"), claude_uuid=claude_uuid)
-                row["recent_anomaly"] = signal.get("anomaly")
-                row["latest_command"] = signal.get("latest_command")
-                row["latest_edit"] = signal.get("latest_edit")
-                rows.append(self._decorate_session_lifecycle_row(row))
+                rows.append(row)
 
         if provider_filter in ("all", "codex") and "codex" in visible:
             for row in _list_codex_sessions(live_only=live_only, active_within_min=active_within_min):
-                rows.append(self._decorate_session_lifecycle_row(row))
+                rows.append(row)
 
         rows = _filter_tombstoned_session_rows(rows)
         rows = _collapse_live_session_rows_by_terminal(rows)
+        if not live_only:
+            rows.sort(key=_session_meaningful_sort_key)
+            rows = self._limit_visible_session_rows(rows, limit=limit)
+
+        enriched_rows: list[dict] = []
+        for row in rows:
+            if row.get("provider") == "claude":
+                native_id = row.get("native_id") or row.get("id") or ""
+                claude_uuid = row.get("claude_uuid") or ""
+                signal = self._recent_session_signal(
+                    native_id,
+                    project=row.get("project"),
+                    claude_uuid=claude_uuid,
+                )
+                row["recent_anomaly"] = signal.get("anomaly")
+                row["latest_command"] = signal.get("latest_command")
+                row["latest_edit"] = signal.get("latest_edit")
+            enriched_rows.append(self._decorate_session_lifecycle_row(row))
+        rows = enriched_rows
+
         if live_only:
             projected_rows = [self._strict_live_projection(row) for row in rows]
             rows = [row for row in projected_rows if row is not None]
         rows.sort(key=_session_meaningful_sort_key)
-        rows = rows[:max(1, min(int(limit or 200), 500))]
+        rows = self._limit_visible_session_rows(rows, limit=limit)
         for row in rows:
             row["runtime_truth_summary"] = self._runtime_truth_summary_for_row(row)
         _record_sessions_scan(rows)
         return rows
+
+    @classmethod
+    def _limit_visible_session_rows(cls, rows: list[dict], limit: int) -> list[dict]:
+        """Keep verified live terminals inside an archive-heavy response cap."""
+        cap = max(1, min(int(limit or 200), 500))
+        if len(rows) <= cap:
+            return rows
+
+        live_rows = [row for row in rows if cls._session_row_is_strictly_live(row)]
+        if len(live_rows) >= cap:
+            return live_rows[:cap]
+
+        live_objects = {id(row) for row in live_rows}
+        selected = live_rows + [
+            row for row in rows
+            if id(row) not in live_objects
+        ][:cap - len(live_rows)]
+        selected.sort(key=_session_meaningful_sort_key)
+        return selected
 
     def _runtime_truth_summary_for_row(self, row: dict) -> dict:
         capabilities = set(row.get("capabilities") or [])
@@ -16789,13 +16856,20 @@ class Handler(BaseHTTPRequestHandler):
         provider = row.get("provider") or "claude"
         native_id = row.get("native_id") or row.get("id") or ""
         transcript_path = None
-        if provider == "codex" and native_id:
-            transcript_path = _resolve_codex_transcript(native_id)
-        elif provider == "claude" and row.get("project") and row.get("claude_uuid"):
-            transcript_path = HOME / ".claude" / "projects" / _encode_project_dir(row["project"]) / f"{row['claude_uuid']}.jsonl"
-        stats = _session_transcript_stats(transcript_path, provider, native_id)
-        row.setdefault("turn_count", stats.get("turn_count"))
-        row["last_meaningful_turn_at"] = stats.get("last_meaningful_turn_at")
+        has_transcript_stats = (
+            "turn_count" in row and "last_meaningful_turn_at" in row
+        )
+        if not has_transcript_stats:
+            if provider == "codex" and native_id:
+                transcript_path = _resolve_codex_transcript(native_id)
+            elif provider == "claude" and row.get("project") and row.get("claude_uuid"):
+                transcript_path = HOME / ".claude" / "projects" / _encode_project_dir(row["project"]) / f"{row['claude_uuid']}.jsonl"
+            stats = _session_transcript_stats(transcript_path, provider, native_id)
+            row.setdefault("turn_count", stats.get("turn_count"))
+            row.setdefault(
+                "last_meaningful_turn_at",
+                stats.get("last_meaningful_turn_at"),
+            )
         identity = _session_workspace_identity(row.get("project"))
         row["branch"] = identity.get("branch")
         row["worktree"] = identity.get("worktree")
@@ -16941,7 +17015,6 @@ class Handler(BaseHTTPRequestHandler):
                 },
             }, status=503)
             return
-        zombie_ids: list[str] = []  # sessions whose claude_pid no longer exists
         for raw in backend_rows:
             session_id = raw["id"]
             project = raw["project"]
@@ -16951,11 +17024,9 @@ class Handler(BaseHTTPRequestHandler):
             claude_uuid = raw.get("claude_uuid") or ""
             terminal_tty = raw.get("terminal_tty") or ""
 
-            # Process-liveness GC for live=true: kill -0 the recorded pid.
-            # If it's gone, mark the row closed and exclude from response.
-            # Avoids stale buckets that fail every Send because the Terminal
-            # tab is gone. Sessions without a recorded pid (predate migration)
-            # are kept — they'll be backfilled on next hook fire.
+            # A read may exclude a row whose process cannot be proved, but one
+            # transient process-scan miss must never mutate durable identity.
+            # SessionEnd and the guarded stale sweep own registry closure.
             if live_only and claude_pid > 0:
                 if not _session_has_verified_provider_process({
                     "provider": "claude",
@@ -16963,7 +17034,6 @@ class Handler(BaseHTTPRequestHandler):
                     "terminal_tty": terminal_tty,
                     "project": project,
                 }):
-                    zombie_ids.append(session_id)
                     continue
 
             row = {
@@ -16992,11 +17062,6 @@ class Handler(BaseHTTPRequestHandler):
             rows.append(row)
 
         rows = [self._decorate_session_lifecycle_row(row) for row in rows]
-
-        # Tombstone any zombies discovered during process-liveness GC. One
-        # batch write so /sessions stays fast even with several stale rows.
-        if zombie_ids:
-            backend.tombstone_sessions(zombie_ids)
 
         if provider_filter == "all":
             if _provider_visible("codex"):
@@ -22343,7 +22408,9 @@ class Handler(BaseHTTPRequestHandler):
                     row["first_prompt"] = _peek_first_prompt(transcript)
             if project and claude_uuid:
                 transcript = HOME / ".claude" / "projects" / _encode_project_dir(project) / f"{claude_uuid}.jsonl"
-                row["turn_count"] = _session_transcript_stats(transcript, "claude", session_id).get("turn_count")
+                stats = _session_transcript_stats(transcript, "claude", session_id)
+                row["turn_count"] = stats.get("turn_count")
+                row["last_meaningful_turn_at"] = stats.get("last_meaningful_turn_at")
             rows.append(row)
         rows = _filter_tombstoned_session_rows(rows)
         with _runtime_snapshot_cache_lock:
