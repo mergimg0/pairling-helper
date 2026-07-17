@@ -1641,10 +1641,7 @@ def _broker_send_text_with_truth(
     public_session_id: str,
 ) -> tuple[dict, int | None, str | None]:
     """Send through a current broker and preserve exact write outcome truth."""
-    if _broker_atomic_control_context_for_id(
-        broker_id,
-        public_session_id=public_session_id,
-    ) is None:
+    if not _broker_is_current_runtime():
         return ({
             "ok": False,
             "reason": "broker_requires_current_runtime",
@@ -1654,6 +1651,19 @@ def _broker_send_text_with_truth(
             "write_outcome": "none",
             "outcome_indeterminate": False,
         }, None, "broker_read_only")
+    if _broker_atomic_control_context_for_id(
+        broker_id,
+        public_session_id=public_session_id,
+    ) is None:
+        return ({
+            "ok": False,
+            "reason": "broker_atomic_control_unavailable",
+            "error_code": "broker_atomic_control_unavailable",
+            "status": 409,
+            "pty_written": False,
+            "write_outcome": "none",
+            "outcome_indeterminate": False,
+        }, None, "broker_atomic_control_unavailable")
     try:
         result = PTY_BROKER.send_text(broker_id, text)
     except PTYBrokerOutcomeUnknownError as exc:
@@ -28044,7 +28054,8 @@ Worker instructions:
 
         broker_found = self._broker_session_for(_qualified_session_id("codex", native_id))
         if broker_found and PTY_BROKER:
-            broker_id, session = broker_found
+            _public_id, session = broker_found
+            broker_id = _broker_session_id(session)
             if not _broker_session_owns_identity(session, "codex", native_id):
                 self._finish_send_text_failure(
                     receipt_context,
@@ -28543,7 +28554,8 @@ Worker instructions:
             return
 
         if broker_found and PTY_BROKER:
-            broker_id, broker_session = broker_found
+            _public_id, broker_session = broker_found
+            broker_id = _broker_session_id(broker_session)
             if not _broker_session_owns_identity(broker_session, "claude", session_id):
                 self._finish_send_text_failure(
                     receipt_context,

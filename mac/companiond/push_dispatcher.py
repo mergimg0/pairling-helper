@@ -4250,9 +4250,16 @@ def _normalize_retry_payload_timing(
         or _positive_finite_float(stable_time)
         or 1.0
     )
-    sent_at = _positive_finite_float(normalized.get("sent_at")) or fallback_sent_at
-    fallback_observed_at = _positive_finite_float(existing.get("observed_at")) or sent_at
-    observed_at = _positive_finite_float(normalized.get("observed_at")) or fallback_observed_at
+    sent_at = (
+        _positive_finite_float(existing.get("sent_at"))
+        or _positive_finite_float(normalized.get("sent_at"))
+        or fallback_sent_at
+    )
+    observed_at = (
+        _positive_finite_float(existing.get("observed_at"))
+        or _positive_finite_float(normalized.get("observed_at"))
+        or sent_at
+    )
     normalized["sent_at"] = sent_at
     normalized["observed_at"] = observed_at
 
@@ -4269,15 +4276,15 @@ def _normalize_retry_payload_timing(
             else None
         )
         bounded_state["updatedAtEpoch"] = (
-            _positive_finite_float(bounded_state.get("updatedAtEpoch"))
-            or existing_updated_at
+            existing_updated_at
+            or _positive_finite_float(bounded_state.get("updatedAtEpoch"))
             or sent_at
         )
         normalized["content_state"] = bounded_state
     else:
         normalized["updatedAtEpoch"] = (
-            _positive_finite_float(normalized.get("updatedAtEpoch"))
-            or _positive_finite_float(existing.get("updatedAtEpoch"))
+            _positive_finite_float(existing.get("updatedAtEpoch"))
+            or _positive_finite_float(normalized.get("updatedAtEpoch"))
             or sent_at
         )
     return normalized

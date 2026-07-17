@@ -298,7 +298,9 @@ def standard_alert_payload(event: PushEvent) -> dict[str, Any]:
         body = _join_sentence(event.required_action, event.session_title or event.project)
     elif event.kind in {"turn_result", "deploy_result"} and event.result_summary:
         body = _join_sentence(event.result_summary, event.build_label or event.session_title or event.project)
-    elif event.kind in {"turn_failed", "tool_risk", "mac_route_risk"} and (event.risk_summary or event.current_step):
+    elif event.kind == "mac_route_risk" and event.risk_summary:
+        body = event.risk_summary
+    elif event.kind in {"turn_failed", "tool_risk"} and (event.risk_summary or event.current_step):
         body = _join_sentence(event.risk_summary or event.current_step, event.route_health or event.session_title or event.project)
     elif event.kind == "worker_pressure" and event.worker_summary:
         body = _join_sentence(event.worker_summary, event.required_action or "Review workers.")
@@ -502,7 +504,11 @@ def _title_for_event(event: PushEvent, default: str) -> str:
 
 def _join_sentence(left: str | None, right: str | None) -> str:
     if left and right:
-        return f"{left}. {right}."
+        left = left.strip()
+        right = right.strip()
+        separator = " " if left.endswith((".", "!", "?")) else ". "
+        suffix = "" if right.endswith((".", "!", "?")) else "."
+        return f"{left}{separator}{right}{suffix}"
     return left or right or ""
 
 
