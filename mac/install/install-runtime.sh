@@ -5906,6 +5906,21 @@ diagnose_runtime() {
     | "$PYTHON3_BIN" -c 'import json,sys; data=json.load(sys.stdin); print(json.dumps(data, indent=2, sort_keys=True))' || true
 }
 
+setup_usage() {
+  cat <<EOF
+usage: pairling setup [--first-run] [--ssh|--no-ssh]
+
+Installs or updates the Pairling Mac runtime, checks Pairling Connect, detects
+supported coding agents, and prepares an iPhone pairing invitation.
+
+options:
+  --first-run  Run the guided first-run flow.
+  --ssh        Enable the optional SSH gateway.
+  --no-ssh     Disable the optional SSH gateway.
+  --help, -h   Show this help without changing the Mac.
+EOF
+}
+
 usage() {
   cat <<EOF
 usage: pairling <command>
@@ -5936,12 +5951,18 @@ cmd="${1:-setup}"
 shift || true
 case "$cmd" in
   setup|install)
-    if [[ "${1:-}" == "--first-run" ]]; then
-      shift
-      "$REPO_ROOT/mac/install/bootstrap-first-run.sh" "$@"
-    else
-      install_runtime "$@"
-    fi
+    case "${1:-}" in
+      --help|-h)
+        setup_usage
+        ;;
+      --first-run)
+        shift
+        "$REPO_ROOT/mac/install/bootstrap-first-run.sh" "$@"
+        ;;
+      *)
+        install_runtime "$@"
+        ;;
+    esac
     ;;
   first-run)
     "$REPO_ROOT/mac/install/bootstrap-first-run.sh" "$@"
