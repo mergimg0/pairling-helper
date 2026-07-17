@@ -329,35 +329,19 @@ class MacHealthAlertPublisher:
         severity = str(coordinator.get("severity") or posture)[:40]
         summary = str(coordinator.get("summary") or "The paired Mac helper needs attention.")[:180]
         unsafe = not bool(health.get("ok")) or posture not in {"ready", "warning"}
-        signature = _stable_hash({"posture": posture, "severity": severity, "summary": summary})
+        observed_at = float(self.now_fn())
+        signature, payload = self._alert_payload(
+            posture=posture,
+            severity=severity,
+            summary=summary,
+            observed_at=observed_at,
+        )
         if not unsafe:
             self._last_signature = signature
             return []
         if signature == self._last_signature:
             return []
         self._last_signature = signature
-        event_id = "push_auto_mac_health_" + signature[:24]
-        event = build_push_event(
-            event_id=event_id,
-            kind="mac_route_risk",
-            source="mac-health",
-            observed_at=float(self.now_fn()),
-            phase="stale",
-            risk_level="critical" if severity == "critical" else "warning",
-            risk_summary=summary,
-            route_health=posture,
-            action_route="pairling://health",
-        )
-        payload = standard_alert_payload(event)
-        payload.update({
-            "health_posture": posture,
-            "health_severity": severity,
-            "health_summary": summary,
-            "phase": "risk",
-            "route_health": event.route_health,
-            "collapse_id": event.collapse_id,
-            "dedupe_key": event.dedupe_key,
-        })
         results: list[dict[str, Any]] = []
         for device in devices:
             key = (device["device_id"], signature)
@@ -368,6 +352,59 @@ class MacHealthAlertPublisher:
             self._last_sent_at[key] = now
             results.append(delivery)
         return results
+
+    @staticmethod
+    def _alert_payload(
+        *,
+        posture: str,
+        severity: str,
+        summary: str,
+        observed_at: float,
+    ) -> tuple[str, dict[str, Any]]:
+        state_signature = _stable_hash({
+            "posture": posture,
+            "severity": severity,
+            "summary": summary,
+        })
+        dedupe_key = state_signature[:32]
+        collapse_id = f"pairling.mac_route_risk.{dedupe_key}"
+
+        def build_payload(event_id: str) -> dict[str, Any]:
+            event = build_push_event(
+                event_id=event_id,
+                kind="mac_route_risk",
+                source="mac-health",
+                observed_at=observed_at,
+                phase="stale",
+                risk_level="critical" if severity == "critical" else "warning",
+                risk_summary=summary,
+                route_health=posture,
+                action_route="pairling://health",
+                dedupe_key=dedupe_key,
+                collapse_id=collapse_id,
+            )
+            payload = standard_alert_payload(event)
+            payload.update({
+                "health_posture": posture,
+                "health_severity": severity,
+                "health_summary": summary,
+                "phase": "risk",
+                "route_health": event.route_health,
+                "collapse_id": event.collapse_id,
+                "dedupe_key": event.dedupe_key,
+            })
+            return payload
+
+        provisional = build_payload("push_auto_mac_health_" + state_signature[:24])
+        identity = {
+            key: value
+            for key, value in provisional.items()
+            if key not in {"event_id", "observed_at", "collapse_id", "dedupe_key"}
+        }
+        content_signature = _stable_hash(identity)
+        return content_signature, build_payload(
+            "push_auto_mac_health_" + content_signature[:24]
+        )
 
     def _standard_push_devices(self) -> list[dict[str, Any]]:
         try:
