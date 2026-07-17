@@ -24,7 +24,8 @@ def fetch_connectd_status(timeout_seconds: float = 1.5) -> dict[str, Any]:
 
     req = urllib.request.Request(CONNECTD_STATUS_URL, method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+        # CONNECTD_STATUS_URL is a fixed loopback HTTP endpoint, not caller input.
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             payload = json.loads(response.read().decode("utf-8"))
     except Exception:
         return {}

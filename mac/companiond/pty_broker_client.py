@@ -7,14 +7,16 @@ import os
 import secrets
 import signal
 import socket
+import stat
 import struct
 import time
 from pathlib import Path
 from typing import Any
 
 
-_RPC_MAX_FRAME_BYTES = 8 * 1024 * 1024
+_RPC_MAX_FRAME_BYTES = 16 * 1024 * 1024
 _READ_RPC_TIMEOUT_SECONDS = 0.35
+_LARGE_SURFACE_RPC_TIMEOUT_SECONDS = 2.0
 _RETRYABLE_SOCKET_ERRNOS = {
     errno.EAGAIN,
     errno.ECONNREFUSED,
@@ -24,10 +26,24 @@ _RETRYABLE_SOCKET_ERRNOS = {
 }
 
 
+class PTYBrokerOutcomeUnknownError(RuntimeError):
+    """A mutating request may have reached the broker without a response."""
+
+
+def _secure_companion_directory(companion_dir: Path) -> None:
+    companion_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    metadata = companion_dir.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise OSError(f"broker credential path must be a real directory: {companion_dir}")
+    if metadata.st_uid != os.geteuid():
+        raise PermissionError("broker credential path must be owned by the current user")
+    os.chmod(companion_dir, 0o700, follow_symlinks=False)
+
+
 def ensure_pty_broker_token(companion_dir: Path) -> str:
     token_path = companion_dir / "pty-broker-token"
     try:
-        companion_dir.mkdir(parents=True, exist_ok=True)
+        _secure_companion_directory(companion_dir)
         if token_path.exists():
             token = token_path.read_text(encoding="utf-8").strip()
             if len(token) == 64 and all(ch in "0123456789abcdef" for ch in token):
@@ -73,9 +89,15 @@ def _read_frame(conn: socket.socket) -> dict[str, Any]:
     return value
 
 
-def _write_frame(conn: socket.socket, payload: dict[str, Any]) -> None:
+def _encode_frame(payload: dict[str, Any]) -> bytes:
     data = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    conn.sendall(struct.pack(">I", len(data)) + data)
+    if len(data) <= 0 or len(data) > _RPC_MAX_FRAME_BYTES:
+        raise ValueError("broker RPC request exceeds bounded transport limit")
+    return struct.pack(">I", len(data)) + data
+
+
+def _write_frame(conn: socket.socket, payload: dict[str, Any]) -> None:
+    conn.sendall(_encode_frame(payload))
 
 
 class PTYBrokerClient:
@@ -84,24 +106,53 @@ class PTYBrokerClient:
         self.token = token
         self.timeout = timeout
 
-    def _rpc(self, op: str, *, rpc_timeout: float | None = None, **fields) -> dict:
+    def _rpc(
+        self,
+        op: str,
+        *,
+        rpc_timeout: float | None = None,
+        mutating: bool = False,
+        **fields,
+    ) -> dict:
         request = {"op": op, "token": self.token, **fields}
+        request_frame = _encode_frame(request)
         timeout = self.timeout if rpc_timeout is None else max(0.05, float(rpc_timeout))
         deadline = time.time() + timeout
-        last_error: Exception | None = None
         while True:
+            request_may_have_reached_broker = False
+            response_received = False
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-                    conn.settimeout(max(0.05, min(1.0, deadline - time.time())))
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        raise socket.timeout("broker RPC deadline exceeded")
+                    conn.settimeout(max(0.001, remaining))
                     conn.connect(str(self.socket_path))
-                    _write_frame(conn, request)
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        raise socket.timeout("broker RPC deadline exceeded")
+                    conn.settimeout(max(0.001, remaining))
+                    # sendall can fail after a partial write. From this point a
+                    # mutating request has an unknown outcome unless the broker
+                    # returns a complete response.
+                    request_may_have_reached_broker = True
+                    conn.sendall(request_frame)
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        raise socket.timeout("broker RPC deadline exceeded")
+                    conn.settimeout(max(0.001, remaining))
                     response = _read_frame(conn)
+                    response_received = True
                 if not response.get("ok"):
                     error = response.get("error") if isinstance(response.get("error"), dict) else {}
                     raise RuntimeError(str(error.get("message") or error.get("code") or "broker RPC failed"))
                 return response
             except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError) as exc:
-                last_error = exc
+                if mutating and request_may_have_reached_broker and not response_received:
+                    raise PTYBrokerOutcomeUnknownError(
+                        f"PTY broker {op} outcome unknown after request transmission: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
                 if (
                     isinstance(exc, OSError)
                     and not isinstance(exc, (FileNotFoundError, ConnectionRefusedError, socket.timeout))
@@ -113,7 +164,12 @@ class PTYBrokerClient:
                 if time.time() >= deadline:
                     raise RuntimeError(f"PTY broker unavailable: {type(exc).__name__}: {exc}") from exc
                 time.sleep(0.05)
-            except Exception:
+            except Exception as exc:
+                if mutating and request_may_have_reached_broker and not response_received:
+                    raise PTYBrokerOutcomeUnknownError(
+                        f"PTY broker {op} outcome unknown after request transmission: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
                 raise
 
     def _read_rpc(self, op: str, **fields) -> dict:
@@ -123,6 +179,7 @@ class PTYBrokerClient:
               rows: int = 30, columns: int = 120, env: dict[str, str] | None = None) -> dict:
         return self._rpc(
             "spawn",
+            mutating=True,
             session_id=session_id,
             provider=provider,
             native_id=native_id,
@@ -142,7 +199,7 @@ class PTYBrokerClient:
     def register_alias(self, alias: str, session: str | dict) -> None:
         session_id = session.get("session_id") if isinstance(session, dict) else str(session or "")
         if session_id:
-            self._rpc("register_alias", alias=alias, session_id=session_id)
+            self._rpc("register_alias", mutating=True, alias=alias, session_id=session_id)
 
     def snapshot(self, session_id: str, public_session_id: str | None = None) -> dict | None:
         return self._read_rpc("snapshot", session_id=session_id, public_session_id=public_session_id or "").get("snapshot")
@@ -159,11 +216,29 @@ class PTYBrokerClient:
             kwargs["window_start"] = int(window_start)
         if window_size is not None:
             kwargs["window_size"] = int(window_size)
-        return self._read_rpc("snapshot_v2", **kwargs).get("surface")
+        return self._rpc(
+            "snapshot_v2",
+            rpc_timeout=min(self.timeout, _LARGE_SURFACE_RPC_TIMEOUT_SECONDS),
+            **kwargs,
+        ).get("surface")
+
+    def snapshot_pair(
+        self,
+        session_id: str,
+        public_session_id: str | None = None,
+    ) -> dict | None:
+        pair = self._rpc(
+            "snapshot_pair",
+            rpc_timeout=min(self.timeout, _LARGE_SURFACE_RPC_TIMEOUT_SECONDS),
+            session_id=session_id,
+            public_session_id=public_session_id or "",
+        ).get("pair")
+        return pair if isinstance(pair, dict) else None
 
     def delta_v2(self, session_id: str, since_generation: int, public_session_id: str | None = None) -> dict | None:
-        return self._read_rpc(
+        return self._rpc(
             "delta_v2",
+            rpc_timeout=min(self.timeout, _LARGE_SURFACE_RPC_TIMEOUT_SECONDS),
             session_id=session_id,
             since_generation=max(0, int(since_generation or 0)),
             public_session_id=public_session_id or "",
@@ -185,13 +260,16 @@ class PTYBrokerClient:
         )
 
     def control(self, session_id: str, action: dict) -> dict:
-        return self._rpc("control", session_id=session_id, action=action).get("result") or {"ok": False, "reason": "empty broker result"}
+        return self._rpc("control", mutating=True, session_id=session_id, action=action).get("result") or {"ok": False, "reason": "empty broker result"}
+
+    def interrupt(self, session_id: str) -> dict:
+        return self._rpc("interrupt", mutating=True, session_id=session_id).get("result") or {"ok": False, "reason": "empty broker result"}
 
     def send_text(self, session_id: str, text: str) -> dict:
-        return self._rpc("send_text", session_id=session_id, text=text).get("result") or {"ok": False, "reason": "empty broker result"}
+        return self._rpc("send_text", mutating=True, session_id=session_id, text=text).get("result") or {"ok": False, "reason": "empty broker result"}
 
     def terminate(self, session_id: str, sig: int = signal.SIGTERM) -> dict:
-        return self._rpc("terminate", session_id=session_id, sig=int(sig)).get("result") or {"ok": False, "reason": "empty broker result"}
+        return self._rpc("terminate", mutating=True, session_id=session_id, sig=int(sig)).get("result") or {"ok": False, "reason": "empty broker result"}
 
     def status(self) -> dict:
         status = self._read_rpc("status").get("status")

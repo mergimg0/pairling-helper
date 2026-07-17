@@ -11,9 +11,6 @@ Runtime endpoints use per-device scoped Authorization: Bearer tokens:
   GET  /transcript?session=<id>&since=<bytes>    stream transcript JSONL since byte offset
   GET  /terminal-stream?session=<id>&since=<bytes> stream live terminal output since byte offset
   GET  /corpus?since=<unix-ts>                   list transcripts modified after ts
-  POST /inject?session=<id>  body: text          queue text for next user prompt
-  POST /inject-now?session=<id> body: text       AppleScript types text into matching Terminal
-  POST /interrupt?session=<id>                   AppleScript sends Esc to matching Terminal
   GET  /session-meta?session=<id>                effort/model/type/sentinel-mode/etc
   GET  /personal-context                         contents of ~/.claude/personal-context.md
   POST /llm-route?model=sonnet|haiku  body:JSON  one-shot prompt via `claude -p` (subscription)
@@ -75,6 +72,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote, unquote
 
+_DAEMON_SCRIPT_PATH = Path(__file__).resolve()
+
 try:
     from runtime_contract import (
         AUTH_MODE as RUNTIME_AUTH_MODE,
@@ -102,7 +101,6 @@ try:
     from pairling_pairing import (
         DEFAULT_PAIR_TTL_SECONDS,
         DEFAULT_SMOKE_LEASE_TTL_SECONDS,
-        PairingAdvertiser,
         PairingError,
         PairingStore,
         ReauthStore,
@@ -135,7 +133,6 @@ except Exception:
     redacted_connectd_summary = None
     DEFAULT_PAIR_TTL_SECONDS = 180
     DEFAULT_SMOKE_LEASE_TTL_SECONDS = 600
-    PairingAdvertiser = None
     PairingError = None
     PairingStore = None
     ReauthStore = None
@@ -165,11 +162,15 @@ try:
     from runtime_manifest import (
         build_manifest_payload as _build_manifest_payload,
         build_runtime_info as _build_runtime_info,
+        classify_ptybroker_identity as _classify_ptybroker_identity,
+        ptybroker_payload_sha256 as _ptybroker_payload_sha256,
         public_runtime_info as _public_runtime_info,
     )
 except Exception:
     _build_manifest_payload = None
     _build_runtime_info = None
+    _classify_ptybroker_identity = None
+    _ptybroker_payload_sha256 = None
     _public_runtime_info = None
 
 try:
@@ -215,12 +216,14 @@ try:
         PHONE_TOOL_AVAILABILITY,
         PHONE_TOOL_WORK_QUEUE,
         audit_detail_for_tool_run,
+        current_worker_id,
         run_pairling_tool,
     )
 except Exception:
     PHONE_TOOL_AVAILABILITY = None
     PHONE_TOOL_WORK_QUEUE = None
     audit_detail_for_tool_run = None
+    current_worker_id = None
     run_pairling_tool = None
 
 try:
@@ -251,11 +254,16 @@ except Exception:
     SafetyMonitorBridge = None
 
 try:
-    from pty_broker_client import PTYBrokerClient, ensure_pty_broker_token
+    from pty_broker_client import (
+        PTYBrokerClient,
+        PTYBrokerOutcomeUnknownError,
+        ensure_pty_broker_token,
+    )
     from pty_broker_client import _read_frame as _broker_read_frame
     from pty_broker_client import _write_frame as _broker_write_frame
 except Exception:
     PTYBrokerClient = None
+    PTYBrokerOutcomeUnknownError = RuntimeError
     ensure_pty_broker_token = None
     _broker_read_frame = None
     _broker_write_frame = None
@@ -780,6 +788,18 @@ def _session_event_identity_keys(handler, raw_session: str) -> set[str]:
     canonical = _qualified_session_id(provider, canonical_native_id)
     identities.add(canonical)
 
+    registry_row = _agent_registry_get(provider, canonical_native_id)
+    durable_broker_id = _durable_broker_id_from_registry_row(
+        registry_row,
+        provider=provider,
+        native_id=canonical_native_id,
+    )
+    durable_provider, durable_native_id = _parse_agent_session_ref(
+        durable_broker_id or ""
+    )
+    if durable_provider == provider and durable_native_id:
+        identities.add(_qualified_session_id(provider, durable_native_id))
+
     broker_lookup = getattr(handler, "_broker_session_for", None)
     if callable(broker_lookup):
         try:
@@ -796,6 +816,53 @@ def _session_event_identity_keys(handler, raw_session: str) -> set[str]:
             if broker_provider == provider and broker_native_id:
                 identities.add(_qualified_session_id(provider, broker_native_id))
     return identities
+
+
+def _session_mutation_receipt_identity(handler, raw_session: str) -> tuple[str, dict | None]:
+    """Return one stable mutation scope and its exact registry row."""
+    provider, native_id = _parse_agent_session_ref(raw_session)
+    if not native_id:
+        return "", None
+    registry_row = _agent_registry_get(provider, native_id)
+    if registry_row is None:
+        registry_row = _agent_registry_row_for_broker_id(
+            provider,
+            _qualified_session_id(provider, native_id),
+        )
+    canonical_native_id = str(
+        (registry_row or {}).get("native_id") or native_id
+    )
+    durable_broker_id = _durable_broker_id_from_registry_row(
+        registry_row,
+        provider=provider,
+        native_id=canonical_native_id,
+    )
+    durable_provider, durable_native_id = _parse_agent_session_ref(
+        durable_broker_id or ""
+    )
+    if durable_provider == provider and durable_native_id:
+        return _qualified_session_id(provider, durable_native_id), registry_row
+
+    broker_lookup = getattr(handler, "_broker_session_for", None)
+    if callable(broker_lookup):
+        try:
+            broker_found = broker_lookup(
+                _qualified_session_id(provider, canonical_native_id)
+            )
+        except Exception:
+            broker_found = None
+        if broker_found:
+            _public_id, broker_session = broker_found
+            broker_id = _broker_session_id(broker_session)
+            broker_provider, broker_native_id = _parse_agent_session_ref(broker_id)
+            if broker_provider == provider and broker_native_id:
+                return _qualified_session_id(provider, broker_native_id), registry_row
+    return _qualified_session_id(provider, canonical_native_id), registry_row
+
+
+def _session_mutation_receipt_scope(handler, raw_session: str) -> str:
+    """Return one stable provider-qualified scope for a session mutation."""
+    return _session_mutation_receipt_identity(handler, raw_session)[0]
 
 
 def _session_truth_event_requires_probe(wake: dict | None, current_truth: dict | None) -> bool:
@@ -1064,7 +1131,6 @@ PAIRING_STORE = (
     if PairingStore and DEVICE_REGISTRY
     else None
 )
-PAIRING_ADVERTISER = PairingAdvertiser() if PairingAdvertiser else None
 REAUTH_STORE = ReauthStore(DEVICE_REGISTRY) if ReauthStore and DEVICE_REGISTRY else None
 _PAIRDROP_STORE_SINGLETON = None
 _PAIRDROP_STORE_SINGLETON_LOCK = threading.Lock()
@@ -1342,6 +1408,300 @@ def _broker_session_owns_identity(session, provider: str, native_id: str) -> boo
     return str(metadata.get("broker_id") or "") == broker_id
 
 
+def _broker_interrupt_for_draining_runtime(broker_id: str) -> dict:
+    """Allow exact Ctrl+C only while a same-Mac previous-runtime PTY drains."""
+    if PTY_BROKER is None:
+        return {"ok": False, "reason": "broker unavailable", "status": 503}
+    if _broker_runtime_relation() not in {"current", "stale_deferred"}:
+        return {
+            "ok": False,
+            "reason": "broker runtime identity is not verified",
+            "error_code": "broker_runtime_identity_unverified",
+            "status": 409,
+            "pty_written": False,
+            "write_outcome": "none",
+        }
+    try:
+        return PTY_BROKER.interrupt(broker_id)
+    except RuntimeError as exc:
+        message = str(exc).strip().lower()
+        drain_rpc_missing = (
+            message == "unknown broker op: interrupt"
+            or message == "unsupported broker op: interrupt"
+            or message == "unsupported op: interrupt"
+        )
+        if not drain_rpc_missing:
+            raise
+        return PTY_BROKER.control(
+            broker_id,
+            {"type": "key", "key": "ctrl_c"},
+        )
+
+
+def _broker_atomic_control_context(
+    pair: dict | None,
+    *,
+    broker_id: str = "",
+) -> dict | None:
+    """Validate the current broker's atomic v1/v2 control contract."""
+    if not isinstance(pair, dict):
+        return None
+    v1 = pair.get("v1")
+    v2 = pair.get("v2")
+    control_proof = pair.get("control_proof")
+    if not all(isinstance(value, dict) for value in (v1, v2, control_proof)):
+        return None
+    generations = [
+        v1.get("generation"),
+        v2.get("generation"),
+        control_proof.get("generation"),
+    ]
+    if not all(isinstance(value, int) and not isinstance(value, bool) for value in generations):
+        return None
+    if len(set(generations)) != 1:
+        return None
+    if type(v2.get("schema_version")) is not int or v2.get("schema_version") != 2:
+        return None
+    if v2.get("source") != "broker_vt" or v2.get("backend") != "pty_broker":
+        return None
+    capabilities = v2.get("capabilities")
+    if not isinstance(capabilities, list) or "control_receipts" not in capabilities:
+        return None
+    for value in (v2, control_proof):
+        if not str(value.get("screen_hash") or "").strip():
+            return None
+        if not str(value.get("nonce") or "").strip():
+            return None
+    proof_session_id = str(control_proof.get("session_id") or "").strip()
+    if not proof_session_id or (broker_id and proof_session_id != broker_id):
+        return None
+    return {
+        "v1": v1,
+        "v2": v2,
+        "control_proof": control_proof,
+        "broker_id": proof_session_id,
+    }
+
+
+CURRENT_PTY_BROKER_PROTOCOL_VERSION = 2
+CURRENT_PTY_BROKER_CODE_VERSION = "pty-broker-v2"
+
+
+def _broker_runtime_relation(status_override: dict | None = None) -> str:
+    """Classify the live broker against this exact verified runtime."""
+    if (
+        PTY_BROKER is None
+        or not hasattr(PTY_BROKER, "status")
+        or _classify_ptybroker_identity is None
+    ):
+        return "incompatible"
+    if status_override is None:
+        try:
+            status = PTY_BROKER.status()
+        except Exception:
+            return "incompatible"
+    else:
+        status = status_override
+    status_key = tuple(
+        status.get(key) if isinstance(status, dict) else None
+        for key in (
+            "pid",
+            "runtime_root",
+            "script_path",
+            "source_revision",
+            "protocol_version",
+            "code_version",
+            "script_sha256",
+            "payload_sha256",
+            "live_session_count",
+        )
+    )
+    now = _time.monotonic()
+    with _BROKER_RUNTIME_RELATION_CACHE_LOCK:
+        if (
+            _BROKER_RUNTIME_RELATION_CACHE["status_key"] == status_key
+            and now - float(_BROKER_RUNTIME_RELATION_CACHE["checked_at"] or 0)
+            <= BROKER_RUNTIME_RELATION_CACHE_SECONDS
+        ):
+            return str(_BROKER_RUNTIME_RELATION_CACHE["relation"])
+    runtime_info = _runtime_info_snapshot()
+    install_root = str(runtime_info.get("install_root") or "").strip()
+    source_revision = str(runtime_info.get("source_revision") or "").strip()
+    if (
+        not bool(runtime_info.get("verified"))
+        or runtime_info.get("source_dirty") is not False
+        or not install_root
+        or not source_revision
+    ):
+        relation = "incompatible"
+        with _BROKER_RUNTIME_RELATION_CACHE_LOCK:
+            _BROKER_RUNTIME_RELATION_CACHE.update(
+                status_key=status_key,
+                checked_at=now,
+                relation=relation,
+            )
+        return relation
+    runtime_root = os.path.realpath(install_root)
+    desired = {
+        "runtime_root": runtime_root,
+        "script_path": os.path.realpath(
+            os.path.join(runtime_root, "companiond", "pty_broker_service.py")
+        ),
+        "source_revision": source_revision,
+        "protocol_version": CURRENT_PTY_BROKER_PROTOCOL_VERSION,
+        "code_version": CURRENT_PTY_BROKER_CODE_VERSION,
+        "payload_sha256": (
+            _ptybroker_payload_sha256(runtime_root)
+            if _ptybroker_payload_sha256 is not None
+            else None
+        ),
+    }
+    try:
+        relation, _reasons = _classify_ptybroker_identity(status, desired)
+    except Exception:
+        relation = "incompatible"
+    if relation not in {"current", "stale_deferred"}:
+        relation = "incompatible"
+    with _BROKER_RUNTIME_RELATION_CACHE_LOCK:
+        _BROKER_RUNTIME_RELATION_CACHE.update(
+            status_key=status_key,
+            checked_at=now,
+            relation=relation,
+        )
+    return relation
+
+
+def _broker_is_current_runtime() -> bool:
+    return _broker_runtime_relation() == "current"
+
+
+def _broker_supports_current_atomic_control(
+    broker_relation: str | None = None,
+) -> bool:
+    """Return true only for the broker contract used by mutating endpoints."""
+    return bool(
+        PTY_BROKER is not None
+        and (broker_relation or _broker_runtime_relation()) == "current"
+        and hasattr(PTY_BROKER, "snapshot_pair")
+        and hasattr(PTY_BROKER, "control")
+        and hasattr(PTY_BROKER, "send_text")
+        and hasattr(PTY_BROKER, "terminate")
+    )
+
+
+def _broker_reconcile_session_after_unknown(
+    broker_id: str,
+    *,
+    provider: str,
+    native_id: str,
+    timeout_seconds: float = 2.0,
+):
+    deadline = _time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        try:
+            session = PTY_BROKER.get(broker_id) if PTY_BROKER is not None else None
+        except Exception:
+            session = None
+        if session is not None and _broker_session_owns_identity(
+            session, provider, native_id
+        ):
+            return session
+        if _time.monotonic() >= deadline:
+            return None
+        _time.sleep(0.05)
+
+
+def _broker_atomic_control_context_for_id(
+    broker_id: str,
+    *,
+    public_session_id: str = "",
+) -> dict | None:
+    if (
+        PTY_BROKER is None
+        or not broker_id
+        or not hasattr(PTY_BROKER, "snapshot_pair")
+        or not _broker_is_current_runtime()
+    ):
+        return None
+    try:
+        pair = PTY_BROKER.snapshot_pair(
+            broker_id,
+            public_session_id=public_session_id or broker_id,
+        )
+    except Exception:
+        return None
+    return _broker_atomic_control_context(pair, broker_id=broker_id)
+
+
+def _broker_send_text_with_truth(
+    broker_id: str,
+    text: str,
+    *,
+    public_session_id: str,
+) -> tuple[dict, int | None, str | None]:
+    """Send through a current broker and preserve exact write outcome truth."""
+    if _broker_atomic_control_context_for_id(
+        broker_id,
+        public_session_id=public_session_id,
+    ) is None:
+        return ({
+            "ok": False,
+            "reason": "broker_requires_current_runtime",
+            "error_code": "broker_requires_current_runtime",
+            "status": 409,
+            "pty_written": False,
+            "write_outcome": "none",
+            "outcome_indeterminate": False,
+        }, None, "broker_read_only")
+    try:
+        result = PTY_BROKER.send_text(broker_id, text)
+    except PTYBrokerOutcomeUnknownError as exc:
+        return ({
+            "ok": False,
+            "reason": "broker_apply_outcome_unknown",
+            "error_code": "broker_apply_outcome_unknown",
+            "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+            "status": 502,
+            "pty_written": None,
+            "write_outcome": "unknown",
+            "outcome_indeterminate": True,
+        }, None, "broker_response_lost")
+    except Exception as exc:
+        return ({
+            "ok": False,
+            "reason": "broker_unavailable",
+            "error_code": "broker_unavailable",
+            "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+            "status": 503,
+            "pty_written": False,
+            "write_outcome": "none",
+            "outcome_indeterminate": False,
+        }, None, "broker_unavailable")
+    if not isinstance(result, dict):
+        result = {
+            "ok": False,
+            "reason": "invalid_broker_response",
+            "error_code": "invalid_broker_response",
+            "status": 502,
+            "pty_written": None,
+            "write_outcome": "unknown",
+            "outcome_indeterminate": True,
+        }
+    source_offset_after = None
+    source_offset_reason = None
+    if result.get("ok"):
+        try:
+            tail = PTY_BROKER.raw_tail(broker_id, since=0)
+        except Exception as exc:
+            tail = None
+            source_offset_reason = f"raw_tail_unavailable:{type(exc).__name__}"
+        if tail:
+            source_offset_after = tail[1]
+        elif source_offset_reason is None:
+            source_offset_reason = "no_broker_log"
+    return result, source_offset_after, source_offset_reason
+
+
 def _broker_raw_log_path(session) -> Path | None:
     raw = _broker_value(session, "raw_log_path", None)
     if isinstance(raw, Path):
@@ -1353,6 +1713,8 @@ def _broker_raw_log_path(session) -> Path | None:
 QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 ORCHESTRATIONS_DIR.mkdir(parents=True, exist_ok=True)
 HANDOFFS_DIR.mkdir(parents=True, exist_ok=True)
+ORCHESTRATIONS_DIR.chmod(0o700)
+HANDOFFS_DIR.chmod(0o700)
 CROSS_PROVIDER_DIR.mkdir(parents=True, exist_ok=True)
 TURN_STATE_DIR.mkdir(parents=True, exist_ok=True)
 TERMINAL_CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1386,11 +1748,155 @@ def _bind_host() -> str:
         pass
     return "127.0.0.1"
 
-# Phase 4 A.3: simple per-session rate limit for /inject-now.
-# Threshold: 1 inject per session per second. Bursts of 5/second across all
+# Simple per-session rate limit for exact terminal mutations.
+# Threshold: one mutation per session per second. Bursts of five per second across all
 # sessions. Mitigates RCE blast radius if token leaks.
 import threading
 import time as _time
+
+BROKER_RUNTIME_RELATION_CACHE_SECONDS = 0.5
+_BROKER_RUNTIME_RELATION_CACHE_LOCK = threading.Lock()
+_BROKER_RUNTIME_RELATION_CACHE = {
+    "status_key": None,
+    "checked_at": 0.0,
+    "relation": "incompatible",
+}
+_PTYBROKER_HANDOVER_WORKER_LOCK = threading.Lock()
+_PTYBROKER_HANDOVER_WORKER: threading.Thread | None = None
+
+
+def _ptybroker_restart_blocker_count(status: dict) -> int | None:
+    raw = status.get("restart_blocker_count")
+    if type(raw) is not int or raw < 0:
+        return None
+    return raw
+
+
+def _ptybroker_handover_command(expected_pid: int) -> list[str] | None:
+    runtime_info = _runtime_info_snapshot()
+    if not runtime_info.get("verified"):
+        return None
+    release_root = _DAEMON_SCRIPT_PATH.parent.parent
+    reported_root = str(runtime_info.get("install_root") or "").strip()
+    if not reported_root or os.path.realpath(reported_root) != str(release_root):
+        return None
+    installer = release_root / "mac" / "install" / "install-runtime.sh"
+    try:
+        if installer.is_symlink() or not installer.is_file():
+            return None
+    except OSError:
+        return None
+    if not os.access(installer, os.X_OK):
+        return None
+    return [
+        str(installer),
+        "reconcile-ptybroker",
+        "--expected-pid",
+        str(expected_pid),
+    ]
+
+
+def _run_ptybroker_handover_reconciler(
+    *,
+    sleep_fn=None,
+    run_fn=None,
+    max_checks: int | None = None,
+) -> str:
+    """Replace one exact previous-runtime broker after its PTYs drain."""
+    sleep_fn = sleep_fn or _time.sleep
+    run_fn = run_fn or subprocess.run
+    observed_zero_pid = 0
+    zero_samples = 0
+    checks = 0
+    while max_checks is None or checks < max_checks:
+        checks += 1
+        if PTY_BROKER is None:
+            return "incompatible"
+        try:
+            status = PTY_BROKER.status()
+        except Exception:
+            observed_zero_pid = 0
+            zero_samples = 0
+            sleep_fn(1.0)
+            continue
+        relation = _broker_runtime_relation(status)
+        if relation == "current":
+            return "current"
+        if relation != "stale_deferred":
+            return "incompatible"
+        pid = status.get("pid") if isinstance(status, dict) else None
+        blockers = (
+            _ptybroker_restart_blocker_count(status)
+            if isinstance(status, dict)
+            else None
+        )
+        if type(pid) is not int or pid <= 0 or blockers is None:
+            return "incompatible"
+        if blockers != 0:
+            observed_zero_pid = 0
+            zero_samples = 0
+            sleep_fn(1.0)
+            continue
+        if pid == observed_zero_pid:
+            zero_samples += 1
+        else:
+            observed_zero_pid = pid
+            zero_samples = 1
+        if zero_samples < 2:
+            sleep_fn(0.5)
+            continue
+
+        command = _ptybroker_handover_command(pid)
+        if command is None:
+            return "runtime_unverified"
+        try:
+            completed = run_fn(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=90,
+            )
+        except (OSError, subprocess.SubprocessError):
+            completed = None
+        observed_zero_pid = 0
+        zero_samples = 0
+        with _BROKER_RUNTIME_RELATION_CACHE_LOCK:
+            _BROKER_RUNTIME_RELATION_CACHE.update(
+                status_key=None,
+                checked_at=0.0,
+                relation="incompatible",
+            )
+        if completed is not None and completed.returncode == 0:
+            sleep_fn(0.25)
+            continue
+        detail = str(getattr(completed, "stderr", "") or "")[-500:]
+        print(
+            f"[broker-handover] reconcile retry required: {detail or 'installer unavailable'}",
+            file=sys.stderr,
+            flush=True,
+        )
+        sleep_fn(2.0)
+    return "deferred"
+
+
+def _start_ptybroker_handover_reconciler() -> threading.Thread | None:
+    global _PTYBROKER_HANDOVER_WORKER
+    if PTY_BROKER is None:
+        return None
+    with _PTYBROKER_HANDOVER_WORKER_LOCK:
+        if (
+            _PTYBROKER_HANDOVER_WORKER is not None
+            and _PTYBROKER_HANDOVER_WORKER.is_alive()
+        ):
+            return _PTYBROKER_HANDOVER_WORKER
+        worker = threading.Thread(
+            target=_run_ptybroker_handover_reconciler,
+            name="pairling-ptybroker-handover",
+            daemon=True,
+        )
+        _PTYBROKER_HANDOVER_WORKER = worker
+        worker.start()
+        return worker
 
 _inject_rate_lock = threading.Lock()
 _inject_rate_state: dict[str, list[float]] = {}  # session_id -> [timestamps]
@@ -1414,6 +1920,8 @@ _proof_replay_cache = (
 SSE_MAX_EVENT_BYTES = 64 * 1024
 SSE_TRANSCRIPT_MAX_EVENT_BYTES = 256 * 1024
 SSE_TERMINAL_CHUNK_BYTES = 48 * 1024
+SSE_SURFACE_CHUNK_BYTES = 32 * 1024
+SSE_SURFACE_MAX_TRANSFER_BYTES = 32 * 1024 * 1024
 TRANSCRIPT_INITIAL_STREAM_BYTES = 900_000
 # Upper bound for the /transcript exact-range mode (max_bytes param), sized to
 # admit multi-megabyte tool-result lines without opening an unbounded read.
@@ -1496,6 +2004,66 @@ def _sse_write_json_event(wfile, event: str, payload: dict, *, max_bytes: int = 
         # Buffered writers raise ValueError after their socket has closed.
         # Treat it like the other normal client-disconnect signals.
         return False
+
+
+def _sse_write_chunked_json_event(
+    wfile,
+    event: str,
+    payload: dict,
+    *,
+    stats_key: str | None = None,
+) -> bool:
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > SSE_SURFACE_MAX_TRANSFER_BYTES:
+        return _sse_write_json_event(
+            wfile,
+            "error",
+            {
+                "reason": "surface_transfer_too_large",
+                "message": "The terminal frame exceeded Pairling's bounded transfer limit.",
+                "actual_bytes": len(encoded),
+                "max_bytes": SSE_SURFACE_MAX_TRANSFER_BYTES,
+                "retryable": True,
+            },
+        ) and False
+    digest = hashlib.sha256(encoded).hexdigest()
+    transfer_id = f"surface-{digest[:24]}"
+    chunks = [
+        encoded[index:index + SSE_SURFACE_CHUNK_BYTES]
+        for index in range(0, len(encoded), SSE_SURFACE_CHUNK_BYTES)
+    ] or [b""]
+    if not _sse_write_json_event(
+        wfile,
+        "surface_begin",
+        {
+            "transfer_id": transfer_id,
+            "surface_event": event,
+            "total_bytes": len(encoded),
+            "sha256": digest,
+            "chunk_count": len(chunks),
+        },
+    ):
+        return False
+    for index, chunk in enumerate(chunks):
+        if not _sse_write_json_event(
+            wfile,
+            "surface_chunk",
+            {
+                "transfer_id": transfer_id,
+                "index": index,
+                "b64": base64.b64encode(chunk).decode("ascii"),
+            },
+        ):
+            return False
+    if not _sse_write_json_event(
+        wfile,
+        "surface_end",
+        {"transfer_id": transfer_id},
+    ):
+        return False
+    if stats_key is not None:
+        _stream_stats_record(stats_key, len(encoded), payload)
+    return True
 
 
 # ----- Stream instrumentation (Phase 0 of the session viewer evolution) -----
@@ -1675,7 +2243,6 @@ _CLIENT_WORKFLOW_AUDIT_INTERVAL_SECONDS = 300.0
 _CLIENT_WORKFLOW_AUDIT_MAX_KEYS = 2048
 _CLIENT_APP_BUILD_HEADER = "X-Pairling-App-Build"
 _CLIENT_SOURCE_REVISION_HEADER = "X-Pairling-App-Source-Revision"
-_LAST_LEGACY_POSTURE_APP_BUILD = 210
 _FAST_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_FAST_REQUESTS)
 _REQUEST_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_REQUESTS)
 _UPLOAD_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_UPLOADS)
@@ -1739,7 +2306,7 @@ class _RuntimeAdmission:
             pass
         self._released = True
 
-PUBLIC_ENDPOINTS = {"/health", "/healthz", "/readyz", "/manifest", "/power-state", "/pair/start", "/pair/claim", "/pair/psk-claim", "/pair/psk-claim-v2", "/pair/psk-activate", "/pair/reauth-challenge", "/pair/reauth-claim"}
+PUBLIC_ENDPOINTS = {"/health", "/healthz", "/readyz", "/manifest", "/power-state", "/pair/start", "/pair/psk-claim-v2", "/pair/psk-activate", "/pair/reauth-challenge", "/pair/reauth-claim"}
 
 # Internal hook tier: loopback-only endpoints used by Claude Code hooks to
 # write the session registry without device pairing. Gated by client IP AND
@@ -1860,8 +2427,6 @@ def _discard_session_ready_event(session_id: str) -> None:
 
 POST_ONLY_ENDPOINTS = {
     "/pair/start",
-    "/pair/claim",
-    "/pair/psk-claim",
     "/pair/psk-claim-v2",
     "/pair/psk-activate",
     "/pair/reauth-challenge",
@@ -1871,9 +2436,6 @@ POST_ONLY_ENDPOINTS = {
     "/pair/bind-node",
     "/aperture-cli/open",
     "/open",
-    "/inject",
-    "/inject-now",
-    "/interrupt",
     "/llm-route",
     "/llm-route-stream",
     "/pairling-tools/run",
@@ -1921,9 +2483,6 @@ GET_OR_POST_ENDPOINTS = {
 HIGH_RISK_ENDPOINTS = {
     "/aperture-cli/open",
     "/open",
-    "/inject",
-    "/inject-now",
-    "/interrupt",
     "/llm-route",
     "/llm-route-stream",
     "/push/permission/allow",
@@ -2195,9 +2754,9 @@ def _required_scopes_for_request(path: str, method: str) -> set[str]:
         return {"pair:admin"}
     if path == "/aperture-cli/open":
         return {"pair:admin"}
-    if path in {"/inject", "/inject-now", "/send-text", "/terminal-control", "/terminal-input"}:
+    if path in {"/send-text", "/terminal-control", "/terminal-input"}:
         return {"session:send"}
-    if path in {"/interrupt", "/sigint", "/sigterm"}:
+    if path in {"/sigint", "/sigterm"}:
         return {"session:signal"}
     if path in {"/spawn-session", "/resume-session", "/cross-provider-action"}:
         return {"session:spawn"}
@@ -2309,26 +2868,20 @@ def _connectd_peer_node_id(headers) -> str:
     return value
 
 
-def _connectd_peer_provenance(headers):
+def _connectd_peer_provenance(headers) -> str:
     """Parse the connectd-injected X-Pairling-Peer-Provenance header strictly.
 
     connectd strips any client-supplied copy first, so when this header is
-    present it is trustworthy. Three outcomes, kept deliberately distinct:
+    present it is trustworthy. Missing, empty, and unknown values are invalid.
 
-    * header ABSENT -> return None. Legacy-eligible: an old connectd that sends
-      X-Pairling-Peer-Node but no provenance keeps the bearer-only bind.
     * header EXACTLY "tagged" (tag:pairling-phone minted node), "interactive"
       (untagged Pairling iOS D2 node), or "ssh_gateway" (SPEC-p5: the
       loopback SSH-tunnel gateway; carries no tailnet identity) -> return
       that exact value.
-    * header PRESENT but any other value (including empty) -> return "" as an
-      invalid sentinel. Distinct from None so a present-but-invalid value is
-      rejected, never silently downgraded to the legacy path.
+    * every other value -> return "" and refuse identity binding.
     """
     getter = headers.get if hasattr(headers, "get") else lambda key, default=None: default
-    raw = getter("X-Pairling-Peer-Provenance", None)
-    if raw is None:
-        return None
+    raw = getter("X-Pairling-Peer-Provenance", "")
     value = str(raw).strip()
     if value in ("tagged", "interactive", "ssh_gateway"):
         return value
@@ -2349,11 +2902,7 @@ def _maybe_persist_tailnet_node_id(headers, client_address, auth_result, proof_v
     node_id = _connectd_peer_node_id(headers)
     if not node_id:
         return False
-    if provenance is None:
-        # Legacy: an old connectd sent a peer-node header but no provenance.
-        # Bind after bearer auth, preserving the pre-Stage-2 behavior.
-        pass
-    elif provenance == "tagged":
+    if provenance == "tagged":
         # tag:pairling-phone minted node: bearer auth is sufficient to bind.
         pass
     elif provenance == "interactive":
@@ -2467,14 +3016,6 @@ def _validated_client_release_headers(headers) -> dict[str, str] | None:
         "app_build": app_build,
         "app_source_revision": source_revision,
     }
-
-
-def _legacy_posture_request_allowed(headers) -> bool:
-    getter = headers.get if hasattr(headers, "get") else lambda key, default=None: default
-    raw_build = str(getter(_CLIENT_APP_BUILD_HEADER, "") or "").strip()
-    if not re.fullmatch(r"[0-9]{1,12}", raw_build):
-        return False
-    return int(raw_build) <= _LAST_LEGACY_POSTURE_APP_BUILD
 
 
 def _client_workflow_route_family(path: str) -> str | None:
@@ -2810,7 +3351,10 @@ def _clear_auth_result_cache() -> None:
 def _runtime_info_snapshot() -> dict:
     if _build_runtime_info is not None:
         try:
-            return _build_runtime_info(__file__, launchd_label=RUNTIME_DAEMON_LABEL)
+            return _build_runtime_info(
+                _DAEMON_SCRIPT_PATH,
+                launchd_label=RUNTIME_DAEMON_LABEL,
+            )
         except Exception as exc:
             return {
                 "name": RUNTIME_NAME,
@@ -2818,7 +3362,7 @@ def _runtime_info_snapshot() -> dict:
                 "contract_version": RUNTIME_CONTRACT_VERSION,
                 "source_revision": "unknown",
                 "installed_at": None,
-                "install_root": str(Path(__file__).resolve().parent),
+                "install_root": str(_DAEMON_SCRIPT_PATH.parent),
                 "compat_mode": "pairling-v1",
                 "launchd_label": RUNTIME_DAEMON_LABEL,
                 "port": PORT,
@@ -2833,7 +3377,7 @@ def _runtime_info_snapshot() -> dict:
         "contract_version": RUNTIME_CONTRACT_VERSION,
         "source_revision": os.environ.get("COMPANION_SOURCE_REVISION", "unknown"),
         "installed_at": os.environ.get("COMPANION_INSTALLED_AT"),
-        "install_root": str(Path(__file__).resolve().parent),
+        "install_root": str(_DAEMON_SCRIPT_PATH.parent),
         "compat_mode": "pairling-v1",
         "launchd_label": RUNTIME_DAEMON_LABEL,
         "port": PORT,
@@ -3184,10 +3728,11 @@ def _pending_approval_capture_screen(request_nonce: str, *, timeout_s: float = 1
         return False
     deadline = _time.monotonic() + max(0.0, float(timeout_s))
     while True:
-        try:
-            snapshot = PTY_BROKER.snapshot(broker_id)
-        except Exception:
-            snapshot = None
+        context = _broker_atomic_control_context_for_id(
+            broker_id,
+            public_session_id=str(row.get("session_id") or broker_id),
+        )
+        snapshot = context.get("v2") if context is not None else None
         if isinstance(snapshot, dict) and _pending_approval_bind_screen(request_nonce, snapshot):
             return True
         if _time.monotonic() >= deadline:
@@ -3366,6 +3911,101 @@ def _permission_stale_screen_response(*, state: str, broker_id: str, code: str,
 
 
 FIRST_PROMPT_DELIVERY_TIMEOUT_SECONDS = 600.0
+FIRST_PROMPT_DELIVERY_DIR = COMPANION_DIR / "first-prompt-deliveries"
+_FIRST_PROMPT_DELIVERY_LOCK = threading.RLock()
+_FIRST_PROMPT_ACTIVE: set[str] = set()
+
+
+def _first_prompt_delivery_path(provider: str, native_id: str) -> Path:
+    key = hashlib.sha256(f"{provider}\0{native_id}".encode()).hexdigest()
+    return FIRST_PROMPT_DELIVERY_DIR / f"{key}.json"
+
+
+def _read_first_prompt_delivery(provider: str, native_id: str) -> dict | None:
+    path = _first_prompt_delivery_path(provider, native_id)
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _write_first_prompt_delivery(record: dict) -> None:
+    provider = str(record.get("provider") or "")
+    native_id = str(record.get("native_id") or "")
+    if provider not in {"claude", "codex"} or not native_id:
+        raise ValueError("invalid first-prompt delivery identity")
+    path = _first_prompt_delivery_path(provider, native_id)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    payload = {**record, "updated_at": _time.time()}
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(payload, f, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+
+def _publish_first_prompt_delivery_receipt(record: dict) -> None:
+    state = str(record.get("state") or "")
+    if state not in {"delivered", "failed", "indeterminate"}:
+        return
+    provider = str(record.get("provider") or "")
+    native_id = str(record.get("native_id") or "")
+    if provider not in {"claude", "codex"} or not native_id:
+        return
+    receipt_state = {
+        "delivered": "applied",
+        "failed": "failed",
+        "indeterminate": "indeterminate",
+    }[state]
+    receipt = _make_action_receipt(
+        client_action_id=str(record.get("client_action_id") or "") or None,
+        state=receipt_state,
+        phases=_receipt_phases(
+            validated=True,
+            applied=state == "delivered",
+            pty_written=(True if state == "delivered" else (None if state == "indeterminate" else False)),
+        ),
+        backend="first_prompt_delivery",
+    )
+    if state == "indeterminate":
+        receipt["phases"]["pty_write_state"] = "unknown"
+    _append_session_live_control_receipt(
+        device_id=str(record.get("device_id") or "") or None,
+        session_id=_qualified_session_id(provider, native_id),
+        client_action_id=str(record.get("client_action_id") or "") or None,
+        action_kind="first_prompt_delivery",
+        audit_action={"type": "first_prompt_delivery", "state": state},
+        receipt=receipt,
+    )
+
+
+def _finish_first_prompt_delivery(
+    provider: str,
+    native_id: str,
+    *,
+    state: str,
+    reason: str | None = None,
+) -> None:
+    with _FIRST_PROMPT_DELIVERY_LOCK:
+        record = _read_first_prompt_delivery(provider, native_id) or {
+            "schema_version": 1,
+            "provider": provider,
+            "native_id": native_id,
+        }
+        record["state"] = state
+        record["reason"] = reason
+        record["finished_at"] = _time.time()
+        # Once delivery is terminal, retaining the prompt text has no recovery
+        # value. Its hash remains useful for audit and replay comparison.
+        record.pop("text", None)
+        _write_first_prompt_delivery(record)
+        published_record = dict(record)
+    _publish_first_prompt_delivery_receipt(published_record)
 
 
 def _first_prompt_surface_is_ready(provider: str, snapshot: dict | None) -> bool:
@@ -3421,7 +4061,7 @@ def _send_terminal_app_text_exact(tty: str, text: str) -> dict:
     end tell
     return "ok"
     '''
-    return _run_osascript(script)
+    return _run_osascript(script, mutation_possible=True)
 
 
 def _deliver_first_prompt_now(handler, *, provider: str, native_id: str, text: str) -> dict:
@@ -3433,7 +4073,11 @@ def _deliver_first_prompt_now(handler, *, provider: str, native_id: str, text: s
         if not _broker_session_owns_identity(session, provider, native_id):
             return {"ok": False, "reason": "broker identity changed", "status": 409}
         broker_id = _broker_session_id(session)
-        result = PTY_BROKER.send_text(broker_id, text)
+        result, _source_offset, _source_reason = _broker_send_text_with_truth(
+            broker_id,
+            text,
+            public_session_id=raw_session,
+        )
         if result.get("ok"):
             control_native_id = _agent_registry_resolve_native_alias(provider, native_id)
             _agent_registry_update_control(
@@ -3455,6 +4099,21 @@ def _deliver_first_prompt_now(handler, *, provider: str, native_id: str, text: s
     reg = _agent_registry_get(provider, native_id) or _agent_registry_get(
         provider, control_native_id
     ) or {}
+    durable_broker_id = _durable_broker_id_from_registry_row(
+        reg,
+        provider=provider,
+        native_id=native_id,
+    )
+    if durable_broker_id:
+        return {
+            "ok": False,
+            "reason": "terminal broker is temporarily unavailable",
+            "error_code": "broker_unavailable",
+            "status": 503,
+            "pty_written": False,
+            "write_outcome": "none",
+            "broker_id": durable_broker_id,
+        }
     if provider == "claude":
         tty = handler._lookup_terminal_tty(native_id)
     else:
@@ -3477,15 +4136,89 @@ def _deliver_first_prompt_now(handler, *, provider: str, native_id: str, text: s
     return result
 
 
-def _schedule_first_prompt_delivery(*, provider: str, native_id: str, text: str) -> bool:
-    """Keep a spawn prompt queued until its exact provider composer is ready."""
+def _schedule_first_prompt_delivery(
+    *,
+    provider: str,
+    native_id: str,
+    text: str,
+    client_action_id: str | None = None,
+    device_id: str | None = None,
+) -> bool:
+    """Durably wait for one exact provider composer, then submit once."""
     if not text or provider not in {"claude", "codex"}:
         return False
+    delivery_key = f"{provider}:{native_id}"
+    text_hash = hashlib.sha256(text.encode()).hexdigest()
+
+    with _FIRST_PROMPT_DELIVERY_LOCK:
+        existing = _read_first_prompt_delivery(provider, native_id)
+        if existing is not None:
+            if existing.get("text_hash") != text_hash:
+                return False
+            if delivery_key in _FIRST_PROMPT_ACTIVE:
+                return True
+            if existing.get("state") in {"delivered", "indeterminate", "failed"}:
+                return False
+            if existing.get("state") == "dispatching":
+                _finish_first_prompt_delivery(
+                    provider,
+                    native_id,
+                    state="indeterminate",
+                    reason="delivery process stopped while terminal dispatch was in flight",
+                )
+                return False
+            text = str(existing.get("text") or text)
+        else:
+            _write_first_prompt_delivery({
+                "schema_version": 1,
+                "provider": provider,
+                "native_id": native_id,
+                "client_action_id": client_action_id,
+                "device_id": device_id,
+                "text": text,
+                "text_hash": text_hash,
+                "state": "pending",
+                "created_at": _time.time(),
+            })
+        _FIRST_PROMPT_ACTIVE.add(delivery_key)
+
+    def set_pending(reason: str) -> None:
+        with _FIRST_PROMPT_DELIVERY_LOCK:
+            record = _read_first_prompt_delivery(provider, native_id) or {}
+            record.update({
+                "schema_version": 1,
+                "provider": provider,
+                "native_id": native_id,
+                "client_action_id": client_action_id,
+                "device_id": record.get("device_id") or device_id,
+                "text": text,
+                "text_hash": text_hash,
+                "state": "pending",
+                "reason": reason,
+            })
+            _write_first_prompt_delivery(record)
+
+    def mark_dispatching() -> None:
+        with _FIRST_PROMPT_DELIVERY_LOCK:
+            record = _read_first_prompt_delivery(provider, native_id) or {}
+            record.update({
+                "schema_version": 1,
+                "provider": provider,
+                "native_id": native_id,
+                "client_action_id": client_action_id,
+                "device_id": record.get("device_id") or device_id,
+                "text": text,
+                "text_hash": text_hash,
+                "state": "dispatching",
+                "dispatch_started_at": _time.time(),
+            })
+            _write_first_prompt_delivery(record)
 
     def run() -> None:
         handler = object.__new__(Handler)
         deadline = _time.time() + FIRST_PROMPT_DELIVERY_TIMEOUT_SECONDS
         last_reason = "provider composer not ready"
+        terminal_state = "failed"
         try:
             while _time.time() < deadline:
                 raw_session = _qualified_session_id(provider, native_id)
@@ -3500,6 +4233,9 @@ def _schedule_first_prompt_delivery(*, provider: str, native_id: str, text: str)
                     snapshot = None
                     last_reason = str(exc)[:120]
                 if _first_prompt_surface_is_ready(provider, snapshot):
+                    # Persist this boundary before touching the terminal. A
+                    # restart from dispatching is unknown and never retried.
+                    mark_dispatching()
                     result = _deliver_first_prompt_now(
                         handler,
                         provider=provider,
@@ -3507,10 +4243,24 @@ def _schedule_first_prompt_delivery(*, provider: str, native_id: str, text: str)
                         text=text,
                     )
                     if result.get("ok"):
+                        _finish_first_prompt_delivery(
+                            provider,
+                            native_id,
+                            state="delivered",
+                            reason="terminal write confirmed",
+                        )
                         return
                     last_reason = str(result.get("reason") or "delivery failed")[:120]
-                    if int(result.get("status") or 0) in {400, 404, 409, 410}:
+                    if result.get("outcome_indeterminate") or result.get("write_outcome") in {
+                        "partial",
+                        "unknown",
+                    }:
+                        terminal_state = "indeterminate"
                         break
+                    if int(result.get("status") or 0) in {400, 404, 409, 410}:
+                        terminal_state = "failed"
+                        break
+                    set_pending(last_reason)
                 elif isinstance((snapshot or {}).get("pending_input"), dict):
                     pending = (snapshot or {}).get("pending_input") or {}
                     last_reason = f"waiting for {pending.get('kind') or pending.get('state') or 'provider input'}"
@@ -3521,10 +4271,24 @@ def _schedule_first_prompt_delivery(*, provider: str, native_id: str, text: str)
                 )
                 if reg and reg.get("closed_at"):
                     last_reason = "session closed before delivery"
+                    terminal_state = "failed"
                     break
                 _time.sleep(0.25 if deadline - _time.time() > 570 else 1.0)
         except Exception as exc:  # noqa: BLE001 - a delivery worker must not stop the daemon
             last_reason = f"{type(exc).__name__}: {str(exc)[:100]}"
+            # If the record reached dispatching, the process may have stopped
+            # after writing. Preserve that uncertainty across restart.
+            record = _read_first_prompt_delivery(provider, native_id) or {}
+            terminal_state = "indeterminate" if record.get("state") == "dispatching" else "failed"
+        finally:
+            with _FIRST_PROMPT_DELIVERY_LOCK:
+                _FIRST_PROMPT_ACTIVE.discard(delivery_key)
+        _finish_first_prompt_delivery(
+            provider,
+            native_id,
+            state=terminal_state,
+            reason=last_reason,
+        )
         print(
             f"[first-prompt] delivery stopped for {provider}:{native_id}: {last_reason}",
             file=sys.stderr,
@@ -3538,8 +4302,46 @@ def _schedule_first_prompt_delivery(*, provider: str, native_id: str, text: str)
             daemon=True,
         ).start()
     except Exception:
+        with _FIRST_PROMPT_DELIVERY_LOCK:
+            _FIRST_PROMPT_ACTIVE.discard(delivery_key)
         return False
     return True
+
+
+def _recover_pending_first_prompt_deliveries() -> None:
+    try:
+        paths = list(FIRST_PROMPT_DELIVERY_DIR.glob("*.json"))
+    except OSError:
+        return
+    for path in paths:
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        provider = str(record.get("provider") or "")
+        native_id = str(record.get("native_id") or "")
+        state = str(record.get("state") or "")
+        if state == "dispatching":
+            _finish_first_prompt_delivery(
+                provider,
+                native_id,
+                state="indeterminate",
+                reason="daemon restarted while terminal dispatch was in flight",
+            )
+            continue
+        text = str(record.get("text") or "")
+        if state == "pending" and text:
+            _schedule_first_prompt_delivery(
+                provider=provider,
+                native_id=native_id,
+                text=text,
+                client_action_id=str(record.get("client_action_id") or "") or None,
+                device_id=str(record.get("device_id") or "") or None,
+            )
+        elif state in {"delivered", "failed", "indeterminate"}:
+            _publish_first_prompt_delivery_receipt(record)
 
 
 RACES_REGISTRY_PATH = APP_SUPPORT_ROOT / "races.json"
@@ -4158,6 +4960,25 @@ def _agent_registry_row_for_broker_id(provider: str, broker_id: str) -> dict | N
     return matches[0] if len(matches) == 1 else None
 
 
+def _durable_broker_id_from_registry_row(
+    row: dict | None,
+    *,
+    provider: str,
+    native_id: str,
+) -> str | None:
+    """Return a read-only ownership hint from durable session metadata.
+
+    This hint is never enough to write to a PTY. It exists so a temporary
+    broker lookup failure cannot make a broker-owned session fall through to
+    Terminal.app control.
+    """
+    metadata = _registry_metadata_from_row(row)
+    broker_id = str(metadata.get("broker_id") or "").strip()
+    if metadata.get("capture_backend") != "pty_broker" and not broker_id:
+        return None
+    return broker_id or _qualified_session_id(provider, native_id)
+
+
 def _agent_registry_resolve_native_alias(provider: str, native_id: str) -> str:
     """Return the canonical native id for an exact broker-backed alias."""
     provider = str(provider or "").strip().lower()
@@ -4411,6 +5232,24 @@ def _session_launch_context_from_metadata(metadata: dict | None) -> dict | None:
     return None
 
 
+def _session_launch_context_for_identity(provider: str, native_id: str) -> dict | None:
+    """Resolve launch metadata only through an exact durable session identity."""
+    provider = str(provider or "").strip().lower()
+    native_id = str(native_id or "").strip()
+    if provider not in {"claude", "codex"} or not native_id:
+        return None
+
+    canonical_native_id = _agent_registry_resolve_native_alias(provider, native_id)
+    registry_row = _agent_registry_get(provider, canonical_native_id)
+    if registry_row is None and provider == "claude":
+        # Export callers may hold the transcript UUID instead of the durable
+        # session row id. This lookup is exact and rejects recency guesses.
+        registry_row = _agent_registry_get_by_claude_uuid(provider, native_id)
+    return _session_launch_context_from_metadata(
+        _registry_metadata_from_row(registry_row)
+    )
+
+
 def _append_launch_frontmatter(front: list[str], launch_context: dict | None) -> None:
     if not isinstance(launch_context, dict):
         return
@@ -4642,47 +5481,104 @@ def _signal_process_group(pid: int, sig: int) -> None:
 
 def _terminate_direct_session_process(row: dict, provider: str, pid: int) -> dict:
     """Terminate a non-broker provider process and prove that it exited."""
+    def post_signal_result(error: str, error_code: str) -> dict:
+        if not _process_alive(pid):
+            return {
+                "ok": True,
+                "error": None,
+                "error_code": None,
+                "outcome_indeterminate": False,
+            }
+        if _session_signal_target_is_verified(row, provider, pid):
+            return {
+                "ok": False,
+                "error": error,
+                "error_code": error_code,
+                "outcome_indeterminate": False,
+            }
+        return {
+            "ok": False,
+            "error": (
+                f"{provider.title()} termination started, but the process identity "
+                "changed before Pairling could confirm the final outcome"
+            ),
+            "error_code": "termination_outcome_unknown",
+            "outcome_indeterminate": True,
+        }
+
     try:
         _signal_process_group(pid, signal.SIGTERM)
     except ProcessLookupError:
-        return {"ok": True, "error": None, "error_code": None}
+        return {
+            "ok": True,
+            "error": None,
+            "error_code": None,
+            "outcome_indeterminate": False,
+        }
     except (PermissionError, OSError) as error:
         return {
             "ok": False,
             "error": f"{type(error).__name__}: {error}",
             "error_code": "signal_failed",
+            "outcome_indeterminate": False,
         }
 
-    if _wait_for_process_exit(pid, SESSION_TERMINATE_GRACE_SECONDS):
-        return {"ok": True, "error": None, "error_code": None}
+    try:
+        exited = _wait_for_process_exit(pid, SESSION_TERMINATE_GRACE_SECONDS)
+    except Exception as error:
+        return post_signal_result(
+            f"{type(error).__name__}: {error}",
+            "termination_wait_failed",
+        )
+    if exited:
+        return {
+            "ok": True,
+            "error": None,
+            "error_code": None,
+            "outcome_indeterminate": False,
+        }
 
     # Do not escalate if the PID no longer proves as this session. It may have
     # been reused, and killing a replacement process would cross identities.
     if not _session_signal_target_is_verified(row, provider, pid):
-        return {
-            "ok": False,
-            "error": f"{provider.title()} process identity changed while termination was pending",
-            "error_code": "process_identity_unverified",
-        }
+        return post_signal_result(
+            f"{provider.title()} process identity changed while termination was pending",
+            "process_identity_unverified",
+        )
 
     try:
         _signal_process_group(pid, signal.SIGKILL)
     except ProcessLookupError:
-        return {"ok": True, "error": None, "error_code": None}
-    except (PermissionError, OSError) as error:
         return {
-            "ok": False,
-            "error": f"{type(error).__name__}: {error}",
-            "error_code": "signal_failed",
+            "ok": True,
+            "error": None,
+            "error_code": None,
+            "outcome_indeterminate": False,
         }
+    except (PermissionError, OSError) as error:
+        return post_signal_result(
+            f"{type(error).__name__}: {error}",
+            "signal_failed",
+        )
 
-    if _wait_for_process_exit(pid, SESSION_TERMINATE_KILL_SECONDS):
-        return {"ok": True, "error": None, "error_code": None}
-    return {
-        "ok": False,
-        "error": f"{provider.title()} process exit could not be confirmed",
-        "error_code": "process_exit_unconfirmed",
-    }
+    try:
+        exited = _wait_for_process_exit(pid, SESSION_TERMINATE_KILL_SECONDS)
+    except Exception as error:
+        return post_signal_result(
+            f"{type(error).__name__}: {error}",
+            "termination_wait_failed",
+        )
+    if exited:
+        return {
+            "ok": True,
+            "error": None,
+            "error_code": None,
+            "outcome_indeterminate": False,
+        }
+    return post_signal_result(
+        f"{provider.title()} process exit could not be confirmed",
+        "process_exit_unconfirmed",
+    )
 
 
 # --- Fleet Live Activity: independent-freshness row cache ----------------
@@ -5791,7 +6687,7 @@ class _WarmWorker:
             "--output-format", "stream-json",
             "--include-partial-messages",
             "--model", self.model,
-            "--dangerously-skip-permissions",
+            "--tools", "",
             "--no-session-persistence",
         ]
         try:
@@ -7006,11 +7902,6 @@ CLAUDE_SESSION_CAPABILITIES = [
     "export",
     "resume",
 ]
-TERMINAL_SURFACE_CAPABILITIES = [
-    "terminal_output",
-    "terminal_surface",
-    "terminal_control",
-]
 CODEX_READ_ONLY_CAPABILITIES = [
     "transcript",
     "export",
@@ -7516,7 +8407,7 @@ def _session_transcript_stats(path: Path | str | None, provider: str, native_id:
 
 
 def _parse_agent_session_ref(raw: str) -> tuple[str, str]:
-    """Return (provider, native_id), treating legacy ids as Claude.
+    """Return (provider, native_id), treating unqualified hook ids as Claude.
 
     Unknown provider prefixes are preserved so operation boundaries can return
     explicit unsupported-provider errors instead of silently relabeling future
@@ -8612,7 +9503,13 @@ def _terminal_surface_v2_payload_from_state(session_id: str, state) -> dict:
     }
 
 
-def _terminal_surface_v2_degraded_from_v1(v1: dict, *, provider: str, native_id: str) -> dict:
+def _terminal_surface_v2_from_text_snapshot(
+    v1: dict,
+    *,
+    provider: str,
+    native_id: str,
+    degraded_reason: str | None = None,
+) -> dict:
     from terminal_screen_backend import TerminalCell, TerminalCursor, TerminalRow, TerminalScreenState
 
     rows = tuple(
@@ -8625,13 +9522,19 @@ def _terminal_surface_v2_degraded_from_v1(v1: dict, *, provider: str, native_id:
         for index, row in enumerate(v1.get("rows") or [])
     )
     dims = v1.get("dimensions") or {}
+    source = str(v1.get("source") or "terminal_app_contents")
+    reason = degraded_reason or (
+        "terminal_app_contents_is_text_only"
+        if source == "terminal_app_contents"
+        else "text_snapshot_is_not_cell_grid"
+    )
     state = TerminalScreenState(
         rows=int(dims.get("rows") or len(rows) or 0),
         columns=int(dims.get("columns") or 0),
         generation=int(v1.get("generation") or 0),
         raw_offset=0,
-        source=str(v1.get("source") or "terminal_app_contents"),
-        backend="terminal_app",
+        source=source,
+        backend="terminal_app" if source == "terminal_app_contents" else "pty_broker_text_snapshot",
         title=None,
         alternate_screen=False,
         cursor=TerminalCursor(row=None, column=None, visible=False),
@@ -8640,13 +9543,13 @@ def _terminal_surface_v2_degraded_from_v1(v1: dict, *, provider: str, native_id:
         capabilities=("text_snapshot",),
         pending_input=v1.get("pending_input"),
         pending_input_detection={
-            "status": "ran" if v1.get("pending_input") is not None else "not_applicable",
-            "parser_version": "terminal_pending_input_v1_fallback",
-            "surface": "v1_fallback",
+            "status": "ran",
+            "parser_version": "terminal_pending_input_text_snapshot_v1",
+            "surface": "text_snapshot",
             "confidence": (v1.get("pending_input") or {}).get("confidence") if isinstance(v1.get("pending_input"), dict) else None,
-            "reason": "terminal_app_contents_is_text_only",
+            "reason": reason,
         },
-        degraded_reason="terminal_app_contents_is_text_only",
+        degraded_reason=reason,
         links=None,
     )
     return _terminal_surface_v2_payload_from_state(_qualified_session_id(provider, native_id), state)
@@ -8691,6 +9594,46 @@ def _terminal_surface_v2_unavailable(*, provider: str, native_id: str, reason: s
     return _terminal_surface_v2_payload_from_state(_qualified_session_id(provider, native_id), state)
 
 
+def _direct_terminal_action_profile(
+    provider: str,
+    registry_row: dict,
+    tty: str,
+    *,
+    allowed: bool = True,
+) -> dict:
+    """Expose only the direct Terminal actions whose identity is still proven."""
+    read_only = {
+        "can_control": False,
+        "can_send_text": False,
+        "can_interrupt": False,
+        "can_terminate": False,
+        "control_profile": "read_only",
+    }
+    if not allowed or provider not in {"claude", "codex"} or not isinstance(registry_row, dict):
+        return read_only
+    if registry_row.get("closed_at") is not None:
+        return read_only
+    if not re.match(r"^/dev/ttys[0-9]{3,}$", tty or ""):
+        return read_only
+    pid = int(registry_row.get("pid") or registry_row.get("claude_pid") or 0)
+    if pid <= 0 or not _process_alive(pid):
+        return read_only
+    # Bind the recorded provider process to the exact Terminal tab before
+    # advertising any action. The endpoints repeat the identity check before
+    # signals leave the daemon, and send_text targets this exact TTY.
+    if _pid_for_tty_command(tty, provider) != pid:
+        return read_only
+    if not _session_signal_target_is_verified(registry_row, provider, pid):
+        return read_only
+    return {
+        "can_control": False,
+        "can_send_text": True,
+        "can_interrupt": True,
+        "can_terminate": True,
+        "control_profile": "direct_terminal_receipted",
+    }
+
+
 def _terminal_surface_source(raw_session: str) -> dict:
     provider, native_id = _parse_agent_session_ref(raw_session)
     qualified = _qualified_session_id(provider, native_id) if native_id else ""
@@ -8727,13 +9670,32 @@ def _terminal_surface_source(raw_session: str) -> dict:
                     PTY_BROKER.register_alias(qualified, _broker_session_id(session))
                 except Exception:
                     pass
+                broker_relation = _broker_runtime_relation()
+                current_atomic_control = (
+                    broker_relation == "current"
+                    and _broker_supports_current_atomic_control(broker_relation)
+                )
+                draining_interrupt = broker_relation == "stale_deferred"
                 return {
                     "available": True,
                     "source": "broker_vt",
                     "reason": "broker_vt",
                     "broker_id": _broker_session_id(session),
                     "tty": _broker_slave_tty(session),
-                    "can_control": True,
+                    "pid": _broker_pid(session),
+                    "can_control": current_atomic_control,
+                    "can_send_text": current_atomic_control,
+                    "can_interrupt": current_atomic_control or draining_interrupt,
+                    "can_terminate": current_atomic_control,
+                    "control_profile": (
+                        "current_atomic_v2"
+                        if current_atomic_control
+                        else (
+                            "draining_broker_interrupt_only"
+                            if draining_interrupt
+                            else "read_only"
+                        )
+                    ),
                 }
         capture_path = _terminal_capture_from_metadata(metadata)
         if capture_path and capture_path.exists():
@@ -8741,13 +9703,17 @@ def _terminal_surface_source(raw_session: str) -> dict:
             if not tty:
                 candidates = _codex_terminal_tty_candidates(reg)
                 tty = candidates[0] if candidates else ""
+            direct_actions = _direct_terminal_action_profile(
+                "codex", reg, tty, allowed=not broker_id
+            )
             return {
                 "available": True,
                 "source": "script_capture",
                 "reason": "script_capture",
                 "terminal_log": str(capture_path),
                 "tty": tty,
-                "can_control": False,
+                "pid": int(reg.get("pid") or 0),
+                **direct_actions,
             }
         tty = reg.get("terminal_tty") or ""
         if not tty:
@@ -8757,12 +9723,16 @@ def _terminal_surface_source(raw_session: str) -> dict:
             return {"available": False, "source": "unavailable", "reason": "no_terminal_tty"}
         if not re.match(r"^/dev/ttys[0-9]{3,}$", tty):
             return {"available": False, "source": "unavailable", "reason": "invalid_tty", "tty": tty}
+        direct_actions = _direct_terminal_action_profile(
+            "codex", reg, tty, allowed=not broker_id
+        )
         return {
             "available": True,
             "source": "terminal_app_contents",
             "reason": "terminal_app_contents",
             "tty": tty,
-            "can_control": True,
+            "pid": int(reg.get("pid") or 0),
+            **direct_actions,
         }
 
     if provider == "claude":
@@ -8789,13 +9759,32 @@ def _terminal_surface_source(raw_session: str) -> dict:
                     PTY_BROKER.register_alias(qualified, _broker_session_id(session))
                 except Exception:
                     pass
+                broker_relation = _broker_runtime_relation()
+                current_atomic_control = (
+                    broker_relation == "current"
+                    and _broker_supports_current_atomic_control(broker_relation)
+                )
+                draining_interrupt = broker_relation == "stale_deferred"
                 return {
                     "available": True,
                     "source": "broker_vt",
                     "reason": "broker_vt",
                     "broker_id": _broker_session_id(session),
                     "tty": _broker_slave_tty(session),
-                    "can_control": True,
+                    "pid": _broker_pid(session),
+                    "can_control": current_atomic_control,
+                    "can_send_text": current_atomic_control,
+                    "can_interrupt": current_atomic_control or draining_interrupt,
+                    "can_terminate": current_atomic_control,
+                    "control_profile": (
+                        "current_atomic_v2"
+                        if current_atomic_control
+                        else (
+                            "draining_broker_interrupt_only"
+                            if draining_interrupt
+                            else "read_only"
+                        )
+                    ),
                 }
         tty = str(reg.get("terminal_tty") or "")
         if not tty:
@@ -8804,20 +9793,28 @@ def _terminal_surface_source(raw_session: str) -> dict:
             return {"available": False, "source": "unavailable", "reason": "invalid_tty", "tty": tty}
         capture_path = _terminal_capture_for_tty(tty, reg.get("project"))
         if capture_path and capture_path.exists():
+            direct_actions = _direct_terminal_action_profile(
+                "claude", reg, tty, allowed=not broker_id
+            )
             return {
                 "available": True,
                 "source": "script_capture",
                 "reason": "script_capture",
                 "terminal_log": str(capture_path),
                 "tty": tty,
-                "can_control": True,
+                "pid": int(reg.get("pid") or 0),
+                **direct_actions,
             }
+        direct_actions = _direct_terminal_action_profile(
+            "claude", reg, tty, allowed=not broker_id
+        )
         return {
             "available": True,
             "source": "terminal_app_contents",
             "reason": "terminal_app_contents",
             "tty": tty,
-            "can_control": True,
+            "pid": int(reg.get("pid") or 0),
+            **direct_actions,
         }
 
     return {"available": False, "source": "unavailable", "reason": broker_error or "no_terminal_tty"}
@@ -8827,12 +9824,17 @@ def _terminal_surface_capabilities(raw_session: str) -> dict:
     source = _terminal_surface_source(raw_session)
     capabilities = []
     if source.get("available"):
-        capabilities.extend(TERMINAL_SURFACE_CAPABILITIES)
+        capabilities.extend(["terminal_output", "terminal_surface"])
+        if source.get("can_control"):
+            capabilities.append("terminal_control")
     return {
         **source,
         "capabilities": capabilities,
         "can_surface": bool(source.get("available")),
         "can_control": bool(source.get("can_control") and source.get("available")),
+        "can_send_text": bool(source.get("can_send_text") and source.get("available")),
+        "can_interrupt": bool(source.get("can_interrupt") and source.get("available")),
+        "can_terminate": bool(source.get("can_terminate") and source.get("available")),
     }
 
 
@@ -8931,12 +9933,13 @@ def _surface_detection(surface: dict | None, *, version: str) -> dict:
     if isinstance(surface, dict) and isinstance(surface.get("pending_input_detection"), dict):
         return dict(surface["pending_input_detection"])
     if version == "v1":
+        parser_ran = isinstance(surface, dict)
         return {
-            "status": "ran" if isinstance((surface or {}).get("pending_input"), dict) else "not_applicable",
-            "parser_version": "terminal_pending_input_v1",
+            "status": "ran" if parser_ran else "unknown",
+            "parser_version": "terminal_pending_input_v1" if parser_ran else None,
             "surface": "v1",
             "confidence": ((surface or {}).get("pending_input") or {}).get("confidence") if isinstance((surface or {}).get("pending_input"), dict) else None,
-            "reason": None,
+            "reason": None if parser_ran else "surface_missing",
         }
     return {
         "status": "unknown",
@@ -9067,6 +10070,25 @@ def _session_runtime_truth_from_parts(
     )
     v1_available = isinstance(v1_surface, dict) and v1_surface.get("source") != "unavailable"
 
+    v1_generation = v1_surface.get("generation") if isinstance(v1_surface, dict) else None
+    v2_generation = v2_surface.get("generation") if isinstance(v2_surface, dict) else None
+    generation_mismatch = bool(
+        isinstance(v1_generation, int)
+        and not isinstance(v1_generation, bool)
+        and isinstance(v2_generation, int)
+        and not isinstance(v2_generation, bool)
+        and v1_generation != v2_generation
+    )
+    if v1_available and v2_renderable and generation_mismatch:
+        contradictions.append(_truth_issue(
+            "terminal_v1_v2_generation_mismatch",
+            "error",
+            "Terminal state is inconsistent. Refresh the helper before sending input.",
+            detail=f"v1 generation {v1_generation} does not match v2 generation {v2_generation}",
+            sources=["terminal_surface_v1", "terminal_surface_v2"],
+            blocks_control=True,
+        ))
+
     if v1_available and v2_renderable and v1_pending_state != v2_pending_state:
         if "present" in {v1_pending_state, v2_pending_state} and "none" in {v1_pending_state, v2_pending_state}:
             contradictions.append(_truth_issue(
@@ -9084,20 +10106,18 @@ def _session_runtime_truth_from_parts(
         "broker_vt",
         "script_capture",
     }
-    stream_can_control = bool(stream.get("can_control"))
-
     if v2_renderable:
         selected_surface = "v2"
         selected = v2_surface or {}
         terminal_backend = str(selected.get("backend") or "unknown")
         surface_agreement = "agree"
     elif v1_available:
-        selected_surface = "v1_fallback"
+        selected_surface = "text_snapshot"
         selected = v1_surface or {}
         terminal_backend = str(selected.get("source") or "unknown")
         surface_agreement = "v2_unavailable"
         degradations.append(_truth_issue(
-            "v1_terminal_fallback",
+            "terminal_text_snapshot_fallback",
             "warning",
             "Read only fallback",
             sources=["terminal_surface_v1"],
@@ -9128,7 +10148,11 @@ def _session_runtime_truth_from_parts(
         terminal_backend = "unavailable"
         surface_agreement = "not_applicable"
 
-    if any(issue["code"] == "terminal_v1_v2_pending_input_mismatch" for issue in contradictions):
+    if any(issue["code"] == "terminal_v1_v2_generation_mismatch" for issue in contradictions):
+        selected_surface = "blocked_by_contradiction"
+        terminal_state = "contradictory"
+        surface_agreement = "render_mismatch"
+    elif any(issue["code"] == "terminal_v1_v2_pending_input_mismatch" for issue in contradictions):
         selected_surface = "blocked_by_contradiction"
         terminal_state = "contradictory"
         surface_agreement = "pending_input_mismatch"
@@ -9223,18 +10247,34 @@ def _session_runtime_truth_from_parts(
             sources=["process"],
         ))
 
+    native_broker_v2 = bool(
+        selected_surface == "v2"
+        and selected.get("source") == "broker_vt"
+        and selected.get("backend") not in {"pty_broker_text_snapshot", "terminal_app"}
+        and "control_receipts" in v2_capabilities
+    )
+    direct_terminal_actions = bool(
+        stream_source in {"terminal_app_contents", "script_capture"}
+        and stream.get("control_profile") == "direct_terminal_receipted"
+        and any(
+            stream.get(name) is True
+            for name in ("can_send_text", "can_interrupt", "can_terminate")
+        )
+    )
     if selected_surface == "v2" and terminal_state in {"live", "needs_input"}:
-        control_state = "eligible" if "control_receipts" in v2_capabilities and selected.get("screen_hash") and selected.get("nonce") else "read_only"
+        control_state = "eligible" if (
+            native_broker_v2 and selected.get("screen_hash") and selected.get("nonce")
+        ) or direct_terminal_actions else "read_only"
         blocked_reason = None if control_state == "eligible" else "surface_not_controllable"
     elif selected_surface == "live_events" and terminal_state in {"live", "needs_input"}:
-        control_state = "eligible" if stream_can_control else "read_only"
+        control_state = "eligible" if direct_terminal_actions else "read_only"
         blocked_reason = None if control_state == "eligible" else "live_events_read_only"
     elif terminal_state in {"contradictory", "degraded"}:
         control_state = "blocked"
         blocked_reason = contradictions[0]["code"] if contradictions else "terminal_surface_degraded"
-    elif selected_surface == "v1_fallback":
-        control_state = "eligible" if selected.get("screen_hash") and selected.get("nonce") else "read_only"
-        blocked_reason = None if control_state == "eligible" else "v1_fallback"
+    elif selected_surface == "text_snapshot":
+        control_state = "eligible" if direct_terminal_actions else "read_only"
+        blocked_reason = None if control_state == "eligible" else "text_snapshot_read_only"
     else:
         control_state = "unavailable"
         blocked_reason = "terminal_surface_unavailable"
@@ -9253,19 +10293,31 @@ def _session_runtime_truth_from_parts(
 
     supported_actions: list[str] = []
     if control_state == "eligible":
-        supported_actions = (
-            ["choice", "text", "key", "interrupt"]
-            if selected_surface == "v2"
-            else ["text", "interrupt"]
-        )
+        if native_broker_v2:
+            supported_actions = ["choice", "text", "key", "interrupt"]
+        elif direct_terminal_actions:
+            if stream.get("can_send_text") is True:
+                supported_actions.append("text")
+            if stream.get("can_interrupt") is True:
+                supported_actions.append("interrupt")
         process_can_terminate = bool(
             process.get("state") == "alive"
             and process.get("pid")
             and process.get("process_alive") is True
             and process.get("identity_verified") is True
         )
-        if process_can_terminate:
+        if process_can_terminate and (
+            native_broker_v2 or stream.get("can_terminate") is True
+        ):
             supported_actions.append("terminate")
+    elif (
+        stream.get("source") == "broker_vt"
+        and stream.get("can_interrupt") is True
+    ):
+        # A broker that still owns a live PTY may remain during runtime drain.
+        # Ctrl-C is intentionally independent of screen proof. No other write
+        # is advertised until the current atomic v2 broker owns the session.
+        supported_actions = ["interrupt"]
 
     control = {
         "state": control_state,
@@ -9489,7 +10541,7 @@ def _terminal_workspace_from_truth(truth: dict) -> dict:
             "included": ["session_runtime_truth", "terminal_surface_v2", "stream_diagnostics", "transcript_truth", "control_basis"],
             "lazy_streams": ["transcript-stream"],
             "fallback_streams": ["terminal-surface-stream", "terminal-stream"],
-            "v1_fallback_is_read_only": True,
+            "text_snapshot_is_read_only": True,
         },
     }
     return workspace
@@ -9511,10 +10563,9 @@ CONTROL_RECEIPT_AUDIT_PATH = HOME / ".claude" / "audit" / "control-receipts.json
 _CONTROL_RECEIPT_INSTANCE_ID = secrets.token_hex(16)
 _CONTROL_RECEIPT_SCHEMA_LOCK = threading.Lock()
 _CONTROL_RECEIPT_BOOTSTRAPPED_PATHS: set[str] = set()
-_SESSION_LIVE_RECEIPTS_LOCK = threading.Lock()
-_SESSION_LIVE_RECEIPTS: dict[str, list[dict]] = {}
-_SESSION_LIVE_RECEIPT_SEQ = 0
-_SESSION_LIVE_RECEIPT_RING_LIMIT = 500
+_ACTIVE_RECEIPTED_MUTATIONS_LOCK = threading.Lock()
+_ACTIVE_RECEIPTED_MUTATIONS: set[str] = set()
+_RECEIPTED_REQUEST_LOCAL = threading.local()
 TERMINAL_CONTROL_ALLOWED_KEYS = {
     "enter",
     "escape",
@@ -9522,6 +10573,7 @@ TERMINAL_CONTROL_ALLOWED_KEYS = {
     "down",
     "left",
     "right",
+    "tab",
     "ctrl_c",
 }
 TERMINAL_CONTROL_KEY_CODES = {
@@ -9546,7 +10598,14 @@ def _receipt_body_hash(material) -> str:
 
 
 def _receipt_key(device_id: str | None, session_id: str, client_action_id: str) -> str:
-    return "|".join([str(device_id or "legacy-device"), session_id, client_action_id])
+    normalized_device_id = str(device_id or "").strip()
+    if not normalized_device_id:
+        raise ValueError("authenticated device_id is required for mutation receipts")
+    return "|".join([normalized_device_id, session_id, client_action_id])
+
+
+def _valid_client_action_id(value: str) -> bool:
+    return re.fullmatch(r"[A-Za-z0-9_.:-]{8,128}", str(value or "")) is not None
 
 
 def _control_receipt_bootstrap_schema(conn: sqlite3.Connection) -> None:
@@ -9566,6 +10625,25 @@ def _control_receipt_bootstrap_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (device_id, session_id, client_action_id)
         )
         """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_live_receipts (
+            receipt_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            observed_at REAL NOT NULL,
+            device_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            client_action_id TEXT NOT NULL,
+            action_kind TEXT NOT NULL,
+            action_json TEXT,
+            receipt_json TEXT NOT NULL,
+            UNIQUE (device_id, session_id, client_action_id, action_kind)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS session_live_receipts_session_seq "
+        "ON session_live_receipts (session_id, receipt_seq)"
     )
 
 
@@ -9598,19 +10676,107 @@ def _control_receipt_conn():
 
 def _clear_control_receipt_ledger() -> None:
     """Test helper. Production code never discards idempotency evidence."""
+    with _ACTIVE_RECEIPTED_MUTATIONS_LOCK:
+        _ACTIVE_RECEIPTED_MUTATIONS.clear()
+    reservations = getattr(_RECEIPTED_REQUEST_LOCAL, "reservations", None)
+    if isinstance(reservations, dict):
+        reservations.clear()
     if not Path(CONTROL_RECEIPT_DB).exists():
         return
     with _control_receipt_conn() as conn:
         conn.execute("DELETE FROM control_action_receipts")
+        conn.execute("DELETE FROM session_live_receipts")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name='session_live_receipts'")
 
 
 def _session_live_receipt_aliases(session_id: str) -> set[str]:
-    aliases = {str(session_id or "").strip()}
+    if ":" not in str(session_id or ""):
+        return set()
     provider, native_id = _parse_agent_session_ref(session_id)
-    if native_id:
-        aliases.add(_qualified_session_id(provider, native_id))
-        aliases.add(native_id)
-    return {alias for alias in aliases if alias}
+    if provider not in _registered_agent_provider_ids() or not _safe_agent_native_id(native_id):
+        return set()
+    return {_qualified_session_id(provider, native_id)}
+
+
+def _session_live_receipt_event_from_row(row: sqlite3.Row) -> dict:
+    try:
+        receipt = json.loads(row["receipt_json"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        receipt = {}
+    try:
+        audit_action = json.loads(row["action_json"]) if row["action_json"] else None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        audit_action = None
+    return {
+        "receipt_seq": int(row["receipt_seq"]),
+        "observed_at": float(row["observed_at"]),
+        "device_id": str(row["device_id"] or "") or None,
+        "session_id": str(row["session_id"]),
+        "client_action_id": str(row["client_action_id"] or "") or None,
+        "action_kind": str(row["action_kind"]),
+        "action": audit_action,
+        "receipt": receipt if isinstance(receipt, dict) else {},
+    }
+
+
+def _insert_session_live_receipt(
+    conn: sqlite3.Connection,
+    *,
+    device_id: str | None,
+    session_id: str,
+    client_action_id: str | None,
+    action_kind: str,
+    receipt: dict,
+    audit_action: dict | None,
+) -> tuple[dict, bool]:
+    aliases = _session_live_receipt_aliases(session_id)
+    if len(aliases) != 1:
+        raise ValueError("session live receipt requires a provider-qualified session")
+    canonical_session_id = next(iter(aliases))
+    observed_at = _time.time()
+    normalized_device_id = str(device_id or "")
+    normalized_action_id = str(client_action_id or "")
+    action_json = (
+        json.dumps(audit_action, sort_keys=True, separators=(",", ":"))
+        if audit_action is not None
+        else None
+    )
+    receipt_json = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    inserted = conn.execute(
+        "INSERT OR IGNORE INTO session_live_receipts "
+        "(observed_at, device_id, session_id, client_action_id, action_kind, action_json, receipt_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            observed_at,
+            normalized_device_id,
+            canonical_session_id,
+            normalized_action_id,
+            action_kind,
+            action_json,
+            receipt_json,
+        ),
+    )
+    row = conn.execute(
+        "SELECT * FROM session_live_receipts "
+        "WHERE device_id=? AND session_id=? AND client_action_id=? AND action_kind=?",
+        (
+            normalized_device_id,
+            canonical_session_id,
+            normalized_action_id,
+            action_kind,
+        ),
+    ).fetchone()
+    if row is None:
+        raise sqlite3.DatabaseError("session live receipt insert was not readable")
+    return _session_live_receipt_event_from_row(row), inserted.rowcount == 1
+
+
+def _publish_session_live_receipt_event(event: dict) -> None:
+    for alias in _session_live_receipt_aliases(str(event.get("session_id") or "")):
+        _publish_session_event(f"receipts:{alias}", {
+            "type": "receipt_appended",
+            "receipt_seq": event["receipt_seq"],
+        })
 
 
 def _append_session_live_control_receipt(
@@ -9622,46 +10788,42 @@ def _append_session_live_control_receipt(
     receipt: dict,
     audit_action: dict | None = None,
 ) -> dict:
-    global _SESSION_LIVE_RECEIPT_SEQ
-    with _SESSION_LIVE_RECEIPTS_LOCK:
-        _SESSION_LIVE_RECEIPT_SEQ += 1
-        event = {
-            "receipt_seq": _SESSION_LIVE_RECEIPT_SEQ,
-            "observed_at": _time.time(),
-            "device_id": device_id,
-            "session_id": session_id,
-            "client_action_id": client_action_id,
-            "action_kind": action_kind,
-            "action": audit_action,
-            "receipt": receipt,
-        }
-        aliases = _session_live_receipt_aliases(session_id)
-        for alias in aliases:
-            ring = _SESSION_LIVE_RECEIPTS.setdefault(alias, [])
-            ring.append(event)
-            if len(ring) > _SESSION_LIVE_RECEIPT_RING_LIMIT:
-                del ring[: len(ring) - _SESSION_LIVE_RECEIPT_RING_LIMIT]
-    for alias in aliases:
-        _publish_session_event(f"receipts:{alias}", {
-            "type": "receipt_appended",
-            "receipt_seq": event["receipt_seq"],
-        })
+    with _control_receipt_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        event, inserted = _insert_session_live_receipt(
+            conn,
+            device_id=device_id,
+            session_id=session_id,
+            client_action_id=client_action_id,
+            action_kind=action_kind,
+            receipt=receipt,
+            audit_action=audit_action,
+        )
+    if inserted:
+        _publish_session_live_receipt_event(event)
     return dict(event)
 
 
-def _session_live_control_receipts_since(session_id: str, since_seq: int = 0) -> list[dict]:
-    seen: set[int] = set()
-    events: list[dict] = []
-    with _SESSION_LIVE_RECEIPTS_LOCK:
-        for alias in _session_live_receipt_aliases(session_id):
-            for event in _SESSION_LIVE_RECEIPTS.get(alias, []):
-                seq = int(event.get("receipt_seq") or 0)
-                if seq <= since_seq or seq in seen:
-                    continue
-                seen.add(seq)
-                events.append(dict(event))
-    events.sort(key=lambda event: int(event.get("receipt_seq") or 0))
-    return events
+def _session_live_control_receipts_since(
+    session_id: str,
+    since_seq: int = 0,
+    *,
+    identity_keys: set[str] | None = None,
+) -> list[dict]:
+    aliases: set[str] = set()
+    for identity in identity_keys or _session_live_receipt_aliases(session_id):
+        aliases.update(_session_live_receipt_aliases(identity))
+    if not aliases or not Path(CONTROL_RECEIPT_DB).exists():
+        return []
+    ordered_aliases = sorted(aliases)
+    placeholders = ",".join("?" for _ in ordered_aliases)
+    with _control_receipt_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM session_live_receipts WHERE session_id IN ({placeholders}) "
+            "AND receipt_seq > ? ORDER BY receipt_seq ASC LIMIT 500",
+            (*ordered_aliases, max(0, int(since_seq or 0))),
+        ).fetchall()
+    return [_session_live_receipt_event_from_row(row) for row in rows]
 
 
 def _session_live_pending_input(truth) -> dict | None:
@@ -9672,6 +10834,13 @@ def _session_live_pending_input(truth) -> dict | None:
     parser_version. Non-dict shapes are absent, never coerced into a prompt.
     """
     if not isinstance(truth, dict):
+        return None
+    control = truth.get("control") if isinstance(truth.get("control"), dict) else {}
+    if (
+        control.get("state") != "eligible"
+        or control.get("basis_surface") != "v2"
+        or control.get("schema_version") != 2
+    ):
         return None
     terminal = truth.get("terminal") if isinstance(truth.get("terminal"), dict) else {}
     v2 = terminal.get("v2") if isinstance(terminal.get("v2"), dict) else {}
@@ -9695,7 +10864,17 @@ def _session_live_pending_input(truth) -> dict | None:
         "nonce": v2.get("nonce"),
         "generation": v2.get("generation"),
     }
-    return {"pending_input": pending, "detection": detection, "screen": screen}
+    return {
+        "pending_input": pending,
+        "detection": detection,
+        "screen": screen,
+        "control": {
+            "state": "eligible",
+            "basis_surface": "v2",
+            "schema_version": 2,
+            "supported_actions": list(control.get("supported_actions") or []),
+        },
+    }
 
 
 def _session_live_pending_approval(provider: str, native_id: str) -> dict | None:
@@ -9754,13 +10933,18 @@ def _session_live_pending_approval(provider: str, native_id: str) -> dict | None
     }
 
 
-def _receipt_phases(*, validated: bool, applied: bool, pty_written: bool) -> dict:
-    return {
+def _receipt_phases(*, validated: bool, applied: bool, pty_written: bool | None) -> dict:
+    phases = {
         "received": True,
         "validated": bool(validated),
         "applied": bool(applied),
-        "pty_written": bool(pty_written),
     }
+    if pty_written is None:
+        phases["pty_written"] = None
+        phases["pty_write_state"] = "unknown"
+    else:
+        phases["pty_written"] = bool(pty_written)
+    return phases
 
 
 def _make_action_receipt(
@@ -9794,6 +10978,91 @@ def _make_action_receipt(
     return {k: v for k, v in receipt.items() if v is not None}
 
 
+def _receipt_attach_response(
+    receipt: dict,
+    *,
+    http_status: int,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    fields: dict | None = None,
+) -> dict:
+    receipt["http_status"] = int(http_status)
+    if error_code:
+        receipt["error_code"] = str(error_code)
+    if error_message:
+        receipt["error_message"] = str(error_message)
+    if fields:
+        receipt["response_fields"] = {
+            key: value for key, value in fields.items() if value is not None
+        }
+    return receipt
+
+
+def _receipt_replay_response(receipt: dict, base: dict) -> tuple[dict, int]:
+    body = dict(base)
+    body["receipt"] = receipt
+    status = int(receipt.get("http_status") or 200)
+    error_code = str(receipt.get("error_code") or "").strip()
+    error_message = str(receipt.get("error_message") or "").strip()
+    if error_code:
+        body["error_code"] = error_code
+        body["error"] = {
+            "code": error_code,
+            "message": error_message or error_code.replace("_", " "),
+        }
+    response_fields = receipt.get("response_fields")
+    if isinstance(response_fields, dict):
+        body.update(response_fields)
+    return body, status
+
+
+def _finalize_spawn_action(
+    *,
+    device_id: str | None,
+    provider: str,
+    client_action_id: str | None,
+    body_hash: str,
+    state: str,
+    http_status: int,
+    backend: str,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    fields: dict | None = None,
+) -> dict:
+    receipt = _make_action_receipt(
+        client_action_id=client_action_id,
+        state=state,
+        phases=_receipt_phases(
+            validated=state != "rejected",
+            applied=state == "applied",
+            pty_written=False,
+        ),
+        backend=backend,
+    )
+    _receipt_attach_response(
+        receipt,
+        http_status=http_status,
+        error_code=error_code,
+        error_message=error_message,
+        fields=fields,
+    )
+    _store_action_receipt(
+        device_id,
+        "spawn_session",
+        client_action_id,
+        body_hash,
+        receipt,
+        action_kind="spawn_session",
+        audit_action={
+            "type": "spawn_session",
+            "provider": provider,
+            "state": state,
+            "error_code": error_code,
+        },
+    )
+    return receipt
+
+
 def _append_control_receipt_audit(entry: dict) -> None:
     try:
         CONTROL_RECEIPT_AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -9801,6 +11070,89 @@ def _append_control_receipt_audit(entry: dict) -> None:
             f.write(json.dumps(entry, sort_keys=True) + "\n")
     except Exception:
         pass
+
+
+def _track_request_receipt_reservation(context: dict) -> None:
+    reservations = getattr(_RECEIPTED_REQUEST_LOCAL, "reservations", None)
+    if not isinstance(reservations, dict):
+        return
+    reservations[str(context["reservation_key"])] = dict(context)
+
+
+def _untrack_request_receipt_reservation(reservation_key: str) -> None:
+    reservations = getattr(_RECEIPTED_REQUEST_LOCAL, "reservations", None)
+    if isinstance(reservations, dict):
+        reservations.pop(reservation_key, None)
+
+
+def _finalize_abandoned_request_receipts(reservations: dict[str, dict]) -> None:
+    """Fail closed when a request leaves a reserved mutation unfinished."""
+    for reservation_key, context in list(reservations.items()):
+        receipt = _make_action_receipt(
+            client_action_id=context.get("client_action_id"),
+            state="indeterminate",
+            phases=_receipt_phases(
+                validated=False,
+                applied=False,
+                pty_written=None,
+            ),
+        )
+        _receipt_attach_response(
+            receipt,
+            http_status=409,
+            error_code="action_outcome_unknown",
+            error_message=(
+                "the request stopped before this action outcome was recorded; "
+                "check current state before starting a new attempt"
+            ),
+        )
+        try:
+            _store_action_receipt(
+                context.get("device_id"),
+                str(context.get("session_id") or ""),
+                context.get("client_action_id"),
+                str(context.get("body_hash") or ""),
+                receipt,
+                action_kind=str(context.get("action_kind") or "mutation"),
+                audit_action={"type": "abandoned_request_reconciled"},
+            )
+        except Exception as exc:
+            # The ledger itself may be unavailable. The active marker is still
+            # removed by _store_action_receipt, so the next retry reconciles the
+            # durable in-progress row instead of waiting until daemon restart.
+            _append_control_receipt_audit({
+                "ts": _time.time(),
+                "device_id": context.get("device_id"),
+                "session_id": context.get("session_id"),
+                "client_action_id": context.get("client_action_id"),
+                "action_kind": context.get("action_kind"),
+                "body_hash": context.get("body_hash"),
+                "action": {"type": "abandoned_request_reconcile_failed"},
+                "persisted": False,
+                "error": type(exc).__name__,
+                "receipt": receipt,
+            })
+        finally:
+            reservations.pop(reservation_key, None)
+
+
+@contextmanager
+def _receipted_request_scope():
+    """Own every mutation reservation created by one request thread."""
+    previous = getattr(_RECEIPTED_REQUEST_LOCAL, "reservations", None)
+    reservations: dict[str, dict] = {}
+    _RECEIPTED_REQUEST_LOCAL.reservations = reservations
+    try:
+        yield
+    finally:
+        _finalize_abandoned_request_receipts(reservations)
+        if previous is None:
+            try:
+                delattr(_RECEIPTED_REQUEST_LOCAL, "reservations")
+            except AttributeError:
+                pass
+        else:
+            _RECEIPTED_REQUEST_LOCAL.reservations = previous
 
 
 def _receipt_duplicate_response(
@@ -9813,8 +11165,14 @@ def _receipt_duplicate_response(
 ) -> tuple[dict | None, dict | None]:
     if not client_action_id:
         return None, None
-    normalized_device_id = str(device_id or "legacy-device")
+    normalized_device_id = str(device_id or "").strip()
+    if not normalized_device_id:
+        raise ValueError("authenticated device_id is required for mutation receipts")
     now = _time.time()
+    inserted_reservation = False
+    reservation_key = _receipt_key(device_id, session_id, client_action_id)
+    active_marker_added = False
+    existing = None
     try:
         with _control_receipt_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -9835,18 +11193,27 @@ def _receipt_duplicate_response(
                 ),
             )
             if inserted.rowcount == 1:
-                return None, None
-            existing = conn.execute(
-                "SELECT * FROM control_action_receipts "
-                "WHERE device_id=? AND session_id=? AND client_action_id=?",
-                (normalized_device_id, session_id, client_action_id),
-            ).fetchone()
+                inserted_reservation = True
+                # Publish same-process ownership before the reservation commit.
+                # A duplicate can read the row as soon as that commit lands.
+                with _ACTIVE_RECEIPTED_MUTATIONS_LOCK:
+                    _ACTIVE_RECEIPTED_MUTATIONS.add(reservation_key)
+                active_marker_added = True
+            else:
+                existing = conn.execute(
+                    "SELECT * FROM control_action_receipts "
+                    "WHERE device_id=? AND session_id=? AND client_action_id=?",
+                    (normalized_device_id, session_id, client_action_id),
+                ).fetchone()
     except (OSError, sqlite3.Error) as exc:
+        if active_marker_added:
+            with _ACTIVE_RECEIPTED_MUTATIONS_LOCK:
+                _ACTIVE_RECEIPTED_MUTATIONS.discard(reservation_key)
         receipt = _make_action_receipt(
             client_action_id=client_action_id,
-            state="rejected",
+            state="indeterminate",
             deduped=True,
-            phases=_receipt_phases(validated=False, applied=False, pty_written=False),
+            phases=_receipt_phases(validated=False, applied=False, pty_written=None),
         )
         return None, {
             "ok": False,
@@ -9855,6 +11222,16 @@ def _receipt_duplicate_response(
             "error": {"code": "idempotency_unavailable", "message": f"action ledger unavailable: {type(exc).__name__}"},
             "status": 503,
         }
+    if inserted_reservation:
+        _track_request_receipt_reservation({
+            "reservation_key": reservation_key,
+            "device_id": device_id,
+            "session_id": session_id,
+            "client_action_id": client_action_id,
+            "body_hash": body_hash,
+            "action_kind": action_kind,
+        })
+        return None, None
     if existing is None:
         return None, None
     if existing["body_hash"] != body_hash or existing["action_kind"] != action_kind:
@@ -9874,6 +11251,43 @@ def _receipt_duplicate_response(
         }
     if existing["state"] != "final":
         restarted = existing["owner_instance"] != _CONTROL_RECEIPT_INSTANCE_ID
+        reservation_key = _receipt_key(device_id, session_id, client_action_id)
+        with _ACTIVE_RECEIPTED_MUTATIONS_LOCK:
+            active_here = reservation_key in _ACTIVE_RECEIPTED_MUTATIONS
+        if restarted or not active_here:
+            receipt = _make_action_receipt(
+                client_action_id=client_action_id,
+                state="indeterminate",
+                deduped=True,
+                phases=_receipt_phases(
+                    validated=False,
+                    applied=False,
+                    pty_written=None,
+                ),
+            )
+            _receipt_attach_response(
+                receipt,
+                http_status=409,
+                error_code="action_outcome_unknown",
+                error_message=(
+                    "the daemon restarted before this action outcome was recorded; "
+                    "check current state before starting a new attempt"
+                    if restarted
+                    else "the action stopped before its outcome was recorded; "
+                    "check current state before starting a new attempt"
+                ),
+            )
+            _store_action_receipt(
+                device_id,
+                session_id,
+                client_action_id,
+                body_hash,
+                receipt,
+                action_kind=action_kind,
+                audit_action={"type": "abandoned_action_reconciled"},
+                allow_owner_takeover=restarted,
+            )
+            return receipt, None
         code = "action_outcome_unknown" if restarted else "action_in_progress"
         message = (
             "the daemon restarted before this action outcome was recorded; refresh before trying another action"
@@ -9882,9 +11296,9 @@ def _receipt_duplicate_response(
         )
         receipt = _make_action_receipt(
             client_action_id=client_action_id,
-            state="received",
+            state="indeterminate" if restarted else "received",
             deduped=True,
-            phases=_receipt_phases(validated=False, applied=False, pty_written=False),
+            phases=_receipt_phases(validated=False, applied=False, pty_written=None),
         )
         return None, {
             "ok": False,
@@ -9911,54 +11325,100 @@ def _store_action_receipt(
     action_kind: str,
     audit_action: dict | None = None,
     persist: bool = True,
+    allow_owner_takeover: bool = False,
 ) -> None:
+    outbox_event: dict | None = None
+    outbox_inserted = False
+    publish_live_receipt = bool(
+        client_action_id
+        and persist
+        and len(_session_live_receipt_aliases(session_id)) == 1
+    )
     if client_action_id and persist:
-        normalized_device_id = str(device_id or "legacy-device")
+        normalized_device_id = str(device_id or "").strip()
+        if not normalized_device_id:
+            raise ValueError("authenticated device_id is required for mutation receipts")
         now = _time.time()
-        with _control_receipt_conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            existing = conn.execute(
-                "SELECT body_hash, action_kind, state, owner_instance FROM control_action_receipts "
-                "WHERE device_id=? AND session_id=? AND client_action_id=?",
-                (normalized_device_id, session_id, client_action_id),
-            ).fetchone()
-            if existing is None:
-                conn.execute(
-                    "INSERT INTO control_action_receipts "
-                    "(device_id, session_id, client_action_id, body_hash, action_kind, state, "
-                    "receipt_json, owner_instance, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, 'final', ?, ?, ?, ?)",
-                    (
-                        normalized_device_id,
-                        session_id,
-                        client_action_id,
-                        body_hash,
-                        action_kind,
-                        json.dumps(receipt, sort_keys=True),
-                        _CONTROL_RECEIPT_INSTANCE_ID,
-                        now,
-                        now,
-                    ),
-                )
-            elif existing["body_hash"] != body_hash:
-                raise RuntimeError("refusing to overwrite an idempotency receipt with different content")
-            elif existing["action_kind"] != action_kind:
-                raise RuntimeError("refusing to finalize an idempotency receipt with a different action kind")
-            elif existing["state"] == "in_progress":
-                if existing["owner_instance"] != _CONTROL_RECEIPT_INSTANCE_ID:
-                    raise RuntimeError("refusing to finalize an action reserved by another daemon instance")
-                conn.execute(
-                    "UPDATE control_action_receipts SET state='final', receipt_json=?, "
-                    "action_kind=?, updated_at=? WHERE device_id=? AND session_id=? AND client_action_id=?",
-                    (
-                        json.dumps(receipt, sort_keys=True),
-                        action_kind,
-                        now,
-                        normalized_device_id,
-                        session_id,
-                        client_action_id,
-                    ),
-                )
+        reservation_key = _receipt_key(device_id, session_id, client_action_id)
+        stored_durably = False
+        try:
+            with _control_receipt_conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                existing = conn.execute(
+                    "SELECT body_hash, action_kind, state, receipt_json, owner_instance "
+                    "FROM control_action_receipts "
+                    "WHERE device_id=? AND session_id=? AND client_action_id=?",
+                    (normalized_device_id, session_id, client_action_id),
+                ).fetchone()
+                if existing is None:
+                    conn.execute(
+                        "INSERT INTO control_action_receipts "
+                        "(device_id, session_id, client_action_id, body_hash, action_kind, state, "
+                        "receipt_json, owner_instance, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, 'final', ?, ?, ?, ?)",
+                        (
+                            normalized_device_id,
+                            session_id,
+                            client_action_id,
+                            body_hash,
+                            action_kind,
+                            json.dumps(receipt, sort_keys=True),
+                            _CONTROL_RECEIPT_INSTANCE_ID,
+                            now,
+                            now,
+                        ),
+                    )
+                elif existing["body_hash"] != body_hash:
+                    raise RuntimeError("refusing to overwrite an idempotency receipt with different content")
+                elif existing["action_kind"] != action_kind:
+                    raise RuntimeError("refusing to finalize an idempotency receipt with a different action kind")
+                elif existing["state"] == "final":
+                    try:
+                        stored_receipt = json.loads(existing["receipt_json"] or "{}")
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise RuntimeError(
+                            "refusing to trust an unreadable final idempotency receipt"
+                        ) from exc
+                    if stored_receipt != receipt:
+                        raise RuntimeError(
+                            "refusing to replace a final idempotency receipt with a different outcome"
+                        )
+                elif existing["state"] == "in_progress":
+                    if (
+                        existing["owner_instance"] != _CONTROL_RECEIPT_INSTANCE_ID
+                        and not allow_owner_takeover
+                    ):
+                        raise RuntimeError("refusing to finalize an action reserved by another daemon instance")
+                    conn.execute(
+                        "UPDATE control_action_receipts SET state='final', receipt_json=?, "
+                        "action_kind=?, owner_instance=?, updated_at=? "
+                        "WHERE device_id=? AND session_id=? AND client_action_id=?",
+                        (
+                            json.dumps(receipt, sort_keys=True),
+                            action_kind,
+                            _CONTROL_RECEIPT_INSTANCE_ID,
+                            now,
+                            normalized_device_id,
+                            session_id,
+                            client_action_id,
+                        ),
+                    )
+                if publish_live_receipt:
+                    outbox_event, outbox_inserted = _insert_session_live_receipt(
+                        conn,
+                        device_id=device_id,
+                        session_id=session_id,
+                        client_action_id=client_action_id,
+                        action_kind=action_kind,
+                        receipt=receipt,
+                        audit_action=audit_action,
+                    )
+            stored_durably = True
+        finally:
+            with _ACTIVE_RECEIPTED_MUTATIONS_LOCK:
+                _ACTIVE_RECEIPTED_MUTATIONS.discard(reservation_key)
+        if stored_durably:
+            _untrack_request_receipt_reservation(reservation_key)
     _append_control_receipt_audit({
         "ts": _time.time(),
         "device_id": device_id,
@@ -9970,22 +11430,126 @@ def _store_action_receipt(
         "persisted": bool(client_action_id and persist),
         "receipt": receipt,
     })
-    _append_session_live_control_receipt(
-        device_id=device_id,
-        session_id=session_id,
-        client_action_id=client_action_id,
+    if publish_live_receipt and outbox_event is None:
+        _append_session_live_control_receipt(
+            device_id=device_id,
+            session_id=session_id,
+            client_action_id=client_action_id,
+            action_kind=action_kind,
+            audit_action=audit_action,
+            receipt=receipt,
+        )
+    elif outbox_inserted:
+        _publish_session_live_receipt_event(outbox_event)
+
+
+def _begin_receipted_mutation(
+    handler,
+    *,
+    receipt_scope: str,
+    action_kind: str,
+    material,
+    action_label: str,
+) -> dict | None:
+    """Reserve one durable mutation before any external side effect."""
+    headers = getattr(handler, "headers", {}) or {}
+    client_action_id = str(headers.get("X-Pairling-Action-Id") or "").strip()
+    if not _valid_client_action_id(client_action_id):
+        handler._send_json({
+            "ok": False,
+            "error": {
+                "code": "action_id_required",
+                "message": f"A valid X-Pairling-Action-Id is required for {action_label}.",
+            },
+        }, status=400)
+        return None
+    device_id = getattr(getattr(handler, "pairling_auth", None), "device_id", None)
+    if not isinstance(device_id, str) or not device_id.strip():
+        handler._send_json({
+            "ok": False,
+            "error": {
+                "code": "authenticated_device_required",
+                "message": "A paired phone identity is required for this action.",
+            },
+        }, status=401)
+        return None
+    device_id = device_id.strip()
+    body_hash = _receipt_body_hash(material)
+    stored_receipt, conflict = _receipt_duplicate_response(
+        device_id,
+        receipt_scope,
+        client_action_id,
+        body_hash,
         action_kind=action_kind,
-        audit_action=audit_action,
-        receipt=receipt,
     )
+    if conflict is not None:
+        conflict_code = str((conflict.get("error") or {}).get("code") or "")
+        if conflict_code in {"action_in_progress", "action_outcome_unknown"}:
+            conflict["outcome_indeterminate"] = True
+        handler._send_json(conflict, status=int(conflict["status"]))
+        return None
+    if stored_receipt is not None:
+        body, status = _receipt_replay_response(
+            stored_receipt,
+            {
+                "ok": stored_receipt.get("state") == "applied",
+                "deduped": True,
+            },
+        )
+        handler._send_json(body, status=status)
+        return None
+    return {
+        "device_id": device_id,
+        "receipt_scope": receipt_scope,
+        "client_action_id": client_action_id,
+        "body_hash": body_hash,
+        "action_kind": action_kind,
+    }
+
+
+def _finalize_receipted_mutation(
+    context: dict,
+    *,
+    state: str,
+    http_status: int,
+    backend: str,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    fields: dict | None = None,
+    audit_action: dict | None = None,
+    pty_written: bool | None = False,
+) -> dict:
+    receipt = _make_action_receipt(
+        client_action_id=context.get("client_action_id"),
+        state=state,
+        phases=_receipt_phases(
+            validated=state != "rejected",
+            applied=state == "applied",
+            pty_written=pty_written,
+        ),
+        backend=backend,
+    )
+    _receipt_attach_response(
+        receipt,
+        http_status=http_status,
+        error_code=error_code,
+        error_message=error_message,
+        fields=fields,
+    )
+    _store_action_receipt(
+        context.get("device_id"),
+        str(context.get("receipt_scope") or ""),
+        context.get("client_action_id"),
+        str(context.get("body_hash") or ""),
+        receipt,
+        action_kind=str(context.get("action_kind") or "mutation"),
+        audit_action=audit_action,
+    )
+    return receipt
 
 
 def _terminal_control_error(code: str, message: str, status: int) -> dict:
     return {"ok": False, "error": {"code": code, "message": message}, "status": status}
-
-
-def _terminal_control_screen_token(payload: dict) -> str:
-    return str(payload.get("screen_hash") or payload.get("nonce") or "").strip()
 
 
 def _terminal_control_session_id(payload: dict, q: dict) -> tuple[str, dict | None]:
@@ -10038,45 +11602,37 @@ def _terminal_control_normalize_action(payload: dict) -> tuple[dict | None, dict
             )
         return {"type": "text", "text": text, "mode": mode}, None
 
-    if action_type == "raw_key":
-        if raw_action.get("debug") is not True:
-            return None, _terminal_control_error("raw_key_disabled", "raw_key requires explicit debug=true", 400)
-        key_code = raw_action.get("key_code")
-        if not isinstance(key_code, int) or key_code < 0 or key_code > 255:
-            return None, _terminal_control_error("bad_raw_key", "raw_key requires a bounded key_code", 400)
-        return {"type": "raw_key", "key_code": key_code, "debug": True}, None
-
-    return None, _terminal_control_error("bad_action", "action type must be key, choice, text, or raw_key", 400)
+    return None, _terminal_control_error("bad_action", "action type must be key, choice, or text", 400)
 
 
 def _terminal_control_validate_screen(payload: dict, snapshot: dict, action: dict) -> dict | None:
-    token = _terminal_control_screen_token(payload)
-    if action.get("type") != "raw_key":
-        if not token:
-            return _terminal_control_error("missing_screen_hash", "latest screen_hash or nonce is required", 409)
-        if token != snapshot.get("screen_hash") and token != snapshot.get("nonce"):
+    screen_hash = str(payload.get("screen_hash") or "").strip()
+    nonce = str(payload.get("nonce") or "").strip()
+    if not screen_hash:
+        return _terminal_control_error("missing_screen_hash", "latest screen_hash is required", 409)
+    if not nonce:
+        return _terminal_control_error("missing_screen_nonce", "latest screen nonce is required", 409)
+    if screen_hash != snapshot.get("screen_hash") or nonce != snapshot.get("nonce"):
+        return {
+            **_terminal_control_error("stale_screen", "terminal screen advanced; refresh before sending control", 409),
+            "current_screen_hash": snapshot.get("screen_hash"),
+            "current_nonce": snapshot.get("nonce"),
+        }
+    snapshot_generation = snapshot.get("generation")
+    if snapshot_generation is not None:
+        payload_generation = payload.get("generation")
+        if type(payload_generation) is not int:
             return {
-                **_terminal_control_error("stale_screen", "terminal screen advanced; refresh before sending control", 409),
+                **_terminal_control_error("bad_generation", "generation must be the current JSON integer", 400),
+                "current_generation": snapshot_generation,
+            }
+        if payload_generation != snapshot_generation:
+            return {
+                **_terminal_control_error("stale_screen", "terminal generation advanced; refresh before sending control", 409),
                 "current_screen_hash": snapshot.get("screen_hash"),
                 "current_nonce": snapshot.get("nonce"),
+                "current_generation": snapshot_generation,
             }
-        snapshot_generation = snapshot.get("generation")
-        if snapshot_generation is not None:
-            try:
-                payload_generation = int(payload.get("generation"))
-                snapshot_generation_int = int(snapshot_generation)
-            except (TypeError, ValueError):
-                return {
-                    **_terminal_control_error("missing_generation", "latest terminal generation is required", 409),
-                    "current_generation": snapshot_generation,
-                }
-            if payload_generation != snapshot_generation_int:
-                return {
-                    **_terminal_control_error("stale_screen", "terminal generation advanced; refresh before sending control", 409),
-                    "current_screen_hash": snapshot.get("screen_hash"),
-                    "current_nonce": snapshot.get("nonce"),
-                    "current_generation": snapshot_generation,
-                }
 
     if action.get("type") == "choice":
         pending = snapshot.get("pending_input") or {}
@@ -10088,14 +11644,20 @@ def _terminal_control_validate_screen(payload: dict, snapshot: dict, action: dic
 
 
 def _terminal_control_surface_schema_version(payload: dict) -> tuple[int, dict | None]:
-    raw = payload.get("surface_schema_version", 1)
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        return 1, _terminal_control_error("bad_surface_schema_version", "surface_schema_version must be 1 or 2", 400)
-    if value not in {1, 2}:
-        return value, _terminal_control_error("bad_surface_schema_version", "surface_schema_version must be 1 or 2", 400)
-    return value, None
+    raw = payload.get("surface_schema_version")
+    if raw is None:
+        return 0, _terminal_control_error(
+            "surface_schema_version_required",
+            "surface_schema_version must be the JSON integer 2",
+            400,
+        )
+    if type(raw) is not int or raw != 2:
+        return 0, _terminal_control_error(
+            "bad_surface_schema_version",
+            "surface_schema_version must be the JSON integer 2",
+            400,
+        )
+    return 2, None
 
 
 def _terminal_control_v2_availability_error(snapshot: dict) -> dict | None:
@@ -10264,10 +11826,15 @@ def _scan_codex_approvals_once() -> None:
     except Exception:
         return
     for broker_id, session in live.items():
-        try:
-            snapshot = PTY_BROKER.snapshot(broker_id)
-        except Exception:
+        context = _broker_atomic_control_context_for_id(
+            broker_id,
+            public_session_id=_qualified_session_id(
+                "codex", str(session.get("native_id") or "")
+            ),
+        )
+        if context is None:
             continue
+        snapshot = context["v2"]
         rows = _rows_from_broker_snapshot(snapshot)
         screen_key = _approval_screen_key(snapshot)
         if _CODEX_APPROVAL_SCREEN_KEYS.get(broker_id) == screen_key and _CODEX_APPROVAL_NONCES.get(broker_id):
@@ -10376,19 +11943,41 @@ def _decorate_claude_session_row(row: dict, native_id: str, claude_pid: int = 0,
     row["id"] = _qualified_session_id("claude", native_id)
     row["terminal_tty"] = terminal_tty
     row["pid"] = claude_pid
-    capabilities = list(CLAUDE_SESSION_CAPABILITIES)
-    if terminal_tty and _terminal_capture_for_tty(terminal_tty, row.get("project")):
-        capabilities.append("terminal_output")
-    if terminal_tty and re.match(r"^/dev/ttys[0-9]{3,}$", terminal_tty):
-        capabilities.extend(["terminal_surface", "terminal_control"])
+    surface = _terminal_surface_capabilities(row["id"])
+    can_send_text = bool(surface.get("can_send_text"))
+    can_interrupt = bool(surface.get("can_interrupt"))
+    can_terminate = bool(surface.get("can_terminate"))
+    capabilities = [
+        capability
+        for capability in CLAUDE_SESSION_CAPABILITIES
+        if capability not in {"send_text", "interrupt", "terminate"}
+    ]
+    capabilities.extend(
+        capability
+        for capability in (surface.get("capabilities") or [])
+        if capability not in capabilities
+    )
+    for capability, enabled in (
+        ("send_text", can_send_text),
+        ("interrupt", can_interrupt),
+        ("terminate", can_terminate),
+    ):
+        if enabled:
+            capabilities.append(capability)
     row["capabilities"] = capabilities
     reason = None
-    if not terminal_tty:
-        reason = "no terminal_tty for session yet"
+    if surface.get("control_profile") == "draining_broker_interrupt_only":
+        reason = "This live terminal is finishing under the previous runtime; only interrupt is available."
+    elif not any((can_send_text, can_interrupt, can_terminate)):
+        reason = (
+            "This terminal is read only in Pairling."
+            if surface.get("available")
+            else "no terminal_tty for session yet"
+        )
     row["controllability"] = {
-        "can_send_text": bool(terminal_tty),
-        "can_interrupt": claude_pid > 0,
-        "can_terminate": claude_pid > 0,
+        "can_send_text": can_send_text,
+        "can_interrupt": can_interrupt,
+        "can_terminate": can_terminate,
         "reason": reason,
     }
     launch_metadata = registry_metadata
@@ -10821,20 +12410,24 @@ def _codex_control_overlay(row: dict, observed_mtime: float | None = None, *, ve
         _agent_registry_mark_closed("codex", row["native_id"])
         return row
     state_payload = _codex_turn_state_payload(row.get("native_id") or "", apply_boundary=False)
-    can_send = bool(tty)
-    can_signal = bool(pid)
+    surface_caps = _terminal_surface_capabilities(
+        _qualified_session_id("codex", row.get("native_id") or "")
+    )
+    can_send = bool(surface_caps.get("can_send_text"))
+    can_interrupt = bool(surface_caps.get("can_interrupt"))
+    can_terminate = bool(surface_caps.get("can_terminate"))
     if tty:
         row["terminal_tty"] = tty
     if pid:
         row["pid"] = pid
     caps = set(row.get("capabilities") or [])
-    if state_payload or can_send or can_signal:
+    if state_payload or can_send or can_interrupt or can_terminate:
         caps.add("live_state")
     caps.update({"send_text", "upload", "commands"} if can_send else set())
-    caps.update({"interrupt", "terminate"} if can_signal else set())
+    caps.update({"interrupt"} if can_interrupt else set())
+    caps.update({"terminate"} if can_terminate else set())
     if _codex_terminal_capture_for_registry(reg):
         caps.add("terminal_output")
-    surface_caps = _terminal_surface_capabilities(_qualified_session_id("codex", row.get("native_id") or ""))
     caps.update(surface_caps.get("capabilities") or [])
     row["capabilities"] = [cap for cap in CODEX_CONTROL_CAPABILITIES if cap in caps]
     if surface_caps.get("source") == "broker_vt":
@@ -10843,9 +12436,17 @@ def _codex_control_overlay(row: dict, observed_mtime: float | None = None, *, ve
         )
     row["controllability"] = {
         "can_send_text": can_send,
-        "can_interrupt": can_signal,
-        "can_terminate": can_signal,
-        "reason": None if (can_send or can_signal) else "Codex control metadata is incomplete.",
+        "can_interrupt": can_interrupt,
+        "can_terminate": can_terminate,
+        "reason": (
+            "This live terminal is finishing under the previous runtime; only interrupt is available."
+            if surface_caps.get("control_profile") == "draining_broker_interrupt_only"
+            else (
+                None
+                if can_send or can_interrupt or can_terminate
+                else "Codex terminal control needs the current Pairling broker."
+            )
+        ),
     }
     if state_payload:
         row["state"] = state_payload.get("state")
@@ -10875,14 +12476,20 @@ def _codex_pending_registry_rows(seen: set[str], live_only: bool, active_within_
         if live_only and heartbeat < cutoff and not process_alive:
             continue
         stale_seconds = max(0, int(_time.time() - heartbeat)) if heartbeat else 0
+        surface_caps = _terminal_surface_capabilities(
+            _qualified_session_id("codex", native_id)
+        )
+        can_send = bool(surface_caps.get("can_send_text"))
+        can_interrupt = bool(surface_caps.get("can_interrupt"))
+        can_terminate = bool(surface_caps.get("can_terminate"))
         caps = (
-            ["live_state"] +
-            (["send_text", "upload", "commands"] if tty else []) +
-            (["interrupt", "terminate"] if pid else [])
+            ["live_state"]
+            + (["send_text", "upload", "commands"] if can_send else [])
+            + (["interrupt"] if can_interrupt else [])
+            + (["terminate"] if can_terminate else [])
         )
         if _codex_terminal_capture_for_registry(reg):
             caps.append("terminal_output")
-        surface_caps = _terminal_surface_capabilities(_qualified_session_id("codex", native_id))
         caps.extend(cap for cap in (surface_caps.get("capabilities") or []) if cap not in caps)
         metadata = _registry_metadata_from_row(reg)
         launch_context = _session_launch_context_from_metadata(metadata)
@@ -10908,10 +12515,18 @@ def _codex_pending_registry_rows(seen: set[str], live_only: bool, active_within_
             "context_pct": None,
             "capabilities": caps,
             "controllability": {
-                "can_send_text": bool(tty),
-                "can_interrupt": bool(pid),
-                "can_terminate": bool(pid),
-                "reason": None if (tty or pid) else "Codex control metadata is incomplete.",
+                "can_send_text": can_send,
+                "can_interrupt": can_interrupt,
+                "can_terminate": can_terminate,
+                "reason": (
+                    "This live terminal is finishing under the previous runtime; only interrupt is available."
+                    if surface_caps.get("control_profile") == "draining_broker_interrupt_only"
+                    else (
+                        None
+                        if can_send or can_interrupt or can_terminate
+                        else "Codex terminal control needs the current Pairling broker."
+                    )
+                ),
             },
         }
         if launch_context is not None:
@@ -11053,9 +12668,19 @@ def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> li
         row = _codex_control_overlay(row, st.st_mtime, verify_process=True)
         if live_only:
             control = row.get("controllability") or {}
-            if row.get("closed_at") is not None or not any(
-                control.get(key)
+            has_verified_action = any(
+                bool(control.get(key))
                 for key in ("can_send_text", "can_interrupt", "can_terminate")
+            )
+            pid = int(row.get("pid") or 0)
+            tty = str(row.get("terminal_tty") or "")
+            has_verified_process = (
+                pid > 0
+                and _process_alive(pid)
+                and bool(re.match(r"^/dev/ttys[0-9]{3,}$", tty))
+            )
+            if row.get("closed_at") is not None or not (
+                has_verified_action or has_verified_process
             ):
                 continue
         rows.append(row)
@@ -12256,7 +13881,12 @@ def _is_direct_slash_invocation_text(text: str) -> bool:
 CLAUDE_INJECTOR = HOME / "Applications" / "ClaudeInjector.app" / "Contents" / "MacOS" / "ClaudeInjector"
 
 
-def _run_osascript(script: str, *, timeout: float = 15.0) -> dict:
+def _run_osascript(
+    script: str,
+    *,
+    timeout: float = 15.0,
+    mutation_possible: bool = False,
+) -> dict:
     """Run AppleScript via ClaudeInjector.app wrapper if present (so macOS
     Accessibility can be granted to a normal .app instead of the hardened
     python3.13 runtime). Falls back to direct osascript."""
@@ -12269,19 +13899,56 @@ def _run_osascript(script: str, *, timeout: float = 15.0) -> dict:
             cmd, capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return {"ok": False, "reason": "applescript timeout"}
+        return {
+            "ok": False,
+            "reason": "applescript timeout",
+            "outcome_indeterminate": bool(mutation_possible),
+            **(
+                {"pty_written": None, "write_outcome": "unknown"}
+                if mutation_possible
+                else {}
+            ),
+        }
+    except OSError as exc:
+        return {
+            "ok": False,
+            "reason": f"applescript launch failed: {type(exc).__name__}",
+            "outcome_indeterminate": False,
+        }
     out = proc.stdout.strip()
     err = proc.stderr.strip()
     if proc.returncode != 0:
-        # error -1719 / -1743 = Accessibility permission missing
-        return {"ok": False, "reason": f"applescript err: {err[:200]}"}
+        # -1743 means Apple Events permission was refused before Terminal could
+        # receive the script. Other errors may happen after a `do script`
+        # mutation, so mutating callers must treat the outcome as unknown.
+        permission_refused = "-1743" in err
+        indeterminate = bool(mutation_possible and not permission_refused)
+        return {
+            "ok": False,
+            "reason": f"applescript err: {err[:200]}",
+            "outcome_indeterminate": indeterminate,
+            **(
+                {"pty_written": None, "write_outcome": "unknown"}
+                if indeterminate
+                else {}
+            ),
+        }
     if out == "no_window":
         return {"ok": False, "reason": "no matching Terminal window"}
     if out == "ok":
         return {"ok": True}
     if out.startswith("ok\t"):
         return {"ok": True, "stdout": out}
-    return {"ok": False, "reason": f"unexpected: {out[:120]}"}
+    return {
+        "ok": False,
+        "reason": f"unexpected: {out[:120]}",
+        "outcome_indeterminate": bool(mutation_possible),
+        **(
+            {"pty_written": None, "write_outcome": "unknown"}
+            if mutation_possible
+            else {}
+        ),
+    }
 
 
 def _peek_cwd_from_transcript(path: Path) -> str:
@@ -12504,20 +14171,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def _run_dispatch(self):
         self._runtime_admission = None
-        try:
-            return self._dispatch()
-        except socket.timeout:
-            self._release_runtime_admission()
-            self._send_json({"ok": False, "error": {"code": "request_timeout"}}, status=408)
-        except RequestBodyRejected as error:
-            self._release_runtime_admission()
-            self.close_connection = True
-            self._send_json({
-                "ok": False,
-                "error": {"code": error.code, "message": error.message},
-            }, status=400)
-        except ClientDisconnected:
-            return
+        with _receipted_request_scope():
+            try:
+                return self._dispatch()
+            except socket.timeout:
+                self._release_runtime_admission()
+                self._send_json({"ok": False, "error": {"code": "request_timeout"}}, status=408)
+            except RequestBodyRejected as error:
+                self._release_runtime_admission()
+                self.close_connection = True
+                self._send_json({
+                    "ok": False,
+                    "error": {"code": error.code, "message": error.message},
+                }, status=400)
+            except ClientDisconnected:
+                return
 
     def do_GET(self):
         return self._run_dispatch()
@@ -12842,10 +14510,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"ok": False, "error": {"code": "funnel_forbidden", "message": "pair start is not available over funnel"}}, status=403)
                 else:
                     self._handle_pair_start(q)
-            elif u.path == "/pair/claim":
-                self._handle_pair_claim(q)
-            elif u.path in {"/pair/psk-claim", "/pair/psk-claim-v2"}:
-                self._handle_pair_psk_claim(q)
+            elif u.path == "/pair/psk-claim-v2":
+                self._handle_pair_psk_claim_v2(q)
             elif u.path == "/pair/psk-activate":
                 self._handle_pair_psk_activate(q)
             elif u.path == "/pair/reauth-challenge":
@@ -12920,12 +14586,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_terminal_input(q)
             elif u.path == "/corpus":
                 self._handle_corpus(q)
-            elif u.path == "/inject":
-                self._handle_inject(q)
-            elif u.path == "/inject-now":
-                self._handle_inject_now(q)
-            elif u.path == "/interrupt":
-                self._handle_interrupt(q)
             elif u.path == "/session-meta":
                 self._handle_session_meta(q)
             elif u.path == "/personal-context":
@@ -13611,8 +15271,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
             return
         device_id = getattr(self.pairling_auth, "device_id", None)
-        worker_id = str(payload.get("worker_id") or "legacy")[:100]
-        supersedes_worker_id = str(payload.get("supersedes_worker_id") or "").strip()[:100] or None
         if not isinstance(payload.get("listener_running"), bool):
             self._send_json({
                 "ok": False,
@@ -13622,6 +15280,29 @@ class Handler(BaseHTTPRequestHandler):
                 },
             }, status=400)
             return
+        worker_id = current_worker_id(payload.get("worker_id")) if current_worker_id is not None else None
+        if worker_id is None:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "invalid_worker_id",
+                    "message": "worker_id must be a current Phone Tools worker ID.",
+                },
+            }, status=400)
+            return
+        raw_supersedes = payload.get("supersedes_worker_id")
+        supersedes_worker_id = None
+        if raw_supersedes is not None:
+            supersedes_worker_id = current_worker_id(raw_supersedes) if current_worker_id is not None else None
+            if supersedes_worker_id is None:
+                self._send_json({
+                    "ok": False,
+                    "error": {
+                        "code": "invalid_supersedes_worker_id",
+                        "message": "supersedes_worker_id must name a current Phone Tools worker.",
+                    },
+                }, status=400)
+                return
         listener_running = payload["listener_running"]
         if PHONE_TOOL_WORK_QUEUE is not None:
             if listener_running:
@@ -13643,7 +15324,6 @@ class Handler(BaseHTTPRequestHandler):
         state = PHONE_TOOL_AVAILABILITY.update(
             payload,
             device_id=device_id,
-            reactivate=worker_id == "legacy",
         )
         self._send_json({
             "ok": True,
@@ -13685,7 +15365,16 @@ class Handler(BaseHTTPRequestHandler):
             }, status=400)
             return
         wait_seconds = max(1, min(wait_seconds, 25))
-        worker_id = str(payload.get("worker_id") or "legacy")[:100]
+        worker_id = current_worker_id(payload.get("worker_id")) if current_worker_id is not None else None
+        if worker_id is None:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "invalid_worker_id",
+                    "message": "worker_id must be a current Phone Tools worker ID.",
+                },
+            }, status=400)
+            return
         device_id = getattr(self.pairling_auth, "device_id", None)
         if not PHONE_TOOL_WORK_QUEUE.worker_is_active(device_id=device_id, worker_id=worker_id):
             self._send_json({
@@ -13704,7 +15393,7 @@ class Handler(BaseHTTPRequestHandler):
                 "app_state": "foreground-worker",
                 "expires_in_seconds": max(20, min(int(wait_seconds or 10) + 20, 120)),
                 "worker_id": worker_id,
-            }, device_id=device_id, reactivate=False)
+            }, device_id=device_id)
         request = PHONE_TOOL_WORK_QUEUE.next_request(
             device_id=device_id,
             tools=tools,
@@ -13742,13 +15431,23 @@ class Handler(BaseHTTPRequestHandler):
                 },
             }, status=400)
             return
+        worker_id = current_worker_id(payload.get("worker_id")) if current_worker_id is not None else None
+        if worker_id is None:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "invalid_worker_id",
+                    "message": "worker_id must be a current Phone Tools worker ID.",
+                },
+            }, status=400)
+            return
         completion = PHONE_TOOL_WORK_QUEUE.complete(
             request_id=str(payload.get("request_id") or ""),
             ok=payload["ok"],
             result=str(payload.get("result") or ""),
             error=str(payload.get("error") or ""),
             device_id=getattr(self.pairling_auth, "device_id", None),
-            worker_id=str(payload.get("worker_id") or "legacy")[:100],
+            worker_id=worker_id,
         )
         if completion != "accepted":
             self._send_json({
@@ -13874,14 +15573,14 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                 })
             started = PAIRING_STORE.start_pair(**start_kwargs)
-            if purpose == "runtime_truth_smoke":
-                bonjour = {"ok": False, "reason": "smoke_pairing_not_advertised"}
-            else:
-                bonjour = (
-                    PAIRING_ADVERTISER.start(started, port=PORT)
-                    if PAIRING_ADVERTISER is not None
-                    else {"ok": False, "reason": "advertiser_unavailable"}
-                )
+            bonjour = {
+                "ok": False,
+                "reason": (
+                    "smoke_pairing_not_advertised"
+                    if purpose == "runtime_truth_smoke"
+                    else "out_of_band_pairing_required"
+                ),
+            }
             pairling_connect_routes = self._pairling_connect_routes()
         except PairingError as exc:
             self._send_json({
@@ -13914,80 +15613,13 @@ class Handler(BaseHTTPRequestHandler):
                 "url": "pairling://pair",
                 "pair_id": started.pair_id,
                 "secret": started.secret,
-                "pairing_nonce": started.pairing_nonce,
                 "attest_challenge": started.attest_challenge,
                 "mac_ake_pub": started.mac_ake_pub,
-                "pv": "2" if started.mac_ake_pub else "1",
+                "pv": "2",
             },
         })
 
-    def _handle_pair_claim(self, q):
-        if PAIRING_STORE is None:
-            self._send_json({
-                "ok": False,
-                "error": {
-                    "code": "pairing_unavailable",
-                    "message": "Pairing store is unavailable",
-                },
-            }, status=503)
-            return
-        try:
-            payload = self._read_json_object()
-            host_chain = self._pairing_host_chain()
-            claim = PAIRING_STORE.claim_pair(
-                pair_id=str(payload.get("pair_id") or ""),
-                secret=str(payload.get("secret") or ""),
-                device_name=str(payload.get("device_name") or "Pairling iPhone"),
-                host_chain=host_chain,
-                cert_pin=None,
-                pairing_nonce=str(payload.get("pairing_nonce") or ""),
-                se_public_key_der=str(payload.get("se_public_key_der") or ""),
-                attest_object=(payload.get("direct_attest_object") if isinstance(payload.get("direct_attest_object"), dict) else None),
-                attest_key_id=str(payload.get("attest_key_id") or ""),
-                attest_environment=str(payload.get("attest_environment") or ""),
-                attested_claim_ticket=payload.get("attested_claim_ticket"),
-                relay_device_id=payload.get("relay_device_id"),
-                relay_required=bool(relay_claims_required and relay_claims_required()),
-                relay_claim_verifier=RELAY_CLAIM_VERIFIER,
-                require_direct_attest=_pair_claim_requires_app_attest(self.headers, self.client_address),
-            )
-            if PAIRING_ADVERTISER is not None:
-                PAIRING_ADVERTISER.stop()
-        except PairingError as exc:
-            self._send_json({
-                "ok": False,
-                "error": {"code": exc.code, "message": exc.message},
-            }, status=exc.status)
-            return
-        except ValueError as exc:
-            self._send_json({"ok": False, "error": {"code": "bad_request", "message": str(exc)}}, status=400)
-            return
-        runtime_routes = self._pairing_runtime_routes(list(claim.host_chain))
-        transport = "pairling-connect" if any(
-            route.get("source") == "pairling_connectd" and route.get("status") == "ready"
-            for route in runtime_routes
-        ) else "http-local"
-        self._send_json({
-            "ok": True,
-            "device": {
-                "id": claim.device.device_id,
-                "token": claim.device.token,
-                "proof_secret": claim.device.proof_secret,
-                "scopes": list(claim.device.scopes),
-                "relay_device_id": claim.relay_device_id,
-                "attestation_status": claim.attestation_status,
-            },
-            "install_id": claim.device.install_id,
-            "runtime": {
-                "port": claim.runtime_port,
-                "host_chain": list(claim.host_chain),
-                "cert_pin": claim.cert_pin,
-                "transport": transport,
-                "routes": runtime_routes,
-            },
-        })
-
-    def _handle_pair_psk_claim(self, q):
+    def _handle_pair_psk_claim_v2(self, q):
         # WS3: PSK-authenticated ECDH claim. The secret is NEVER received; the
         # phone proves knowledge of it by completing the key exchange. The
         # bearer token is returned AES-GCM-sealed under K_token, so a passive
@@ -14009,16 +15641,14 @@ class Handler(BaseHTTPRequestHandler):
                     426,
                     "update Pairling on this iPhone before pairing with this Mac",
                 )
-            request_path = urlparse(str(getattr(self, "path", "/pair/psk-claim"))).path
-            require_request_binding = request_path == "/pair/psk-claim-v2"
-            if require_request_binding and "attested_claim_ticket" in payload:
+            if "attested_claim_ticket" in payload:
                 raise PairingError(
                     "plaintext_attested_claim_forbidden",
                     400,
                     "v2 pairing requires an encrypted relay claim ticket",
                 )
             raw_protocol_version = payload.get("pv")
-            if require_request_binding and (
+            if (
                 isinstance(raw_protocol_version, bool)
                 or not isinstance(raw_protocol_version, int)
             ):
@@ -14027,10 +15657,8 @@ class Handler(BaseHTTPRequestHandler):
                     400,
                     "v2 pairing requires an integer protocol version",
                 )
-            if (
-                require_request_binding
-                and "direct_attest_object" in payload
-                and not isinstance(payload.get("direct_attest_object"), dict)
+            if "direct_attest_object" in payload and not isinstance(
+                payload.get("direct_attest_object"), dict
             ):
                 raise PairingError(
                     "psk_request_binding_invalid",
@@ -14081,9 +15709,6 @@ class Handler(BaseHTTPRequestHandler):
                 attest_object=(payload.get("direct_attest_object") if isinstance(payload.get("direct_attest_object"), dict) else None),
                 attest_key_id=(payload.get("attest_key_id") if "attest_key_id" in payload else None),
                 attest_environment=(payload.get("attest_environment") if "attest_environment" in payload else None),
-                attested_claim_ticket=(
-                    None if require_request_binding else payload.get("attested_claim_ticket")
-                ),
                 enc_attested_claim_ticket=(
                     payload.get("enc_attested_claim_ticket")
                     if "enc_attested_claim_ticket" in payload
@@ -14102,18 +15727,11 @@ class Handler(BaseHTTPRequestHandler):
                 seal_proof_secret=True,
                 request_contract=(payload.get("request_contract") if "request_contract" in payload else None),
                 request_binding=(payload.get("request_binding") if "request_binding" in payload else None),
-                protocol_version=(
-                    raw_protocol_version
-                    if require_request_binding
-                    else int(raw_protocol_version or 0)
-                ),
+                protocol_version=raw_protocol_version,
                 activation_contract=str(payload.get("activation_contract") or ""),
-                require_request_binding=require_request_binding,
                 runtime_routes=runtime_routes,
                 transport=transport,
             )
-            if PAIRING_ADVERTISER is not None:
-                PAIRING_ADVERTISER.stop()
         except PairingError as exc:
             self._send_json({"ok": False, "error": {"code": exc.code, "message": exc.message}}, status=exc.status)
             return
@@ -16234,8 +17852,8 @@ class Handler(BaseHTTPRequestHandler):
                         f"approvals:{identity_provider}:{identity_native_id}",
                         f"approvals:{identity_provider}:{identity}",
                     })
-                for alias in _session_live_receipt_aliases(session_id):
-                    topics.add(f"receipts:{alias}")
+                for identity in identities:
+                    topics.add(f"receipts:{identity}")
                 return topics
 
             last_terminal_push_at = 0.0
@@ -16398,7 +18016,11 @@ class Handler(BaseHTTPRequestHandler):
                 if want_receipts or now - last_receipt_check >= 2.0:
                     last_receipt_check = now
                     try:
-                        receipt_events = _session_live_control_receipts_since(session_id, receipt_seq)
+                        receipt_events = _session_live_control_receipts_since(
+                            session_id,
+                            receipt_seq,
+                            identity_keys=identity_keys,
+                        )
                     except Exception as e:
                         receipt_events = []
                         self.log_message("session-live control receipts failed for %s: %s", session_id, str(e)[:200])
@@ -17571,6 +19193,10 @@ class Handler(BaseHTTPRequestHandler):
             "tty": source.get("tty"),
             "terminal_log": source.get("terminal_log"),
             "can_control": bool(source.get("can_control")),
+            "can_send_text": bool(source.get("can_send_text")),
+            "can_interrupt": bool(source.get("can_interrupt")),
+            "can_terminate": bool(source.get("can_terminate")),
+            "control_profile": source.get("control_profile"),
             "last_chunk_at": None,
             "capacity_state": capacity_state,
             "capacity_verified": "capacity_state" in source,
@@ -17702,24 +19328,28 @@ class Handler(BaseHTTPRequestHandler):
         v2 = None
         terminal_probe_error = None
         try:
-            v1 = self._broker_surface_snapshot(session_id)
+            pair = self._broker_surface_pair_snapshot(session_id)
         except Exception as e:
             terminal_probe_error = str(e)[:160]
-            v1 = None
+            pair = None
+        if isinstance(pair, dict):
+            pair_v1 = pair.get("v1")
+            pair_v2 = pair.get("v2")
+            if isinstance(pair_v1, dict) and isinstance(pair_v2, dict):
+                v1 = pair_v1
+                v2 = pair_v2
+            else:
+                terminal_probe_error = "atomic broker surface pair was incomplete"
         if v1 is not None:
-            try:
-                v2 = self._broker_surface_v2_snapshot(session_id)
-            except Exception:
-                v2 = None
             if v2 is None:
-                v2 = _terminal_surface_v2_degraded_from_v1(v1, provider=provider, native_id=native_id)
+                v2 = _terminal_surface_v2_from_text_snapshot(v1, provider=provider, native_id=native_id)
         else:
             try:
                 v1 = self._terminal_app_surface_snapshot(
                     session_id,
                     osascript_timeout=TERMINAL_TRUTH_OSASCRIPT_TIMEOUT_SECONDS,
                 )
-                v2 = _terminal_surface_v2_degraded_from_v1(v1, provider=provider, native_id=native_id)
+                v2 = _terminal_surface_v2_from_text_snapshot(v1, provider=provider, native_id=native_id)
             except Exception as e:
                 terminal_probe_error = str(e)[:160]
                 v1 = None
@@ -17862,7 +19492,12 @@ class Handler(BaseHTTPRequestHandler):
                 workspace = _terminal_workspace_from_truth(truth)
                 current_hash = _terminal_workspace_stream_digest(workspace)
                 if current_hash != last_hash:
-                    if not _sse_write_json_event(self.wfile, "snapshot", workspace, max_bytes=SSE_MAX_EVENT_BYTES):
+                    if not _sse_write_chunked_json_event(
+                        self.wfile,
+                        "snapshot",
+                        workspace,
+                        stats_key="terminal_workspace_snapshot",
+                    ):
                         return
                     last_hash = current_hash
                     last_keepalive = _time.time()
@@ -18236,6 +19871,22 @@ class Handler(BaseHTTPRequestHandler):
         public_session_id, session = found
         return PTY_BROKER.snapshot(_broker_session_id(session), public_session_id=public_session_id) if PTY_BROKER else None
 
+    def _broker_surface_pair_snapshot(self, raw_session: str) -> dict | None:
+        found = self._broker_session_for(raw_session)
+        if (
+            not found
+            or PTY_BROKER is None
+            or not hasattr(PTY_BROKER, "snapshot_pair")
+            or not _broker_is_current_runtime()
+        ):
+            return None
+        public_session_id, session = found
+        pair = PTY_BROKER.snapshot_pair(
+            _broker_session_id(session),
+            public_session_id=public_session_id,
+        )
+        return pair if isinstance(pair, dict) else None
+
     def _broker_surface_v2_snapshot(
         self,
         raw_session: str,
@@ -18368,7 +20019,7 @@ class Handler(BaseHTTPRequestHandler):
             v1 = self._terminal_app_surface_snapshot(raw_session, osascript_timeout=osascript_timeout)
         except (FileNotFoundError, RuntimeError) as e:
             return _terminal_surface_v2_unavailable(provider=provider, native_id=native_id, reason=str(e))
-        return _terminal_surface_v2_degraded_from_v1(v1, provider=provider, native_id=native_id)
+        return _terminal_surface_v2_from_text_snapshot(v1, provider=provider, native_id=native_id)
 
     def _terminal_surface_v2_delta(
         self,
@@ -18447,10 +20098,6 @@ class Handler(BaseHTTPRequestHandler):
         last_keepalive = _time.time()
         deadline = _time.time() + 600
         first = True
-        # deltas=1 opts a client into dirty-row delta events; without it the
-        # stream keeps the original full-snapshot behavior so shipped apps
-        # never receive an event they do not decode.
-        deltas_enabled = q.get("deltas", ["0"])[0] in {"1", "true"}
         surface_subscription = None
         if SESSION_EVENT_HUB is not None:
             provider, native_id = _parse_agent_session_ref(raw_session)
@@ -18463,7 +20110,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             while _time.time() < deadline:
                 try:
-                    if deltas_enabled and not first and since_generation:
+                    if not first and since_generation:
                         kind, payload = self._terminal_surface_v2_delta(
                             raw_session,
                             since_generation=since_generation,
@@ -18509,17 +20156,26 @@ class Handler(BaseHTTPRequestHandler):
                     continue
 
                 if kind == "delta" and payload is not None:
-                    if payload.get("dirty_rows"):
-                        if not _sse_write_json_event(self.wfile, "delta", payload, max_bytes=SSE_MAX_EVENT_BYTES, stats_key="surface_delta"):
-                            return
-                        last_keepalive = _time.time()
+                    if not _sse_write_chunked_json_event(
+                        self.wfile,
+                        "delta",
+                        payload,
+                        stats_key="surface_delta",
+                    ):
+                        return
+                    last_keepalive = _time.time()
                     last_hash = str(payload.get("screen_hash") or last_hash)
                     since_generation = int(payload.get("generation") or since_generation or 0)
                     since_offset = int(payload.get("raw_offset") or since_offset or 0)
                 elif kind == "snapshot" and payload is not None:
                     current_hash = str(payload.get("screen_hash") or "")
                     if first or current_hash != last_hash:
-                        if not _sse_write_json_event(self.wfile, "snapshot", payload, max_bytes=SSE_MAX_EVENT_BYTES, stats_key="surface_snapshot"):
+                        if not _sse_write_chunked_json_event(
+                            self.wfile,
+                            "snapshot",
+                            payload,
+                            stats_key="surface_snapshot",
+                        ):
                             return
                         first = False
                         last_hash = current_hash
@@ -18708,13 +20364,10 @@ class Handler(BaseHTTPRequestHandler):
         elif action["type"] == "text":
             safe_text = _as_escape(str(action["text"]))
             payload_expr = f'"{safe_text}"'
-        elif action["type"] in {"key", "raw_key"}:
-            if action["type"] == "key":
-                key_code = TERMINAL_CONTROL_KEY_CODES.get(action["key"])
-                if key_code is None:
-                    return {"ok": False, "reason": "key requires signal path", "status": 400}
-            else:
-                key_code = int(action["key_code"])
+        elif action["type"] == "key":
+            key_code = TERMINAL_CONTROL_KEY_CODES.get(action["key"])
+            if key_code is None:
+                return {"ok": False, "reason": "key requires signal path", "status": 400}
             script = f'''
             tell application "Terminal"
                 set targetTab to missing value
@@ -18749,7 +20402,7 @@ class Handler(BaseHTTPRequestHandler):
             end tell
             return "ok" & tab & usedTTY
             '''
-            return _run_osascript(script)
+            return _run_osascript(script, mutation_possible=True)
         else:
             return {"ok": False, "reason": "unsupported action", "status": 400}
 
@@ -18779,7 +20432,7 @@ class Handler(BaseHTTPRequestHandler):
         end tell
         return "ok" & tab & usedTTY
         '''
-        return _run_osascript(script)
+        return _run_osascript(script, mutation_possible=True)
 
     # ----- /terminal-input: type mode (SPEC-p4 §2.2) -----
     # Keystrokes stream to the broker PTY without steer's per-action
@@ -18789,56 +20442,241 @@ class Handler(BaseHTTPRequestHandler):
     # invented — echo is the real PTY roundtrip, and the response carries
     # received_at + generation so the client can measure it.
     def _handle_terminal_input(self, q):
+        raw = self._read_body() or b""
         try:
-            payload = self._read_json_object()
-        except Exception as e:
-            self._send_json(_terminal_control_error("bad_json", str(e), 400), status=400)
-            return
+            decoded_payload = json.loads(raw)
+            payload = decoded_payload if isinstance(decoded_payload, dict) else {}
+            payload_error = None if isinstance(decoded_payload, dict) else (
+                "invalid_body",
+                "body must be a JSON object",
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            payload = {}
+            payload_error = ("bad_json", str(exc)[:200] or "invalid JSON")
         raw_session = str(payload.get("session_id") or "").strip()
-        if ":" not in raw_session:
-            self._send_json(_terminal_control_error("provider_required", "session_id must be provider-qualified", 400), status=400)
-            return
         provider, native_id = _parse_agent_session_ref(raw_session)
-        if not native_id or not _valid_provider_filter(provider, allow_all=False):
-            self._send_json(_terminal_control_error("bad_session", "session_id must be provider-qualified", 400), status=400)
-            return
-        if provider not in _agent_provider_ids():
-            _send_unsupported_provider(self, provider, "terminal_input")
-            return
         action = str(payload.get("action") or "").strip().lower()
-        if action not in {"enter", "input", "exit"}:
-            self._send_json(_terminal_control_error("bad_action", "action must be enter, input, or exit", 400), status=400)
+        action_kind = {
+            "enter": "terminal_input_enter",
+            "input": "terminal_input",
+            "exit": "terminal_input_exit",
+        }.get(action, "terminal_input_invalid")
+        session_key = _qualified_session_id(provider, native_id) if native_id else raw_session
+        receipt_scope = (
+            _session_mutation_receipt_scope(self, raw_session)
+            if ":" in raw_session and native_id
+            else "terminal-input:request"
+        )
+        mutation = _begin_receipted_mutation(
+            self,
+            receipt_scope=receipt_scope,
+            action_kind=action_kind,
+            material=raw,
+            action_label="terminal input",
+        )
+        if mutation is None:
             return
-        device_id = getattr(getattr(self, "pairling_auth", None), "device_id", None)
-        client_action_id = str(payload.get("client_action_id") or "").strip() or None
-        session_key = _qualified_session_id(provider, native_id)
+
+        device_id = mutation["device_id"]
+        client_action_id = mutation["client_action_id"]
         now = _time.time()
 
-        def reject(code: str, message: str, status: int) -> None:
+        def reject(
+            code: str,
+            message: str,
+            status: int,
+            *,
+            state: str = "rejected",
+        ) -> None:
             receipt = _make_action_receipt(
                 client_action_id=client_action_id,
-                state="rejected",
-                idempotent=False,
-                phases=_receipt_phases(validated=False, applied=False, pty_written=False),
+                state=state,
+                idempotent=True,
+                phases=_receipt_phases(
+                    validated=False,
+                    applied=False,
+                    pty_written=None if state == "indeterminate" else False,
+                ),
+            )
+            _receipt_attach_response(
+                receipt,
+                http_status=status,
+                error_code=code,
+                error_message=message,
+                fields={
+                    "session_id": raw_session or None,
+                    "input_epoch": str(payload.get("input_epoch") or "").strip() or None,
+                    "outcome_indeterminate": True if state == "indeterminate" else None,
+                },
             )
             _store_action_receipt(
-                device_id, session_key, client_action_id, "", receipt,
-                action_kind="terminal_input",
+                device_id,
+                mutation["receipt_scope"],
+                client_action_id,
+                mutation["body_hash"],
+                receipt,
+                action_kind=mutation["action_kind"],
                 audit_action={"type": "terminal_input", "action": action, "error": code},
-                persist=False,
             )
             body = _terminal_control_error(code, message, status)
+            body.update(receipt.get("response_fields") or {})
             body["receipt"] = receipt
             self._send_json(body, status=status)
 
+        if payload_error is not None:
+            reject(payload_error[0], payload_error[1], 400)
+            return
+        if ":" not in raw_session:
+            reject("provider_required", "session_id must be provider-qualified", 400)
+            return
+        if not native_id or not _valid_provider_filter(provider, allow_all=False):
+            reject("bad_session", "session_id must be provider-qualified", 400)
+            return
+        if provider not in _agent_provider_ids():
+            reject(
+                "unsupported_provider",
+                f"{provider or 'unknown'} does not support terminal input",
+                400,
+            )
+            return
+        if action not in {"enter", "input", "exit"}:
+            reject("bad_action", "action must be enter, input, or exit", 400)
+            return
+
         if action == "exit":
+            requested_epoch = str(payload.get("input_epoch") or "").strip()
             with _TYPE_MODE_LOCK:
-                _TYPE_MODE_SESSIONS.pop(session_key, None)
+                current = _TYPE_MODE_SESSIONS.get(session_key)
+                existing = dict(current) if isinstance(current, dict) else None
+            if isinstance(existing, dict) and existing.get("device_id") != device_id:
+                reject(
+                    "type_mode_identity_changed",
+                    "Only the phone that entered type mode can exit it.",
+                    409,
+                )
+                return
+            if (
+                isinstance(existing, dict)
+                and requested_epoch != str(existing.get("input_epoch") or "")
+            ):
+                reject(
+                    "input_epoch_changed",
+                    "Type mode was replaced by a newer typing session.",
+                    409,
+                )
+                return
+            if PTY_BROKER is None:
+                reject(
+                    "broker_unavailable",
+                    "The terminal broker is unavailable, so type mode was not cleared.",
+                    503,
+                )
+                return
+            broker_id = str((existing or {}).get("broker_id") or "")
+            if not broker_id:
+                try:
+                    exit_target = self._terminal_control_target(session_key)
+                except Exception as exc:
+                    reject("terminal_not_found", str(exc)[:200], 404)
+                    return
+                if (
+                    exit_target.get("source") != "broker_vt"
+                    or not exit_target.get("broker_id")
+                ):
+                    reject(
+                        "type_mode_unavailable",
+                        "Type mode can only be cleared through the Pairling terminal broker.",
+                        409,
+                    )
+                    return
+                broker_id = str(exit_target.get("broker_id") or "")
+                try:
+                    broker_mode = PTY_BROKER.control(broker_id, {
+                        "type": "input_mode_status",
+                        "device_id": str(device_id or ""),
+                    })
+                except Exception as exc:
+                    reject("broker_unavailable", str(exc)[:200], 503)
+                    return
+                if not broker_mode.get("ok"):
+                    reason = str(broker_mode.get("reason") or "type_mode_not_active")
+                    reject(
+                        reason,
+                        "The terminal broker does not have this phone's type-mode lease.",
+                        409,
+                    )
+                    return
+                if requested_epoch != str(broker_mode.get("input_epoch") or ""):
+                    reject(
+                        "input_epoch_changed",
+                        "Type mode was replaced by a newer typing session.",
+                        409,
+                    )
+                    return
+            try:
+                broker_exit = PTY_BROKER.control(broker_id, {
+                    "type": "input_mode_exit",
+                    "input_epoch": requested_epoch,
+                    "device_id": str(device_id or ""),
+                })
+            except PTYBrokerOutcomeUnknownError:
+                reject(
+                    "broker_apply_outcome_unknown",
+                    "The broker response was lost. Check type mode before trying again.",
+                    502,
+                    state="indeterminate",
+                )
+                return
+            except Exception as exc:
+                reject("broker_unavailable", str(exc)[:200], 503)
+                return
+            if not broker_exit.get("ok"):
+                reason = str(
+                    broker_exit.get("reason") or "type_mode_exit_failed"
+                )
+                reject(
+                    reason,
+                    "The terminal broker did not confirm that type mode was cleared.",
+                    409,
+                )
+                return
+            with _TYPE_MODE_LOCK:
+                current = _TYPE_MODE_SESSIONS.get(session_key)
+                if (
+                    isinstance(current, dict)
+                    and current.get("device_id") == device_id
+                    and str(current.get("input_epoch") or "") == requested_epoch
+                    and str(current.get("broker_id") or "") == broker_id
+                ):
+                    _TYPE_MODE_SESSIONS.pop(session_key, None)
             _append_terminal_control_audit({
                 "ts": now, "path": "/terminal-input", "session_id": session_key,
-                "device_id": device_id, "action": "exit", "ok": True,
+                "device_id": device_id, "action": "exit", "broker_id": broker_id,
+                "ok": True,
             })
-            self._send_json({"ok": True, "session_id": session_key, "mode": "steer"})
+            response_fields = {
+                "session_id": raw_session,
+                "mode": "steer",
+                "input_epoch": requested_epoch,
+            }
+            receipt = _make_action_receipt(
+                client_action_id=client_action_id,
+                state="applied",
+                idempotent=True,
+                phases=_receipt_phases(validated=True, applied=True, pty_written=False),
+                backend="pty_broker",
+            )
+            _receipt_attach_response(receipt, http_status=200, fields=response_fields)
+            _store_action_receipt(
+                device_id,
+                mutation["receipt_scope"],
+                client_action_id,
+                mutation["body_hash"],
+                receipt,
+                action_kind=mutation["action_kind"],
+                audit_action={"type": "terminal_input", "action": "exit"},
+            )
+            self._send_json({"ok": True, **response_fields, "receipt": receipt})
             return
 
         try:
@@ -18850,44 +20688,102 @@ class Handler(BaseHTTPRequestHandler):
             reject("type_mode_unavailable", "Type mode needs a Pairling-owned PTY; this session runs in a Terminal window (steer stays available).", 409)
             return
 
+        def current_atomic_context() -> dict | None:
+            try:
+                pair = self._broker_surface_pair_snapshot(session_key)
+            except Exception:
+                pair = None
+            return _broker_atomic_control_context(
+                pair,
+                broker_id=str(target.get("broker_id") or ""),
+            )
+
         if action == "enter":
             allowed, _retry = _inject_rate_check(f"terminal-input-enter:{session_key}", max_per_min=12)
             if not allowed:
                 reject("rate_limited", "too many type-mode entries", 429)
                 return
+            context = current_atomic_context()
+            if context is None:
+                reject(
+                    "type_mode_requires_current_broker",
+                    "Type mode needs the current atomic terminal broker; update the helper and try again.",
+                    409,
+                )
+                return
+            input_epoch = hashlib.sha256(
+                f"{device_id or 'device'}\0{session_key}\0{client_action_id}".encode()
+            ).hexdigest()[:32]
+            try:
+                broker_mode = PTY_BROKER.control(target["broker_id"], {
+                    "type": "input_mode_enter",
+                    "input_epoch": input_epoch,
+                    "device_id": str(device_id or ""),
+                })
+            except PTYBrokerOutcomeUnknownError:
+                reject(
+                    "broker_apply_outcome_unknown",
+                    "The broker response was lost. Retry entering type mode.",
+                    502,
+                    state="indeterminate",
+                )
+                return
+            except Exception as exc:
+                reject("broker_unavailable", str(exc)[:200], 503)
+                return
+            if not broker_mode.get("ok"):
+                reject(
+                    str(broker_mode.get("reason") or "type_mode_unavailable"),
+                    "The terminal broker could not start type mode.",
+                    409,
+                )
+                return
             with _TYPE_MODE_LOCK:
                 _TYPE_MODE_SESSIONS[session_key] = {
                     "device_id": device_id,
+                    "broker_id": str(target.get("broker_id") or ""),
+                    "broker_pid": int(target.get("pid") or 0),
                     "entered_at": now,
                     "last_input_at": now,
+                    "input_epoch": input_epoch,
+                    "next_sequence": int(broker_mode.get("next_sequence") or 1),
                 }
             global LAST_HUMAN_ACTIVITY_AT
             LAST_HUMAN_ACTIVITY_AT = now
             receipt = _make_action_receipt(
                 client_action_id=client_action_id,
                 state="applied",
-                idempotent=False,
+                idempotent=True,
                 phases=_receipt_phases(validated=True, applied=True, pty_written=False),
                 backend=target.get("source"),
                 tty=target.get("tty"),
                 pid=target.get("pid"),
             )
-            _store_action_receipt(
-                device_id, session_key, client_action_id, "", receipt,
-                action_kind="terminal_input_mode",
-                audit_action={"type": "terminal_input", "action": "enter"},
-                persist=False,
-            )
-            generation = None
-            if PTY_BROKER:
-                probe = PTY_BROKER.control(target["broker_id"], {"type": "input", "b64": "", "expected_generation": None})
-                generation = probe.get("generation")
-            self._send_json({
-                "ok": True,
+            response_fields = {
                 "session_id": session_key,
                 "mode": "type",
-                "generation": generation,
+                "generation": context["v2"]["generation"],
+                "input_epoch": input_epoch,
+                "next_sequence": int(broker_mode.get("next_sequence") or 1),
                 "received_at": now,
+            }
+            _receipt_attach_response(
+                receipt,
+                http_status=200,
+                fields=response_fields,
+            )
+            _store_action_receipt(
+                device_id,
+                mutation["receipt_scope"],
+                client_action_id,
+                mutation["body_hash"],
+                receipt,
+                action_kind=mutation["action_kind"],
+                audit_action={"type": "terminal_input", "action": "enter"},
+            )
+            self._send_json({
+                "ok": True,
+                **response_fields,
                 "receipt": receipt,
             })
             return
@@ -18900,173 +20796,340 @@ class Handler(BaseHTTPRequestHandler):
                 state = "expired"
             elif state is not None:
                 state["last_input_at"] = now
+        requested_input_epoch = str(payload.get("input_epoch") or "").strip()
+        if state is None and PTY_BROKER is not None:
+            try:
+                broker_mode = PTY_BROKER.control(target["broker_id"], {
+                    "type": "input_mode_status",
+                    "device_id": str(device_id or ""),
+                })
+            except Exception:
+                broker_mode = None
+            if (
+                isinstance(broker_mode, dict)
+                and broker_mode.get("ok") is True
+                and requested_input_epoch
+                == str(broker_mode.get("input_epoch") or "")
+            ):
+                state = {
+                    "device_id": device_id,
+                    "broker_id": str(target.get("broker_id") or ""),
+                    "broker_pid": int(target.get("pid") or 0),
+                    "entered_at": now,
+                    "last_input_at": now,
+                    "input_epoch": requested_input_epoch,
+                    "next_sequence": int(broker_mode.get("next_sequence") or 1),
+                }
+                with _TYPE_MODE_LOCK:
+                    _TYPE_MODE_SESSIONS[session_key] = state
         if state is None:
             reject("type_mode_not_active", "Enter type mode before streaming input.", 409)
             return
         if state == "expired":
             reject("type_mode_expired", "Type mode expired after 10 idle minutes; enter it again.", 409)
             return
+        state_device_id = state.get("device_id") if isinstance(state, dict) else None
+        state_broker_id = str(state.get("broker_id") or "") if isinstance(state, dict) else ""
+        state_broker_pid = int(state.get("broker_pid") or 0) if isinstance(state, dict) else 0
+        state_input_epoch = str(state.get("input_epoch") or "") if isinstance(state, dict) else ""
+        current_broker_id = str(target.get("broker_id") or "")
+        current_broker_pid = int(target.get("pid") or 0)
+        if (
+            state_device_id != device_id
+            or state_broker_id != current_broker_id
+            or state_broker_pid != current_broker_pid
+        ):
+            with _TYPE_MODE_LOCK:
+                _TYPE_MODE_SESSIONS.pop(session_key, None)
+            reject(
+                "type_mode_identity_changed",
+                "Type mode belongs to a different phone or terminal process; enter it again.",
+                409,
+            )
+            return
         b64 = str(payload.get("b64") or "")
         try:
             decoded = base64.b64decode(b64, validate=True)
         except Exception:
-            self._send_json(_terminal_control_error("bad_input_encoding", "b64 must be valid base64", 400), status=400)
+            reject("bad_input_encoding", "b64 must be valid base64", 400)
             return
         if not decoded or len(decoded) > 1024:
-            self._send_json(_terminal_control_error("input_size", "input must be 1..1024 bytes", 400), status=400)
+            reject("input_size", "input must be 1..1024 bytes", 400)
             return
         generation = payload.get("generation")
+        if not isinstance(generation, int) or isinstance(generation, bool):
+            reject(
+                "bad_generation",
+                "A current integer terminal generation is required for type input.",
+                400,
+            )
+            return
+        input_epoch = str(payload.get("input_epoch") or "").strip()
+        input_sequence = payload.get("input_sequence")
+        if input_epoch != state_input_epoch:
+            reject(
+                "input_epoch_changed",
+                "Type mode was replaced. Enter it again before typing.",
+                409,
+            )
+            return
+        if (
+            not isinstance(input_sequence, int)
+            or isinstance(input_sequence, bool)
+            or input_sequence < 1
+        ):
+            reject(
+                "bad_input_sequence",
+                "A positive input sequence is required for type input.",
+                400,
+            )
+            return
         if PTY_BROKER is None:
             reject("broker_unavailable", "PTY broker is unavailable", 503)
             return
-        result = PTY_BROKER.control(target["broker_id"], {
-            "type": "input",
-            "b64": b64,
-            "expected_generation": generation,
-        })
+        if current_atomic_context() is None:
+            with _TYPE_MODE_LOCK:
+                _TYPE_MODE_SESSIONS.pop(session_key, None)
+            reject(
+                "type_mode_requires_current_broker",
+                "The terminal broker changed or cannot prove atomic control; enter type mode again.",
+                409,
+            )
+            return
+        try:
+            result = PTY_BROKER.control(target["broker_id"], {
+                "type": "input",
+                "b64": b64,
+                "expected_generation": generation,
+                "input_epoch": input_epoch,
+                "input_sequence": input_sequence,
+                "device_id": str(device_id or ""),
+            })
+        except PTYBrokerOutcomeUnknownError as exc:
+            receipt = _make_action_receipt(
+                client_action_id=client_action_id,
+                state="indeterminate",
+                idempotent=True,
+                phases=_receipt_phases(validated=True, applied=False, pty_written=None),
+                backend=target.get("source"),
+                tty=target.get("tty"),
+                pid=target.get("pid"),
+            )
+            receipt["phases"]["pty_write_state"] = "unknown"
+            body = _terminal_control_error(
+                "broker_apply_outcome_unknown",
+                "The broker response was lost. Pairling will retry this exact input sequence without typing it twice.",
+                502,
+            )
+            body["outcome_indeterminate"] = True
+            _receipt_attach_response(
+                receipt,
+                http_status=502,
+                error_code="broker_apply_outcome_unknown",
+                error_message="The broker response was lost. Pairling will retry this exact input sequence without typing it twice.",
+                fields={
+                    "session_id": raw_session,
+                    "input_epoch": input_epoch,
+                    "input_sequence": input_sequence,
+                    "outcome_indeterminate": True,
+                },
+            )
+            _store_action_receipt(
+                device_id, mutation["receipt_scope"], client_action_id, mutation["body_hash"], receipt,
+                action_kind=mutation["action_kind"],
+                audit_action={"type": "terminal_input", "action": "input", "error": "broker_apply_outcome_unknown"},
+            )
+            body["receipt"] = receipt
+            self._send_json(body, status=502)
+            return
+        except Exception as exc:
+            reject("broker_unavailable", str(exc)[:200], 503)
+            return
         if not result.get("ok"):
             reason = str(result.get("reason") or "terminal_input_failed")
             if reason == "stale_generation":
                 receipt = _make_action_receipt(
                     client_action_id=client_action_id,
                     state="rejected",
-                    idempotent=False,
+                    idempotent=True,
                     phases=_receipt_phases(validated=True, applied=False, pty_written=False),
                     backend=target.get("source"),
                     tty=target.get("tty"),
                 )
-                _store_action_receipt(
-                    device_id, session_key, client_action_id, "", receipt,
-                    action_kind="terminal_input",
-                    audit_action={"type": "terminal_input", "action": "input", "error": "stale_generation"},
-                    persist=False,
-                )
                 body = _terminal_control_error("stale_generation", "The screen was replaced; input dropped.", 409)
                 body["generation"] = result.get("generation")
+                body["input_epoch"] = result.get("input_epoch")
+                body["input_sequence"] = result.get("input_sequence")
+                body["next_sequence"] = result.get("next_sequence")
+                _receipt_attach_response(
+                    receipt,
+                    http_status=409,
+                    error_code="stale_generation",
+                    error_message="The screen was replaced; input dropped.",
+                    fields={
+                        "session_id": raw_session,
+                        "generation": result.get("generation"),
+                        "input_epoch": result.get("input_epoch"),
+                        "input_sequence": result.get("input_sequence"),
+                        "next_sequence": result.get("next_sequence"),
+                    },
+                )
+                _store_action_receipt(
+                    device_id, mutation["receipt_scope"], client_action_id, mutation["body_hash"], receipt,
+                    action_kind=mutation["action_kind"],
+                    audit_action={"type": "terminal_input", "action": "input", "error": "stale_generation"},
+                )
                 body["receipt"] = receipt
                 self._send_json(body, status=409)
                 return
             status = 400 if reason in {"bad_input_encoding", "input_size", "bad_generation"} else 502
-            self._send_json(_terminal_control_error(reason, reason.replace("_", " "), status), status=status)
+            outcome_indeterminate = bool(result.get("outcome_indeterminate"))
+            pty_written = (
+                bool(result.get("pty_written"))
+                if "pty_written" in result
+                else (None if outcome_indeterminate else False)
+            )
+            receipt = _make_action_receipt(
+                client_action_id=client_action_id,
+                state="indeterminate" if outcome_indeterminate else "failed",
+                idempotent=True,
+                phases=_receipt_phases(validated=True, applied=False, pty_written=pty_written),
+                backend=target.get("source"),
+                tty=target.get("tty"),
+                pid=target.get("pid"),
+            )
+            if result.get("write_outcome"):
+                receipt["phases"]["pty_write_state"] = str(result["write_outcome"])
+            body = _terminal_control_error(reason, reason.replace("_", " "), status)
+            body["outcome_indeterminate"] = outcome_indeterminate
+            body["bytes_written"] = result.get("bytes_written")
+            body["bytes_expected"] = result.get("bytes_expected")
+            body["input_epoch"] = result.get("input_epoch")
+            body["input_sequence"] = result.get("input_sequence")
+            body["next_sequence"] = result.get("next_sequence")
+            _receipt_attach_response(
+                receipt,
+                http_status=status,
+                error_code=reason,
+                error_message=reason.replace("_", " "),
+                fields={
+                    "session_id": raw_session,
+                    "outcome_indeterminate": outcome_indeterminate,
+                    "bytes_written": result.get("bytes_written"),
+                    "bytes_expected": result.get("bytes_expected"),
+                    "input_epoch": result.get("input_epoch"),
+                    "input_sequence": result.get("input_sequence"),
+                    "next_sequence": result.get("next_sequence"),
+                },
+            )
+            _store_action_receipt(
+                device_id, mutation["receipt_scope"], client_action_id, mutation["body_hash"], receipt,
+                action_kind=mutation["action_kind"],
+                audit_action={"type": "terminal_input", "action": "input", "error": reason},
+            )
+            body["receipt"] = receipt
+            self._send_json(body, status=status)
             return
         LAST_HUMAN_ACTIVITY_AT = now
+        with _TYPE_MODE_LOCK:
+            current_state = _TYPE_MODE_SESSIONS.get(session_key)
+            if (
+                isinstance(current_state, dict)
+                and str(current_state.get("input_epoch") or "") == input_epoch
+            ):
+                current_state["last_input_at"] = now
+                current_state["next_sequence"] = int(
+                    result.get("next_sequence") or (input_sequence + 1)
+                )
+        receipt = _make_action_receipt(
+            client_action_id=client_action_id,
+            state="applied",
+            idempotent=True,
+            deduped=bool(result.get("deduped")),
+            phases=_receipt_phases(validated=True, applied=True, pty_written=True),
+            backend=target.get("source"),
+            tty=target.get("tty"),
+            pid=target.get("pid"),
+        )
+        response_fields = {
+            "session_id": raw_session,
+            "generation": result.get("generation"),
+            "input_epoch": input_epoch,
+            "input_sequence": input_sequence,
+            "next_sequence": result.get("next_sequence") or (input_sequence + 1),
+            "deduped": bool(result.get("deduped")),
+            "received_at": now,
+        }
+        _receipt_attach_response(receipt, http_status=200, fields=response_fields)
+        _store_action_receipt(
+            device_id,
+            mutation["receipt_scope"],
+            client_action_id,
+            mutation["body_hash"],
+            receipt,
+            action_kind=mutation["action_kind"],
+            audit_action={
+                "type": "terminal_input",
+                "action": "input",
+                "input_epoch": input_epoch,
+                "input_sequence": input_sequence,
+                "bytes": len(decoded),
+            },
+        )
         self._send_json({
             "ok": True,
-            "session_id": session_key,
-            "generation": result.get("generation"),
-            "received_at": now,
+            **response_fields,
+            "receipt": receipt,
         })
 
     def _handle_terminal_control(self, q):
-        audit = {
-            "ts": _time.time(),
-            "path": "/terminal-control",
-            "device_id": getattr(getattr(self, "pairling_auth", None), "device_id", None),
-            "ok": False,
-        }
+        raw = self._read_body() or b""
         try:
-            payload = self._read_json_object()
-        except Exception as e:
-            audit["error"] = "bad_json"
-            _append_terminal_control_audit(audit)
-            self._send_json(_terminal_control_error("bad_json", str(e), 400), status=400)
-            return
+            decoded_payload = json.loads(raw)
+            payload = decoded_payload if isinstance(decoded_payload, dict) else {}
+            payload_error = None if isinstance(decoded_payload, dict) else (
+                "invalid_body",
+                "body must be a JSON object",
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            payload = {}
+            payload_error = ("bad_json", str(exc)[:200] or "invalid JSON")
 
         body_session = str(payload.get("session_id") or "").strip()
         query_session = str((q.get("session", [""]) or [""])[0] or "").strip()
+        claimed_session = body_session or query_session
+        claimed_provider, claimed_native_id = _parse_agent_session_ref(claimed_session)
+        receipt_session_id = (
+            _session_mutation_receipt_scope(self, claimed_session)
+            if ":" in claimed_session and claimed_native_id
+            else "terminal-control:request"
+        )
+        mutation = _begin_receipted_mutation(
+            self,
+            receipt_scope=receipt_session_id,
+            action_kind="terminal_control",
+            material=raw + b"\0query-session=" + query_session.encode(),
+            action_label="terminal control",
+        )
+        if mutation is None:
+            return
+
+        audit = {
+            "ts": _time.time(),
+            "path": "/terminal-control",
+            "device_id": mutation["device_id"],
+            "ok": False,
+        }
         if body_session:
             audit["body_session_id"] = body_session
         if query_session:
             audit["query_session_id"] = query_session
-        raw_session, session_err = _terminal_control_session_id(payload, q)
-        audit["session_id"] = raw_session or body_session or query_session
-        if session_err:
-            audit["error"] = session_err["error"]["code"]
-            _append_terminal_control_audit(audit)
-            self._send_json(session_err, status=int(session_err["status"]))
-            return
-        if ":" not in raw_session:
-            audit["error"] = "provider_required"
-            _append_terminal_control_audit(audit)
-            self._send_json(
-                _terminal_control_error("provider_required", "session_id must be provider-qualified", 400),
-                status=400,
-            )
-            return
-
-        provider, native_id = _parse_agent_session_ref(raw_session)
-        audit["provider"] = provider
-        audit["native_id"] = native_id
-        if not native_id or not _valid_provider_filter(provider, allow_all=False):
-            audit["error"] = "bad_session"
-            _append_terminal_control_audit(audit)
-            self._send_json(
-                _terminal_control_error("bad_session", "session_id must be provider-qualified", 400),
-                status=400,
-            )
-            return
-        if provider not in _agent_provider_ids():
-            audit["error"] = "unsupported_provider"
-            _append_terminal_control_audit(audit)
-            _send_unsupported_provider(self, provider, "terminal_control")
-            return
-
-        allowed, retry = _inject_rate_check(f"terminal-control:{_qualified_session_id(provider, native_id)}", max_per_min=60)
-        if not allowed:
-            audit["error"] = "rate_limited"
-            _append_terminal_control_audit(audit)
-            self._send_json({
-                "ok": False,
-                "error": {"code": "rate_limited", "message": "too many terminal control requests"},
-                "retry_after": retry,
-            }, status=429)
-            return
-
-        action, err = _terminal_control_normalize_action(payload)
-        if err:
-            audit["error"] = err["error"]["code"]
-            _append_terminal_control_audit(audit)
-            self._send_json(err, status=int(err["status"]))
-            return
-        audit["action"] = _terminal_control_audit_action(action)
-        surface_schema_version, version_err = _terminal_control_surface_schema_version(payload)
-        audit["surface_schema_version"] = surface_schema_version
-        if version_err:
-            audit["error"] = version_err["error"]["code"]
-            _append_terminal_control_audit(audit)
-            self._send_json(version_err, status=int(version_err["status"]))
-            return
-        client_action_id = str(payload.get("client_action_id") or self.headers.get("X-Pairling-Action-Id") or "").strip()
-        device_id = audit.get("device_id")
-        body_hash = _receipt_body_hash({"session_id": raw_session, "action": action, "surface_schema_version": surface_schema_version})
-        deduped_receipt, conflict = _receipt_duplicate_response(
-            device_id,
-            raw_session,
-            client_action_id,
-            body_hash,
-            action_kind="terminal_control",
-        )
-        if conflict:
-            _store_action_receipt(
-                device_id,
-                raw_session,
-                client_action_id,
-                body_hash,
-                conflict["receipt"],
-                action_kind="terminal_control",
-                audit_action=audit.get("action"),
-                persist=False,
-            )
-            self._send_json(conflict, status=int(conflict["status"]))
-            return
-        if deduped_receipt:
-            self._send_json({
-                "ok": deduped_receipt.get("state") == "applied",
-                "session_id": raw_session,
-                "action": action,
-                "receipt": deduped_receipt,
-            })
-            return
+        audit["session_id"] = claimed_session
+        device_id = mutation["device_id"]
+        client_action_id = mutation["client_action_id"]
+        body_hash = mutation["body_hash"]
+        action = None
+        raw_session = claimed_session
 
         def reject_reserved_action(code: str, message: str, status: int) -> None:
             audit["error"] = code
@@ -19076,29 +21139,136 @@ class Handler(BaseHTTPRequestHandler):
                 state="rejected",
                 phases=_receipt_phases(validated=False, applied=False, pty_written=False),
             )
+            _receipt_attach_response(
+                receipt,
+                http_status=status,
+                error_code=code,
+                error_message=message,
+                fields={
+                    "session_id": raw_session or None,
+                    "action": action,
+                },
+            )
             _store_action_receipt(
                 device_id,
-                raw_session,
+                receipt_session_id,
                 client_action_id or None,
                 body_hash,
                 receipt,
-                action_kind="terminal_control",
+                action_kind=mutation["action_kind"],
                 audit_action=audit.get("action"),
             )
             response = _terminal_control_error(code, message, status)
-            response["session_id"] = raw_session
+            response.update(receipt.get("response_fields") or {})
             response["receipt"] = receipt
             self._send_json(response, status=status)
 
+        if payload_error is not None:
+            reject_reserved_action(payload_error[0], payload_error[1], 400)
+            return
+        raw_session, session_err = _terminal_control_session_id(payload, q)
+        audit["session_id"] = raw_session or body_session or query_session
+        if session_err:
+            reject_reserved_action(
+                str(session_err["error"]["code"]),
+                str(session_err["error"]["message"]),
+                int(session_err["status"]),
+            )
+            return
+        if ":" not in raw_session:
+            reject_reserved_action(
+                "provider_required",
+                "session_id must be provider-qualified",
+                400,
+            )
+            return
+
+        provider, native_id = _parse_agent_session_ref(raw_session)
+        audit["provider"] = provider
+        audit["native_id"] = native_id
+        if not native_id or not _valid_provider_filter(provider, allow_all=False):
+            reject_reserved_action(
+                "bad_session",
+                "session_id must be provider-qualified",
+                400,
+            )
+            return
+        if provider not in _agent_provider_ids():
+            reject_reserved_action(
+                "unsupported_provider",
+                f"{provider} does not support terminal control",
+                400,
+            )
+            return
+
+        action, err = _terminal_control_normalize_action(payload)
+        audit["action"] = _terminal_control_audit_action(action)
+        if err:
+            reject_reserved_action(
+                str(err["error"]["code"]),
+                str(err["error"]["message"]),
+                int(err["status"]),
+            )
+            return
+        surface_schema_version, version_err = _terminal_control_surface_schema_version(payload)
+        audit["surface_schema_version"] = surface_schema_version
+        if version_err:
+            reject_reserved_action(
+                str(version_err["error"]["code"]),
+                str(version_err["error"]["message"]),
+                int(version_err["status"]),
+            )
+            return
+
+        allowed, retry = _inject_rate_check(
+            f"terminal-control:{_qualified_session_id(provider, native_id)}",
+            max_per_min=60,
+        )
+        if not allowed:
+            reject_reserved_action(
+                "rate_limited",
+                f"Too many terminal control requests. Retry in {retry}s.",
+                429,
+            )
+            return
+
+        broker_control_proof = None
         try:
             target = self._terminal_control_target(raw_session)
             audit["tty"] = target.get("tty")
             audit["terminal_source"] = target.get("source")
             audit["broker_id"] = target.get("broker_id")
-            if surface_schema_version == 2:
-                snapshot = self._terminal_surface_v2_snapshot(raw_session)
-            else:
-                snapshot = self._broker_surface_snapshot(raw_session) or self._terminal_app_surface_snapshot(raw_session)
+            if target.get("source") != "broker_vt" or not target.get("broker_id"):
+                reject_reserved_action(
+                    "surface_not_controllable",
+                    "Terminal control requires a Pairling-owned version 2 broker surface.",
+                    409,
+                )
+                return
+            if surface_schema_version != 2:
+                reject_reserved_action(
+                    "surface_schema_version_required",
+                    "Broker terminal control requires a current version 2 screen proof.",
+                    409,
+                )
+                return
+            try:
+                pair = self._broker_surface_pair_snapshot(raw_session)
+            except Exception:
+                pair = None
+            context = _broker_atomic_control_context(
+                pair,
+                broker_id=str(target.get("broker_id") or ""),
+            )
+            if context is None:
+                reject_reserved_action(
+                    "surface_not_controllable",
+                    "Atomic terminal control proof is unavailable; refresh the helper before sending input.",
+                    409,
+                )
+                return
+            snapshot = context["v2"]
+            broker_control_proof = context["control_proof"]
             audit["surface_source"] = snapshot.get("source")
             audit["surface_backend"] = snapshot.get("backend")
             audit["screen_hash"] = snapshot.get("screen_hash")
@@ -19134,9 +21304,22 @@ class Handler(BaseHTTPRequestHandler):
                 tty=target.get("tty"),
                 pid=target.get("pid"),
             )
+            _receipt_attach_response(
+                receipt,
+                http_status=int(stale["status"]),
+                error_code=str(stale["error"]["code"]),
+                error_message=str(stale["error"]["message"]),
+                fields={
+                    "session_id": target["session_id"],
+                    "action": action,
+                    "current_screen_hash": stale.get("current_screen_hash"),
+                    "current_nonce": stale.get("current_nonce"),
+                    "current_generation": stale.get("current_generation"),
+                },
+            )
             stale["session_id"] = target["session_id"]
             stale["receipt"] = receipt
-            _store_action_receipt(device_id, raw_session, client_action_id or None, body_hash, receipt, action_kind="terminal_control", audit_action=audit.get("action"))
+            _store_action_receipt(device_id, receipt_session_id, client_action_id or None, body_hash, receipt, action_kind="terminal_control", audit_action=audit.get("action"))
             self._send_json(stale, status=int(stale["status"]))
             return
 
@@ -19145,15 +21328,85 @@ class Handler(BaseHTTPRequestHandler):
         _append_terminal_control_audit({**audit, "phase": "validated"})
 
         if target.get("source") == "broker_vt":
-            result = PTY_BROKER.control(target["broker_id"], action) if PTY_BROKER else {"ok": False, "reason": "broker unavailable", "status": 503}
+            broker_action = dict(action)
+            if surface_schema_version == 2:
+                broker_action.update({
+                    "require_screen_proof": True,
+                    "expected_screen_hash": broker_control_proof["screen_hash"],
+                    "expected_nonce": broker_control_proof["nonce"],
+                    "expected_generation": broker_control_proof["generation"],
+                })
+            if PTY_BROKER is None:
+                result = {
+                    "ok": False,
+                    "reason": "broker_unavailable",
+                    "error_code": "broker_unavailable",
+                    "status": 503,
+                    "pty_written": False,
+                    "write_outcome": "none",
+                }
+            else:
+                try:
+                    result = PTY_BROKER.control(target["broker_id"], broker_action)
+                except PTYBrokerOutcomeUnknownError as exc:
+                    # Once the request crossed the broker socket, a disconnect
+                    # cannot prove whether zero, some, or all bytes reached the
+                    # PTY. Finalize the action as indeterminate so idempotent
+                    # replay never performs a second write.
+                    result = {
+                        "ok": False,
+                        "reason": "broker_apply_outcome_unknown",
+                        "error_code": "broker_apply_outcome_unknown",
+                        "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+                        "status": 502,
+                        "write_outcome": "unknown",
+                        "outcome_indeterminate": True,
+                    }
+                except Exception as exc:
+                    result = {
+                        "ok": False,
+                        "reason": "broker_unavailable",
+                        "error_code": "broker_unavailable",
+                        "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+                        "status": 503,
+                        "pty_written": False,
+                        "write_outcome": "none",
+                        "outcome_indeterminate": False,
+                    }
         elif action["type"] == "key" and action["key"] == "ctrl_c":
             result = self._terminal_control_signal(target, signal.SIGINT, "SIGINT")
         else:
             result = self._terminal_control_run_in_terminal(target, action)
 
         ok = bool(result.get("ok"))
+        public_current_proof = None
+        if (
+            not ok
+            and result.get("reason") == "stale_screen"
+            and target.get("source") == "broker_vt"
+            and surface_schema_version == 2
+        ):
+            try:
+                refreshed_pair = self._broker_surface_pair_snapshot(raw_session)
+            except Exception:
+                refreshed_pair = None
+            refreshed_v2 = refreshed_pair.get("v2") if isinstance(refreshed_pair, dict) else None
+            refreshed_generation = refreshed_v2.get("generation") if isinstance(refreshed_v2, dict) else None
+            if (
+                isinstance(refreshed_v2, dict)
+                and str(refreshed_v2.get("screen_hash") or "")
+                and str(refreshed_v2.get("nonce") or "")
+                and isinstance(refreshed_generation, int)
+                and not isinstance(refreshed_generation, bool)
+            ):
+                public_current_proof = {
+                    "current_screen_hash": refreshed_v2["screen_hash"],
+                    "current_nonce": refreshed_v2["nonce"],
+                    "current_generation": refreshed_generation,
+                }
         audit["ok"] = ok
-        audit["phase"] = "applied"
+        outcome_indeterminate = bool(result.get("outcome_indeterminate"))
+        audit["phase"] = "applied" if ok else ("indeterminate" if outcome_indeterminate else "failed")
         if not ok:
             audit["error"] = result.get("error") or result.get("reason") or "terminal_control_failed"
         _append_terminal_control_audit(audit)
@@ -19162,28 +21415,50 @@ class Handler(BaseHTTPRequestHandler):
         source_offset_after = None
         source_offset_reason = None
         if ok and target.get("source") == "broker_vt" and PTY_BROKER:
-            tail = PTY_BROKER.raw_tail(target.get("broker_id"), since=0)
+            try:
+                tail = PTY_BROKER.raw_tail(target.get("broker_id"), since=0)
+            except Exception as exc:
+                tail = None
+                source_offset_reason = f"raw_tail_unavailable:{type(exc).__name__}"
             if tail:
                 source_offset_after = tail[1]
-            else:
+            elif source_offset_reason is None:
                 source_offset_reason = "no_broker_log"
+        result_reports_pty_write = "pty_written" in result
+        if result_reports_pty_write:
+            pty_written: bool | None = bool(result.get("pty_written"))
+        elif outcome_indeterminate:
+            pty_written = None
+        else:
+            pty_written = bool(ok)
+        receipt_phases = _receipt_phases(
+            validated=True,
+            applied=ok,
+            pty_written=pty_written,
+        )
+        if result.get("write_outcome"):
+            receipt_phases["pty_write_state"] = str(result["write_outcome"])
         receipt = _make_action_receipt(
             client_action_id=client_action_id or None,
-            state="applied" if ok else "failed",
-            phases=_receipt_phases(
-                validated=True,
-                applied=ok,
-                pty_written=bool(ok and not (action.get("type") == "key" and action.get("key") == "ctrl_c")),
-            ),
+            state="applied" if ok else ("indeterminate" if outcome_indeterminate else "failed"),
+            phases=receipt_phases,
             backend=target.get("source"),
             tty=used_tty,
             pid=result.get("pid") or target.get("pid"),
             source_offset_after=source_offset_after,
             source_offset_reason=source_offset_reason,
         )
-        _store_action_receipt(device_id, raw_session, client_action_id or None, body_hash, receipt, action_kind="terminal_control", audit_action=audit.get("action"))
-        self._send_json({
-            "ok": ok,
+        response_code = str(
+            result.get("error_code")
+            or result.get("reason")
+            or "terminal_control_failed"
+        )
+        response_message = (
+            "The terminal screen advanced; refresh before sending control."
+            if response_code == "stale_screen"
+            else str(result.get("error") or result.get("reason") or "Terminal control failed.")
+        )
+        response_fields = {
             "session_id": target["session_id"],
             "action": action,
             "screen_hash": snapshot.get("screen_hash"),
@@ -19192,8 +21467,34 @@ class Handler(BaseHTTPRequestHandler):
             "pid": result.get("pid"),
             "reason": result.get("reason") or result.get("error"),
             "error_code": result.get("error_code"),
+            "bytes_written": result.get("bytes_written"),
+            "bytes_expected": result.get("bytes_expected"),
+            "write_outcome": result.get("write_outcome"),
+            "outcome_indeterminate": outcome_indeterminate,
+            **(public_current_proof or {}),
+        }
+        _receipt_attach_response(
+            receipt,
+            http_status=status,
+            error_code=response_code if not ok else None,
+            error_message=response_message if not ok else None,
+            fields=response_fields,
+        )
+        _store_action_receipt(device_id, receipt_session_id, client_action_id or None, body_hash, receipt, action_kind="terminal_control", audit_action=audit.get("action"))
+        response = {
+            "ok": ok,
+            **response_fields,
             "receipt": receipt,
-        }, status=status)
+        }
+        response = {key: value for key, value in response.items() if value is not None}
+        if not ok:
+            response["error"] = {
+                "code": response_code,
+                "message": response_message,
+            }
+        if public_current_proof is not None:
+            response.update(public_current_proof)
+        self._send_json(response, status=status)
 
     def _resolve_transcript(self, session_id: str):
         """Map an iOS app session_id (which may be a Claude Code UUID OR a
@@ -19268,111 +21569,6 @@ class Handler(BaseHTTPRequestHandler):
         if not session_id or not field.replace("_", "").isalnum():
             return None
         return _claude_sessions_backend().lookup_field(session_id, field)
-
-    # ----- /inject-now: AppleScript types text into matching Terminal window -----
-    def _handle_inject_now(self, q):
-        session_id = q.get("session", [""])[0]
-        session_id = _claude_native_session_id(session_id)
-        if not session_id:
-            self.send_error(400, "session required")
-            return
-        text = self._read_body().decode("utf-8", errors="replace").strip()
-        if not text:
-            self.send_error(400, "empty body")
-            return
-
-        # Phase 4 A.3: rate limit. Reject 429 if the session is being spammed.
-        allowed, retry = _inject_rate_check(_qualified_session_id("claude", session_id))
-        if not allowed:
-            self.send_response(429)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", str(retry))
-            body = json.dumps({"ok": False, "error": "rate_limited", "retry_after": retry}).encode()
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-
-        text, sanitize_err = _sanitize_terminal_text_input(
-            text,
-            allow_newline=True,
-            max_chars=4000,
-        )
-        if sanitize_err:
-            self.send_error(int(sanitize_err["status"]), str(sanitize_err["message"]))
-            return
-
-        project = self._lookup_pg_project(session_id)
-        if not project:
-            transcript = self._resolve_transcript(session_id)
-            if transcript:
-                project = _peek_cwd_from_transcript(transcript)
-        if not project:
-            self.send_error(404, f"could not resolve project for session {session_id}")
-            return
-
-        project_basename = os.path.basename(project.rstrip("/")) or project
-        result = self._applescript_inject(project_basename, text)
-
-        status = 200
-        if not result.get("ok"):
-            # Fall back to the queue-file path so nothing is lost
-            queue_file = QUEUE_DIR / f"{session_id}.txt"
-            with open(queue_file, "a") as f:
-                f.write(text + "\n")
-            status = 202
-            body = json.dumps({
-                "ok": False, "injected": False, "queued": True,
-                "state": "queued_not_injected",
-                "fallback_reason": result.get("reason", "unknown"),
-                "window_match": project_basename,
-                "error": {
-                    "code": "terminal_injection_queued",
-                    "message": "Text was queued but was not typed into Terminal.",
-                },
-            }).encode()
-        else:
-            body = json.dumps({
-                "ok": True, "injected": True,
-                "window_match": project_basename,
-            }).encode()
-
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    # ----- /interrupt: AppleScript sends Esc keystroke to matching Terminal -----
-    def _handle_interrupt(self, q):
-        session_id = q.get("session", [""])[0]
-        session_id = _claude_native_session_id(session_id)
-        if not session_id:
-            self.send_error(400, "session required")
-            return
-        project = self._lookup_pg_project(session_id) or ""
-        if not project:
-            transcript = self._resolve_transcript(session_id)
-            if transcript:
-                project = _peek_cwd_from_transcript(transcript) or ""
-        if not project:
-            self.send_error(404, f"could not resolve project for session {session_id}")
-            return
-
-        project_basename = os.path.basename(project.rstrip("/")) or project
-        result = self._applescript_send_esc(project_basename)
-
-        body = json.dumps({
-            "ok": result.get("ok", False),
-            "interrupted": result.get("ok", False),
-            "window_match": project_basename,
-            "reason": result.get("reason"),
-        }).encode()
-        self.send_response(200 if result.get("ok") else 502)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
 
     # ----- /session-meta: effort, model, type, sentinel mode, working_on, size -----
     def _handle_session_meta(self, q):
@@ -19458,49 +21654,132 @@ class Handler(BaseHTTPRequestHandler):
         Pairling's layer. That covenant is the whole feature, so this
         endpoint never transforms the payload. Fail-closed when the
         observatory is absent."""
-        if not DEEPFIELD_INBOX_DIR.parent.parent.is_dir():
-            self._send_json({"ok": False, "error": {"code": "no_observatory", "message": "deepfield is not present on this Mac"}}, status=404)
-            return
         raw = self._read_body() or b""
+        mutation = _begin_receipted_mutation(
+            self,
+            receipt_scope="deepfield_observation",
+            action_kind="deepfield_observation",
+            material=raw,
+            action_label="deepfield observations",
+        )
+        if mutation is None:
+            return
+
+        def finish(
+            *,
+            state: str,
+            status: int,
+            error_code: str | None = None,
+            error_message: str | None = None,
+            file_name: str | None = None,
+        ) -> None:
+            receipt = _finalize_receipted_mutation(
+                mutation,
+                state=state,
+                http_status=status,
+                backend="deepfield_inbox",
+                error_code=error_code,
+                error_message=error_message,
+                fields={"file": file_name} if file_name else None,
+                audit_action={"type": "deepfield_observation", "file": file_name},
+            )
+            body = {"ok": state == "applied", "receipt": receipt}
+            if file_name:
+                body["file"] = file_name
+            if error_code:
+                body["error"] = {
+                    "code": error_code,
+                    "message": error_message or error_code.replace("_", " "),
+                }
+            self._send_json(body, status=status)
+
+        if not DEEPFIELD_INBOX_DIR.parent.parent.is_dir():
+            finish(
+                state="rejected",
+                status=404,
+                error_code="no_observatory",
+                error_message="deepfield is not present on this Mac",
+            )
+            return
         if not raw.strip():
-            self._send_json({"ok": False, "error": {"code": "empty", "message": "empty observation"}}, status=400)
+            finish(
+                state="rejected",
+                status=400,
+                error_code="empty",
+                error_message="empty observation",
+            )
             return
         if len(raw) > 65536:
-            self._send_json({"ok": False, "error": {"code": "too_large", "message": "observation exceeds 64KB"}}, status=413)
+            finish(
+                state="rejected",
+                status=413,
+                error_code="too_large",
+                error_message="observation exceeds 64KB",
+            )
             return
+        published_path: Path | None = None
+        tmp: Path | None = None
         try:
             DEEPFIELD_INBOX_DIR.mkdir(parents=True, exist_ok=True)
             stamp = _time.strftime("%Y-%m-%d-%H%M%S")
             header = f"<!-- caught {_time.strftime('%Y-%m-%d %H:%M:%S %Z')} via pairling-blurt, unprocessed -->\n\n".encode()
             payload = header + raw + (b"" if raw.endswith(b"\n") else b"\n")
-            # Reserve the filename atomically with O_EXCL, not a check-then-write.
-            # The stamp has one-second resolution, so two observations in the
-            # same second raced between `path.exists()` and the write and both
-            # wrote the same file (and the same derived .tmp), silently losing
-            # one verbatim observation. O_EXCL makes exactly one caller win each
-            # name; the loser bumps the suffix and tries again.
+            tmp = DEEPFIELD_INBOX_DIR / (
+                f".{stamp}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+            )
+            fd = os.open(str(tmp), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                view = memoryview(payload)
+                written = 0
+                while written < len(view):
+                    count = os.write(fd, view[written:])
+                    if count <= 0:
+                        raise OSError("observation write made no progress")
+                    written += count
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+            # A hard link publishes the already-complete file without replacing
+            # an existing observation. Readers can therefore see either no
+            # destination or the whole payload, never a zero-byte reservation.
             suffix = 1
             while True:
                 name = f"{stamp}.md" if suffix == 1 else f"{stamp}-{suffix}.md"
                 path = DEEPFIELD_INBOX_DIR / name
                 try:
-                    fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-                    os.close(fd)
+                    os.link(tmp, path)
+                    published_path = path
                     break
                 except FileExistsError:
                     suffix += 1
                     if suffix > 100000:
                         raise
-            # Content is written to a per-writer-unique tmp, then atomically
-            # replaced into the reserved name, so a reader never sees a partial
-            # file and no two writers share a tmp.
-            tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-            tmp.write_bytes(payload)
-            os.replace(tmp, path)
+            directory_fd = os.open(str(DEEPFIELD_INBOX_DIR), os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         except Exception as exc:
-            self._send_json({"ok": False, "error": {"code": "write_failed", "message": f"{type(exc).__name__}"}}, status=500)
+            finish(
+                state="indeterminate" if published_path is not None else "failed",
+                status=500,
+                error_code=(
+                    "observation_outcome_unknown"
+                    if published_path is not None
+                    else "write_failed"
+                ),
+                error_message=f"{type(exc).__name__}",
+                file_name=published_path.name if published_path is not None else None,
+            )
             return
-        self._send_json({"ok": True, "file": path.name})
+        finally:
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        finish(state="applied", status=200, file_name=published_path.name)
 
     def _handle_postures_list(self, q):
         try:
@@ -19535,49 +21814,116 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_posture_write(self, q):
         raw = self._read_body() or b"{}"
+        mutation = _begin_receipted_mutation(
+            self,
+            receipt_scope="posture_write",
+            action_kind="posture_write",
+            material=raw,
+            action_label="posture changes",
+        )
+        if mutation is None:
+            return
+
+        def finish(
+            *,
+            state: str,
+            status: int,
+            code: str | None = None,
+            message: str | None = None,
+            fields: dict | None = None,
+            audit: dict | None = None,
+        ) -> None:
+            receipt = _finalize_receipted_mutation(
+                mutation,
+                state=state,
+                http_status=status,
+                backend="posture_store",
+                error_code=code,
+                error_message=message,
+                fields=fields,
+                audit_action=audit,
+            )
+            response, response_status = _receipt_replay_response(
+                receipt,
+                {"ok": state == "applied"},
+            )
+            self._send_json(response, status=response_status)
+
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:
-            self._send_json({"ok": False, "error": {"code": "invalid_request", "message": "body must be JSON"}}, status=400)
+            finish(
+                state="rejected",
+                status=400,
+                code="invalid_request",
+                message="body must be JSON",
+            )
             return
         if not isinstance(payload, dict):
-            self._send_json({"ok": False, "error": {"code": "invalid_request", "message": "body must be a JSON object"}}, status=400)
+            finish(
+                state="rejected",
+                status=400,
+                code="invalid_request",
+                message="body must be a JSON object",
+            )
             return
+
         name = str(payload.get("name") or "").strip()
         description = str(payload.get("description") or "")
         body = str(payload.get("body") or "")
         mode = str(payload.get("mode") or "").strip().lower()
         original_slug = str(payload.get("original_slug") or "").strip() or None
         expected_revision = str(payload.get("expected_revision") or "").strip() or None
-        client_action_id = str(payload.get("client_action_id") or "").strip() or None
-        body_hash = hashlib.sha256(raw).hexdigest()
-        device_id = getattr(getattr(self, "pairling_auth", None), "device_id", None)
         audit_action = {
             "type": "posture_write",
             "name": name[:80],
-            "mode": mode or "legacy_upsert",
+            "mode": mode,
             "original_slug": original_slug,
         }
         if not name or not body.strip():
-            self._send_json({"ok": False, "error": {"code": "invalid_request", "message": "name and body are required"}}, status=400)
+            finish(
+                state="rejected",
+                status=400,
+                code="invalid_request",
+                message="name and body are required",
+                audit=audit_action,
+            )
             return
-        if mode not in {"", "create", "edit"}:
-            self._send_json({"ok": False, "error": {"code": "invalid_request", "message": "mode must be create or edit"}}, status=400)
+        if not mode:
+            finish(
+                state="rejected",
+                status=400,
+                code="posture_mode_required",
+                message="Choose create or edit explicitly.",
+                audit=audit_action,
+            )
             return
-        if mode == "" and not _legacy_posture_request_allowed(self.headers):
-            self._send_json({
-                "ok": False,
-                "error": {
-                    "code": "posture_mode_required",
-                    "message": "Current clients must choose create or edit explicitly.",
-                },
-            }, status=400)
+        if mode not in {"create", "edit"}:
+            finish(
+                state="rejected",
+                status=400,
+                code="invalid_request",
+                message="mode must be create or edit",
+                audit=audit_action,
+            )
             return
         if mode == "create" and (original_slug is not None or expected_revision is not None):
-            self._send_json({"ok": False, "error": {"code": "invalid_request", "message": "create cannot include an original slug or expected revision"}}, status=400)
+            finish(
+                state="rejected",
+                status=400,
+                code="invalid_request",
+                message="create cannot include an original slug or expected revision",
+                audit=audit_action,
+            )
             return
         if mode == "edit" and (original_slug is None or expected_revision is None):
-            self._send_json({"ok": False, "error": {"code": "invalid_request", "message": "edit requires original_slug and expected_revision"}}, status=400)
+            finish(
+                state="rejected",
+                status=400,
+                code="invalid_request",
+                message="edit requires original_slug and expected_revision",
+                audit=audit_action,
+            )
             return
         try:
             written = postures.mutate_posture(
@@ -19588,43 +21934,19 @@ class Handler(BaseHTTPRequestHandler):
                 original_slug=original_slug if mode == "edit" else None,
                 expected_revision=expected_revision if mode == "edit" else None,
                 create_only=mode == "create",
-                # Builds before the versioned edit contract used POST as an
-                # upsert. Keep that wire behavior for those clients, but mark
-                # it in both the response and audit receipt.
-                legacy_upsert=mode == "",
             )
         except postures.PostureTooLarge:
-            receipt = _make_action_receipt(
-                client_action_id=client_action_id,
+            message = f"posture body exceeds {postures.POSTURE_MAX_BYTES} bytes"
+            finish(
                 state="rejected",
-                idempotent=False,
-                phases=_receipt_phases(validated=True, applied=False, pty_written=False),
+                status=413,
+                code="posture_too_large",
+                message=message,
+                fields={"error": {"code": "posture_too_large", "message": message}},
+                audit={**audit_action, "error": "too_large"},
             )
-            _store_action_receipt(
-                device_id, "", client_action_id, body_hash, receipt,
-                action_kind="posture_write",
-                audit_action={**audit_action, "error": "too_large"},
-                persist=False,
-            )
-            self._send_json({
-                "ok": False,
-                "error": {"code": "posture_too_large", "message": f"posture body exceeds {postures.POSTURE_MAX_BYTES} bytes"},
-                "receipt": receipt,
-            }, status=413)
             return
         except postures.PostureConflict as exc:
-            receipt = _make_action_receipt(
-                client_action_id=client_action_id,
-                state="rejected",
-                idempotent=False,
-                phases=_receipt_phases(validated=True, applied=False, pty_written=False),
-            )
-            _store_action_receipt(
-                device_id, "", client_action_id, body_hash, receipt,
-                action_kind="posture_write",
-                audit_action={**audit_action, "error": "posture_conflict"},
-                persist=False,
-            )
             current = exc.current if isinstance(exc.current, dict) else None
             current_summary = None
             if current is not None:
@@ -19632,144 +21954,155 @@ class Handler(BaseHTTPRequestHandler):
                     key: current.get(key)
                     for key in ("slug", "name", "description", "mtime", "revision")
                 }
-            self._send_json({
-                "ok": False,
-                "error": {
-                    "code": "posture_conflict",
-                    "message": str(exc)[:200],
-                    "current": current_summary,
-                    "conflict_copies": exc.conflict_copies,
-                },
-                "receipt": receipt,
-            }, status=409)
+            error = {
+                "code": "posture_conflict",
+                "message": str(exc)[:200],
+                "current": current_summary,
+                "conflict_copies": exc.conflict_copies,
+            }
+            finish(
+                state="rejected",
+                status=409,
+                code="posture_conflict",
+                message=error["message"],
+                fields={"error": error},
+                audit={**audit_action, "error": "posture_conflict"},
+            )
             return
         except ValueError as exc:
-            self._send_json({
-                "ok": False,
-                "error": {"code": "invalid_request", "message": str(exc)[:200]},
-            }, status=400)
+            finish(
+                state="rejected",
+                status=400,
+                code="invalid_request",
+                message=str(exc)[:200],
+                audit={**audit_action, "error": "invalid_request"},
+            )
             return
         except (postures.PostureIOError, OSError) as exc:
-            receipt = _make_action_receipt(
-                client_action_id=client_action_id,
-                state="rejected",
-                idempotent=False,
-                phases=_receipt_phases(validated=True, applied=False, pty_written=False),
+            code = getattr(exc, "code", "posture_io_failed")
+            message = "The posture could not be saved on this Mac."
+            finish(
+                state="failed",
+                status=500,
+                code=code,
+                message=message,
+                fields={"error": {"code": code, "message": message}},
+                audit={**audit_action, "error": type(exc).__name__},
             )
-            _store_action_receipt(
-                device_id, "", client_action_id, body_hash, receipt,
-                action_kind="posture_write",
-                audit_action={**audit_action, "error": type(exc).__name__},
-                persist=False,
-            )
-            self._send_json({
-                "ok": False,
-                "error": {
-                    "code": getattr(exc, "code", "posture_io_failed"),
-                    "message": "The posture could not be saved on this Mac.",
-                },
-                "receipt": receipt,
-            }, status=500)
             return
-        receipt = _make_action_receipt(
-            client_action_id=client_action_id,
+        finish(
             state="applied",
-            idempotent=False,
-            phases=_receipt_phases(validated=True, applied=True, pty_written=False),
-        )
-        _store_action_receipt(
-            device_id, "", client_action_id, body_hash, receipt,
-            action_kind="posture_write",
-            audit_action={
+            status=200,
+            fields={"posture": written},
+            audit={
                 **audit_action,
                 "slug": written["slug"],
                 "overwrote": written["overwrote"],
                 "renamed_from": written.get("renamed_from"),
                 "revision": written.get("revision"),
-                "legacy_upsert": written.get("legacy_upsert", False),
             },
-            persist=False,
         )
-        self._send_json({"ok": True, "posture": written, "receipt": receipt})
 
     def _handle_posture_delete(self, q, slug: str):
-        client_action_id = (q.get("client_action_id", [None]) or [None])[0]
         expected_revision = str((q.get("expected_revision", [""]) or [""])[0] or "").strip() or None
-        device_id = getattr(getattr(self, "pairling_auth", None), "device_id", None)
         audit_action = {"type": "posture_delete", "slug": slug[:80]}
-        legacy_delete = expected_revision is None and _legacy_posture_request_allowed(self.headers)
-        if expected_revision is None and not legacy_delete:
-            self._send_json({
-                "ok": False,
-                "error": {
-                    "code": "posture_revision_required",
-                    "message": "Current clients must provide the posture revision when deleting.",
-                },
-            }, status=400)
+        mutation = _begin_receipted_mutation(
+            self,
+            receipt_scope=f"posture_delete:{slug}",
+            action_kind="posture_delete",
+            material={"slug": slug, "expected_revision": expected_revision},
+            action_label="posture deletion",
+        )
+        if mutation is None:
+            return
+
+        def finish(
+            *,
+            state: str,
+            status: int,
+            code: str | None = None,
+            message: str | None = None,
+            fields: dict | None = None,
+            audit: dict | None = None,
+        ) -> None:
+            receipt = _finalize_receipted_mutation(
+                mutation,
+                state=state,
+                http_status=status,
+                backend="posture_store",
+                error_code=code,
+                error_message=message,
+                fields=fields,
+                audit_action=audit,
+            )
+            response, response_status = _receipt_replay_response(
+                receipt,
+                {"ok": state == "applied"},
+            )
+            self._send_json(response, status=response_status)
+
+        if expected_revision is None:
+            finish(
+                state="rejected",
+                status=400,
+                code="posture_revision_required",
+                message="Provide the posture revision when deleting.",
+                audit=audit_action,
+            )
             return
         try:
             removed = postures.delete_posture(
                 self._postures_root(),
                 slug,
                 expected_revision=expected_revision,
-                # An omitted revision is the intentional compatibility path
-                # for already-shipped clients. Current clients always send it.
-                require_revision=not legacy_delete,
             )
         except postures.PostureConflict as exc:
-            receipt = _make_action_receipt(
-                client_action_id=client_action_id,
+            message = str(exc)[:200]
+            finish(
                 state="rejected",
-                idempotent=False,
-                phases=_receipt_phases(validated=True, applied=False, pty_written=False),
+                status=409,
+                code="posture_conflict",
+                message=message,
+                fields={"error": {"code": "posture_conflict", "message": message}},
+                audit={**audit_action, "error": "posture_conflict"},
             )
-            _store_action_receipt(
-                device_id, "", client_action_id, "", receipt,
-                action_kind="posture_delete",
-                audit_action={**audit_action, "error": "posture_conflict"},
-                persist=False,
-            )
-            self._send_json({
-                "ok": False,
-                "error": {"code": "posture_conflict", "message": str(exc)[:200]},
-                "receipt": receipt,
-            }, status=409)
             return
         except ValueError as exc:
-            self._send_json({
-                "ok": False,
-                "error": {"code": "invalid_request", "message": str(exc)[:200]},
-            }, status=400)
+            finish(
+                state="rejected",
+                status=400,
+                code="invalid_request",
+                message=str(exc)[:200],
+                audit={**audit_action, "error": "invalid_request"},
+            )
             return
         except (postures.PostureIOError, OSError) as exc:
-            self._send_json({
-                "ok": False,
-                "error": {
-                    "code": getattr(exc, "code", "posture_io_failed"),
-                    "message": "The posture could not be deleted from this Mac.",
-                },
-            }, status=500)
+            code = getattr(exc, "code", "posture_io_failed")
+            message = "The posture could not be deleted from this Mac."
+            finish(
+                state="failed",
+                status=500,
+                code=code,
+                message=message,
+                fields={"error": {"code": code, "message": message}},
+                audit={**audit_action, "error": type(exc).__name__},
+            )
             return
-        receipt = _make_action_receipt(
-            client_action_id=client_action_id,
-            state="applied" if removed else "rejected",
-            idempotent=False,
-            phases=_receipt_phases(validated=True, applied=removed, pty_written=False),
-        )
-        _store_action_receipt(
-            device_id, "", client_action_id, "", receipt,
-            action_kind="posture_delete",
-            audit_action={**audit_action, "removed": removed},
-            persist=False,
-        )
         if not removed:
-            self._send_json({
-                "ok": False,
-                "error": {"code": "not_found", "message": "no such posture"},
-                "receipt": receipt,
-            }, status=404)
+            finish(
+                state="rejected",
+                status=404,
+                code="not_found",
+                message="no such posture",
+                audit={**audit_action, "removed": False},
+            )
             return
-        self._send_json({"ok": True, "slug": slug, "receipt": receipt})
+        finish(
+            state="applied",
+            status=200,
+            fields={"slug": slug},
+            audit={**audit_action, "removed": True},
+        )
 
     # ----- /personal-context: serve ~/.claude/personal-context.md -----
     def _handle_personal_context(self, q):
@@ -20649,6 +22982,54 @@ class Handler(BaseHTTPRequestHandler):
             })
         return items
 
+    def _send_race_mutation_result(self, context: dict, result: dict) -> None:
+        response = dict(result)
+        status = int(response.pop("status", 200 if response.get("ok") else 500))
+        ok = bool(response.get("ok"))
+        error_code = str(response.pop("code", "") or "")
+        error_message = str(response.pop("message", "") or "")
+        outcome_indeterminate = bool(response.get("outcome_indeterminate"))
+        if not ok:
+            error_code = error_code or (
+                "race_action_outcome_unknown"
+                if outcome_indeterminate
+                else "race_action_failed"
+            )
+            error_message = error_message or error_code.replace("_", " ")
+            response["error"] = {
+                "code": error_code,
+                "message": error_message,
+            }
+            response["error_code"] = error_code
+
+        state = (
+            "applied"
+            if ok
+            else (
+                "indeterminate"
+                if outcome_indeterminate
+                else ("rejected" if 400 <= status < 500 else "failed")
+            )
+        )
+        receipt = _finalize_receipted_mutation(
+            context,
+            state=state,
+            http_status=status,
+            backend="git_worktree",
+            error_code=error_code if not ok else None,
+            error_message=error_message if not ok else None,
+            fields=response,
+            audit_action={
+                "type": context["action_kind"],
+                "race_id": response.get("race_id"),
+                "state": state,
+                "error_code": error_code or None,
+            },
+        )
+        response["receipt"] = receipt
+        response["deduped"] = False
+        self._send_json(response, status=status)
+
     def _handle_race_prepare(self, q):
         try:
             payload = self._read_json_object()
@@ -20666,12 +23047,26 @@ class Handler(BaseHTTPRequestHandler):
         if not os.path.isdir(project):
             self._send_json({"ok": False, "error": {"code": "missing_project", "message": "project directory does not exist"}}, status=404)
             return
-        result = _race_prepare(project)
-        status = result.pop("status", 200 if result.get("ok") else 500)
-        if not result.get("ok"):
-            self._send_json({"ok": False, "error": {"code": result.get("code"), "message": result.get("message", "")}}, status=status)
+        context = _begin_receipted_mutation(
+            self,
+            receipt_scope="race:prepare",
+            action_kind="race_prepare",
+            material={"project": project},
+            action_label="race preparation",
+        )
+        if context is None:
             return
-        self._send_json(result, status=status)
+        try:
+            result = _race_prepare(project)
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "status": 500,
+                "code": "race_prepare_outcome_unknown",
+                "message": f"race preparation stopped unexpectedly: {type(exc).__name__}",
+                "outcome_indeterminate": True,
+            }
+        self._send_race_mutation_result(context, result)
 
     def _handle_race_status(self, q, race_id: str):
         result = _race_status(race_id)
@@ -20682,10 +23077,40 @@ class Handler(BaseHTTPRequestHandler):
         try:
             payload = self._read_json_object()
         except Exception:
-            payload = {}
-        result = _race_finish(race_id, force=bool(payload.get("force")))
-        status = result.pop("status", 200 if result.get("ok") else 500)
-        self._send_json(result, status=status)
+            self._send_json({"ok": False, "error": {"code": "bad_json", "message": "invalid JSON"}}, status=400)
+            return
+        raw_force = payload.get("force", False)
+        if not isinstance(raw_force, bool):
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "bad_force",
+                    "message": "force must be a JSON boolean",
+                },
+            }, status=400)
+            return
+        force = raw_force
+        context = _begin_receipted_mutation(
+            self,
+            receipt_scope=f"race:{race_id}:finish",
+            action_kind="race_finish",
+            material={"race_id": race_id, "force": force},
+            action_label="race finish",
+        )
+        if context is None:
+            return
+        try:
+            result = _race_finish(race_id, force=force)
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "status": 500,
+                "code": "race_finish_outcome_unknown",
+                "message": f"race finish stopped unexpectedly: {type(exc).__name__}",
+                "race_id": race_id,
+                "outcome_indeterminate": True,
+            }
+        self._send_race_mutation_result(context, result)
 
     def _handle_fleet_digest(self, q):
         try:
@@ -20815,12 +23240,40 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": {"code": "not_found", "message": "unknown request_nonce"}}, status=404)
             return
         current_state = str(row.get("state") or "")
+
+        def send_terminal_state(state: str) -> None:
+            if state == "outcome_unknown":
+                self._send_json({
+                    "ok": False,
+                    "state": state,
+                    "broker_id": str(row.get("broker_id") or ""),
+                    "already_resolved": False,
+                    "error": {
+                        "code": "approval_apply_outcome_unknown",
+                        "message": "Pairling still cannot confirm whether this permission decision reached the terminal. Inspect the session on the Mac before acting again.",
+                    },
+                }, status=502)
+                return
+            if state in {"screen_proof_unavailable", "screen_state_unknown"}:
+                self._send_json({
+                    "ok": False,
+                    "state": state,
+                    "broker_id": str(row.get("broker_id") or ""),
+                    "already_resolved": False,
+                    "error": {
+                        "code": "approval_screen_unverified",
+                        "message": "Pairling cannot prove the current permission screen. Decide on the Mac.",
+                    },
+                }, status=409)
+                return
+            self._send_json({"ok": True, "state": state, "already_resolved": True})
+
         if current_state in _PERMISSION_IN_FLIGHT_NOUNS:
             self._send_json(_permission_in_flight_response(current_state), status=409)
             return
         if current_state not in {"pending", "attention"}:
             # Already resolved (double-tap / re-delivery) — safe idempotent no-op.
-            self._send_json({"ok": True, "state": str(row.get("state") or ""), "already_resolved": True})
+            send_terminal_state(current_state)
             return
         if not _pending_approval_cas(request_nonce, current_state, spec["in_flight"]):
             latest = _pending_approval_get(request_nonce) or {}
@@ -20828,7 +23281,7 @@ class Handler(BaseHTTPRequestHandler):
             if latest_state in _PERMISSION_IN_FLIGHT_NOUNS:
                 self._send_json(_permission_in_flight_response(latest_state), status=409)
             else:
-                self._send_json({"ok": True, "state": latest_state, "already_resolved": True})
+                send_terminal_state(latest_state)
             return
         provider = str(row.get("provider") or "claude")
         expected_proof = _approval_row_screen_proof(row)
@@ -20909,10 +23362,28 @@ class Handler(BaseHTTPRequestHandler):
             }, status=409)
             return
 
-        try:
-            current_snapshot = PTY_BROKER.snapshot(broker_id)
-        except Exception:
-            current_snapshot = None
+        context = _broker_atomic_control_context_for_id(
+            broker_id,
+            public_session_id=str(row.get("session_id") or broker_id),
+        )
+        if context is None:
+            _pending_approval_cas(request_nonce, spec["in_flight"], current_state)
+            self._send_json({
+                "ok": False,
+                "state": current_state,
+                "broker_id": broker_id,
+                "injected": {
+                    "ok": False,
+                    "reason": "approval_requires_current_broker",
+                    "pty_written": False,
+                },
+                "error": {
+                    "code": "approval_requires_current_broker",
+                    "message": "This permission decision needs the current atomic terminal broker; decide on the Mac or update the helper.",
+                },
+            }, status=409)
+            return
+        current_snapshot = context["v2"]
         current_proof = _approval_snapshot_proof(current_snapshot)
         if not _approval_proof_matches(expected_proof, current_proof):
             reject_stale(current_snapshot)
@@ -20925,23 +23396,62 @@ class Handler(BaseHTTPRequestHandler):
             "type": "key",
             "key": spec["key"],
             "require_screen_proof": True,
-            "expected_screen_hash": expected_proof["screen_hash"],
-            "expected_generation": expected_proof["generation"],
-            "expected_nonce": expected_proof["nonce"],
+            "expected_screen_hash": context["control_proof"]["screen_hash"],
+            "expected_generation": context["control_proof"]["generation"],
+            "expected_nonce": context["control_proof"]["nonce"],
         }
         try:
             injected = PTY_BROKER.control(broker_id, action)
-        except Exception as e:
-            injected = {"ok": False, "reason": f"{type(e).__name__}: {str(e)[:120]}", "pty_written": False}
+        except PTYBrokerOutcomeUnknownError as exc:
+            _pending_approval_cas(request_nonce, spec["in_flight"], "outcome_unknown")
+            self._send_json({
+                "ok": False,
+                "state": "outcome_unknown",
+                "broker_id": broker_id,
+                "injected": {
+                    "ok": False,
+                    "reason": "approval_apply_outcome_unknown",
+                    "pty_written": None,
+                    "write_outcome": "unknown",
+                    "outcome_indeterminate": True,
+                },
+                "error": {
+                    "code": "approval_apply_outcome_unknown",
+                    "message": "The broker response was lost, so Pairling cannot confirm whether the permission decision reached the terminal.",
+                    "detail": f"{type(exc).__name__}: {str(exc)[:120]}",
+                },
+            }, status=502)
+            return
+        except Exception as exc:
+            injected = {
+                "ok": False,
+                "reason": f"{type(exc).__name__}: {str(exc)[:120]}",
+                "pty_written": False,
+                "write_outcome": "none",
+            }
 
         if not injected.get("ok") and injected.get("reason") == "stale_screen":
-            try:
-                latest_snapshot = PTY_BROKER.snapshot(broker_id)
-            except Exception:
-                latest_snapshot = None
+            latest_context = _broker_atomic_control_context_for_id(
+                broker_id,
+                public_session_id=str(row.get("session_id") or broker_id),
+            )
+            latest_snapshot = latest_context.get("v2") if latest_context is not None else None
             reject_stale(latest_snapshot)
             return
         if not injected.get("ok"):
+            if injected.get("outcome_indeterminate"):
+                _pending_approval_cas(request_nonce, spec["in_flight"], "outcome_unknown")
+                self._send_json({
+                    "ok": False,
+                    "state": "outcome_unknown",
+                    "broker_id": broker_id,
+                    "injected": injected,
+                    "error": {
+                        "code": "approval_apply_outcome_unknown",
+                        "message": "Pairling cannot confirm how much of the permission decision reached the terminal.",
+                    },
+                }, status=502)
+                return
             _pending_approval_cas(request_nonce, spec["in_flight"], current_state)
             latest = _pending_approval_get(request_nonce) or {}
             self._send_json({
@@ -21299,39 +23809,78 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(_aperture_cli_contexts_payload(home=HOME, env=os.environ))
 
     def _handle_aperture_cli_open(self, q):
+        receipt_context = _begin_receipted_mutation(
+            self,
+            receipt_scope="aperture:open",
+            action_kind="aperture_cli_open",
+            material={"operation": "open_aperture_cli"},
+            action_label="Aperture CLI launch",
+        )
+        if receipt_context is None:
+            return
+
         if _aperture_cli_status_payload is None:
+            message = "Aperture CLI integration is unavailable"
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="failed",
+                http_status=503,
+                backend="terminal_app",
+                error_code="aperture_cli_integration_unavailable",
+                error_message=message,
+                audit_action={"type": "aperture_cli_open"},
+            )
             self._send_json({
                 "ok": False,
                 "error": {
                     "code": "aperture_cli_integration_unavailable",
-                    "message": "Aperture CLI integration is unavailable",
+                    "message": message,
                 },
+                "receipt": receipt,
             }, status=503)
             return
 
         allowed, retry = _inject_rate_check("__aperture_cli_open__")
         if not allowed:
-            self.send_response(429)
-            self.send_header("Retry-After", str(retry))
-            self.send_header("Content-Type", "application/json")
-            body = json.dumps({
+            message = f"retry in {retry}s"
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="rejected",
+                http_status=429,
+                backend="terminal_app",
+                error_code="rate_limited",
+                error_message=message,
+                fields={"retry_after": retry},
+                audit_action={"type": "aperture_cli_open"},
+            )
+            self._send_json({
                 "ok": False,
-                "error": {"code": "rate_limited", "message": f"retry in {retry}s"},
-            }).encode()
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+                "error": {"code": "rate_limited", "message": message},
+                "retry_after": retry,
+                "receipt": receipt,
+            }, status=429)
             return
 
         status_payload = _aperture_cli_status_payload(home=HOME, env=os.environ)
         binary = str(status_payload.get("binary_path") or "").strip()
         if not binary or not os.path.exists(binary) or not os.access(binary, os.X_OK):
+            message = "Aperture CLI binary was not found on this Mac."
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="failed",
+                http_status=503,
+                backend="terminal_app",
+                error_code="aperture_cli_not_installed",
+                error_message=message,
+                audit_action={"type": "aperture_cli_open"},
+            )
             self._send_json({
                 "ok": False,
                 "error": {
                     "code": "aperture_cli_not_installed",
-                    "message": "Aperture CLI binary was not found on this Mac.",
+                    "message": message,
                 },
+                "receipt": receipt,
             }, status=503)
             return
 
@@ -21347,20 +23896,64 @@ class Handler(BaseHTTPRequestHandler):
             return "ok\t" & (tty of newTab)
         end tell
         '''
-        result = _run_osascript(script)
+        result = _run_osascript(script, mutation_possible=True)
         if not result.get("ok"):
+            outcome_indeterminate = bool(result.get("outcome_indeterminate"))
+            message = str(result.get("reason") or "Terminal could not open Aperture CLI.")
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="indeterminate" if outcome_indeterminate else "failed",
+                http_status=502,
+                backend="terminal_app",
+                error_code=(
+                    "aperture_cli_launch_outcome_unknown"
+                    if outcome_indeterminate else "terminal_open_failed"
+                ),
+                error_message=message,
+                fields={"outcome_indeterminate": outcome_indeterminate},
+                audit_action={"type": "aperture_cli_open"},
+                pty_written=None if outcome_indeterminate else False,
+            )
             self._send_json({
                 "ok": False,
                 "error": {
-                    "code": "terminal_open_failed",
-                    "message": result.get("reason") or "Terminal could not open Aperture CLI.",
+                    "code": (
+                        "aperture_cli_launch_outcome_unknown"
+                        if outcome_indeterminate else "terminal_open_failed"
+                    ),
+                    "message": message,
                 },
+                "outcome_indeterminate": outcome_indeterminate,
+                "receipt": receipt,
             }, status=502)
             return
 
         stdout = result.get("stdout") or ""
         parts = stdout.split("\t")
         tty = parts[1].strip() if len(parts) >= 2 else ""
+        if re.fullmatch(r"/dev/ttys[0-9]{3,}", tty) is None:
+            message = "Terminal accepted the launch, but Pairling could not identify the new tab."
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="indeterminate",
+                http_status=502,
+                backend="terminal_app",
+                error_code="aperture_cli_launch_outcome_unknown",
+                error_message=message,
+                fields={"outcome_indeterminate": True},
+                audit_action={"type": "aperture_cli_open"},
+                pty_written=None,
+            )
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "aperture_cli_launch_outcome_unknown",
+                    "message": message,
+                },
+                "outcome_indeterminate": True,
+                "receipt": receipt,
+            }, status=502)
+            return
         try:
             audit_path = HOME / ".claude" / "audit" / "aperture-cli-open.jsonl"
             audit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -21376,13 +23969,22 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
-        self._send_json({
+        response = {
             "ok": True,
             "tty": tty or None,
             "version": status_payload.get("version"),
             "endpoint": (status_payload.get("settings") or {}).get("active_endpoint"),
             "message": "Aperture CLI opened on Mac.",
-        })
+        }
+        response["receipt"] = _finalize_receipted_mutation(
+            receipt_context,
+            state="applied",
+            http_status=200,
+            backend="terminal_app",
+            fields=response,
+            audit_action={"type": "aperture_cli_open", "tty": tty},
+        )
+        self._send_json(response)
 
     def _handle_workers(self, q):
         try:
@@ -21411,10 +24013,42 @@ class Handler(BaseHTTPRequestHandler):
 
     # ----- /orchestrations: bounded multi-agent orchestration -----
     _ORCHESTRATION_MODES = {"research", "debug", "scaffold", "decide", "draft", "remember", "extend"}
-    _ORCHESTRATION_AUTONOMY = {"review_first", "bounded_auto", "full_auto"}
     _ORCHESTRATION_PERMISSIONS = {"default", "accept_edits", "plan"}
-    _ORCHESTRATION_STOP_CONDITIONS = {"first_findings", "tests_pass", "budget_hit", "time_limit", "manual_stop"}
+    _ORCHESTRATION_STOP_CONDITIONS = {"manual_stop"}
     _ORCHESTRATION_ACTIVE_HEARTBEAT_SECONDS = 180
+
+    @staticmethod
+    def _orchestration_permission_args(provider: str, permission_profile: str) -> list[str]:
+        """Translate the user-visible profile into enforced provider flags."""
+        if permission_profile not in Handler._ORCHESTRATION_PERMISSIONS:
+            raise ValueError("invalid permission profile")
+        if provider == "claude":
+            mode = {
+                "default": "manual",
+                "accept_edits": "acceptEdits",
+                "plan": "plan",
+            }[permission_profile]
+            return ["--permission-mode", mode]
+        if provider == "codex":
+            sandbox = "read-only" if permission_profile == "plan" else "workspace-write"
+            return ["--sandbox", sandbox, "--ask-for-approval", "on-request"]
+        raise ValueError(f"unsupported orchestration provider: {provider}")
+
+    @staticmethod
+    def _orchestration_wait_for_provider_pid(
+        tty: str,
+        provider: str,
+        timeout_seconds: float = 3.0,
+    ) -> int:
+        deadline = _time.monotonic() + max(0.0, timeout_seconds)
+        while True:
+            pid = _pid_for_tty_command(tty, provider)
+            if pid:
+                return pid
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                return 0
+            _time.sleep(min(0.1, remaining))
 
     def _route_orchestration_path(self, path: str, q):
         parts = [p for p in path.split("/") if p]
@@ -21449,9 +24083,16 @@ class Handler(BaseHTTPRequestHandler):
     def _orchestration_write(self, run: dict) -> None:
         run["updated_at"] = _time.time()
         path = self._orchestration_path(run["id"])
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(run, indent=2, sort_keys=True))
+        tmp = path.with_name(
+            f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+        )
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(json.dumps(run, indent=2, sort_keys=True))
+            file.flush()
+            os.fsync(file.fileno())
         tmp.replace(path)
+        path.chmod(0o600)
 
     def _orchestration_event(self, run: dict, kind: str, title: str, detail: str | None = None) -> None:
         events = run.setdefault("events", [])
@@ -21630,6 +24271,12 @@ class Handler(BaseHTTPRequestHandler):
         orchestration_id = run["id"]
         title = f"orchestration-{role}-{orchestration_id[:6]}"
         launch_script = prompt_path.with_suffix(".launch.sh")
+        permission_args = self._orchestration_permission_args(
+            "claude", str(run.get("permission_profile") or "default")
+        )
+        permission_flags = " ".join(
+            self._orchestration_shell_quote(arg) for arg in permission_args
+        )
         launch_script.write_text(
             "#!/bin/zsh\n"
             "set -e\n"
@@ -21637,7 +24284,7 @@ class Handler(BaseHTTPRequestHandler):
             f"export PAIRLING_ORCHESTRATION_ID={self._orchestration_shell_quote(orchestration_id)}\n"
             f"export PAIRLING_ORCHESTRATION_ROLE={self._orchestration_shell_quote(role)}\n"
             f"prompt=$(cat {self._orchestration_shell_quote(str(prompt_path))})\n"
-            f"exec {self._orchestration_shell_quote(str(claude_bin))} --dangerously-skip-permissions \"$prompt\"\n",
+            f"exec {self._orchestration_shell_quote(str(claude_bin))} {permission_flags} \"$prompt\"\n",
             encoding="utf-8",
         )
         launch_script.chmod(0o700)
@@ -21653,18 +24300,27 @@ class Handler(BaseHTTPRequestHandler):
             return "ok\t" & (tty of newTab)
         end tell
         '''
-        result = _run_osascript(script)
+        result = _run_osascript(script, mutation_possible=True)
         tty = ""
         if result.get("ok"):
             parts = (result.get("stdout") or "").split("\t")
             if len(parts) >= 2:
                 tty = parts[1].strip()
-        pid = _pid_for_tty_command(tty, "claude") if tty else 0
+        pid = self._orchestration_wait_for_provider_pid(tty, "claude") if tty else 0
+        outcome_indeterminate = bool(result.get("outcome_indeterminate"))
+        launch_confirmed = bool(result.get("ok") and tty and pid)
+        if result.get("ok") and not launch_confirmed:
+            outcome_indeterminate = True
         return {
             "provider": "claude",
             "role": role,
-            "ok": bool(result.get("ok")),
-            "error": result.get("reason"),
+            "ok": launch_confirmed,
+            "error": (
+                result.get("reason")
+                if not result.get("ok")
+                else (None if launch_confirmed else "Claude launch could not be confirmed from the Terminal process.")
+            ),
+            "outcome_indeterminate": outcome_indeterminate,
             "title": title,
             "prompt_path": str(prompt_path),
             "launch_script": str(launch_script),
@@ -21710,11 +24366,13 @@ class Handler(BaseHTTPRequestHandler):
         })
         cmd = [
             str(codex_bin),
+            *self._orchestration_permission_args(
+                "codex", str(run.get("permission_profile") or "default")
+            ),
             "exec",
             "--json",
             "-C",
             project,
-            "--dangerously-bypass-approvals-and-sandbox",
             "-o",
             str(last_path),
             "-",
@@ -21740,6 +24398,21 @@ class Handler(BaseHTTPRequestHandler):
                 "role": role,
                 "ok": False,
                 "error": f"{type(e).__name__}: {e}",
+                "title": title,
+                "prompt_path": str(prompt_path),
+                "output_path": str(output_path),
+            }
+        if proc.poll() is not None:
+            try:
+                startup_error = stderr_path.read_text(errors="replace")[-1000:].strip()
+            except OSError:
+                startup_error = ""
+            return {
+                "provider": "codex",
+                "role": role,
+                "ok": False,
+                "error": startup_error or f"Codex exited during launch with status {proc.returncode}",
+                "outcome_indeterminate": False,
                 "title": title,
                 "prompt_path": str(prompt_path),
                 "output_path": str(output_path),
@@ -21784,18 +24457,14 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def _orchestration_prompt(self, run: dict, role: str, worker_index: int | None = None) -> str:
-        stop_conditions = ", ".join(run.get("stop_conditions") or [])
         handoff_path = run.get("handoff_path")
-        common = f"""You are part of a bounded Pairling orchestration launched from Pairling.
+        common = f"""You are part of a Pairling orchestration launched from Pairling.
 
 Orchestration id: {run['id']}
 Role: {role}
 Project: {run['project']}
 Mode: {run['mode']}
-Autonomy: {run['autonomy']}
 Permission profile: {run['permission_profile']}
-Max wall time: {run['max_minutes']} minutes
-Stop conditions: {stop_conditions}
 Source handoff file: {handoff_path or 'none'}
 
 Objective:
@@ -21814,7 +24483,6 @@ Planner/Judge instructions:
 - Inspect the repository and handoff context.
 - Produce a bounded plan suitable for the worker count.
 - Identify disjoint write scopes and verification gates.
-- If the orchestration is review_first, do not make project edits; produce the plan and ask for review.
 - If workers are already running, judge their output and summarize convergence.
 """
         return common + f"""
@@ -21822,8 +24490,8 @@ Worker instructions:
 - You are worker {worker_index or 1} of {run['max_workers']}.
 - Take one bounded slice of the objective and execute it end to end.
 - Avoid overlapping files with other workers where possible.
-- Run the most relevant local verification available within the time budget.
-- Stop cleanly when the task is done, blocked, or a stop condition is reached.
+- Run the most relevant local verification available.
+- Stop cleanly when the assigned slice is done or blocked.
 """
 
     def _orchestration_launch_background(self, run_id: str) -> None:
@@ -21846,6 +24514,7 @@ Worker instructions:
 
             planner_prompt = run_dir / "planner.md"
             planner_prompt.write_text(self._orchestration_prompt(run, "planner"))
+            planner_prompt.chmod(0o600)
             planner_provider = launch_for_role("planner")
             run["launches"].append(launch_role_for(planner_provider)(run, "planner", planner_prompt, "planner"))
             run["launches"][-1]["provider"] = planner_provider
@@ -21853,13 +24522,36 @@ Worker instructions:
                 worker_prompt = run_dir / f"worker-{idx}.md"
                 role = f"worker-{idx}"
                 worker_prompt.write_text(self._orchestration_prompt(run, "worker", idx))
+                worker_prompt.chmod(0o600)
                 role_provider = launch_for_role(role)
                 run["launches"].append(launch_role_for(role_provider)(run, role, worker_prompt, f"worker {idx}"))
                 run["launches"][-1]["provider"] = role_provider
 
-            failed = [l for l in run["launches"] if not l.get("ok")]
-            if failed:
+            indeterminate = [
+                launch for launch in run["launches"]
+                if launch.get("outcome_indeterminate")
+            ]
+            failed = [
+                launch for launch in run["launches"]
+                if not launch.get("ok") and not launch.get("outcome_indeterminate")
+            ]
+            run["failed_launch_count"] = len(failed)
+            run["indeterminate_launch_count"] = len(indeterminate)
+            if indeterminate:
+                run["status"] = "launch_indeterminate"
+                run["status_detail"] = (
+                    f"Pairling could not confirm {len(indeterminate)} role launch outcome(s). "
+                    "It will not label this orchestration as running."
+                )
+                self._orchestration_event(
+                    run,
+                    "error",
+                    "One or more role launch outcomes are unknown",
+                    "; ".join((launch.get("error") or "unknown") for launch in indeterminate)[:500],
+                )
+            elif failed:
                 run["status"] = "launch_error"
+                run["status_detail"] = f"{len(failed)} role(s) failed to launch."
                 self._orchestration_event(run, "error", "One or more roles failed to launch", "; ".join((f.get("error") or "unknown") for f in failed)[:500])
             else:
                 run["status"] = "running"
@@ -21867,6 +24559,7 @@ Worker instructions:
                 self._orchestration_event(run, "launched", "Planner and workers launched", f"{len(run['launches'])} {surface} opened.")
         except Exception as e:
             run["status"] = "launch_error"
+            run["status_detail"] = f"Orchestration launcher failed: {type(e).__name__}: {e}"
             self._orchestration_event(run, "error", "Orchestration launcher crashed", f"{type(e).__name__}: {e}")
         self._orchestration_write(run)
 
@@ -22061,27 +24754,13 @@ Worker instructions:
         run["stop_status"] = self._orchestration_stop_status(run, sessions)
         if run.get("status") == "running":
             created = float(run.get("created_at") or now)
-            max_minutes = int(run.get("max_minutes") or 30)
-            max_context = max([float(s.get("context_pct") or 0.0) for s in sessions] or [0.0])
-            if "budget_hit" in (run.get("stop_conditions") or []) and max_context >= 95:
-                run["status"] = "budget_hit"
-                run["finished_reason"] = "budget_hit"
-                run["finished_at"] = now
-                run["status_detail"] = f"Highest observed context pressure reached {max_context:.0f}%."
-                self._orchestration_event(run, "stop", "Budget hit", run["status_detail"])
-            elif _time.time() - created > max_minutes * 60:
-                run["status"] = "time_limit"
-                run["finished_reason"] = "time_limit"
-                run["finished_at"] = now
-                run["status_detail"] = f"{max_minutes} minute cap elapsed."
-                self._orchestration_event(run, "stop", "Time limit reached", f"{max_minutes} minute cap elapsed.")
-            elif not active and known and now - created > 60:
+            if not active and known and now - created > 60:
                 run["status"] = "quiet"
                 run["finished_reason"] = "quiet"
                 run["finished_at"] = now
                 run["status_detail"] = "All registered orchestration sessions are idle; no explicit stop condition fired."
                 self._orchestration_event(run, "status", "Orchestration finished quietly", run["status_detail"])
-        elif run.get("status") in {"quiet", "time_limit", "budget_hit", "stopped"} and not run.get("status_detail"):
+        elif run.get("status") in {"quiet", "stopped"} and not run.get("status_detail"):
             run["finished_reason"] = run.get("finished_reason") or run.get("status")
             run["status_detail"] = self._orchestration_status_detail(run.get("status"), run)
             run["finished_at"] = run.get("finished_at") or run.get("updated_at") or now
@@ -22091,10 +24770,6 @@ Worker instructions:
     def _orchestration_status_detail(self, status: str, run: dict) -> str:
         if status == "quiet":
             return "All registered orchestration sessions are idle; no explicit stop condition fired."
-        if status == "time_limit":
-            return f"{int(run.get('max_minutes') or 30)} minute cap elapsed."
-        if status == "budget_hit":
-            return "An orchestration session crossed the configured context budget threshold."
         if status == "stopped":
             return "Stopped manually from the phone."
         return ""
@@ -22102,23 +24777,11 @@ Worker instructions:
     def _orchestration_stop_status(self, run: dict, sessions: list[dict]) -> list[dict]:
         status = run.get("status")
         finished_reason = run.get("finished_reason") or status
-        max_context = max([float(s.get("context_pct") or 0.0) for s in sessions] or [0.0])
-        labels = {
-            "first_findings": "First findings",
-            "tests_pass": "Tests pass",
-            "budget_hit": "Budget hit",
-            "time_limit": "Time limit",
-            "manual_stop": "Manual stop",
-        }
+        labels = {"manual_stop": "Manual stop"}
         details = {
-            "first_findings": "Armed only; workers must report findings in their final status.",
-            "tests_pass": "Armed only; test success is shown in worker output.",
-            "budget_hit": f"Highest observed context pressure: {max_context:.0f}%.",
-            "time_limit": f"Cap: {int(run.get('max_minutes') or 30)}m.",
-            "manual_stop": "Triggered when active orchestration sessions are stopped from the phone.",
+            "manual_stop": "Reached only when active orchestration sessions are stopped from the phone.",
         }
         items = []
-        armed = set(run.get("stop_conditions") or [])
         if finished_reason == "quiet" or status == "quiet":
             items.append({
                 "id": "quiet",
@@ -22126,13 +24789,11 @@ Worker instructions:
                 "state": "reached",
                 "detail": "All registered orchestration sessions are idle. No configured stop condition was triggered.",
             })
-        for condition in ["first_findings", "tests_pass", "budget_hit", "time_limit", "manual_stop"]:
-            if condition not in armed and condition != "manual_stop":
-                continue
+        for condition in ["manual_stop"]:
             state = "armed"
             if condition == finished_reason or (condition == "manual_stop" and status == "stopped"):
                 state = "reached"
-            elif status in {"quiet", "time_limit", "budget_hit", "stopped", "launch_error"}:
+            elif status in {"quiet", "stopped", "launch_error", "launch_indeterminate"}:
                 state = "not_reached"
             items.append({
                 "id": condition,
@@ -22143,60 +24804,198 @@ Worker instructions:
         return items
 
     def _handle_orchestrations_create(self, q):
+        client_action_id = str(
+            (getattr(self, "headers", {}) or {}).get("X-Pairling-Action-Id") or ""
+        ).strip()
+        if not _valid_client_action_id(client_action_id):
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "action_id_required",
+                    "message": "A valid X-Pairling-Action-Id is required to create an orchestration.",
+                },
+            }, status=400)
+            return
+        raw_body = self._read_body() or b"{}"
         try:
-            payload = json.loads(self._read_body() or b"{}")
+            payload = json.loads(raw_body)
         except json.JSONDecodeError:
             self.send_error(400, "body must be JSON")
+            return
+        device_id = getattr(getattr(self, "pairling_auth", None), "device_id", None)
+        if not isinstance(device_id, str) or not device_id.strip():
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "authenticated_device_required",
+                    "message": "A paired phone identity is required to create an orchestration.",
+                },
+            }, status=401)
+            return
+        device_id = device_id.strip()
+        orchestration_id = "orchestration-" + hashlib.sha256(
+            f"{device_id}\0{client_action_id}".encode()
+        ).hexdigest()[:12]
+        mutation = _begin_receipted_mutation(
+            self,
+            receipt_scope=orchestration_id,
+            action_kind="orchestration_create",
+            material=raw_body,
+            action_label="orchestration creation",
+        )
+        if mutation is None:
+            return
+
+        def reject_create(
+            status: int,
+            code: str,
+            message: str,
+            *,
+            error_details: dict | None = None,
+        ) -> None:
+            error = {"code": code, "message": message, **(error_details or {})}
+            receipt = _finalize_receipted_mutation(
+                mutation,
+                state="rejected",
+                http_status=status,
+                backend="orchestration_launcher",
+                error_code=code,
+                error_message=message,
+                fields={
+                    "orchestration_id": orchestration_id,
+                    "error": error,
+                },
+                audit_action={
+                    "type": "orchestration_create",
+                    "orchestration_id": orchestration_id,
+                    "state": "rejected",
+                    "error_code": code,
+                },
+            )
+            body, response_status = _receipt_replay_response(receipt, {"ok": False})
+            self._send_json(body, status=response_status)
+
+        existing_run = self._orchestration_read(orchestration_id)
+        if existing_run is not None:
+            receipt = _finalize_receipted_mutation(
+                mutation,
+                state="indeterminate",
+                http_status=409,
+                backend="orchestration_launcher",
+                error_code="orchestration_create_outcome_unknown",
+                error_message=(
+                    "This action already has an orchestration record, but its launch outcome "
+                    "cannot be reconstructed. Pairling did not launch another fleet."
+                ),
+                fields={
+                    "orchestration": existing_run,
+                    "ts": _time.time(),
+                    "outcome_indeterminate": True,
+                },
+                audit_action={
+                    "type": "orchestration_create",
+                    "orchestration_id": orchestration_id,
+                    "state": "indeterminate",
+                },
+            )
+            body, status = _receipt_replay_response(receipt, {"ok": False})
+            self._send_json(body, status=status)
+            return
+
+        if not isinstance(payload, dict):
+            reject_create(400, "invalid_body", "body must be a JSON object")
             return
         project = (payload.get("project") or "").strip()
         project_error = self._orchestration_validate_project(project)
         if project_error:
-            self.send_error(400, project_error)
+            reject_create(400, "invalid_project", project_error)
             return
         objective = (payload.get("objective") or "").strip()
         if not objective:
-            self.send_error(400, "objective required")
+            reject_create(400, "objective_required", "objective required")
             return
         mode = payload.get("mode") or "research"
-        autonomy = payload.get("autonomy") or "review_first"
         permission_profile = payload.get("permission_profile") or "default"
         provider_mode = (payload.get("provider") or "claude").lower()
         if provider_mode == "mixed":
             provider_mode = "all"
         if not _valid_provider_filter(provider_mode):
-            _send_unknown_provider(self, provider_mode)
+            error = _unknown_provider_payload(provider_mode)["error"]
+            reject_create(
+                400,
+                str(error["code"]),
+                str(error["message"]),
+                error_details={
+                    "known_providers": error["known_providers"],
+                    "known_future_providers": error["known_future_providers"],
+                },
+            )
             return
         if provider_mode == "all":
             provider = None
         elif provider_mode in _agent_provider_ids():
             provider = provider_mode
         else:
-            _send_unsupported_provider(self, provider_mode, "orchestration_launch")
+            error = _unsupported_provider_payload(provider_mode, "orchestration_launch")["error"]
+            reject_create(
+                400,
+                str(error["code"]),
+                str(error["message"]),
+                error_details={
+                    "provider": provider_mode,
+                    "capability": "orchestration_launch",
+                },
+            )
             return
         if provider is not None and not _provider_visible(provider):
-            _send_provider_hidden(self, provider)
+            error = _provider_hidden_payload(provider)["error"]
+            reject_create(
+                409,
+                str(error["code"]),
+                str(error["message"]),
+                error_details={"provider": provider},
+            )
             return
         if mode not in self._ORCHESTRATION_MODES:
-            self.send_error(400, "invalid orchestration mode")
-            return
-        if autonomy not in self._ORCHESTRATION_AUTONOMY:
-            self.send_error(400, "invalid autonomy")
+            reject_create(400, "invalid_orchestration_mode", "invalid orchestration mode")
             return
         if permission_profile not in self._ORCHESTRATION_PERMISSIONS:
-            self.send_error(400, "invalid permission profile")
+            reject_create(400, "invalid_permission_profile", "invalid permission profile")
+            return
+        if provider_mode in {"codex", "all"} and permission_profile == "accept_edits":
+            reject_create(
+                400,
+                "unsupported_permission_profile",
+                "accept edits is not a distinct Codex permission profile; choose default or plan",
+            )
             return
         try:
             max_workers = max(1, min(int(payload.get("max_workers") or 1), 4))
-            max_minutes = max(5, min(int(payload.get("max_minutes") or 30), 180))
         except (TypeError, ValueError):
-            self.send_error(400, "max_workers/max_minutes must be integers")
+            reject_create(
+                400,
+                "invalid_orchestration_limits",
+                "max_workers must be an integer",
+            )
             return
-        stop_conditions = payload.get("stop_conditions") or ["first_findings", "time_limit"]
-        stop_conditions = [s for s in stop_conditions if s in self._ORCHESTRATION_STOP_CONDITIONS]
-        if not stop_conditions:
-            stop_conditions = ["time_limit"]
-        if autonomy != "review_first" and self._orchestration_project_dirty(project) and not payload.get("allow_dirty_project"):
-            self.send_error(409, "project has uncommitted changes; set allow_dirty_project to continue")
+        stop_conditions = payload.get("stop_conditions") or ["manual_stop"]
+        if (
+            not isinstance(stop_conditions, list)
+            or any(s not in self._ORCHESTRATION_STOP_CONDITIONS for s in stop_conditions)
+        ):
+            reject_create(
+                400,
+                "invalid_stop_conditions",
+                "only manual_stop is currently enforced",
+            )
+            return
+        stop_conditions = ["manual_stop"]
+        if self._orchestration_project_dirty(project) and not payload.get("allow_dirty_project"):
+            reject_create(
+                409,
+                "dirty_project",
+                "project has uncommitted changes; set allow_dirty_project to continue",
+            )
             return
 
         health = _health_payload()
@@ -22217,64 +25016,136 @@ Worker instructions:
 
         allowed, retry = _inject_rate_check("__orchestrations__")
         if not allowed:
-            self.send_response(429)
-            self.send_header("Retry-After", str(retry))
-            self.send_header("Content-Type", "application/json")
-            body = json.dumps({"ok": False, "error": f"rate limited, retry in {retry}s"}).encode()
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            receipt = _finalize_receipted_mutation(
+                mutation,
+                state="failed",
+                http_status=429,
+                backend="orchestration_launcher",
+                error_code="rate_limited",
+                error_message=f"Orchestration creation is rate limited. Retry in {retry}s.",
+                fields={"retry_after_seconds": retry},
+                audit_action={
+                    "type": "orchestration_create",
+                    "orchestration_id": orchestration_id,
+                    "state": "rate_limited",
+                },
+            )
+            body, status = _receipt_replay_response(receipt, {"ok": False})
+            self._send_json(body, status=status)
             return
 
-        orchestration_id = "orchestration-" + secrets.token_hex(6)
-        orchestration_dir = ORCHESTRATIONS_DIR / orchestration_id
-        orchestration_dir.mkdir(parents=True, exist_ok=True)
-        handoff_text = payload.get("handoff_text") or ""
-        handoff_title = (payload.get("handoff_title") or "Manual Orchestration brief").strip()[:120]
-        handoff_path = None
-        if handoff_text.strip():
-            handoff = {
-                "schemaVersion": 1,
-                "source": payload.get("handoff_source") or "Pairling",
-                "title": handoff_title,
-                "generatedAt": _time.time(),
-                "workflowHint": mode,
-                "suggestedPrompt": objective,
-                "transcriptText": handoff_text,
-            }
-            handoff_path = HANDOFFS_DIR / f"{orchestration_id}.json"
-            handoff_path.write_text(json.dumps(handoff, indent=2, sort_keys=True))
+        try:
+            orchestration_dir = ORCHESTRATIONS_DIR / orchestration_id
+            orchestration_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+            orchestration_dir.chmod(0o700)
+            handoff_text = payload.get("handoff_text") or ""
+            handoff_title = (payload.get("handoff_title") or "Manual Orchestration brief").strip()[:120]
+            handoff_path = None
+            if handoff_text.strip():
+                handoff = {
+                    "schemaVersion": 1,
+                    "source": payload.get("handoff_source") or "Pairling",
+                    "title": handoff_title,
+                    "generatedAt": _time.time(),
+                    "workflowHint": mode,
+                    "suggestedPrompt": objective,
+                    "transcriptText": handoff_text,
+                }
+                handoff_path = HANDOFFS_DIR / f"{orchestration_id}.json"
+                handoff_path.write_text(json.dumps(handoff, indent=2, sort_keys=True))
+                handoff_path.chmod(0o600)
 
-        run = {
-            "id": orchestration_id,
-            "status": "launching",
-            "created_at": _time.time(),
-            "updated_at": _time.time(),
-            "provider": provider,
-            "provider_mode": provider_mode,
-            "providers": ["claude", "codex"] if provider_mode == "all" else [provider_mode],
-            "project": project,
-            "objective": objective[:8000],
-            "mode": mode,
-            "autonomy": autonomy,
-            "permission_profile": permission_profile,
-            "max_workers": max_workers,
-            "max_minutes": max_minutes,
-            "stop_conditions": stop_conditions,
-            "handoff_title": handoff_title,
-            "handoff_path": str(handoff_path) if handoff_path else None,
-            "coordinator": coordinator_meta,
-            "preflight": preflight_meta,
-            "placement": placement_meta,
-            "launches": [],
-            "sessions": [],
-            "events": [],
-        }
-        self._orchestration_event(run, "created", "Orchestration created", f"{provider_mode} · {mode} · {max_workers} worker(s) · {max_minutes}m")
-        self._orchestration_event(run, "preflight", "Coordinator preflight captured", f"{preflight_meta.get('posture', 'unknown')} · {preflight_meta.get('route', 'unknown')} · {preflight_meta.get('summary') or 'no summary'}")
-        self._orchestration_write(run)
-        threading.Thread(target=self._orchestration_launch_background, args=(orchestration_id,), daemon=True).start()
-        self._send_json({"ok": True, "orchestration": run, "ts": _time.time()})
+            run = {
+                "id": orchestration_id,
+                "status": "launching",
+                "created_at": _time.time(),
+                "updated_at": _time.time(),
+                "create_action_id": client_action_id,
+                "create_body_hash": mutation["body_hash"],
+                "provider": provider,
+                "provider_mode": provider_mode,
+                "providers": ["claude", "codex"] if provider_mode == "all" else [provider_mode],
+                "project": project,
+                "objective": objective[:8000],
+                "mode": mode,
+                "permission_profile": permission_profile,
+                "max_workers": max_workers,
+                "stop_conditions": stop_conditions,
+                "handoff_title": handoff_title,
+                "handoff_path": str(handoff_path) if handoff_path else None,
+                "coordinator": coordinator_meta,
+                "preflight": preflight_meta,
+                "placement": placement_meta,
+                "launches": [],
+                "sessions": [],
+                "events": [],
+            }
+            self._orchestration_event(run, "created", "Orchestration created", f"{provider_mode} · {mode} · {max_workers} worker(s)")
+            self._orchestration_event(run, "preflight", "Coordinator preflight captured", f"{preflight_meta.get('posture', 'unknown')} · {preflight_meta.get('route', 'unknown')} · {preflight_meta.get('summary') or 'no summary'}")
+            self._orchestration_write(run)
+        except Exception as error:
+            receipt = _finalize_receipted_mutation(
+                mutation,
+                state="failed",
+                http_status=500,
+                backend="orchestration_launcher",
+                error_code="orchestration_create_failed",
+                error_message=f"{type(error).__name__}: {error}",
+                fields={"orchestration_id": orchestration_id},
+                audit_action={
+                    "type": "orchestration_create",
+                    "orchestration_id": orchestration_id,
+                    "state": "failed",
+                },
+            )
+            body, status = _receipt_replay_response(receipt, {"ok": False})
+            self._send_json(body, status=status)
+            return
+
+        try:
+            threading.Thread(
+                target=self._orchestration_launch_background,
+                args=(orchestration_id,),
+                daemon=True,
+            ).start()
+        except Exception as error:
+            run["status"] = "launch_error"
+            run["status_detail"] = f"Orchestration launcher could not start: {type(error).__name__}: {error}"
+            self._orchestration_event(run, "error", "Orchestration launcher could not start", run["status_detail"])
+            self._orchestration_write(run)
+            receipt = _finalize_receipted_mutation(
+                mutation,
+                state="failed",
+                http_status=500,
+                backend="orchestration_launcher",
+                error_code="orchestration_launcher_failed",
+                error_message=run["status_detail"],
+                fields={"orchestration": run, "ts": _time.time()},
+                audit_action={
+                    "type": "orchestration_create",
+                    "orchestration_id": orchestration_id,
+                    "state": "failed",
+                },
+            )
+            body, status = _receipt_replay_response(receipt, {"ok": False})
+            self._send_json(body, status=status)
+            return
+
+        response_ts = _time.time()
+        receipt = _finalize_receipted_mutation(
+            mutation,
+            state="applied",
+            http_status=200,
+            backend="orchestration_launcher",
+            fields={"orchestration": run, "ts": response_ts},
+            audit_action={
+                "type": "orchestration_create",
+                "orchestration_id": orchestration_id,
+                "state": "launching",
+            },
+        )
+        body, status = _receipt_replay_response(receipt, {"ok": True})
+        self._send_json(body, status=status)
 
     def _handle_orchestrations_list(self, q):
         try:
@@ -22337,64 +25208,90 @@ Worker instructions:
             return
 
     def _handle_orchestration_stop(self, orchestration_id: str):
+        mutation = _begin_receipted_mutation(
+            self,
+            receipt_scope=f"orchestration:{orchestration_id}:stop",
+            action_kind="orchestration_stop",
+            material={
+                "orchestration_id": orchestration_id,
+                "action": "stop_active_sessions",
+            },
+            action_label="orchestration stop",
+        )
+        if mutation is None:
+            return
+
+        client_action_id = mutation["client_action_id"]
+        device_id = mutation["device_id"]
+        receipt_session_id = mutation["receipt_scope"]
+        body_hash = mutation["body_hash"]
         run = self._orchestration_read(orchestration_id)
         if not run:
-            self.send_error(404, "orchestration not found")
+            message = "orchestration not found"
+            receipt = _finalize_receipted_mutation(
+                mutation,
+                state="rejected",
+                http_status=404,
+                backend="orchestration_launcher",
+                error_code="orchestration_not_found",
+                error_message=message,
+                fields={
+                    "stopped": [],
+                    "errors": [message],
+                    "unknown_outcomes": [],
+                    "orchestration": None,
+                },
+                audit_action={"type": "stop_orchestration", "state": "rejected"},
+            )
+            body, status = _receipt_replay_response(receipt, {"ok": False})
+            self._send_json(body, status=status)
             return
         run = self._orchestration_refresh(run)
-        client_action_id = str(self.headers.get("X-Pairling-Action-Id") or "").strip()
-        device_id = getattr(getattr(self, "pairling_auth", None), "device_id", None)
-        receipt_session_id = f"orchestration:{orchestration_id}:stop"
-        body_hash = _receipt_body_hash({"orchestration_id": orchestration_id, "action": "stop_active_sessions"})
-        deduped_receipt, conflict = _receipt_duplicate_response(
-            device_id,
-            receipt_session_id,
-            client_action_id,
-            body_hash,
-            action_kind="orchestration_stop",
-        )
-        if conflict:
-            _store_action_receipt(
-                device_id,
-                receipt_session_id,
-                client_action_id,
-                body_hash,
-                conflict["receipt"],
-                action_kind="orchestration_stop",
-                audit_action={"type": "idempotency_conflict"},
-                persist=False,
-            )
-            self._send_json({
-                "ok": False,
-                "stopped": [],
-                "errors": [conflict["error"]["message"]],
-                "receipt": conflict["receipt"],
-                "orchestration": run,
-                "error_code": conflict["error"]["code"],
-            }, status=int(conflict["status"]))
-            return
-        if deduped_receipt:
-            self._send_json({
-                "ok": deduped_receipt.get("state") == "applied",
-                "stopped": [],
-                "errors": [],
-                "receipt": deduped_receipt,
-                "orchestration": run,
-            })
-            return
         stopped = []
         errors = []
+        unknown_outcomes = []
         identity_drift = False
+        broker_runtime_mismatch = False
+        broker_unavailable = False
+        represented_session_targets: set[tuple[str, str]] = set()
+        processed_session_targets: set[tuple[str, str]] = set()
+        active_target_count = 0
+
+        def durable_broker_id(provider: str, native_id: str) -> str | None:
+            row = _agent_registry_get(provider, native_id)
+            if row is None:
+                row = _agent_registry_row_for_broker_id(
+                    provider,
+                    _qualified_session_id(provider, native_id),
+                )
+            return _durable_broker_id_from_registry_row(
+                row,
+                provider=provider,
+                native_id=native_id,
+            )
+
         for s in run.get("sessions") or []:
-            sid = s.get("session_id")
+            sid = str(s.get("session_id") or "").strip()
             if not sid:
+                if s.get("is_active"):
+                    errors.append("active orchestration session is missing its session_id")
                 continue
-            if not s.get("is_active"):
-                continue
-            session_provider = s.get("provider") or run.get("provider") or "claude"
+            session_provider = str(
+                s.get("provider") or run.get("provider") or "claude"
+            ).strip().lower()
             _, native_id = _parse_agent_session_ref(sid)
             if not native_id:
+                if s.get("is_active"):
+                    errors.append(f"{sid}: active orchestration session has no native session id")
                 continue
+            target_key = (session_provider, native_id)
+            represented_session_targets.add(target_key)
+            if not s.get("is_active"):
+                continue
+            if target_key in processed_session_targets:
+                continue
+            processed_session_targets.add(target_key)
+            active_target_count += 1
             qualified = _qualified_session_id(session_provider, native_id)
             broker_found = self._broker_session_for(qualified)
             if broker_found and PTY_BROKER:
@@ -22403,7 +25300,23 @@ Worker instructions:
                     identity_drift = True
                     errors.append(f"{sid}: broker ownership changed; refresh before stopping")
                     continue
-                result = PTY_BROKER.terminate(_broker_session_id(broker_session), signal.SIGTERM)
+                if not _broker_is_current_runtime():
+                    broker_runtime_mismatch = True
+                    errors.append(f"{sid}: current terminal broker required before stopping")
+                    continue
+                try:
+                    result = PTY_BROKER.terminate(_broker_session_id(broker_session), signal.SIGTERM)
+                except PTYBrokerOutcomeUnknownError as exc:
+                    unknown_outcomes.append(f"{sid}: {str(exc)[:160]}")
+                    continue
+                except Exception as exc:
+                    errors.append(f"{sid}: {type(exc).__name__}: {exc}")
+                    continue
+                if result.get("outcome_indeterminate"):
+                    unknown_outcomes.append(
+                        f"{sid}: {result.get('error') or result.get('reason') or 'termination outcome unknown'}"
+                    )
+                    continue
                 if result.get("ok"):
                     stopped.append(sid)
                     if session_provider == "codex":
@@ -22413,33 +25326,58 @@ Worker instructions:
                 else:
                     errors.append(f"{sid}: {result.get('error') or result.get('reason') or 'broker termination failed'}")
                 continue
-            _row, pid, verification_error = _verified_session_signal_target(session_provider, native_id)
+            known_broker_id = durable_broker_id(session_provider, native_id)
+            if known_broker_id:
+                broker_unavailable = True
+                errors.append(f"{sid}: terminal broker is temporarily unavailable")
+                continue
+            verified_row, pid, verification_error = _verified_session_signal_target(session_provider, native_id)
             if verification_error == "process_identity_unverified":
                 identity_drift = True
                 errors.append(f"{sid}: process identity changed; refresh before stopping")
                 continue
             if verification_error:
+                errors.append(
+                    f"{sid}: target verification failed ({str(verification_error)[:160]})"
+                )
                 continue
-            try:
-                os.kill(pid, signal.SIGTERM)
-                stopped.append(sid)
-                if session_provider == "codex":
-                    _agent_registry_mark_closed("codex", native_id)
+            termination = _terminate_direct_session_process(
+                verified_row or {}, session_provider, pid
+            )
+            if not termination.get("ok"):
+                detail = str(termination.get("error") or "termination failed")[:160]
+                if termination.get("outcome_indeterminate"):
+                    unknown_outcomes.append(f"{sid}: {detail}")
                 else:
-                    self._mark_session_closed(native_id)
-            except Exception as e:
-                errors.append(f"{sid}: {type(e).__name__}: {e}")
+                    errors.append(f"{sid}: {detail}")
+                continue
+            stopped.append(sid)
+            if session_provider == "codex":
+                _agent_registry_mark_closed("codex", native_id)
+            else:
+                self._mark_session_closed(native_id)
         stopped_set = set(stopped)
         for launch in run.get("launches") or []:
-            launch_provider = launch.get("provider") or run.get("provider") or "claude"
+            launch_provider = str(
+                launch.get("provider") or run.get("provider") or "claude"
+            ).strip().lower()
             if launch_provider != "claude":
                 continue
-            sid = launch.get("session_id") or f"claude:{launch.get('role') or launch.get('title') or 'launch'}"
-            if sid in stopped_set:
-                continue
+            sid = str(
+                launch.get("session_id")
+                or f"claude:{launch.get('role') or launch.get('title') or 'launch'}"
+            ).strip()
             _, native_id = _parse_agent_session_ref(sid)
             if not native_id:
+                errors.append(f"{sid or 'orchestration launch'}: launch has no native session id")
                 continue
+            target_key = ("claude", native_id)
+            # run.sessions is the authoritative live/idle view. Launches only
+            # fill a missing old record; they never retry or override it.
+            if target_key in represented_session_targets:
+                continue
+            represented_session_targets.add(target_key)
+            active_target_count += 1
             broker_found = self._broker_session_for(_qualified_session_id("claude", native_id))
             if broker_found and PTY_BROKER:
                 _, broker_session = broker_found
@@ -22447,7 +25385,23 @@ Worker instructions:
                     identity_drift = True
                     errors.append(f"{sid}: broker ownership changed; refresh before stopping")
                     continue
-                result = PTY_BROKER.terminate(_broker_session_id(broker_session), signal.SIGTERM)
+                if not _broker_is_current_runtime():
+                    broker_runtime_mismatch = True
+                    errors.append(f"{sid}: current terminal broker required before stopping")
+                    continue
+                try:
+                    result = PTY_BROKER.terminate(_broker_session_id(broker_session), signal.SIGTERM)
+                except PTYBrokerOutcomeUnknownError as exc:
+                    unknown_outcomes.append(f"{sid}: {str(exc)[:160]}")
+                    continue
+                except Exception as exc:
+                    errors.append(f"{sid}: {type(exc).__name__}: {exc}")
+                    continue
+                if result.get("outcome_indeterminate"):
+                    unknown_outcomes.append(
+                        f"{sid}: {result.get('error') or result.get('reason') or 'termination outcome unknown'}"
+                    )
+                    continue
                 if result.get("ok"):
                     stopped.append(sid)
                     stopped_set.add(sid)
@@ -22455,26 +25409,55 @@ Worker instructions:
                 else:
                     errors.append(f"{sid}: {result.get('error') or result.get('reason') or 'broker termination failed'}")
                 continue
-            _row, pid, verification_error = _verified_session_signal_target("claude", native_id)
+            known_broker_id = durable_broker_id("claude", native_id)
+            if known_broker_id:
+                broker_unavailable = True
+                errors.append(f"{sid}: terminal broker is temporarily unavailable")
+                continue
+            verified_row, pid, verification_error = _verified_session_signal_target("claude", native_id)
             if verification_error == "process_identity_unverified":
                 identity_drift = True
                 errors.append(f"{sid}: process identity changed; refresh before stopping")
                 continue
             if verification_error:
+                errors.append(
+                    f"{sid}: target verification failed ({str(verification_error)[:160]})"
+                )
                 continue
-            try:
-                os.kill(pid, signal.SIGTERM)
-                stopped.append(sid)
-                stopped_set.add(sid)
-                self._mark_session_closed(native_id)
-            except Exception as e:
-                errors.append(f"{sid}: {type(e).__name__}: {e}")
-        if stopped:
+            termination = _terminate_direct_session_process(
+                verified_row or {}, "claude", pid
+            )
+            if not termination.get("ok"):
+                detail = str(termination.get("error") or "termination failed")[:160]
+                if termination.get("outcome_indeterminate"):
+                    unknown_outcomes.append(f"{sid}: {detail}")
+                else:
+                    errors.append(f"{sid}: {detail}")
+                continue
+            stopped.append(sid)
+            stopped_set.add(sid)
+            self._mark_session_closed(native_id)
+        if active_target_count > 0 and len(stopped) != active_target_count and not errors and not unknown_outcomes:
+            errors.append("not every active session produced a confirmed stop outcome")
+
+        if active_target_count > 0 and not errors and not unknown_outcomes:
             run["status"] = "stopped"
             run["finished_reason"] = "manual_stop"
             run["finished_at"] = _time.time()
             run["status_detail"] = f"Stopped {len(stopped)} active session(s). Idle sessions were left untouched."
             self._orchestration_event(run, "stop", "Active orchestration sessions stopped from phone", run["status_detail"])
+        elif errors or unknown_outcomes:
+            run["status"] = run.get("status") or "quiet"
+            run["status_detail"] = (
+                f"Stopped {len(stopped)} of {active_target_count} active session(s). "
+                "One or more stop outcomes were not confirmed."
+            )
+            self._orchestration_event(
+                run,
+                "stop_failed",
+                "Orchestration stop was not fully confirmed",
+                run["status_detail"],
+            )
         else:
             run["status"] = run.get("status") or "quiet"
             run["status_detail"] = "No active orchestration sessions were running; idle sessions were left untouched."
@@ -22482,9 +25465,61 @@ Worker instructions:
         self._orchestration_write(run)
         receipt = _make_action_receipt(
             client_action_id=client_action_id or None,
-            state="applied" if not errors else "failed",
-            phases=_receipt_phases(validated=True, applied=not errors, pty_written=False),
+            state="indeterminate" if unknown_outcomes else ("applied" if not errors else "failed"),
+            phases=_receipt_phases(
+                validated=True,
+                applied=not errors and not unknown_outcomes,
+                pty_written=None if unknown_outcomes else False,
+            ),
             backend="process_signal",
+        )
+        final_status = (
+            409
+            if identity_drift or broker_runtime_mismatch
+            else (
+                503
+                if broker_unavailable
+                else (502 if unknown_outcomes or errors else 200)
+            )
+        )
+        final_error_code = (
+            "process_identity_unverified"
+            if identity_drift
+            else (
+                "broker_requires_current_runtime"
+                if broker_runtime_mismatch
+                else (
+                    "broker_unavailable"
+                    if broker_unavailable
+                    else (
+                        "broker_termination_outcome_unknown"
+                        if unknown_outcomes
+                        else ("orchestration_stop_failed" if errors else None)
+                    )
+                )
+            )
+        )
+        _receipt_attach_response(
+            receipt,
+            http_status=final_status,
+            error_code=(
+                final_error_code
+            ),
+            error_message=(
+                "One or more session stop outcomes could not be confirmed."
+                if unknown_outcomes
+                else (
+                    "One or more active sessions could not be stopped."
+                    if errors
+                    else None
+                )
+            ),
+            fields={
+                "stopped": stopped,
+                "errors": errors,
+                "unknown_outcomes": unknown_outcomes,
+                "orchestration": run,
+            },
         )
         _store_action_receipt(
             device_id,
@@ -22493,12 +25528,18 @@ Worker instructions:
             body_hash,
             receipt,
             action_kind="orchestration_stop",
-            audit_action={"type": "stop_orchestration", "stopped_count": len(stopped), "error_count": len(errors)},
+            audit_action={
+                "type": "stop_orchestration",
+                "stopped_count": len(stopped),
+                "error_count": len(errors),
+                "unknown_count": len(unknown_outcomes),
+            },
         )
-        response = {"ok": not errors, "stopped": stopped, "errors": errors, "receipt": receipt, "orchestration": run}
-        if identity_drift:
-            response["error_code"] = "process_identity_unverified"
-        self._send_json(response, status=409 if identity_drift else 200)
+        response, response_status = _receipt_replay_response(
+            receipt,
+            {"ok": not errors and not unknown_outcomes},
+        )
+        self._send_json(response, status=response_status)
 
     # ----- /workstate-feed: read-only substrate feed for native context surfaces -----
     def _handle_workstate_feed(self, q):
@@ -22619,6 +25660,16 @@ Worker instructions:
             _send_unknown_provider(self, provider_filter)
             return
         client_action_id = str(self.headers.get("X-Pairling-Action-Id") or "").strip()
+        if not _valid_client_action_id(client_action_id):
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "action_id_required",
+                    "message": "A valid X-Pairling-Action-Id is required to stop workers.",
+                },
+                "error_code": "action_id_required",
+            }, status=400)
+            return
         device_id = getattr(getattr(self, "pairling_auth", None), "device_id", None)
         receipt_session_id = f"worker-kill:{provider_filter}:{kill_filter or 'ids'}"
         body_hash = _receipt_body_hash({
@@ -22645,6 +25696,7 @@ Worker instructions:
                 persist=False,
             )
             self._send_json({
+                "ok": False,
                 "killed": [],
                 "skipped": [],
                 "errors": [conflict["error"]["message"]],
@@ -22654,13 +25706,16 @@ Worker instructions:
             }, status=int(conflict["status"]))
             return
         if deduped_receipt:
-            self._send_json({
+            replay, replay_status = _receipt_replay_response(deduped_receipt, {
+                "ok": deduped_receipt.get("state") == "applied",
                 "killed": [],
                 "skipped": [],
                 "errors": [],
-                "receipt": deduped_receipt,
                 "deduped": True,
             })
+            if isinstance(replay.get("error"), dict):
+                replay["error"] = replay["error"].get("message")
+            self._send_json(replay, status=replay_status)
             return
 
         # If filter=stale, populate target_ids from /worker-stats logic
@@ -22686,11 +25741,24 @@ Worker instructions:
         # SAFETY: never kill anything with a recent heartbeat (<5 min)
         # SAFETY: refuse mass kills > 100 to avoid runaway
         if len(target_ids) > 100:
+            too_many_message = f"too many ids ({len(target_ids)}); max 100"
             receipt = _make_action_receipt(
                 client_action_id=client_action_id or None,
                 state="rejected",
                 phases=_receipt_phases(validated=False, applied=False, pty_written=False),
                 backend="worker_kill",
+            )
+            _receipt_attach_response(
+                receipt,
+                http_status=400,
+                error_code="too_many_targets",
+                error_message=too_many_message,
+                fields={
+                    "killed": [],
+                    "skipped": [],
+                    "errors": [too_many_message],
+                    "outcome_indeterminate": False,
+                },
             )
             _store_action_receipt(
                 device_id,
@@ -22702,9 +25770,11 @@ Worker instructions:
                 audit_action={"type": "worker_kill_rejected", "reason": "too_many_ids"},
             )
             self._send_json({
+                "ok": False,
                 "killed": [],
                 "skipped": [],
-                "errors": [f"too many ids ({len(target_ids)}); max 100"],
+                "errors": [too_many_message],
+                "error_code": "too_many_targets",
                 "receipt": receipt,
                 "deduped": False,
             }, status=400)
@@ -22714,6 +25784,10 @@ Worker instructions:
         skipped: list[str] = []
         errors: list[str] = []
         identity_drift = False
+        broker_runtime_mismatch = False
+        broker_unavailable = False
+        outcome_indeterminate = False
+        terminal_error_code: str | None = None
 
         for raw_sid in target_ids:
             provider, sid = _parse_agent_session_ref(str(raw_sid or ""))
@@ -22736,6 +25810,7 @@ Worker instructions:
                 _current, pid, verification_error = _verified_session_signal_target("codex", sid)
                 if verification_error == "process_identity_unverified":
                     identity_drift = True
+                    terminal_error_code = terminal_error_code or "process_identity_unverified"
                     errors.append(f"{raw_sid}: process identity changed; refresh before stopping")
                     continue
                 if verification_error:
@@ -22746,12 +25821,77 @@ Worker instructions:
                 if current_idle_seconds < 300:
                     skipped.append(f"{raw_sid} (active <5min)")
                     continue
-                try:
-                    os.kill(pid, signal.SIGTERM)
+
+                broker_found = self._broker_session_for(_qualified_session_id("codex", sid))
+                durable_broker_id = _durable_broker_id_from_registry_row(
+                    reg,
+                    provider="codex",
+                    native_id=sid,
+                )
+                if broker_found and PTY_BROKER:
+                    _public_id, broker_session = broker_found
+                    broker_id = _broker_session_id(broker_session)
+                    if not _broker_session_owns_identity(broker_session, "codex", sid):
+                        identity_drift = True
+                        terminal_error_code = terminal_error_code or "process_identity_unverified"
+                        errors.append(f"{raw_sid}: broker ownership changed; refresh before stopping")
+                        continue
+                    if not _broker_is_current_runtime():
+                        broker_runtime_mismatch = True
+                        terminal_error_code = terminal_error_code or "broker_requires_current_runtime"
+                        errors.append(f"{raw_sid}: termination requires the current terminal broker")
+                        continue
+                    try:
+                        result = PTY_BROKER.terminate(broker_id, signal.SIGTERM)
+                    except PTYBrokerOutcomeUnknownError as exc:
+                        outcome_indeterminate = True
+                        terminal_error_code = "worker_kill_outcome_unknown"
+                        errors.append(f"{raw_sid}: termination outcome is unknown: {str(exc)[:100]}")
+                        continue
+                    except Exception as exc:
+                        broker_unavailable = True
+                        terminal_error_code = terminal_error_code or "broker_unavailable"
+                        errors.append(f"{raw_sid}: terminal broker unavailable: {str(exc)[:100]}")
+                        continue
+                    if not bool(result.get("ok")):
+                        if result.get("outcome_indeterminate"):
+                            outcome_indeterminate = True
+                            terminal_error_code = "worker_kill_outcome_unknown"
+                        else:
+                            terminal_error_code = terminal_error_code or str(
+                                result.get("error_code") or "worker_kill_failed"
+                            )
+                        errors.append(
+                            f"{raw_sid}: {str(result.get('error') or result.get('reason') or 'termination failed')[:120]}"
+                        )
+                        continue
                     _agent_registry_mark_closed("codex", sid)
                     killed.append(str(raw_sid))
-                except (ProcessLookupError, PermissionError, OSError) as e:
-                    errors.append(f"{raw_sid}: {type(e).__name__}: {str(e)[:100]}")
+                    continue
+                if durable_broker_id:
+                    broker_unavailable = True
+                    terminal_error_code = terminal_error_code or "broker_unavailable"
+                    errors.append(f"{raw_sid}: terminal broker is unavailable; no direct signal was sent")
+                    continue
+
+                termination = _terminate_direct_session_process(
+                    _current or reg,
+                    "codex",
+                    pid,
+                )
+                if not termination.get("ok"):
+                    if termination.get("outcome_indeterminate"):
+                        outcome_indeterminate = True
+                        terminal_error_code = "worker_kill_outcome_unknown"
+                    terminal_error_code = terminal_error_code or str(
+                        termination.get("error_code") or "worker_kill_failed"
+                    )
+                    errors.append(
+                        f"{raw_sid}: {str(termination.get('error') or 'termination failed')[:120]}"
+                    )
+                    continue
+                _agent_registry_mark_closed("codex", sid)
+                killed.append(str(raw_sid))
                 continue
 
             if provider != "claude" or not _safe_session_id(sid):
@@ -22771,6 +25911,7 @@ Worker instructions:
             _current, pid, verification_error = _verified_session_signal_target("claude", sid)
             if verification_error == "process_identity_unverified":
                 identity_drift = True
+                terminal_error_code = terminal_error_code or "process_identity_unverified"
                 errors.append(f"{raw_sid}: process identity changed; refresh before stopping")
                 continue
             if verification_error:
@@ -22780,12 +25921,83 @@ Worker instructions:
             if current_idle_seconds < 300:
                 skipped.append(f"{sid} (active <5min)")
                 continue
-            try:
-                os.kill(pid, signal.SIGTERM)
+
+            broker_registry_row = _agent_registry_get("claude", sid)
+            if broker_registry_row is None:
+                broker_registry_row = _agent_registry_row_for_broker_id(
+                    "claude",
+                    _qualified_session_id("claude", sid),
+                )
+            broker_found = self._broker_session_for(_qualified_session_id("claude", sid))
+            durable_broker_id = _durable_broker_id_from_registry_row(
+                broker_registry_row,
+                provider="claude",
+                native_id=sid,
+            )
+            if broker_found and PTY_BROKER:
+                _public_id, broker_session = broker_found
+                broker_id = _broker_session_id(broker_session)
+                if not _broker_session_owns_identity(broker_session, "claude", sid):
+                    identity_drift = True
+                    terminal_error_code = terminal_error_code or "process_identity_unverified"
+                    errors.append(f"{raw_sid}: broker ownership changed; refresh before stopping")
+                    continue
+                if not _broker_is_current_runtime():
+                    broker_runtime_mismatch = True
+                    terminal_error_code = terminal_error_code or "broker_requires_current_runtime"
+                    errors.append(f"{raw_sid}: termination requires the current terminal broker")
+                    continue
+                try:
+                    result = PTY_BROKER.terminate(broker_id, signal.SIGTERM)
+                except PTYBrokerOutcomeUnknownError as exc:
+                    outcome_indeterminate = True
+                    terminal_error_code = "worker_kill_outcome_unknown"
+                    errors.append(f"{raw_sid}: termination outcome is unknown: {str(exc)[:100]}")
+                    continue
+                except Exception as exc:
+                    broker_unavailable = True
+                    terminal_error_code = terminal_error_code or "broker_unavailable"
+                    errors.append(f"{raw_sid}: terminal broker unavailable: {str(exc)[:100]}")
+                    continue
+                if not bool(result.get("ok")):
+                    if result.get("outcome_indeterminate"):
+                        outcome_indeterminate = True
+                        terminal_error_code = "worker_kill_outcome_unknown"
+                    else:
+                        terminal_error_code = terminal_error_code or str(
+                            result.get("error_code") or "worker_kill_failed"
+                        )
+                    errors.append(
+                        f"{raw_sid}: {str(result.get('error') or result.get('reason') or 'termination failed')[:120]}"
+                    )
+                    continue
                 self._mark_session_closed(sid)
                 killed.append(str(raw_sid))
-            except (ProcessLookupError, PermissionError, OSError) as e:
-                errors.append(f"{raw_sid}: {type(e).__name__}: {str(e)[:100]}")
+                continue
+            if durable_broker_id:
+                broker_unavailable = True
+                terminal_error_code = terminal_error_code or "broker_unavailable"
+                errors.append(f"{raw_sid}: terminal broker is unavailable; no direct signal was sent")
+                continue
+
+            termination = _terminate_direct_session_process(
+                _current or record,
+                "claude",
+                pid,
+            )
+            if not termination.get("ok"):
+                if termination.get("outcome_indeterminate"):
+                    outcome_indeterminate = True
+                    terminal_error_code = "worker_kill_outcome_unknown"
+                terminal_error_code = terminal_error_code or str(
+                    termination.get("error_code") or "worker_kill_failed"
+                )
+                errors.append(
+                    f"{raw_sid}: {str(termination.get('error') or 'termination failed')[:120]}"
+                )
+                continue
+            self._mark_session_closed(sid)
+            killed.append(str(raw_sid))
 
         # Audit log
         audit_dir = HOME / ".claude" / "audit"
@@ -22803,11 +26015,39 @@ Worker instructions:
                 "errors": errors,
             }) + "\n")
 
+        if outcome_indeterminate:
+            response_status = 502
+            terminal_error_code = "worker_kill_outcome_unknown"
+        elif identity_drift or broker_runtime_mismatch:
+            response_status = 409
+        elif broker_unavailable:
+            response_status = 503
+        elif errors:
+            response_status = 502
+        else:
+            response_status = 200
+
         receipt = _make_action_receipt(
             client_action_id=client_action_id or None,
-            state="applied" if not errors else "failed",
+            state=(
+                "indeterminate"
+                if outcome_indeterminate
+                else ("applied" if not errors else "failed")
+            ),
             phases=_receipt_phases(validated=True, applied=not errors, pty_written=False),
             backend="worker_kill",
+        )
+        _receipt_attach_response(
+            receipt,
+            http_status=response_status,
+            error_code=terminal_error_code if errors else None,
+            error_message=errors[0] if errors else None,
+            fields={
+                "killed": killed,
+                "skipped": skipped,
+                "errors": errors,
+                "outcome_indeterminate": outcome_indeterminate,
+            },
         )
         _store_action_receipt(
             device_id,
@@ -22827,20 +26067,69 @@ Worker instructions:
             },
         )
         response = {
+            "ok": receipt.get("state") == "applied",
             "killed": killed,
             "skipped": skipped,
             "errors": errors,
             "receipt": receipt,
             "deduped": False,
-            **({"error_code": "process_identity_unverified"} if identity_drift else {}),
+            "outcome_indeterminate": outcome_indeterminate,
+            **({"error_code": terminal_error_code} if terminal_error_code else {}),
         }
-        self._send_json(response, status=409 if identity_drift else 200)
+        self._send_json(response, status=response_status)
 
     def _handle_spawn_session_broker(self, project: str, provider: str, launch_context: dict | None = None,
                                      native_id_override: str | None = None,
-                                     first_prompt: str = "") -> None:
+                                     first_prompt: str = "",
+                                     spawn_action_id: str = "",
+                                     spawn_body_hash: str = "") -> None:
+        spawn_device_id = getattr(getattr(self, "pairling_auth", None), "device_id", None)
         if PTY_BROKER is None:
-            self._send_json({"ok": False, "error": "PTY broker unavailable"}, status=503)
+            message = "PTY broker unavailable"
+            receipt = _finalize_spawn_action(
+                device_id=spawn_device_id,
+                provider=provider,
+                client_action_id=spawn_action_id or None,
+                body_hash=spawn_body_hash,
+                state="failed",
+                http_status=503,
+                backend="pty_broker",
+                error_code="broker_unavailable",
+                error_message=message,
+                fields={"outcome_indeterminate": False},
+            )
+            self._send_json({
+                "ok": False,
+                "error": {"code": "broker_unavailable", "message": message},
+                "error_code": "broker_unavailable",
+                "outcome_indeterminate": False,
+                "receipt": receipt,
+            }, status=503)
+            return
+        if not _broker_is_current_runtime():
+            message = "New sessions require the current terminal broker. A session still owned by the previous runtime remains read-only until it finishes."
+            receipt = _finalize_spawn_action(
+                device_id=spawn_device_id,
+                provider=provider,
+                client_action_id=spawn_action_id or None,
+                body_hash=spawn_body_hash,
+                state="rejected",
+                http_status=409,
+                backend="pty_broker",
+                error_code="broker_requires_current_runtime",
+                error_message=message,
+                fields={"outcome_indeterminate": False},
+            )
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "broker_requires_current_runtime",
+                    "message": message,
+                },
+                "error_code": "broker_requires_current_runtime",
+                "outcome_indeterminate": False,
+                "receipt": receipt,
+            }, status=409)
             return
 
         capture_id = secrets.token_hex(12)
@@ -22869,7 +26158,26 @@ Worker instructions:
             # global settings stay untouched; the hook is an observer, never a mode.
             command = f"exec claude --settings {shlex.quote(str(SPAWN_SETTINGS_PATH))}"
         if not command:
-            self._send_json({"ok": False, "error": "Aperture CLI launch command unavailable"}, status=503)
+            message = "Aperture CLI launch command unavailable"
+            receipt = _finalize_spawn_action(
+                device_id=spawn_device_id,
+                provider=provider,
+                client_action_id=spawn_action_id or None,
+                body_hash=spawn_body_hash,
+                state="failed",
+                http_status=503,
+                backend="pty_broker",
+                error_code="aperture_cli_launch_unavailable",
+                error_message=message,
+                fields={"outcome_indeterminate": False},
+            )
+            self._send_json({
+                "ok": False,
+                "error": {"code": "aperture_cli_launch_unavailable", "message": message},
+                "error_code": "aperture_cli_launch_unavailable",
+                "outcome_indeterminate": False,
+                "receipt": receipt,
+            }, status=503)
             return
 
         if provider == "claude":
@@ -22879,22 +26187,44 @@ Worker instructions:
 
         ok = False
         reason = None
+        outcome_indeterminate = False
         session = None
+        reconciled_existing = False
         try:
-            session = PTY_BROKER.spawn(
-                session_id=broker_session_id,
+            session = PTY_BROKER.get(broker_session_id)
+            if session is not None:
+                if not _broker_session_owns_identity(session, provider, native_id):
+                    raise ProcessIdentityDriftError("existing broker session identity does not match spawn action")
+                ok = True
+                reconciled_existing = True
+                reason = "existing spawn action reconciled by broker session id"
+            else:
+                session = PTY_BROKER.spawn(
+                    session_id=broker_session_id,
+                    provider=provider,
+                    native_id=native_id,
+                    project=project,
+                    command=command,
+                    rows=30,
+                    columns=120,
+                    # Mark phone-spawned sessions so the global PermissionRequest hook
+                    # self-enables ONLY here (no-op for the user's own claude sessions).
+                    env={**(broker_env or {}), "PAIRLING_PHONE_SESSION": "1",
+                         "PAIRLING_BROKER_SESSION_ID": broker_session_id},
+                )
+                ok = True
+        except PTYBrokerOutcomeUnknownError as exc:
+            session = _broker_reconcile_session_after_unknown(
+                broker_session_id,
                 provider=provider,
                 native_id=native_id,
-                project=project,
-                command=command,
-                rows=30,
-                columns=120,
-                # Mark phone-spawned sessions so the global PermissionRequest hook
-                # self-enables ONLY here (no-op for the user's own claude sessions).
-                env={**(broker_env or {}), "PAIRLING_PHONE_SESSION": "1",
-                     "PAIRLING_BROKER_SESSION_ID": broker_session_id},
             )
-            ok = True
+            if session is not None:
+                ok = True
+                reason = "spawn response lost; reconciled by broker session id"
+            else:
+                outcome_indeterminate = True
+                reason = f"spawn outcome unknown: {str(exc)[:180]}"
         except Exception as e:
             reason = f"{type(e).__name__}: {e}"
 
@@ -22944,6 +26274,8 @@ Worker instructions:
                     "capture_id": capture_id,
                     "broker_id": broker_session_id,
                     "broker_socket": str(PTY_BROKER_SOCKET),
+                    "spawn_action_id": spawn_action_id or None,
+                    "spawn_body_hash": spawn_body_hash or None,
                     **launch_meta,
                 },
             )
@@ -22981,7 +26313,34 @@ Worker instructions:
             pass
 
         if not ok or session is None:
-            self._send_json({"ok": False, "error": reason or "PTY broker spawn failed"}, status=502)
+            error_code = "broker_spawn_outcome_unknown" if outcome_indeterminate else "broker_spawn_failed"
+            message = reason or "PTY broker spawn failed"
+            receipt = _finalize_spawn_action(
+                device_id=spawn_device_id,
+                provider=provider,
+                client_action_id=spawn_action_id or None,
+                body_hash=spawn_body_hash,
+                state="indeterminate" if outcome_indeterminate else "failed",
+                http_status=502,
+                backend="pty_broker",
+                error_code=error_code,
+                error_message=message,
+                fields={
+                    "session_id": broker_session_id,
+                    "outcome_indeterminate": outcome_indeterminate,
+                },
+            )
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": error_code,
+                    "message": message,
+                },
+                "error_code": error_code,
+                "session_id": broker_session_id,
+                "outcome_indeterminate": outcome_indeterminate,
+                "receipt": receipt,
+            }, status=502)
             return
 
         first_prompt_scheduled = False
@@ -22990,10 +26349,21 @@ Worker instructions:
                 provider=provider,
                 native_id=native_id,
                 text=first_prompt,
+                client_action_id=spawn_action_id or None,
+                device_id=spawn_device_id,
             )
-        self._send_json({
+        first_prompt_delivery = (
+            _read_first_prompt_delivery(provider, native_id) if first_prompt else None
+        )
+        response = {
             "ok": True,
+            "deduped": reconciled_existing,
             "first_prompt_scheduled": first_prompt_scheduled,
+            "first_prompt_delivery_state": (
+                first_prompt_delivery.get("state")
+                if isinstance(first_prompt_delivery, dict)
+                else None
+            ),
             "project": project,
             "provider": provider,
             "native_id": native_id,
@@ -23015,7 +26385,19 @@ Worker instructions:
                 "generated": {"env_redacted": ((launch_context or {}).get("generated") or {}).get("env_redacted")},
             } if launch_context is not None else None,
             "attach_command": f"pairling attach {broker_session_id}",
-        })
+        }
+        receipt = _finalize_spawn_action(
+            device_id=spawn_device_id,
+            provider=provider,
+            client_action_id=spawn_action_id or None,
+            body_hash=spawn_body_hash,
+            state="applied",
+            http_status=200,
+            backend="pty_broker",
+            fields={key: value for key, value in response.items() if key != "deduped"},
+        )
+        response["receipt"] = receipt
+        self._send_json(response)
 
     # ----- /spawn-session: open a new broker-owned agent CLI session -----
     def _handle_onestream_handoff(self, q):
@@ -23121,28 +26503,94 @@ Worker instructions:
         - Global rate limit reuses _inject_rate_check with a special key.
         - Every spawn (success or failure) appended to ~/.claude/audit/.
         """
-        payload: dict = {}
         headers = getattr(self, "headers", {}) or {}
         header_content_type = headers.get("Content-Type") if hasattr(headers, "get") else ""
         content_type = (header_content_type or "").lower()
+        raw_body = (
+            self._read_body() or b"{}"
+            if "application/json" in content_type
+            else b"{}"
+        )
+        payload: dict = {}
+        payload_error: tuple[str, str] | None = None
         if "application/json" in content_type:
             try:
-                payload = json.loads(self._read_body() or b"{}")
-                if not isinstance(payload, dict):
-                    self.send_error(400, "body must be JSON object")
-                    return
-            except json.JSONDecodeError:
-                self.send_error(400, "body must be JSON")
-                return
+                decoded_payload = json.loads(raw_body)
+                if isinstance(decoded_payload, dict):
+                    payload = decoded_payload
+                else:
+                    payload_error = ("invalid_body", "body must be a JSON object")
+            except json.JSONDecodeError as exc:
+                payload_error = ("bad_json", str(exc)[:200] or "body must be JSON")
+
+        query_material = {
+            key: list(q.get(key, []))
+            for key in ("project", "provider", "launch_strategy")
+            if q.get(key)
+        }
+        mutation = _begin_receipted_mutation(
+            self,
+            receipt_scope="spawn_session",
+            action_kind="spawn_session",
+            material={
+                "body_sha256": hashlib.sha256(raw_body).hexdigest(),
+                "query": query_material,
+            },
+            action_label="session launch",
+        )
+        if mutation is None:
+            return
+
         aperture_payload = payload.get("aperture") if isinstance(payload.get("aperture"), dict) else {}
         launch_strategy = str(payload.get("launch_strategy") or q.get("launch_strategy", ["direct_pairling"])[0] or "direct_pairling").strip().lower()
         requested_spawn_backend = str(payload.get("spawn_backend") or "").strip().lower()
         requested_native_id = str(payload.get("native_id") or "").strip()
         project = str(payload.get("project") or q.get("project", [""])[0]).strip()
         provider = str(payload.get("provider") or aperture_payload.get("client_id") or q.get("provider", ["claude"])[0]).lower()
+        client_action_id = mutation["client_action_id"]
+        spawn_body_hash = mutation["body_hash"]
+        device_id = str(mutation["device_id"])
+
+        def reject_spawn(
+            status: int,
+            code: str,
+            message: str,
+            *,
+            fields: dict | None = None,
+            state: str = "rejected",
+        ) -> None:
+            response_fields = {
+                "provider": provider or None,
+                "project": project or None,
+                "launch_strategy": launch_strategy or None,
+                "outcome_indeterminate": state == "indeterminate",
+                **(fields or {}),
+            }
+            receipt = _finalize_spawn_action(
+                device_id=device_id,
+                provider=provider or "unknown",
+                client_action_id=client_action_id,
+                body_hash=spawn_body_hash,
+                state=state,
+                http_status=status,
+                backend="session_launcher",
+                error_code=code,
+                error_message=message,
+                fields=response_fields,
+            )
+            body, response_status = _receipt_replay_response(
+                receipt,
+                {"ok": False, "deduped": False},
+            )
+            self._send_json(body, status=response_status)
+
+        if payload_error is not None:
+            reject_spawn(400, payload_error[0], payload_error[1])
+            return
+
         # Thick new-session (field report item 6): an optional first prompt
         # rides the spawn and is delivered once the session is ready, using
-        # the same readiness event and inject discipline the phone's manual
+        # the same readiness event and send discipline the phone's manual
         # flow uses. Sanitized like every terminal-bound text.
         first_prompt = str(payload.get("first_prompt") or "").strip()
         if first_prompt:
@@ -23150,40 +26598,65 @@ Worker instructions:
                 first_prompt, allow_newline=True, max_chars=4000,
             )
             if _fp_err:
-                first_prompt = ""
+                reject_spawn(
+                    int(_fp_err["status"]),
+                    str(_fp_err["code"]),
+                    str(_fp_err["message"]),
+                )
+                return
         if launch_strategy not in {"direct_pairling", "aperture_cli"}:
-            self.send_error(400, "launch_strategy must be direct_pairling or aperture_cli")
+            reject_spawn(
+                400,
+                "invalid_launch_strategy",
+                "launch_strategy must be direct_pairling or aperture_cli",
+            )
             return
         if requested_spawn_backend not in {"", "terminal_app", "broker"}:
-            self.send_error(400, "spawn_backend must be terminal_app or broker")
+            reject_spawn(400, "invalid_spawn_backend", "spawn_backend must be terminal_app or broker")
             return
         if requested_native_id and re.fullmatch(r"pending-[a-f0-9]{16}", requested_native_id) is None:
-            self.send_error(400, "native_id must be pending- followed by 16 lowercase hex characters")
+            reject_spawn(
+                400,
+                "invalid_native_id",
+                "native_id must be pending- followed by 16 lowercase hex characters",
+            )
             return
         if requested_native_id and launch_strategy != "direct_pairling":
-            self.send_error(400, "native_id is supported only for direct_pairling launches")
+            reject_spawn(
+                400,
+                "native_id_not_supported",
+                "native_id is supported only for direct_pairling launches",
+            )
             return
         if not _valid_provider_filter(provider, allow_all=False):
-            _send_unknown_provider(self, provider)
+            error = _unknown_provider_payload(provider or "empty")["error"]
+            reject_spawn(
+                400,
+                str(error["code"]),
+                str(error["message"]),
+                fields={"error": error},
+            )
             return
         if provider not in _agent_provider_ids():
-            _send_unsupported_provider(self, provider, "spawn")
+            error = _unsupported_provider_payload(provider, "spawn")["error"]
+            reject_spawn(
+                400,
+                str(error["code"]),
+                str(error["message"]),
+                fields={"error": error},
+            )
             return
         if not _provider_visible(provider):
-            _send_provider_hidden(self, provider)
+            reject_spawn(409, "provider_hidden", f"{provider} is hidden in Pairling")
             return
-        # A new session implies a fresh composer: force the catalog streams
-        # to re-check so a just-installed plugin is present immediately
-        # (SPEC-p2 §2.4).
-        _bump_catalog_epoch()
         if not project:
-            self.send_error(400, "project required")
+            reject_spawn(400, "project_required", "project required")
             return
         if not project.startswith("/"):
-            self.send_error(400, "project must be absolute path")
+            reject_spawn(400, "invalid_project", "project must be absolute path")
             return
         if ".." in project.split("/"):
-            self.send_error(400, "path traversal rejected")
+            reject_spawn(400, "path_traversal_rejected", "path traversal rejected")
             return
 
         home = str(HOME)
@@ -23197,40 +26670,112 @@ Worker instructions:
         elif project.startswith("/private/tmp/") or project.startswith("/tmp/"):
             pass
         else:
-            self.send_error(403, f"project path must be under $HOME or /tmp: {project}")
+            reject_spawn(403, "project_not_allowed", f"project path must be under $HOME or /tmp: {project}")
             return
 
         if not os.path.isdir(project):
-            self.send_error(404, f"directory not found: {project}")
+            reject_spawn(404, "project_not_found", f"directory not found: {project}")
             return
 
+        deterministic_native_id = requested_native_id or (
+            "pending-"
+            + hashlib.sha256(f"{device_id}\0{client_action_id}".encode()).hexdigest()[:16]
+        )
+        existing_row = _agent_registry_get(provider, deterministic_native_id)
+        if existing_row is not None:
+            existing_metadata = _registry_metadata_from_row(existing_row)
+            if (
+                existing_metadata.get("spawn_action_id") != client_action_id
+                or existing_metadata.get("spawn_body_hash") != spawn_body_hash
+            ):
+                reject_spawn(
+                    409,
+                    "idempotency_conflict",
+                    "This launch action ID is already bound to different session data.",
+                    fields={
+                        "native_id": deterministic_native_id,
+                        "session_id": _qualified_session_id(provider, deterministic_native_id),
+                    },
+                )
+                return
+            existing_broker_id = str(existing_metadata.get("broker_id") or "")
+            first_prompt_scheduled = False
+            if first_prompt:
+                first_prompt_scheduled = _schedule_first_prompt_delivery(
+                    provider=provider,
+                    native_id=deterministic_native_id,
+                    text=first_prompt,
+                    client_action_id=client_action_id,
+                    device_id=device_id,
+                )
+            first_prompt_delivery = (
+                _read_first_prompt_delivery(provider, deterministic_native_id)
+                if first_prompt
+                else None
+            )
+            response = {
+                "ok": True,
+                "deduped": True,
+                "first_prompt_scheduled": first_prompt_scheduled,
+                "first_prompt_delivery_state": (
+                    first_prompt_delivery.get("state")
+                    if isinstance(first_prompt_delivery, dict)
+                    else None
+                ),
+                "project": project,
+                "provider": provider,
+                "native_id": deterministic_native_id,
+                "session_id": _qualified_session_id(provider, deterministic_native_id),
+                "tty": existing_row.get("terminal_tty") or "",
+                "pid": int(existing_row.get("pid") or 0),
+                "terminal_log": existing_metadata.get("terminal_log"),
+                "capture_backend": existing_metadata.get("capture_backend"),
+                "terminal_source": existing_metadata.get("terminal_source") or (
+                    "broker_vt" if existing_broker_id else "terminal_app_contents"
+                ),
+                "broker_id": existing_broker_id or None,
+                "broker_socket": existing_metadata.get("broker_socket"),
+                "launch_strategy": existing_metadata.get("launch_strategy") or launch_strategy,
+                "launch_visibility": existing_metadata.get("launch_visibility"),
+                "attach_command": f"pairling attach {existing_broker_id}" if existing_broker_id else None,
+            }
+            response["receipt"] = _finalize_spawn_action(
+                device_id=device_id,
+                provider=provider,
+                client_action_id=client_action_id,
+                body_hash=spawn_body_hash,
+                state="applied",
+                http_status=200,
+                backend="pty_broker" if existing_broker_id else "terminal_app",
+                fields={key: value for key, value in response.items() if key != "deduped"},
+            )
+            self._send_json(response)
+            return
         # Rate limit: single global key. _inject_rate_check enforces 30/min
         # AND a 1-second cooldown between consecutive calls. For spawn, that's
         # plenty — actual launch takes ~2-3s anyway.
         allowed, retry = _inject_rate_check("__spawn_session__")
         if not allowed:
-            self.send_response(429)
-            self.send_header("Retry-After", str(retry))
-            self.send_header("Content-Type", "application/json")
-            body = json.dumps({"ok": False, "error": f"rate limited, retry in {retry}s"}).encode()
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            reject_spawn(
+                429,
+                "rate_limited",
+                f"rate limited, retry in {retry}s",
+                fields={"retry_after": retry},
+            )
             return
 
         aperture_launch_context = None
         if launch_strategy == "aperture_cli":
             if _aperture_cli_validate_launch_context is None:
-                self._send_json({
-                    "ok": False,
-                    "error": {
-                        "code": "aperture_cli_integration_unavailable",
-                        "message": "Aperture CLI launch integration is unavailable",
-                    },
-                }, status=503)
+                reject_spawn(
+                    503,
+                    "aperture_cli_integration_unavailable",
+                    "Aperture CLI launch integration is unavailable",
+                    state="failed",
+                )
                 return
             try:
-                preview_native_id = "pending-" + secrets.token_hex(8)
+                preview_native_id = deterministic_native_id
                 aperture_launch_context = _aperture_cli_validate_launch_context(
                     aperture_payload,
                     preview_native_id,
@@ -23239,19 +26784,26 @@ Worker instructions:
                     write_config=True,
                 )
             except Exception as exc:
-                self._send_json({
-                    "ok": False,
-                    "error": {
-                        "code": "invalid_aperture_launch_context",
-                        "message": str(exc),
-                    },
-                }, status=400)
+                reject_spawn(
+                    400,
+                    "invalid_aperture_launch_context",
+                    str(exc)[:200],
+                )
                 return
 
         spawn_backend = requested_spawn_backend or os.environ.get("PAIRLING_SPAWN_BACKEND", "terminal_app").lower()
         if requested_native_id and spawn_backend != "broker":
-            self.send_error(400, "native_id is supported only for broker launches")
+            reject_spawn(
+                400,
+                "native_id_backend_mismatch",
+                "native_id is supported only for broker launches",
+            )
             return
+
+        # A real new launch changes the composer catalogs. The durable action
+        # reservation above must exist before this global epoch mutation.
+        _bump_catalog_epoch()
+
         if launch_strategy == "aperture_cli" or spawn_backend == "broker":
             self._handle_spawn_session_broker(
                 project,
@@ -23260,16 +26812,21 @@ Worker instructions:
                 native_id_override=(
                     preview_native_id
                     if launch_strategy == "aperture_cli"
-                    else (requested_native_id or None)
+                    else deterministic_native_id
                 ),
                 first_prompt=first_prompt,
+                spawn_action_id=client_action_id,
+                spawn_body_hash=spawn_body_hash,
             )
             return
 
         capture_id = ""
         capture_log_path: Path | None = None
+        spawn_marker_path: Path | None = None
         if provider == "codex":
-            capture_id = secrets.token_hex(12)
+            capture_id = hashlib.sha256(
+                f"{device_id}\0{client_action_id}\0{provider}".encode()
+            ).hexdigest()[:24]
             capture_log_path = TERMINAL_CAPTURE_DIR / f"codex-{capture_id}.log"
             inner = (
                 f"cd {shlex.quote(project)} && "
@@ -23278,7 +26835,9 @@ Worker instructions:
             )
             shell_cmd = _terminal_script_command(capture_log_path, inner, interactive_shell=True)
         else:
-            capture_id = secrets.token_hex(12)
+            capture_id = hashlib.sha256(
+                f"{device_id}\0{client_action_id}\0{provider}".encode()
+            ).hexdigest()[:24]
             capture_log_path = TERMINAL_CAPTURE_DIR / f"claude-{capture_id}.log"
             inner = (
                 f"cd {shlex.quote(project)} && "
@@ -23286,34 +26845,57 @@ Worker instructions:
                 f"exec claude --settings {shlex.quote(str(SPAWN_SETTINGS_PATH))}"
             )
             shell_cmd = _terminal_script_command(capture_log_path, inner)
+        spawn_marker_path = TERMINAL_CAPTURE_DIR / f"spawn-{capture_id}.tty"
+        try:
+            spawn_marker_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         as_escaped_cmd = _as_escape(shell_cmd)
 
-        # Set Terminal's custom title to the project basename so /inject-now's
-        # window-title matcher can find this window later. Terminal's auto-
-        # title shows running command + cwd (e.g. "project — claude") which
-        # rarely contains the project name; explicit custom title fixes that.
+        # Set a useful Terminal title for the person at the Mac. Mutations use
+        # the exact recorded tty and never use this title as session identity.
         basename = os.path.basename(project.rstrip("/")) or provider
         title = f"{provider}:{basename}" if provider == "codex" else basename
         as_escaped_title = _as_escape(title)
+        as_escaped_marker_path = _as_escape(str(spawn_marker_path))
 
         script = f'''
         tell application "Terminal"
             activate
             set newTab to do script "{as_escaped_cmd}"
             set custom title of newTab to "{as_escaped_title}"
+            set markerTTY to tty of newTab
+            set markerPath to "{as_escaped_marker_path}"
+            do shell script ("/usr/bin/printf '%s' " & quoted form of markerTTY & " > " & quoted form of markerPath)
             delay 0.5
-            return "ok\t" & (tty of newTab)
+            return "ok\t" & markerTTY
         end tell
         '''
-        result = _run_osascript(script)
+        result = _run_osascript(script, mutation_possible=True)
         tty = ""
         if result.get("ok"):
             stdout = result.get("stdout") or ""
             parts = stdout.split("\t")
             if len(parts) >= 2:
                 tty = parts[1].strip()
+        elif result.get("outcome_indeterminate") and spawn_marker_path is not None:
+            for _attempt in range(20):
+                try:
+                    marker_tty = spawn_marker_path.read_text().strip()
+                except OSError:
+                    marker_tty = ""
+                if re.fullmatch(r"/dev/ttys[0-9]{3,}", marker_tty):
+                    tty = marker_tty
+                    result = {
+                        "ok": True,
+                        "stdout": f"ok\t{tty}",
+                        "reconciled_after_unknown": True,
+                        "reason": "Terminal spawn reconciled from its durable action marker.",
+                    }
+                    break
+                _time.sleep(0.1)
         pid = 0
-        native_id = "pending-" + secrets.token_hex(8)
+        native_id = deterministic_native_id
         if result.get("ok"):
             _time.sleep(0.75)
             pid = _pid_for_tty_command(tty, provider) if tty else 0
@@ -23340,6 +26922,8 @@ Worker instructions:
                     "capture_backend": "script" if capture_log_path else None,
                     "terminal_source": "terminal_app_contents",
                     "capture_id": capture_id or None,
+                    "spawn_action_id": client_action_id,
+                    "spawn_body_hash": spawn_body_hash,
                 },
                 working_on=f"New {provider.title()} session",
             )
@@ -23368,12 +26952,38 @@ Worker instructions:
             pass  # audit failure shouldn't break the spawn
 
         if not result.get("ok"):
-            self.send_response(502)
-            self.send_header("Content-Type", "application/json")
-            body = json.dumps({"ok": False, "error": result.get("reason", "unknown")}).encode()
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            outcome_indeterminate = bool(result.get("outcome_indeterminate"))
+            error_code = (
+                "terminal_spawn_outcome_unknown"
+                if outcome_indeterminate
+                else "terminal_spawn_failed"
+            )
+            message = str(result.get("reason") or "Terminal session launch failed.")
+            receipt = _finalize_spawn_action(
+                device_id=device_id,
+                provider=provider,
+                client_action_id=client_action_id,
+                body_hash=spawn_body_hash,
+                state="indeterminate" if outcome_indeterminate else "failed",
+                http_status=502,
+                backend="terminal_app",
+                error_code=error_code,
+                error_message=message,
+                fields={
+                    "native_id": native_id,
+                    "session_id": _qualified_session_id(provider, native_id),
+                    "outcome_indeterminate": outcome_indeterminate,
+                },
+            )
+            self._send_json({
+                "ok": False,
+                "error": {"code": error_code, "message": message},
+                "error_code": error_code,
+                "native_id": native_id,
+                "session_id": _qualified_session_id(provider, native_id),
+                "outcome_indeterminate": outcome_indeterminate,
+                "receipt": receipt,
+            }, status=502)
             return
 
         first_prompt_scheduled = False
@@ -23382,10 +26992,21 @@ Worker instructions:
                 provider=provider,
                 native_id=native_id,
                 text=first_prompt,
+                client_action_id=client_action_id,
+                device_id=device_id,
             )
-        self._send_json({
+        first_prompt_delivery = (
+            _read_first_prompt_delivery(provider, native_id) if first_prompt else None
+        )
+        response = {
             "ok": True,
+            "deduped": bool(result.get("reconciled_after_unknown")),
             "first_prompt_scheduled": first_prompt_scheduled,
+            "first_prompt_delivery_state": (
+                first_prompt_delivery.get("state")
+                if isinstance(first_prompt_delivery, dict)
+                else None
+            ),
             "project": project,
             "provider": provider,
             "native_id": native_id,
@@ -23398,7 +27019,19 @@ Worker instructions:
             "launch_strategy": "direct_pairling",
             "launch_visibility": "visible_terminal",
             "attach_command": None,
-        })
+        }
+        receipt = _finalize_spawn_action(
+            device_id=device_id,
+            provider=provider,
+            client_action_id=client_action_id,
+            body_hash=spawn_body_hash,
+            state="applied",
+            http_status=200,
+            backend="terminal_app",
+            fields={key: value for key, value in response.items() if key != "deduped"},
+        )
+        response["receipt"] = receipt
+        self._send_json(response)
 
     def _session_context_for_workflow(self, raw_session: str) -> dict | None:
         provider, native_id = _parse_agent_session_ref(raw_session)
@@ -23474,18 +27107,26 @@ Worker instructions:
             return "ok\t" & (tty of newTab)
         end tell
         '''
-        result = _run_osascript(script)
+        result = _run_osascript(script, mutation_possible=True)
         tty = ""
         if result.get("ok"):
             parts = (result.get("stdout") or "").split("\t")
             if len(parts) >= 2:
                 tty = parts[1].strip()
+        launch_ok = bool(
+            result.get("ok")
+            and re.fullmatch(r"/dev/ttys[0-9]{3,}", tty) is not None
+        )
+        outcome_indeterminate = bool(
+            result.get("outcome_indeterminate")
+            or (result.get("ok") and not launch_ok)
+        )
         pid = 0
         native_id = None
-        if provider == "codex" and result.get("ok"):
+        if provider == "codex" and launch_ok:
             native_id = "pending-" + secrets.token_hex(8)
             _time.sleep(0.75)
-            pid = _pid_for_tty_command(tty, "codex") if tty else 0
+            pid = _pid_for_tty_command(tty, "codex")
             reg_meta = dict(metadata)
             reg_meta.update({
                 "spawned_by": "phone-companion",
@@ -23496,12 +27137,21 @@ Worker instructions:
             _write_agent_turn_state("codex", native_id, "thinking", event="cross_provider")
         return {
             "provider": provider,
-            "ok": bool(result.get("ok")),
+            "ok": launch_ok,
             "native_id": native_id,
             "session_id": _qualified_session_id(provider, native_id) if native_id else None,
             "tty": tty,
             "pid": pid,
-            "error": None if result.get("ok") else result.get("reason", "unknown"),
+            "error": (
+                None
+                if launch_ok
+                else (
+                    "Terminal launch identity could not be confirmed"
+                    if result.get("ok")
+                    else result.get("reason", "unknown")
+                )
+            ),
+            "outcome_indeterminate": outcome_indeterminate,
         }
 
     def _handle_cross_provider_action(self, q):
@@ -23515,35 +27165,131 @@ Worker instructions:
             self.send_error(400, "kind must be compare, handoff, or arbitrate")
             return
         source_ref = str(payload.get("source_session") or "").strip()
-        source = self._session_context_for_workflow(source_ref)
-        if not source:
-            self.send_error(404, "source session context not found")
+        if ":" not in source_ref:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "provider_required",
+                    "message": "source_session must be provider-qualified",
+                },
+            }, status=400)
             return
-        other = "codex" if source["provider"] == "claude" else "claude"
+        source_provider, source_native_id = _parse_agent_session_ref(source_ref)
+        if (
+            not source_native_id
+            or not _safe_agent_native_id(source_native_id)
+            or re.fullmatch(r"[a-z0-9_]{1,48}", source_provider) is None
+        ):
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "bad_session",
+                    "message": "source_session must name a supported provider and session",
+                },
+            }, status=400)
+            return
+        canonical_source = _qualified_session_id(source_provider, source_native_id)
+        other = "codex" if source_provider == "claude" else "claude"
         target_provider = str(payload.get("target_provider") or other).lower()
-        if not _valid_provider_filter(target_provider, allow_all=False):
-            _send_unknown_provider(self, target_provider)
+        if re.fullmatch(r"[a-z0-9_]{1,48}", target_provider) is None:
+            self._send_json(_unknown_provider_payload(target_provider), status=400)
             return
-        if target_provider not in _agent_provider_ids():
-            _send_unsupported_provider(self, target_provider, "cross_provider_action")
+        providers = ["claude", "codex"] if kind == "compare" else [target_provider]
+
+        receipt_context = _begin_receipted_mutation(
+            self,
+            receipt_scope=f"cross-provider:{canonical_source}",
+            action_kind="cross_provider_action",
+            material={
+                "kind": kind,
+                "source_session": canonical_source,
+                "target_provider": target_provider,
+                "providers": providers,
+            },
+            action_label="cross-provider launch",
+        )
+        if receipt_context is None:
             return
-        if not _provider_visible(target_provider):
-            _send_provider_hidden(self, target_provider)
+
+        for provider in [source_provider, *providers]:
+            if not _valid_provider_filter(provider, allow_all=False):
+                body = _unknown_provider_payload(provider)
+                receipt = _finalize_receipted_mutation(
+                    receipt_context,
+                    state="rejected",
+                    http_status=400,
+                    backend="cross_provider",
+                    error_code="unknown_provider",
+                    error_message=str(body["error"]["message"]),
+                    fields={"source_session": canonical_source, "provider": provider},
+                    audit_action={"type": "cross_provider_action", "kind": kind},
+                )
+                body["receipt"] = receipt
+                self._send_json(body, status=400)
+                return
+            if provider not in _agent_provider_ids():
+                body = _unsupported_provider_payload(provider, "cross_provider_action")
+                receipt = _finalize_receipted_mutation(
+                    receipt_context,
+                    state="rejected",
+                    http_status=400,
+                    backend="cross_provider",
+                    error_code="unsupported_provider",
+                    error_message=str(body["error"]["message"]),
+                    fields={"source_session": canonical_source, "provider": provider},
+                    audit_action={"type": "cross_provider_action", "kind": kind},
+                )
+                body["receipt"] = receipt
+                self._send_json(body, status=400)
+                return
+            if not _provider_visible(provider):
+                body = _provider_hidden_payload(provider)
+                receipt = _finalize_receipted_mutation(
+                    receipt_context,
+                    state="rejected",
+                    http_status=409,
+                    backend="cross_provider",
+                    error_code="provider_hidden",
+                    error_message=str(body["error"]["message"]),
+                    fields={"source_session": canonical_source, "provider": provider},
+                    audit_action={"type": "cross_provider_action", "kind": kind},
+                )
+                body["receipt"] = receipt
+                self._send_json(body, status=409)
+                return
+
+        source = self._session_context_for_workflow(canonical_source)
+        if not source:
+            message = "Source session context was not found."
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="rejected",
+                http_status=404,
+                backend="cross_provider",
+                error_code="source_session_not_found",
+                error_message=message,
+                fields={"source_session": canonical_source},
+                audit_action={"type": "cross_provider_action", "kind": kind},
+            )
+            self._send_json({
+                "ok": False,
+                "error": {"code": "source_session_not_found", "message": message},
+                "source_session": canonical_source,
+                "receipt": receipt,
+            }, status=404)
             return
+
         workflow_id = "xprov-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(4)
         artifact_path = CROSS_PROVIDER_DIR / f"{workflow_id}.json"
         prompt_base = source.get("first_prompt") or source.get("last_assistant") or "Continue the work from the linked session."
         transcript_context = (source.get("last_assistant") or "")[-6000:]
-        providers: list[str]
         if kind == "compare":
-            providers = ["claude", "codex"]
             task_prompt = (
                 "Run the same task independently for cross-provider comparison.\n\n"
                 f"Original request:\n{prompt_base}\n\n"
                 "Return concise findings, assumptions, and the next concrete implementation step."
             )
         elif kind == "handoff":
-            providers = [target_provider]
             task_prompt = (
                 f"Continue this {source['provider']} session in {target_provider}.\n\n"
                 f"Source session: {source['session_id']}\n"
@@ -23552,7 +27298,6 @@ Worker instructions:
                 "Pick up the work directly. Preserve intent, call out uncertainty, and continue in this project."
             )
         else:
-            providers = [target_provider]
             task_prompt = (
                 f"Review and arbitrate the recent output from {source['session_id']}.\n\n"
                 f"Original request:\n{prompt_base}\n\n"
@@ -23560,7 +27305,28 @@ Worker instructions:
                 "Find correctness issues, missing tests, weak assumptions, and the strongest alternative approach."
             )
         prompt_path = CROSS_PROVIDER_DIR / f"{workflow_id}.prompt.txt"
-        prompt_path.write_text(task_prompt)
+        try:
+            CROSS_PROVIDER_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+            CROSS_PROVIDER_DIR.chmod(0o700)
+            prompt_path.write_text(task_prompt, encoding="utf-8")
+            prompt_path.chmod(0o600)
+        except OSError as exc:
+            message = f"Could not store the cross-provider prompt: {type(exc).__name__}"
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="failed",
+                http_status=500,
+                backend="terminal_app",
+                error_code="cross_provider_prompt_store_failed",
+                error_message=message,
+                audit_action={"type": "cross_provider_action", "kind": kind},
+            )
+            self._send_json({
+                "ok": False,
+                "error": {"code": "cross_provider_prompt_store_failed", "message": message},
+                "receipt": receipt,
+            }, status=500)
+            return
         artifact = {
             "id": workflow_id,
             "kind": kind,
@@ -23573,30 +27339,155 @@ Worker instructions:
         }
         launches = []
         for provider in providers:
-            launches.append(self._launch_provider_prompt(
-                provider,
-                source["project"],
-                prompt_path,
-                kind,
-                {"kind": "cross_provider", "workflow_id": workflow_id, "workflow_kind": kind},
-            ))
+            try:
+                launches.append(self._launch_provider_prompt(
+                    provider,
+                    source["project"],
+                    prompt_path,
+                    kind,
+                    {"kind": "cross_provider", "workflow_id": workflow_id, "workflow_kind": kind},
+                ))
+            except Exception as exc:
+                launches.append({
+                    "provider": provider,
+                    "ok": False,
+                    "native_id": None,
+                    "session_id": None,
+                    "tty": "",
+                    "pid": 0,
+                    "error": f"launch result unavailable: {type(exc).__name__}",
+                    "outcome_indeterminate": True,
+                })
         artifact["launches"] = launches
-        artifact_path.write_text(json.dumps(artifact, indent=2, sort_keys=True))
-        body = json.dumps({"ok": True, **artifact}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        artifact_persisted = True
+        try:
+            artifact_path.write_text(json.dumps(artifact, indent=2, sort_keys=True), encoding="utf-8")
+            artifact_path.chmod(0o600)
+        except OSError:
+            artifact_persisted = False
 
-    def _handle_resume_session_broker(self, *, provider: str, project: str, native_id: str, prompt: str) -> None:
+        successful = [launch for launch in launches if launch.get("ok")]
+        unknown = [launch for launch in launches if launch.get("outcome_indeterminate")]
+        all_applied = len(successful) == len(launches)
+        partial = bool(successful) and not all_applied
+        outcome_indeterminate = bool(unknown or partial or not artifact_persisted)
+        fully_applied = all_applied and artifact_persisted
+        if fully_applied:
+            state = "applied"
+            status = 200
+            error_code = None
+            error_message = None
+        elif outcome_indeterminate:
+            state = "indeterminate"
+            status = 502
+            error_code = "cross_provider_launch_outcome_unknown"
+            error_message = "The provider launch or its workflow record could not be confirmed. Do not retry this action."
+        else:
+            state = "failed"
+            status = 502
+            error_code = "cross_provider_launch_failed"
+            error_message = "No provider launch completed."
+        response_fields = {
+            **artifact,
+            "outcome_indeterminate": outcome_indeterminate,
+            "artifact_persisted": artifact_persisted,
+        }
+        receipt = _finalize_receipted_mutation(
+            receipt_context,
+            state=state,
+            http_status=status,
+            backend="terminal_app",
+            error_code=error_code,
+            error_message=error_message,
+            fields=response_fields,
+            audit_action={
+                "type": "cross_provider_action",
+                "kind": kind,
+                "providers": providers,
+            },
+            pty_written=None if outcome_indeterminate else False,
+        )
+        response = {
+            "ok": fully_applied,
+            **response_fields,
+            "receipt": receipt,
+        }
+        if error_code:
+            response["error"] = {"code": error_code, "message": error_message}
+        self._send_json(response, status=status)
+
+    def _handle_resume_session_broker(
+        self,
+        *,
+        provider: str,
+        project: str,
+        native_id: str,
+        prompt: str,
+        receipt_context: dict,
+    ) -> None:
         if PTY_BROKER is None:
-            self._send_json({"ok": False, "error": "PTY broker unavailable"}, status=503)
+            message = "PTY broker unavailable"
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="failed",
+                http_status=503,
+                backend="pty_broker",
+                error_code="broker_unavailable",
+                error_message=message,
+                audit_action={"type": "resume_session", "provider": provider},
+            )
+            self._send_json({
+                "ok": False,
+                "error": {"code": "broker_unavailable", "message": message},
+                "receipt": receipt,
+            }, status=503)
+            return
+        if not _broker_is_current_runtime():
+            message = "Resume requires the current terminal broker. A session still owned by the previous runtime remains read-only until it finishes."
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="rejected",
+                http_status=409,
+                backend="pty_broker",
+                error_code="broker_requires_current_runtime",
+                error_message=message,
+                audit_action={"type": "resume_session", "provider": provider},
+            )
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "broker_requires_current_runtime",
+                    "message": message,
+                },
+                "receipt": receipt,
+            }, status=409)
             return
         broker_session_id = _qualified_session_id(provider, native_id)
         existing = PTY_BROKER.get(broker_session_id)
         if existing is not None:
-            self._send_json({
+            if not _broker_session_owns_identity(existing, provider, native_id):
+                message = "Existing broker session identity does not match the requested resume."
+                receipt = _finalize_receipted_mutation(
+                    receipt_context,
+                    state="rejected",
+                    http_status=409,
+                    backend="pty_broker",
+                    error_code="process_identity_unverified",
+                    error_message=message,
+                    fields={"session_id": broker_session_id},
+                    audit_action={"type": "resume_session", "provider": provider},
+                )
+                self._send_json({
+                    "ok": False,
+                    "error": {
+                        "code": "process_identity_unverified",
+                        "message": message,
+                    },
+                    "session_id": broker_session_id,
+                    "receipt": receipt,
+                }, status=409)
+                return
+            response = {
                 "ok": True,
                 "provider": provider,
                 "native_id": native_id,
@@ -23610,7 +27501,16 @@ Worker instructions:
                 "broker_id": _broker_session_id(existing),
                 "broker_socket": str(PTY_BROKER_SOCKET),
                 "attach_command": f"pairling attach {broker_session_id}",
-            })
+            }
+            response["receipt"] = _finalize_receipted_mutation(
+                receipt_context,
+                state="applied",
+                http_status=200,
+                backend="pty_broker",
+                fields=response,
+                audit_action={"type": "resume_session", "provider": provider},
+            )
+            self._send_json(response)
             return
 
         command = (
@@ -23623,6 +27523,7 @@ Worker instructions:
         session = None
         ok = False
         reason = None
+        outcome_indeterminate = False
         try:
             session = PTY_BROKER.spawn(
                 session_id=broker_session_id,
@@ -23636,6 +27537,18 @@ Worker instructions:
                      "PAIRLING_BROKER_SESSION_ID": broker_session_id},
             )
             ok = True
+        except PTYBrokerOutcomeUnknownError as exc:
+            session = _broker_reconcile_session_after_unknown(
+                broker_session_id,
+                provider=provider,
+                native_id=native_id,
+            )
+            if session is not None:
+                ok = True
+                reason = "resume response lost; reconciled by broker session id"
+            else:
+                outcome_indeterminate = True
+                reason = f"resume outcome unknown: {str(exc)[:180]}"
         except Exception as e:
             reason = f"{type(e).__name__}: {e}"
 
@@ -23695,10 +27608,34 @@ Worker instructions:
             pass
 
         if not ok or session is None:
-            self._send_json({"ok": False, "error": reason or "PTY broker resume failed"}, status=502)
+            error_code = "broker_resume_outcome_unknown" if outcome_indeterminate else "broker_resume_failed"
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="indeterminate" if outcome_indeterminate else "failed",
+                http_status=502,
+                backend="pty_broker",
+                error_code=error_code,
+                error_message=reason or "PTY broker resume failed",
+                fields={
+                    "session_id": broker_session_id,
+                    "outcome_indeterminate": outcome_indeterminate,
+                },
+                audit_action={"type": "resume_session", "provider": provider},
+                pty_written=None if outcome_indeterminate else False,
+            )
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": error_code,
+                    "message": reason or "PTY broker resume failed",
+                },
+                "session_id": broker_session_id,
+                "outcome_indeterminate": outcome_indeterminate,
+                "receipt": receipt,
+            }, status=502)
             return
 
-        self._send_json({
+        response = {
             "ok": True,
             "provider": provider,
             "native_id": native_id,
@@ -23712,7 +27649,16 @@ Worker instructions:
             "broker_id": broker_session_id,
             "broker_socket": str(PTY_BROKER_SOCKET),
             "attach_command": f"pairling attach {broker_session_id}",
-        })
+        }
+        response["receipt"] = _finalize_receipted_mutation(
+            receipt_context,
+            state="applied",
+            http_status=200,
+            backend="pty_broker",
+            fields=response,
+            audit_action={"type": "resume_session", "provider": provider},
+        )
+        self._send_json(response)
 
     def _handle_resume_session(self, q):
         """Provider-aware app resume. Claude keeps its existing in-terminal
@@ -23725,7 +27671,7 @@ Worker instructions:
         except json.JSONDecodeError:
             self.send_error(400, "body must be JSON")
             return
-        provider = str(payload.get("provider") or "claude").lower()
+        provider = str(payload.get("provider") or "").lower()
         project = str(payload.get("project") or "").strip()
         native_id = str(payload.get("session_id") or payload.get("native_id") or "").strip()
         prompt = str(payload.get("prompt") or "").strip()
@@ -23735,13 +27681,10 @@ Worker instructions:
         if provider not in _agent_provider_ids():
             _send_unsupported_provider(self, provider, "resume")
             return
-        if not _provider_visible(provider):
-            _send_provider_hidden(self, provider)
-            return
         if provider != "codex":
             self.send_error(400, "Claude resume uses /send-text with /resume <id>")
             return
-        if not project or not project.startswith("/") or not os.path.isdir(project):
+        if not project or not project.startswith("/"):
             self.send_error(400, "valid absolute project required")
             return
         if ".." in project.split("/"):
@@ -23754,26 +27697,108 @@ Worker instructions:
         if not _safe_agent_native_id(native_id):
             self.send_error(400, "bad Codex session id")
             return
-        if not _resolve_codex_transcript(native_id):
-            self.send_error(404, "no Codex transcript for session")
-            return
         if len(prompt) > 4000:
             self.send_error(413, "prompt too long")
             return
 
+        receipt_context = _begin_receipted_mutation(
+            self,
+            receipt_scope=f"resume:{_qualified_session_id(provider, native_id)}",
+            action_kind="resume_session",
+            material={
+                "provider": provider,
+                "project": project,
+                "native_id": native_id,
+                "prompt": prompt,
+            },
+            action_label="session resume",
+        )
+        if receipt_context is None:
+            return
+
+        if not _provider_visible(provider):
+            body = _provider_hidden_payload(provider)
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="rejected",
+                http_status=409,
+                backend="session_resume",
+                error_code="provider_hidden",
+                error_message=str(body["error"]["message"]),
+                fields={"provider": provider},
+                audit_action={"type": "resume_session", "provider": provider},
+            )
+            body["receipt"] = receipt
+            self._send_json(body, status=409)
+            return
+        if not os.path.isdir(project):
+            message = "The project directory is no longer available."
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="rejected",
+                http_status=400,
+                backend="session_resume",
+                error_code="project_unavailable",
+                error_message=message,
+                fields={"project": project},
+                audit_action={"type": "resume_session", "provider": provider},
+            )
+            self._send_json({
+                "ok": False,
+                "error": {"code": "project_unavailable", "message": message},
+                "project": project,
+                "receipt": receipt,
+            }, status=400)
+            return
+        if not _resolve_codex_transcript(native_id):
+            message = "No Codex transcript exists for this session."
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="rejected",
+                http_status=404,
+                backend="session_resume",
+                error_code="transcript_not_found",
+                error_message=message,
+                fields={"session_id": _qualified_session_id(provider, native_id)},
+                audit_action={"type": "resume_session", "provider": provider},
+            )
+            self._send_json({
+                "ok": False,
+                "error": {"code": "transcript_not_found", "message": message},
+                "session_id": _qualified_session_id(provider, native_id),
+                "receipt": receipt,
+            }, status=404)
+            return
+
         allowed, retry = _inject_rate_check("__resume_session__")
         if not allowed:
-            self.send_response(429)
-            self.send_header("Retry-After", str(retry))
-            body = json.dumps({"ok": False, "error": f"rate limited, retry in {retry}s"}).encode()
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            message = f"rate limited, retry in {retry}s"
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="rejected",
+                http_status=429,
+                backend="session_resume",
+                error_code="rate_limited",
+                error_message=message,
+                fields={"retry_after": retry},
+                audit_action={"type": "resume_session", "provider": provider},
+            )
+            self._send_json({
+                "ok": False,
+                "error": {"code": "rate_limited", "message": message},
+                "retry_after": retry,
+                "receipt": receipt,
+            }, status=429)
             return
 
         if os.environ.get("PAIRLING_RESUME_BACKEND", "terminal_app").lower() == "broker":
-            self._handle_resume_session_broker(provider=provider, project=project, native_id=native_id, prompt=prompt)
+            self._handle_resume_session_broker(
+                provider=provider,
+                project=project,
+                native_id=native_id,
+                prompt=prompt,
+                receipt_context=receipt_context,
+            )
             return
 
         capture_id = secrets.token_hex(12)
@@ -23798,14 +27823,15 @@ Worker instructions:
             return "ok\t" & (tty of newTab)
         end tell
         '''
-        result = _run_osascript(script)
+        result = _run_osascript(script, mutation_possible=True)
         tty = ""
         if result.get("ok"):
             parts = (result.get("stdout") or "").split("\t")
             if len(parts) >= 2:
                 tty = parts[1].strip()
+        valid_tty = re.fullmatch(r"/dev/ttys[0-9]{3,}", tty)
         pid = 0
-        if result.get("ok"):
+        if result.get("ok") and valid_tty is not None:
             _time.sleep(0.75)
             pid = _pid_for_tty_command(tty, "codex") if tty else 0
             if tty:
@@ -23854,14 +27880,54 @@ Worker instructions:
         except Exception:
             pass
         if not result.get("ok"):
-            self.send_response(502)
-            self.send_header("Content-Type", "application/json")
-            body = json.dumps({"ok": False, "error": result.get("reason", "unknown")}).encode()
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            outcome_indeterminate = bool(result.get("outcome_indeterminate"))
+            error_code = "resume_outcome_unknown" if outcome_indeterminate else "resume_failed"
+            message = str(result.get("reason") or "Terminal session resume failed.")
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="indeterminate" if outcome_indeterminate else "failed",
+                http_status=502,
+                backend="terminal_app",
+                error_code=error_code,
+                error_message=message,
+                fields={
+                    "session_id": _qualified_session_id("codex", native_id),
+                    "outcome_indeterminate": outcome_indeterminate,
+                },
+                audit_action={"type": "resume_session", "provider": provider},
+                pty_written=None if outcome_indeterminate else False,
+            )
+            self._send_json({
+                "ok": False,
+                "error": {"code": error_code, "message": message},
+                "outcome_indeterminate": outcome_indeterminate,
+                "receipt": receipt,
+            }, status=502)
             return
-        self._send_json({
+        if valid_tty is None:
+            message = "Terminal accepted the resume, but Pairling could not identify the new tab."
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="indeterminate",
+                http_status=502,
+                backend="terminal_app",
+                error_code="resume_outcome_unknown",
+                error_message=message,
+                fields={
+                    "session_id": _qualified_session_id("codex", native_id),
+                    "outcome_indeterminate": True,
+                },
+                audit_action={"type": "resume_session", "provider": provider},
+                pty_written=None,
+            )
+            self._send_json({
+                "ok": False,
+                "error": {"code": "resume_outcome_unknown", "message": message},
+                "outcome_indeterminate": True,
+                "receipt": receipt,
+            }, status=502)
+            return
+        response = {
             "ok": True,
             "provider": "codex",
             "native_id": native_id,
@@ -23874,7 +27940,16 @@ Worker instructions:
             "terminal_source": "terminal_app_contents",
             "launch_visibility": "visible_terminal",
             "attach_command": None,
-        })
+        }
+        response["receipt"] = _finalize_receipted_mutation(
+            receipt_context,
+            state="applied",
+            http_status=200,
+            backend="terminal_app",
+            fields=response,
+            audit_action={"type": "resume_session", "provider": provider, "tty": tty},
+        )
+        self._send_json(response)
 
     def _finish_send_text_failure(
         self,
@@ -23899,6 +27974,13 @@ Worker instructions:
             tty=tty,
             pid=pid,
         )
+        _receipt_attach_response(
+            receipt,
+            http_status=status,
+            error_code=error_code or "send_text_failed",
+            error_message=reason,
+            fields=extra,
+        )
         _store_action_receipt(
             receipt_context.get("device_id"),
             str(receipt_context.get("session_id") or ""),
@@ -23922,7 +28004,11 @@ Worker instructions:
         device_id = receipt_context.get("device_id")
         body_hash = receipt_context.get("body_hash") or _receipt_body_hash(text)
         receipt_session_id = receipt_context.get("session_id") or _qualified_session_id("codex", native_id)
-        reg = _agent_registry_get("codex", native_id)
+        public_session_id = receipt_context.get("public_session_id") or _qualified_session_id("codex", native_id)
+        if "registry_row" in receipt_context:
+            reg = receipt_context.get("registry_row")
+        else:
+            reg = _agent_registry_get("codex", native_id)
         if reg and reg.get("closed_at"):
             pid = int(reg.get("pid") or 0)
             if pid and _process_alive(pid):
@@ -23942,6 +28028,12 @@ Worker instructions:
             )
             return
 
+        durable_broker_id = _durable_broker_id_from_registry_row(
+            reg,
+            provider="codex",
+            native_id=native_id,
+        )
+
         broker_found = self._broker_session_for(_qualified_session_id("codex", native_id))
         if broker_found and PTY_BROKER:
             broker_id, session = broker_found
@@ -23958,7 +28050,11 @@ Worker instructions:
                     extra={"broker_id": _broker_session_id(session)},
                 )
                 return
-            result = PTY_BROKER.send_text(broker_id, text)
+            result, source_offset_after, source_offset_reason = _broker_send_text_with_truth(
+                broker_id,
+                text,
+                public_session_id=str(public_session_id),
+            )
             if result.get("ok"):
                 _agent_registry_update_control(
                     "codex",
@@ -23969,28 +28065,51 @@ Worker instructions:
                     reopen=True,
                 )
                 _write_agent_turn_state("codex", native_id, "thinking", started_at=_time.time(), event="send_text")
-            source_offset_after = None
-            if result.get("ok") and PTY_BROKER:
-                tail = PTY_BROKER.raw_tail(broker_id, since=0)
-                if tail:
-                    source_offset_after = tail[1]
+            outcome_indeterminate = bool(result.get("outcome_indeterminate"))
+            pty_written = (
+                result.get("pty_written")
+                if "pty_written" in result
+                else (None if outcome_indeterminate else bool(result.get("ok")))
+            )
             receipt = _make_action_receipt(
                 client_action_id=client_action_id,
-                state="applied" if result.get("ok") else "failed",
-                phases=_receipt_phases(validated=True, applied=bool(result.get("ok")), pty_written=bool(result.get("ok"))),
+                state="applied" if result.get("ok") else ("indeterminate" if outcome_indeterminate else "failed"),
+                phases=_receipt_phases(validated=True, applied=bool(result.get("ok")), pty_written=pty_written),
                 backend="pty_broker",
                 tty=_broker_slave_tty(session),
                 pid=_broker_pid(session),
                 source_offset_after=source_offset_after,
+                source_offset_reason=source_offset_reason,
             )
+            if result.get("write_outcome"):
+                receipt["phases"]["pty_write_state"] = str(result["write_outcome"])
+            if not result.get("ok"):
+                _receipt_attach_response(
+                    receipt,
+                    http_status=int(result.get("status") or 502),
+                    error_code=str(result.get("error_code") or result.get("reason") or "send_text_failed"),
+                    error_message=str(result.get("error") or result.get("reason") or "Send failed."),
+                    fields={
+                        "reason": result.get("reason"),
+                        "bytes_written": result.get("bytes_written"),
+                        "bytes_expected": result.get("bytes_expected"),
+                        "write_outcome": result.get("write_outcome"),
+                        "outcome_indeterminate": outcome_indeterminate,
+                    },
+                )
             _store_action_receipt(device_id, receipt_session_id, client_action_id, body_hash, receipt, action_kind="send_text", audit_action={"type": "send_text", "chars": len(text)})
             body = json.dumps({
                 "ok": bool(result.get("ok")),
-                "session_id": receipt_session_id,
+                "session_id": public_session_id,
                 "tty": _broker_slave_tty(session),
                 "pid": _broker_pid(session),
                 "broker_id": _broker_session_id(session),
                 "reason": result.get("reason"),
+                "error_code": result.get("error_code"),
+                "bytes_written": result.get("bytes_written"),
+                "bytes_expected": result.get("bytes_expected"),
+                "write_outcome": result.get("write_outcome"),
+                "outcome_indeterminate": outcome_indeterminate,
                 "receipt": receipt,
             }).encode()
             self.send_response(200 if result.get("ok") else int(result.get("status") or 502))
@@ -23998,6 +28117,22 @@ Worker instructions:
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+
+        if durable_broker_id:
+            self._finish_send_text_failure(
+                receipt_context,
+                text,
+                status=503,
+                reason="Codex terminal broker is temporarily unavailable. No text was sent.",
+                state="failed",
+                validated=True,
+                backend="pty_broker",
+                tty=str(reg.get("terminal_tty") or "") or None,
+                pid=int(reg.get("pid") or 0) or None,
+                error_code="broker_unavailable",
+                extra={"broker_id": durable_broker_id},
+            )
             return
 
         tty = reg.get("terminal_tty") or ""
@@ -24070,7 +28205,7 @@ Worker instructions:
         end tell
         return "ok" & tab & usedTTY
         '''
-        result = _run_osascript(script)
+        result = _run_osascript(script, mutation_possible=True)
         if (not result.get("ok")) and result.get("reason") == "no matching Terminal window":
             if pid and _process_alive(pid):
                 self._finish_send_text_failure(
@@ -24114,23 +28249,62 @@ Worker instructions:
                 source_offset_reason = None
         except OSError:
             pass
+        outcome_indeterminate = bool(result.get("outcome_indeterminate"))
+        pty_written = (
+            result.get("pty_written")
+            if "pty_written" in result
+            else (None if outcome_indeterminate else bool(result.get("ok")))
+        )
         receipt = _make_action_receipt(
             client_action_id=client_action_id,
-            state="applied" if result.get("ok") else "failed",
-            phases=_receipt_phases(validated=True, applied=bool(result.get("ok")), pty_written=bool(result.get("ok"))),
+            state=(
+                "applied"
+                if result.get("ok")
+                else ("indeterminate" if outcome_indeterminate else "failed")
+            ),
+            phases=_receipt_phases(
+                validated=True,
+                applied=bool(result.get("ok")),
+                pty_written=pty_written,
+            ),
             backend="terminal_app",
             tty=tty,
             pid=pid,
             source_offset_after=source_offset_after,
             source_offset_reason=source_offset_reason,
         )
+        if result.get("write_outcome"):
+            receipt["phases"]["pty_write_state"] = str(result["write_outcome"])
+        if not result.get("ok"):
+            _receipt_attach_response(
+                receipt,
+                http_status=502,
+                error_code=(
+                    "terminal_write_outcome_unknown"
+                    if outcome_indeterminate
+                    else "send_text_failed"
+                ),
+                error_message=str(result.get("reason") or "Send failed."),
+                fields={
+                    "reason": result.get("reason"),
+                    "write_outcome": result.get("write_outcome"),
+                    "outcome_indeterminate": outcome_indeterminate,
+                },
+            )
         _store_action_receipt(device_id, receipt_session_id, client_action_id, body_hash, receipt, action_kind="send_text", audit_action={"type": "send_text", "chars": len(text)})
         body = json.dumps({
             "ok": result.get("ok", False),
-            "session_id": receipt_session_id,
+            "session_id": public_session_id,
             "tty": tty,
             "pid": pid,
             "reason": result.get("reason"),
+            "error_code": (
+                "terminal_write_outcome_unknown"
+                if outcome_indeterminate
+                else ("send_text_failed" if not result.get("ok") else None)
+            ),
+            "write_outcome": result.get("write_outcome"),
+            "outcome_indeterminate": outcome_indeterminate,
             "receipt": receipt,
         }).encode()
         self.send_response(200 if result.get("ok") else 502)
@@ -24141,16 +28315,10 @@ Worker instructions:
 
     # ----- /send-text: write directly to a Terminal tab's pty (no keystrokes) -----
     def _handle_send_text(self, q):
-        """Write text + Enter to the pty that the target session's claude is
-        reading from. Uses Terminal.app's `do script ... in <tab>` Apple Event,
-        which internally calls write() on the tab's pty master fd. Compared to
-        the legacy /inject-now keystroke-synthesis path:
-          - no Accessibility permission required
-          - no System Events / focus shenanigans
-          - target tab is identified by stable tty (e.g. /dev/ttys005), not
-            by fragile window-title substring matching
-          - works while Terminal.app is in the background, app is unfocused
-          - text always lands in the right tab regardless of which tab is selected
+        """Write text plus Enter to the exact provider session's PTY.
+
+        Terminal.app sessions are matched by their recorded tty. Broker sessions
+        are matched by their provider-qualified broker identity.
 
         terminal_tty is populated for any session that has fired at least one
         hook event since the schema migration. Sessions started before then
@@ -24158,27 +28326,35 @@ Worker instructions:
         terminal_tty when it's NULL).
         """
         raw_session = q.get("session", [""])[0]
+        if ":" not in raw_session:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "provider_required",
+                    "message": "session must be provider-qualified",
+                },
+                "error_code": "provider_required",
+            }, status=400)
+            return
         provider, native_id = _parse_agent_session_ref(raw_session)
-        if not native_id:
-            self.send_error(400, "session required")
+        if not native_id or not _valid_provider_filter(provider, allow_all=False):
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "bad_session",
+                    "message": "session must be provider-qualified",
+                },
+                "error_code": "bad_session",
+            }, status=400)
+            return
+        if provider not in _agent_provider_ids():
+            _send_unsupported_provider(self, provider, "send_text")
             return
 
         raw = self._read_body()
         text = raw.decode("utf-8", errors="replace")
         if not text:
             self.send_error(400, "empty body")
-            return
-
-        # Rate limit (same envelope as /inject-now)
-        allowed, retry = _inject_rate_check(_qualified_session_id(provider, native_id))
-        if not allowed:
-            self.send_response(429)
-            self.send_header("Retry-After", str(retry))
-            body = json.dumps({"ok": False, "error": f"rate limited, retry in {retry}s"}).encode()
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
             return
 
         # Embedded newlines are preserved for bracketed paste; client-supplied
@@ -24192,12 +28368,28 @@ Worker instructions:
             self.send_error(int(sanitize_err["status"]), str(sanitize_err["message"]))
             return
 
-        receipt_session_id = _qualified_session_id(provider, native_id)
+        public_session_id = _qualified_session_id(provider, native_id)
+        receipt_session_id, registry_row = _session_mutation_receipt_identity(
+            self,
+            public_session_id,
+        )
         client_action_id = str(self.headers.get("X-Pairling-Action-Id") or "").strip()
+        if not _valid_client_action_id(client_action_id):
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "action_id_required",
+                    "message": "A valid X-Pairling-Action-Id is required for terminal text.",
+                },
+                "error_code": "action_id_required",
+            }, status=400)
+            return
         receipt_context = {
             "client_action_id": client_action_id or None,
             "device_id": getattr(getattr(self, "pairling_auth", None), "device_id", None),
             "session_id": receipt_session_id,
+            "public_session_id": public_session_id,
+            "registry_row": registry_row,
             "body_hash": _receipt_body_hash({"session_id": receipt_session_id, "text": text}),
         }
         deduped_receipt, conflict = _receipt_duplicate_response(
@@ -24221,11 +28413,47 @@ Worker instructions:
             self._send_json(conflict, status=int(conflict["status"]))
             return
         if deduped_receipt:
-            self._send_json({
+            replay, replay_status = _receipt_replay_response(deduped_receipt, {
                 "ok": deduped_receipt.get("state") == "applied",
-                "session_id": receipt_session_id,
-                "receipt": deduped_receipt,
+                "session_id": public_session_id,
             })
+            self._send_json(replay, status=replay_status)
+            return
+
+        # Replays are resolved above before the limiter. A new action that is
+        # rate-limited finalizes its reservation so later retries return the
+        # same rejection instead of remaining stuck in progress.
+        allowed, retry = _inject_rate_check(_qualified_session_id(provider, native_id))
+        if not allowed:
+            reason = f"rate limited, retry in {retry}s"
+            receipt = _make_action_receipt(
+                client_action_id=client_action_id,
+                state="rejected",
+                phases=_receipt_phases(validated=False, applied=False, pty_written=False),
+            )
+            _receipt_attach_response(
+                receipt,
+                http_status=429,
+                error_code="rate_limited",
+                error_message=reason,
+                fields={"retry_after": retry},
+            )
+            _store_action_receipt(
+                receipt_context["device_id"],
+                receipt_session_id,
+                client_action_id,
+                receipt_context["body_hash"],
+                receipt,
+                action_kind="send_text",
+                audit_action={"type": "send_text", "chars": len(text), "error": "rate_limited"},
+            )
+            self._send_json({
+                "ok": False,
+                "error": {"code": "rate_limited", "message": reason},
+                "error_code": "rate_limited",
+                "retry_after": retry,
+                "receipt": receipt,
+            }, status=429)
             return
 
         global LAST_HUMAN_ACTIVITY_AT
@@ -24245,8 +28473,38 @@ Worker instructions:
             )
             return
 
+        broker_registry_row = receipt_context.get("registry_row")
+        if broker_registry_row is None:
+            broker_registry_row = _agent_registry_row_for_broker_id(
+                "claude",
+                _qualified_session_id("claude", session_id),
+            )
+        durable_broker_id = _durable_broker_id_from_registry_row(
+            broker_registry_row,
+            provider="claude",
+            native_id=session_id,
+        )
+        broker_found = self._broker_session_for(
+            _qualified_session_id("claude", session_id)
+        )
+        if not broker_found and durable_broker_id:
+            self._finish_send_text_failure(
+                receipt_context,
+                text,
+                status=503,
+                reason="Claude terminal broker is temporarily unavailable. No text was sent.",
+                state="failed",
+                validated=True,
+                backend="pty_broker",
+                tty=str((broker_registry_row or {}).get("terminal_tty") or "") or None,
+                pid=int((broker_registry_row or {}).get("pid") or 0) or None,
+                error_code="broker_unavailable",
+                extra={"broker_id": durable_broker_id},
+            )
+            return
+
         tty = self._lookup_terminal_tty(session_id)
-        if not tty:
+        if not broker_found and not tty:
             receipt = _make_action_receipt(
                 client_action_id=receipt_context["client_action_id"],
                 state="rejected",
@@ -24266,7 +28524,7 @@ Worker instructions:
             return
 
         # Validate tty format before AppleScript embed.
-        if not re.match(r'^/dev/ttys[0-9]{3,}$', tty):
+        if not broker_found and not re.match(r'^/dev/ttys[0-9]{3,}$', tty):
             self._finish_send_text_failure(
                 receipt_context,
                 text,
@@ -24276,7 +28534,6 @@ Worker instructions:
             )
             return
 
-        broker_found = self._broker_session_for(_qualified_session_id("claude", session_id))
         if broker_found and PTY_BROKER:
             broker_id, broker_session = broker_found
             if not _broker_session_owns_identity(broker_session, "claude", session_id):
@@ -24292,29 +28549,56 @@ Worker instructions:
                     extra={"broker_id": _broker_session_id(broker_session)},
                 )
                 return
-            result = PTY_BROKER.send_text(broker_id, text)
-            source_offset_after = None
-            if result.get("ok"):
-                tail = PTY_BROKER.raw_tail(broker_id, since=0)
-                if tail:
-                    source_offset_after = tail[1]
+            result, source_offset_after, source_offset_reason = _broker_send_text_with_truth(
+                broker_id,
+                text,
+                public_session_id=public_session_id,
+            )
+            outcome_indeterminate = bool(result.get("outcome_indeterminate"))
+            pty_written = (
+                result.get("pty_written")
+                if "pty_written" in result
+                else (None if outcome_indeterminate else bool(result.get("ok")))
+            )
             receipt = _make_action_receipt(
                 client_action_id=receipt_context["client_action_id"],
-                state="applied" if result.get("ok") else "failed",
-                phases=_receipt_phases(validated=True, applied=bool(result.get("ok")), pty_written=bool(result.get("ok"))),
+                state="applied" if result.get("ok") else ("indeterminate" if outcome_indeterminate else "failed"),
+                phases=_receipt_phases(validated=True, applied=bool(result.get("ok")), pty_written=pty_written),
                 backend="pty_broker",
                 tty=_broker_slave_tty(broker_session),
                 pid=_broker_pid(broker_session),
                 source_offset_after=source_offset_after,
+                source_offset_reason=source_offset_reason,
             )
+            if result.get("write_outcome"):
+                receipt["phases"]["pty_write_state"] = str(result["write_outcome"])
+            if not result.get("ok"):
+                _receipt_attach_response(
+                    receipt,
+                    http_status=int(result.get("status") or 502),
+                    error_code=str(result.get("error_code") or result.get("reason") or "send_text_failed"),
+                    error_message=str(result.get("error") or result.get("reason") or "Send failed."),
+                    fields={
+                        "reason": result.get("reason"),
+                        "bytes_written": result.get("bytes_written"),
+                        "bytes_expected": result.get("bytes_expected"),
+                        "write_outcome": result.get("write_outcome"),
+                        "outcome_indeterminate": outcome_indeterminate,
+                    },
+                )
             _store_action_receipt(receipt_context["device_id"], receipt_session_id, receipt_context["client_action_id"], receipt_context["body_hash"], receipt, action_kind="send_text", audit_action={"type": "send_text", "chars": len(text)})
             body = json.dumps({
                 "ok": bool(result.get("ok")),
-                "session_id": receipt_session_id,
+                "session_id": public_session_id,
                 "tty": _broker_slave_tty(broker_session),
                 "pid": _broker_pid(broker_session),
                 "broker_id": _broker_session_id(broker_session),
                 "reason": result.get("reason"),
+                "error_code": result.get("error_code"),
+                "bytes_written": result.get("bytes_written"),
+                "bytes_expected": result.get("bytes_expected"),
+                "write_outcome": result.get("write_outcome"),
+                "outcome_indeterminate": outcome_indeterminate,
                 "receipt": receipt,
             }).encode()
             self.send_response(200 if result.get("ok") else int(result.get("status") or 502))
@@ -24389,7 +28673,7 @@ Worker instructions:
         end tell
         return "ok"
         '''
-        result = _run_osascript(script)
+        result = _run_osascript(script, mutation_possible=True)
 
         # If no Terminal tab matches the recorded tty, the session is a zombie:
         # the user closed that tab. Auto-tombstone and tell the iPhone with a
@@ -24417,20 +28701,59 @@ Worker instructions:
                 source_offset_reason = None
         except OSError:
             pass
+        outcome_indeterminate = bool(result.get("outcome_indeterminate"))
+        pty_written = (
+            result.get("pty_written")
+            if "pty_written" in result
+            else (None if outcome_indeterminate else bool(result.get("ok")))
+        )
         receipt = _make_action_receipt(
             client_action_id=receipt_context["client_action_id"],
-            state="applied" if result.get("ok") else "failed",
-            phases=_receipt_phases(validated=True, applied=bool(result.get("ok")), pty_written=bool(result.get("ok"))),
+            state=(
+                "applied"
+                if result.get("ok")
+                else ("indeterminate" if outcome_indeterminate else "failed")
+            ),
+            phases=_receipt_phases(
+                validated=True,
+                applied=bool(result.get("ok")),
+                pty_written=pty_written,
+            ),
             backend="terminal_app",
             tty=tty,
             source_offset_after=source_offset_after,
             source_offset_reason=source_offset_reason,
         )
+        if result.get("write_outcome"):
+            receipt["phases"]["pty_write_state"] = str(result["write_outcome"])
+        if not result.get("ok"):
+            _receipt_attach_response(
+                receipt,
+                http_status=502,
+                error_code=(
+                    "terminal_write_outcome_unknown"
+                    if outcome_indeterminate
+                    else "send_text_failed"
+                ),
+                error_message=str(result.get("reason") or "Send failed."),
+                fields={
+                    "reason": result.get("reason"),
+                    "write_outcome": result.get("write_outcome"),
+                    "outcome_indeterminate": outcome_indeterminate,
+                },
+            )
         _store_action_receipt(receipt_context["device_id"], receipt_session_id, receipt_context["client_action_id"], receipt_context["body_hash"], receipt, action_kind="send_text", audit_action={"type": "send_text", "chars": len(text)})
         body = json.dumps({
             "ok": result.get("ok", False),
             "tty": tty,
             "reason": result.get("reason"),
+            "error_code": (
+                "terminal_write_outcome_unknown"
+                if outcome_indeterminate
+                else ("send_text_failed" if not result.get("ok") else None)
+            ),
+            "write_outcome": result.get("write_outcome"),
+            "outcome_indeterminate": outcome_indeterminate,
             "receipt": receipt,
         }).encode()
         self.send_response(200 if result.get("ok") else 502)
@@ -24463,12 +28786,39 @@ Worker instructions:
 
     def _send_signal_to_session(self, q, sig: int, sig_name: str) -> None:
         raw_session = q.get("session", [""])[0]
-        provider, native_id = _parse_agent_session_ref(raw_session)
-        if not native_id:
-            self.send_error(400, "session required")
+        if ":" not in raw_session:
+            self._send_json({
+                "ok": False,
+                "signal": sig_name,
+                "error": "session must be provider-qualified",
+                "error_code": "provider_required",
+            }, status=400)
             return
-        receipt_session_id = _qualified_session_id(provider, native_id)
+        provider, native_id = _parse_agent_session_ref(raw_session)
+        if not native_id or not _valid_provider_filter(provider, allow_all=False):
+            self._send_json({
+                "ok": False,
+                "signal": sig_name,
+                "error": "session must be provider-qualified",
+                "error_code": "bad_session",
+            }, status=400)
+            return
+        if provider not in _agent_provider_ids():
+            _send_unsupported_provider(self, provider, sig_name.lower())
+            return
+        public_session_id = _qualified_session_id(provider, native_id)
+        receipt_session_id = _session_mutation_receipt_scope(self, public_session_id)
+        signal_action_kind = "sigterm" if sig == signal.SIGTERM else "sigint"
         client_action_id = str(self.headers.get("X-Pairling-Action-Id") or "").strip()
+        if not _valid_client_action_id(client_action_id):
+            self._send_json({
+                "ok": False,
+                "session_id": public_session_id,
+                "signal": sig_name,
+                "error": "A valid X-Pairling-Action-Id is required for session control.",
+                "error_code": "action_id_required",
+            }, status=400)
+            return
         device_id = getattr(getattr(self, "pairling_auth", None), "device_id", None)
         body_hash = _receipt_body_hash({"session_id": receipt_session_id, "signal": sig_name})
         deduped_receipt, conflict = _receipt_duplicate_response(
@@ -24476,7 +28826,7 @@ Worker instructions:
             receipt_session_id,
             client_action_id,
             body_hash,
-            action_kind="session_signal",
+            action_kind=signal_action_kind,
         )
         if conflict:
             _store_action_receipt(
@@ -24485,13 +28835,13 @@ Worker instructions:
                 client_action_id,
                 body_hash,
                 conflict["receipt"],
-                action_kind="session_signal",
+                action_kind=signal_action_kind,
                 audit_action={"type": "idempotency_conflict", "signal": sig_name},
                 persist=False,
             )
             self._send_json({
                 "ok": False,
-                "session_id": receipt_session_id,
+                "session_id": public_session_id,
                 "pid": None,
                 "signal": sig_name,
                 "error": conflict["error"]["message"],
@@ -24500,14 +28850,16 @@ Worker instructions:
             }, status=int(conflict["status"]))
             return
         if deduped_receipt:
-            self._send_json({
+            replay, replay_status = _receipt_replay_response(deduped_receipt, {
                 "ok": deduped_receipt.get("state") == "applied",
-                "session_id": receipt_session_id,
+                "session_id": public_session_id,
                 "pid": deduped_receipt.get("pid"),
                 "signal": sig_name,
                 "error": None,
-                "receipt": deduped_receipt,
             })
+            if isinstance(replay.get("error"), dict):
+                replay["error"] = replay["error"].get("message")
+            self._send_json(replay, status=replay_status)
             return
 
         def send_signal_result(
@@ -24518,29 +28870,48 @@ Worker instructions:
             broker_id: str | None = None,
             error_code: str | None = None,
             already_closed: bool = False,
+            pty_written: bool | None = False,
+            write_outcome: str | None = None,
+            outcome_indeterminate: bool = False,
         ) -> None:
             receipt = _make_action_receipt(
                 client_action_id=client_action_id or None,
-                state="applied" if ok else "failed",
-                phases=_receipt_phases(validated=True, applied=ok, pty_written=False),
+                state="applied" if ok else ("indeterminate" if outcome_indeterminate else "failed"),
+                phases=_receipt_phases(validated=True, applied=ok, pty_written=pty_written),
                 backend="pty_broker" if broker_id else "process_signal",
                 pid=pid,
             )
+            if write_outcome:
+                receipt["phases"]["pty_write_state"] = write_outcome
+            if not ok:
+                _receipt_attach_response(
+                    receipt,
+                    http_status=status,
+                    error_code=error_code or "session_signal_failed",
+                    error_message=err or "Session signal failed.",
+                    fields={
+                        "signal": sig_name,
+                        "pid": pid,
+                        "broker_id": broker_id,
+                        "outcome_indeterminate": outcome_indeterminate,
+                    },
+                )
             _store_action_receipt(
                 device_id,
                 receipt_session_id,
                 client_action_id or None,
                 body_hash,
                 receipt,
-                action_kind="session_signal",
+                action_kind=signal_action_kind,
                 audit_action={"type": sig_name.lower(), "provider": provider, "ok": ok},
             )
             body = {
                 "ok": ok,
-                "session_id": receipt_session_id,
+                "session_id": public_session_id,
                 "pid": pid,
                 "signal": sig_name,
                 "error": err,
+                "outcome_indeterminate": outcome_indeterminate,
                 "receipt": receipt,
             }
             if broker_id:
@@ -24553,6 +28924,11 @@ Worker instructions:
 
         if provider == "codex":
             reg = _agent_registry_get("codex", native_id)
+            durable_broker_id = _durable_broker_id_from_registry_row(
+                reg,
+                provider="codex",
+                native_id=native_id,
+            )
             if sig == signal.SIGTERM and reg and reg.get("closed_at") is not None:
                 send_signal_result(True, None, None, 200, already_closed=True)
                 return
@@ -24570,10 +28946,61 @@ Worker instructions:
                         error_code="process_identity_unverified",
                     )
                     return
-                if sig == signal.SIGINT:
-                    result = PTY_BROKER.control(broker_id, {"type": "key", "key": "ctrl_c"})
-                else:
-                    result = PTY_BROKER.terminate(broker_id, sig)
+                broker_relation = _broker_runtime_relation()
+                if sig == signal.SIGINT and broker_relation not in {"current", "stale_deferred"}:
+                    send_signal_result(
+                        False,
+                        _broker_pid(broker_session) or None,
+                        "Interrupt requires an exactly identified current or draining terminal broker.",
+                        409,
+                        broker_id=broker_id,
+                        error_code="broker_runtime_identity_unverified",
+                        pty_written=False,
+                        write_outcome="none",
+                    )
+                    return
+                if sig != signal.SIGINT and broker_relation != "current":
+                    send_signal_result(
+                        False,
+                        _broker_pid(broker_session) or None,
+                        "Termination requires the current terminal broker.",
+                        409,
+                        broker_id=broker_id,
+                        error_code="broker_requires_current_runtime",
+                        pty_written=False,
+                        write_outcome="none",
+                    )
+                    return
+                try:
+                    if sig == signal.SIGINT:
+                        result = _broker_interrupt_for_draining_runtime(broker_id)
+                    else:
+                        result = PTY_BROKER.terminate(broker_id, sig)
+                except PTYBrokerOutcomeUnknownError as exc:
+                    send_signal_result(
+                        False,
+                        _broker_pid(broker_session) or None,
+                        str(exc)[:200],
+                        502,
+                        broker_id=broker_id,
+                        error_code="broker_signal_outcome_unknown",
+                        pty_written=None,
+                        write_outcome="unknown",
+                        outcome_indeterminate=True,
+                    )
+                    return
+                except Exception as exc:
+                    send_signal_result(
+                        False,
+                        _broker_pid(broker_session) or None,
+                        str(exc)[:200],
+                        503,
+                        broker_id=broker_id,
+                        error_code="broker_unavailable",
+                        pty_written=False,
+                        write_outcome="none",
+                    )
+                    return
                 ok = bool(result.get("ok"))
                 if ok:
                     _write_agent_turn_state("codex", native_id, "idle", event=sig_name.lower())
@@ -24585,6 +29012,26 @@ Worker instructions:
                     result.get("error") or result.get("reason"),
                     200 if ok else int(result.get("status") or 502),
                     broker_id=broker_id,
+                    pty_written=(
+                        bool(result.get("pty_written"))
+                        if "pty_written" in result
+                        else bool(ok and sig == signal.SIGINT)
+                    ),
+                    write_outcome=result.get("write_outcome"),
+                    outcome_indeterminate=bool(result.get("outcome_indeterminate")),
+                )
+                return
+
+            if durable_broker_id:
+                send_signal_result(
+                    False,
+                    int(reg.get("pid") or 0) or None,
+                    "Codex terminal broker is temporarily unavailable.",
+                    503,
+                    broker_id=durable_broker_id,
+                    error_code="broker_unavailable",
+                    pty_written=False,
+                    write_outcome="none",
                 )
                 return
 
@@ -24621,7 +29068,9 @@ Worker instructions:
                 ok = bool(termination.get("ok"))
                 err = termination.get("error")
                 error_code = termination.get("error_code")
+                outcome_indeterminate = bool(termination.get("outcome_indeterminate"))
             else:
+                outcome_indeterminate = False
                 try:
                     os.kill(pid, sig)
                 except (ProcessLookupError, PermissionError, OSError) as e:
@@ -24632,7 +29081,14 @@ Worker instructions:
             if ok and sig == signal.SIGTERM:
                 _agent_registry_mark_closed("codex", native_id)
             status = 409 if error_code == "process_identity_unverified" else (200 if ok else 502)
-            send_signal_result(ok, pid, err, status, error_code=error_code)
+            send_signal_result(
+                ok,
+                pid,
+                err,
+                status,
+                error_code=error_code,
+                outcome_indeterminate=outcome_indeterminate,
+            )
             return
 
         session_id = _claude_native_session_id(raw_session)
@@ -24641,6 +29097,17 @@ Worker instructions:
             return
 
         record = _claude_sessions_backend().session_record(session_id)
+        broker_registry_row = _agent_registry_get("claude", session_id)
+        if broker_registry_row is None:
+            broker_registry_row = _agent_registry_row_for_broker_id(
+                "claude",
+                _qualified_session_id("claude", session_id),
+            )
+        durable_broker_id = _durable_broker_id_from_registry_row(
+            broker_registry_row,
+            provider="claude",
+            native_id=session_id,
+        )
         if sig == signal.SIGTERM and record and record.get("closed_at") is not None:
             send_signal_result(True, None, None, 200, already_closed=True)
             return
@@ -24658,10 +29125,61 @@ Worker instructions:
                     error_code="process_identity_unverified",
                 )
                 return
-            if sig == signal.SIGINT:
-                result = PTY_BROKER.control(broker_id, {"type": "key", "key": "ctrl_c"})
-            else:
-                result = PTY_BROKER.terminate(broker_id, sig)
+            broker_relation = _broker_runtime_relation()
+            if sig == signal.SIGINT and broker_relation not in {"current", "stale_deferred"}:
+                send_signal_result(
+                    False,
+                    _broker_pid(broker_session) or None,
+                    "Interrupt requires an exactly identified current or draining terminal broker.",
+                    409,
+                    broker_id=broker_id,
+                    error_code="broker_runtime_identity_unverified",
+                    pty_written=False,
+                    write_outcome="none",
+                )
+                return
+            if sig != signal.SIGINT and broker_relation != "current":
+                send_signal_result(
+                    False,
+                    _broker_pid(broker_session) or None,
+                    "Termination requires the current terminal broker.",
+                    409,
+                    broker_id=broker_id,
+                    error_code="broker_requires_current_runtime",
+                    pty_written=False,
+                    write_outcome="none",
+                )
+                return
+            try:
+                if sig == signal.SIGINT:
+                    result = _broker_interrupt_for_draining_runtime(broker_id)
+                else:
+                    result = PTY_BROKER.terminate(broker_id, sig)
+            except PTYBrokerOutcomeUnknownError as exc:
+                send_signal_result(
+                    False,
+                    _broker_pid(broker_session) or None,
+                    str(exc)[:200],
+                    502,
+                    broker_id=broker_id,
+                    error_code="broker_signal_outcome_unknown",
+                    pty_written=None,
+                    write_outcome="unknown",
+                    outcome_indeterminate=True,
+                )
+                return
+            except Exception as exc:
+                send_signal_result(
+                    False,
+                    _broker_pid(broker_session) or None,
+                    str(exc)[:200],
+                    503,
+                    broker_id=broker_id,
+                    error_code="broker_unavailable",
+                    pty_written=False,
+                    write_outcome="none",
+                )
+                return
             ok = bool(result.get("ok"))
             if ok and sig == signal.SIGTERM:
                 self._mark_session_closed(session_id)
@@ -24671,6 +29189,26 @@ Worker instructions:
                 result.get("error") or result.get("reason"),
                 200 if ok else int(result.get("status") or 502),
                 broker_id=broker_id,
+                pty_written=(
+                    bool(result.get("pty_written"))
+                    if "pty_written" in result
+                    else bool(ok and sig == signal.SIGINT)
+                ),
+                write_outcome=result.get("write_outcome"),
+                outcome_indeterminate=bool(result.get("outcome_indeterminate")),
+            )
+            return
+
+        if durable_broker_id:
+            send_signal_result(
+                False,
+                int((broker_registry_row or {}).get("pid") or 0) or None,
+                "Claude terminal broker is temporarily unavailable.",
+                503,
+                broker_id=durable_broker_id,
+                error_code="broker_unavailable",
+                pty_written=False,
+                write_outcome="none",
             )
             return
 
@@ -24699,7 +29237,9 @@ Worker instructions:
             ok = bool(termination.get("ok"))
             err = termination.get("error")
             error_code = termination.get("error_code")
+            outcome_indeterminate = bool(termination.get("outcome_indeterminate"))
         else:
+            outcome_indeterminate = False
             try:
                 os.kill(pid, sig)
             except (ProcessLookupError, PermissionError, OSError) as e:
@@ -24709,7 +29249,14 @@ Worker instructions:
             self._mark_session_closed(session_id)
 
         status = 409 if error_code == "process_identity_unverified" else (200 if ok else 502)
-        send_signal_result(ok, pid, err, status, error_code=error_code)
+        send_signal_result(
+            ok,
+            pid,
+            err,
+            status,
+            error_code=error_code,
+            outcome_indeterminate=outcome_indeterminate,
+        )
 
     # ----- /commands: snapshot catalog of slash commands across all sources -----
     def _handle_commands(self, q):
@@ -25069,80 +29616,123 @@ Worker instructions:
         """Toggle one provider's visibility. Writes ONLY Pairling's own
         ~/.pairling/providers.json — never a provider dotdir (Law 3) — and
         emits a PairlingActionReceipt-family record for the mutation."""
-        if _provider_visibility_set_included is None:
-            self._send_json({
-                "ok": False,
-                "error": {
-                    "code": "provider_registry_unavailable",
-                    "message": "Provider visibility is unavailable",
-                },
-            }, status=503)
-            return
-        auth = auth_result if auth_result is not None else getattr(self, "pairling_auth", None)
         raw = self._read_body() or b"{}"
+        mutation = _begin_receipted_mutation(
+            self,
+            receipt_scope="provider_visibility",
+            action_kind="provider_visibility",
+            material=raw,
+            action_label="provider visibility changes",
+        )
+        if mutation is None:
+            return
+
+        def finish(
+            *,
+            state: str,
+            status: int,
+            error_code: str | None = None,
+            error_message: str | None = None,
+            excluded: list[str] | None = None,
+            providers: list[dict] | None = None,
+            audit_action: dict | None = None,
+        ) -> None:
+            fields = {}
+            if excluded is not None:
+                fields["excluded"] = excluded
+            if providers is not None:
+                fields["providers"] = providers
+            receipt = _finalize_receipted_mutation(
+                mutation,
+                state=state,
+                http_status=status,
+                backend="provider_visibility_store",
+                error_code=error_code,
+                error_message=error_message,
+                fields=fields or None,
+                audit_action=audit_action,
+            )
+            body = {"ok": state == "applied", "receipt": receipt, **fields}
+            if error_code:
+                body["error"] = {
+                    "code": error_code,
+                    "message": error_message or error_code.replace("_", " "),
+                }
+            self._send_json(body, status=status)
+
+        if _provider_visibility_set_included is None:
+            finish(
+                state="failed",
+                status=503,
+                error_code="provider_registry_unavailable",
+                error_message="Provider visibility is unavailable",
+            )
+            return
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:
-            self._send_json({"ok": False, "error": {"code": "invalid_request", "message": "body must be JSON"}}, status=400)
+            finish(
+                state="rejected",
+                status=400,
+                error_code="invalid_request",
+                error_message="body must be JSON",
+            )
             return
         if not isinstance(payload, dict):
-            self._send_json({"ok": False, "error": {"code": "invalid_request", "message": "body must be a JSON object"}}, status=400)
+            finish(
+                state="rejected",
+                status=400,
+                error_code="invalid_request",
+                error_message="body must be a JSON object",
+            )
             return
         provider = str(payload.get("provider") or "").strip().lower()
         included = payload.get("included")
-        client_action_id = str(payload.get("client_action_id") or "").strip() or None
         if provider not in _known_agent_provider_ids():
-            self._send_json(_unknown_provider_payload(provider), status=400)
+            unknown = _unknown_provider_payload(provider)
+            finish(
+                state="rejected",
+                status=400,
+                error_code=str(unknown.get("error", {}).get("code") or "unknown_provider"),
+                error_message=str(unknown.get("error", {}).get("message") or "unknown provider"),
+            )
             return
         if not isinstance(included, bool):
-            self._send_json({"ok": False, "error": {"code": "invalid_request", "message": "included must be true or false"}}, status=400)
+            finish(
+                state="rejected",
+                status=400,
+                error_code="invalid_request",
+                error_message="included must be true or false",
+            )
             return
-        body_hash = hashlib.sha256(raw).hexdigest()
-        device_id = getattr(auth, "device_id", None)
         audit_action = {"type": "provider_visibility", "provider": provider, "included": included}
         try:
             excluded = sorted(_provider_visibility_set_included(provider, included, home=HOME))
         except OSError as exc:
-            receipt = _make_action_receipt(
-                client_action_id=client_action_id,
-                state="rejected",
-                idempotent=False,
-                phases=_receipt_phases(validated=True, applied=False, pty_written=False),
-            )
-            _store_action_receipt(
-                device_id, "", client_action_id, body_hash, receipt,
-                action_kind="provider_visibility",
+            outcome_unknown = bool(getattr(exc, "outcome_unknown", False))
+            finish(
+                state="indeterminate" if outcome_unknown else "failed",
+                status=500,
+                error_code=(
+                    "visibility_outcome_unknown"
+                    if outcome_unknown
+                    else "visibility_write_failed"
+                ),
+                error_message=str(exc)[:200],
                 audit_action={**audit_action, "error": str(exc)[:120]},
-                persist=False,
             )
-            self._send_json({
-                "ok": False,
-                "error": {"code": "visibility_write_failed", "message": str(exc)[:200]},
-                "receipt": receipt,
-            }, status=500)
             return
-        receipt = _make_action_receipt(
-            client_action_id=client_action_id,
-            state="applied",
-            idempotent=False,
-            phases=_receipt_phases(validated=True, applied=True, pty_written=False),
-        )
-        _store_action_receipt(
-            device_id, "", client_action_id, body_hash, receipt,
-            action_kind="provider_visibility",
-            audit_action=audit_action,
-            persist=False,
-        )
         # Visibility shapes the command catalogs; force the streams to
         # re-emit on the next tick (SPEC-p2 §2.4).
         _bump_catalog_epoch()
         rows, _ = self._providers_visibility_rows()
-        self._send_json({
-            "ok": True,
-            "excluded": excluded,
-            "providers": rows,
-            "receipt": receipt,
-        })
+        finish(
+            state="applied",
+            status=200,
+            excluded=excluded,
+            providers=rows,
+            audit_action=audit_action,
+        )
 
     # ----- /status: hybrid status snapshot (passthrough text + structured fields) -----
     def _handle_status(self, q):
@@ -26637,6 +31227,11 @@ Worker instructions:
             verbosity = "clean"
 
         provider, native_id = _parse_agent_session_ref(session_id)
+        launch_context = (
+            _session_launch_context_for_identity(provider, native_id)
+            if fmt != "json"
+            else None
+        )
         try:
             path = self._resolve_session_transcript_path(
                 provider,
@@ -27457,7 +32052,7 @@ Worker instructions:
         item = self._public_pairdrop_file(item)
         self._send_json({"ok": True, "file": item}, status=201)
 
-    def _read_json_object(self) -> dict:
+    def _read_pairdrop_json_object(self) -> dict:
         body = self._read_body()
         if not body:
             return {}
@@ -27488,7 +32083,7 @@ Worker instructions:
         }
 
     def _handle_pairdrop_upload_session_create(self):
-        payload = self._read_json_object()
+        payload = self._read_pairdrop_json_object()
         filename_value = payload.get("filename")
         if not isinstance(filename_value, str):
             raise PairDropStoreError("bad_filename")
@@ -28188,7 +32783,7 @@ Worker instructions:
             str(claude_bin), "-p",
             "--output-format", "text",
             "--model", model,
-            "--dangerously-skip-permissions",
+            "--tools", "",
         ]
         if system:
             cmd.extend(["--append-system-prompt", system])
@@ -28293,7 +32888,7 @@ Worker instructions:
         end tell
         return "ok"
         '''
-        return _run_osascript(script)
+        return _run_osascript(script, mutation_possible=True)
 
     def _applescript_send_esc(self, window_match: str):
         safe_match = _as_escape(window_match)
@@ -28318,7 +32913,7 @@ Worker instructions:
         end tell
         return "ok"
         '''
-        return _run_osascript(script)
+        return _run_osascript(script, mutation_possible=True)
 
     # ----- /corpus: deterministic Claude + Codex transcript inventory -----
     def _handle_corpus(self, q):
@@ -28412,24 +33007,6 @@ Worker instructions:
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-
-    # ----- /inject: queue text for next user prompt -----
-    def _handle_inject(self, q):
-        session_id = q.get("session", [""])[0]
-        session_id = _claude_native_session_id(session_id)
-        if not session_id:
-            self.send_error(400, "session required")
-            return
-        text = self._read_body().decode("utf-8", errors="replace").strip()
-        if not text:
-            self.send_error(400, "empty body")
-            return
-
-        queue_file = QUEUE_DIR / f"{session_id}.txt"
-        with open(queue_file, "a") as f:
-            f.write(text + "\n")
-
-        self._send_text(200, b"queued\n")
 
     # ----- helpers -----
     def _send_text(self, code, body: bytes):
@@ -28629,6 +33206,8 @@ if __name__ == "__main__":
     os.environ["PAIRLING_BOUND_HOST"] = host
     _maybe_backfill_claude_registry_from_pg()
     _reconcile_broker_sessions_on_boot()
+    _start_ptybroker_handover_reconciler()
+    _recover_pending_first_prompt_deliveries()
     FD_WATCHDOG = _start_fd_watchdog()
     if PUSH_DISPATCHER is not None and DEVICE_REGISTRY is not None:
         try:

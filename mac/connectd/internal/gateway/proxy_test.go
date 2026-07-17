@@ -347,7 +347,7 @@ func TestNewHandlerAcceptsLoopbackUpstream(t *testing.T) {
 	}
 }
 
-func TestPrePairModeOnlyAllowsHealthManifestRoutezAndClaims(t *testing.T) {
+func TestPrePairModeOnlyAllowsHealthManifestRoutezAndV2Pairing(t *testing.T) {
 	var forwarded []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		forwarded = append(forwarded, r.Method+" "+r.URL.Path)
@@ -365,9 +365,7 @@ func TestPrePairModeOnlyAllowsHealthManifestRoutezAndClaims(t *testing.T) {
 		{http.MethodGet, "/healthz"},
 		{http.MethodGet, "/routez"},
 		{http.MethodGet, "/manifest"},
-		{http.MethodPost, "/pair/claim"},
 		{http.MethodPost, "/pair/psk-activate"},
-		{http.MethodPost, "/pair/psk-claim"},
 		{http.MethodPost, "/pair/psk-claim-v2"},
 	}
 	for _, tc := range allowed {
@@ -385,6 +383,8 @@ func TestPrePairModeOnlyAllowsHealthManifestRoutezAndClaims(t *testing.T) {
 		path   string
 		want   int
 	}{
+		{http.MethodPost, "/pair/claim", http.StatusNotFound},
+		{http.MethodPost, "/pair/psk-claim", http.StatusNotFound},
 		{http.MethodPost, "/pair/start", http.StatusNotFound},
 		{http.MethodGet, "/sessions", http.StatusNotFound},
 		{http.MethodGet, "/sessions-stream", http.StatusNotFound},
@@ -445,21 +445,9 @@ func TestPairlingConnectModeRequiresBearerForPostPairEndpointsAndRejectsRemotePa
 	}
 
 	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "http://pairling-connect.local/pair/claim", strings.NewReader(`{}`)))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("pre-pair claim status = %d body = %s", rec.Code, rec.Body.String())
-	}
-
-	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "http://pairling-connect.local/pair/psk-activate", strings.NewReader(`{}`)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("pre-pair PSK activation status = %d body = %s", rec.Code, rec.Body.String())
-	}
-
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "http://pairling-connect.local/pair/psk-claim", strings.NewReader(`{}`)))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("pre-pair PSK claim status = %d body = %s", rec.Code, rec.Body.String())
 	}
 
 	rec = httptest.NewRecorder()
@@ -468,7 +456,7 @@ func TestPairlingConnectModeRequiresBearerForPostPairEndpointsAndRejectsRemotePa
 		t.Fatalf("pre-pair PSK v2 claim status = %d body = %s", rec.Code, rec.Body.String())
 	}
 
-	if fmt.Sprintf("%+v", forwarded) != "[POST /send-text POST /pair/claim POST /pair/psk-activate POST /pair/psk-claim POST /pair/psk-claim-v2]" {
+	if fmt.Sprintf("%+v", forwarded) != "[POST /send-text POST /pair/psk-activate POST /pair/psk-claim-v2]" {
 		t.Fatalf("forwarded = %+v", forwarded)
 	}
 }
@@ -747,7 +735,7 @@ func TestPairlingConnectModeMatchesEndpointContract(t *testing.T) {
 }
 
 func TestPrePairClaimsAreRateLimitedAndBodyLimited(t *testing.T) {
-	for _, path := range []string{"/pair/claim", "/pair/psk-activate", "/pair/psk-claim", "/pair/psk-claim-v2"} {
+	for _, path := range []string{"/pair/psk-activate", "/pair/psk-claim-v2"} {
 		t.Run(path, func(t *testing.T) {
 			var upstreamCalls int
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

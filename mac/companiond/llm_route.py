@@ -65,7 +65,7 @@ def run_local_llm(
             str(cli), "-p",
             "--output-format", "text",
             "--model", model,
-            "--dangerously-skip-permissions",
+            "--tools", "",
         ]
         if system:
             cmd.extend(["--append-system-prompt", system])

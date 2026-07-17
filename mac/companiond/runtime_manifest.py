@@ -38,6 +38,32 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+PTY_BROKER_PAYLOAD_RELATIVE_PATHS = (
+    "companiond/pty_broker_service.py",
+    "companiond/pty_broker.py",
+    "companiond/terminal_screen_backend.py",
+    "companiond/terminal_text_sanitizer.py",
+    "companiond/runtime_manifest.py",
+    "companiond/runtime_contract.py",
+    "companiond/runtime_paths.py",
+)
+
+
+def ptybroker_payload_sha256(runtime_root: str | Path) -> str | None:
+    root = Path(runtime_root).resolve(strict=False)
+    digest = hashlib.sha256()
+    try:
+        for relative in PTY_BROKER_PAYLOAD_RELATIVE_PATHS:
+            value = sha256_file(root / relative)
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(value.encode("ascii"))
+            digest.update(b"\n")
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -214,12 +240,39 @@ def classify_ptybroker_identity(
         reasons.append("source_revision_missing")
     elif live_revision and desired_revision and str(live_revision) != str(desired_revision):
         reasons.append("source_revision_mismatch")
-    try:
-        live_protocol = int(live.get("protocol_version") or 0)
-    except (TypeError, ValueError):
+    raw_live_protocol = live.get("protocol_version")
+    if type(raw_live_protocol) is int:
+        live_protocol = raw_live_protocol
+    else:
         live_protocol = 0
-    if live_protocol != int(desired.get("protocol_version") or 0):
-        reasons.append("protocol_version_missing" if not live.get("protocol_version") else "protocol_version_mismatch")
+        reasons.append(
+            "protocol_version_missing"
+            if raw_live_protocol is None
+            else "protocol_version_invalid"
+        )
+    raw_desired_protocol = desired.get("protocol_version")
+    desired_protocol = raw_desired_protocol if type(raw_desired_protocol) is int else 0
+    if live_protocol != desired_protocol:
+        if "protocol_version_missing" not in reasons and "protocol_version_invalid" not in reasons:
+            reasons.append("protocol_version_mismatch")
+        if live_protocol > desired_protocol > 0:
+            reasons.append("protocol_version_unsupported")
+    live_code_version = str(live.get("code_version") or "")
+    desired_code_version = str(desired.get("code_version") or "")
+    if desired_code_version and live_code_version != desired_code_version:
+        reasons.append("code_version_missing" if not live_code_version else "code_version_mismatch")
+    desired_payload_sha256 = str(desired.get("payload_sha256") or "")
+    live_payload_sha256 = str(live.get("payload_sha256") or "")
+    if not desired_payload_sha256:
+        reasons.append("desired_payload_sha256_missing")
+    elif not live_payload_sha256:
+        reasons.append("payload_sha256_missing")
+    elif (
+        desired_payload_sha256
+        and live_payload_sha256
+        and live_payload_sha256 != desired_payload_sha256
+    ):
+        reasons.append("payload_sha256_mismatch")
     pid = live.get("pid")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         reasons.append("pid_missing")
@@ -230,15 +283,35 @@ def classify_ptybroker_identity(
         or live_session_count < 0
     ):
         reasons.append("live_session_count_missing")
+    restart_blocker_count = live.get("restart_blocker_count")
+    if (
+        not isinstance(restart_blocker_count, int)
+        or isinstance(restart_blocker_count, bool)
+        or restart_blocker_count < 0
+    ):
+        reasons.append("restart_blocker_count_missing")
+    elif (
+        isinstance(live_session_count, int)
+        and not isinstance(live_session_count, bool)
+        and restart_blocker_count < live_session_count
+    ):
+        reasons.append("restart_blocker_count_invalid")
     fatal_reasons = {
         "status_not_object",
         "runtime_root_missing",
         "script_path_missing",
         "source_revision_missing",
         "protocol_version_missing",
+        "protocol_version_invalid",
         "protocol_version_mismatch",
+        "protocol_version_unsupported",
+        "code_version_missing",
+        "payload_sha256_missing",
+        "desired_payload_sha256_missing",
         "pid_missing",
         "live_session_count_missing",
+        "restart_blocker_count_missing",
+        "restart_blocker_count_invalid",
     }
     if fatal_reasons.intersection(reasons):
         return "incompatible", reasons
@@ -657,7 +730,7 @@ def build_manifest_payload(
             },
         },
         "endpoints": {
-            "public": ["/health", "/manifest", "/pair/start", "/pair/claim", "/pair/psk-activate", "/pair/psk-claim", "/pair/psk-claim-v2"],
+            "public": ["/health", "/manifest", "/pair/start", "/pair/psk-activate", "/pair/psk-claim-v2"],
             "authenticated": [
                 "/manifest",
                 "/sessions",
@@ -673,7 +746,6 @@ def build_manifest_payload(
                 "/transcript",
                 "/transcript-stream",
                 "/send-text",
-                "/inject-now",
                 "/worker-kill",
                 "/pairling-tools/run",
                 "/phone-tools/activity",

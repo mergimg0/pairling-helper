@@ -61,7 +61,15 @@ func TestFunnelBootstrapMatchesContract(t *testing.T) {
 	if !reflect.DeepEqual(implementationPaths, contractPaths) {
 		t.Errorf("Funnel implementation paths = %v, contract paths = %v", implementationPaths, contractPaths)
 	}
-	if len(contractPaths) != 7 {
-		t.Errorf("connectd_funnel_bootstrap true rows = %d, want exactly 7", len(contractPaths))
+	expectedBootstrapPaths := map[string]bool{
+		"GET /health":             true,
+		"GET /healthz":            true,
+		"GET /readyz":             true,
+		"GET /manifest":           true,
+		"POST /pair/psk-claim-v2": true,
+		"POST /pair/psk-activate": true,
+	}
+	if !reflect.DeepEqual(contractPaths, expectedBootstrapPaths) {
+		t.Errorf("Funnel contract paths = %v, expected current paths = %v", contractPaths, expectedBootstrapPaths)
 	}
 }

@@ -7,7 +7,15 @@ import sys
 import time
 from pathlib import Path
 
-from pty_broker import PTYBrokerManager, ensure_pty_broker_token
+from pty_broker import (
+    PTYBrokerManager,
+    cleanup_orphan_scrollback,
+    ensure_pty_broker_token,
+    secure_sensitive_local_storage,
+)
+
+
+SERVICE_SCRIPT_PATH = Path(__file__).resolve()
 
 
 def _app_support_root() -> Path:
@@ -18,7 +26,7 @@ def _app_support_root() -> Path:
 
 
 def _runtime_root() -> Path:
-    return Path(__file__).absolute().parent.parent
+    return SERVICE_SCRIPT_PATH.parent.parent
 
 
 def _source_revision(runtime_root: Path) -> str | None:
@@ -40,9 +48,22 @@ def _source_revision(runtime_root: Path) -> str | None:
 
 
 def main() -> int:
+    os.umask(0o077)
     home = Path.home()
     companion_dir = home / ".claude" / "companion"
     terminal_capture_dir = companion_dir / "terminal-capture"
+    audit_dir = home / ".claude" / "audit"
+    logs_dir = Path(
+        os.environ.get("PAIRLING_LOGS_ROOT")
+        or home / "Library" / "Logs" / "Pairling"
+    ).expanduser()
+    secure_sensitive_local_storage(
+        companion_dir,
+        terminal_capture_dir,
+        audit_dir=audit_dir,
+        logs_dir=logs_dir,
+    )
+    cleanup_orphan_scrollback(terminal_capture_dir)
     token = ensure_pty_broker_token(companion_dir)
     socket_path = companion_dir / "pty-broker.sock"
     runtime_root = _runtime_root()
@@ -51,7 +72,7 @@ def main() -> int:
         log_dir=terminal_capture_dir,
         token=token,
         runtime_root=runtime_root,
-        script_path=Path(__file__).absolute(),
+        script_path=SERVICE_SCRIPT_PATH,
         source_revision=_source_revision(runtime_root),
     )
 

@@ -644,9 +644,8 @@ func prePairAllowed(method, path string) bool {
 
 // funnelBootstrapAllowed is the public Funnel surface: the most restrictive mode.
 // It is a strict subset of the pre-pair set, declared explicitly so it can never
-// inherit a widening of prePairGetPaths/prePairPostPaths. It excludes /routez
-// (route-topology leak), /pair/claim (legacy plaintext), /pair/start, and the
-// reauth paths. There is no bearer post-pair fallthrough.
+// inherit a widening of prePairGetPaths/prePairPostPaths. It excludes /routez,
+// /pair/start, and the reauth paths. There is no bearer post-pair fallthrough.
 func funnelBootstrapAllowed(method, path string) bool {
 	switch method {
 	case http.MethodGet:
@@ -667,16 +666,15 @@ var funnelBootstrapGetPaths = map[string]bool{
 
 var funnelBootstrapPostPaths = map[string]bool{
 	"/pair/psk-activate": true,
-	"/pair/psk-claim":    true,
 	"/pair/psk-claim-v2": true,
 }
 
 func isPrePairClaimPath(path string) bool {
-	return path == "/pair/claim" || path == "/pair/psk-activate" || path == "/pair/psk-claim" || path == "/pair/psk-claim-v2"
+	return path == "/pair/psk-activate" || path == "/pair/psk-claim-v2"
 }
 
 func isFunnelECDHClaimPath(path string) bool {
-	return path == "/pair/claim" || path == "/pair/psk-claim" || path == "/pair/psk-claim-v2"
+	return path == "/pair/psk-claim-v2"
 }
 
 func isFunnelRateLimitedPath(path string) bool {
@@ -875,9 +873,7 @@ var prePairGetPaths = map[string]bool{
 }
 
 var prePairPostPaths = map[string]bool{
-	"/pair/claim":        true,
 	"/pair/psk-activate": true,
-	"/pair/psk-claim":    true,
 	"/pair/psk-claim-v2": true,
 }
 

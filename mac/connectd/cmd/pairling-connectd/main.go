@@ -177,25 +177,13 @@ func run(args []string) int {
 	statusStore.SetListenerRunning(true)
 	go monitorTailnetIPs(ctx, srv, statusStore)
 
-	// Increment 1: optional public Funnel listener for the pre-pair bootstrap
-	// claim, off by default. A SEPARATE handler in ExposureModeFunnelBootstrap,
+	// Optional public Funnel listener for the pre-pair bootstrap claim, off by
+	// default. A SEPARATE handler in ExposureModeFunnelBootstrap,
 	// never the tailnet pairling_connect handler, so the bearer post-pair surface
 	// is structurally unreachable over Funnel. A failure to open is logged and
 	// recorded but does not bring down the tailnet listener.
-	// Increment 8: PSK-required boot precondition. On a funnel-enabled install the
-	// legacy plaintext /pair/claim must be impossible, so refuse to open the
-	// public listener unless PSK is required (the daemon default). A PSK-off
-	// misconfiguration would otherwise risk a secret-on-the-wire claim path.
-	pskRequired := true
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("PAIRLING_PSK_REQUIRED"))) {
-	case "0", "false", "no", "off":
-		pskRequired = false
-	}
-	if *funnelEnabled && !pskRequired {
-		log.Printf("refusing to open funnel listener: PAIRLING_PSK_REQUIRED must be on for a funnel-enabled install")
-	}
 	var funnelServer *http.Server
-	if *funnelEnabled && pskRequired {
+	if *funnelEnabled {
 		funnelMacIDHash := ""
 		if id := strings.TrimSpace(runtimecfg.LoadInstallID(appSupport)); id != "" {
 			sum := sha256.Sum256([]byte(id))

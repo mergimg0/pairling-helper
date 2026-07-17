@@ -65,7 +65,16 @@ def _canonical_endpoint_url(raw: str) -> tuple[str, str | None, str | None, bool
         return "", None, None, False
     normalized = value if "://" in value else f"http://{value}"
     parsed = urllib.parse.urlsplit(normalized)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    try:
+        parsed.port
+    except ValueError:
+        return value, None, None, normalized != value
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
         return value, None, None, normalized != value
     path = parsed.path.rstrip("/")
     canonical = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
@@ -80,6 +89,8 @@ def _normalize_endpoint(obj: Any) -> dict[str, Any] | None:
         return None
     bridge_id = _safe_str(obj.get("bridgeId"), 96)
     normalized_url, display_host, host, normalized = _canonical_endpoint_url(url)
+    if display_host is None or host is None:
+        return None
     return {
         "url": normalized_url,
         "mode": "bridge" if bridge_id else "direct",
@@ -255,7 +266,22 @@ class ApertureCLIProbe:
         }
 
     def fetch_providers(self, endpoint: dict[str, Any]) -> dict[str, Any]:
-        base_url = str(endpoint.get("runtime_url") or endpoint.get("normalized_url") or endpoint.get("url") or DEFAULT_ENDPOINT).rstrip("/")
+        raw_base_url = str(
+            endpoint.get("runtime_url")
+            or endpoint.get("normalized_url")
+            or endpoint.get("url")
+            or DEFAULT_ENDPOINT
+        )
+        base_url, display_host, host, _ = _canonical_endpoint_url(raw_base_url)
+        if display_host is None or host is None:
+            return {
+                "reachable": False,
+                "items": [],
+                "count": 0,
+                "compatibility_keys": [],
+                "source_endpoint": {**endpoint, "stale": True},
+                "last_error": "Aperture endpoint must use HTTP or HTTPS.",
+            }
         url = base_url + "/api/providers"
         mode = endpoint.get("mode") or "direct"
         if mode == "bridge":
@@ -268,7 +294,8 @@ class ApertureCLIProbe:
                 "last_error": "Bridge endpoints require an active Aperture CLI tsnet proxy; Pairling native bridge probing is not enabled yet.",
             }
         try:
-            with urllib.request.urlopen(url, timeout=PROVIDER_TIMEOUT_SECONDS) as response:
+            # _canonical_endpoint_url has just restricted this URL to HTTP or HTTPS with a host.
+            with urllib.request.urlopen(url, timeout=PROVIDER_TIMEOUT_SECONDS) as response:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
                 status = getattr(response, "status", 200)
                 body = response.read(1024 * 1024)
         except (urllib.error.URLError, TimeoutError, OSError) as exc:

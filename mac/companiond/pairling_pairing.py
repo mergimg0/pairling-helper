@@ -58,25 +58,12 @@ try:
 except Exception:
     _psk = None
 
-
-def _psk_required() -> bool:
-    # PSK-authenticated ECDH is the only MITM-safe pairing path, so it is REQUIRED by
-    # default. Only an explicit opt-out ("0"/"false"/"no"/"off") permits the legacy
-    # plaintext /pair/claim — used by contract tests that exercise the legacy branch on
-    # purpose, and as a break-glass if the crypto module is ever unavailable.
-    return os.environ.get("PAIRLING_PSK_REQUIRED", "on").strip().lower() not in {"0", "false", "no", "off"}
-
-
-# Boot-time hard-dependency assertion. With PSK required by default, the cryptography
-# module (imported by pairling_psk) is a hard runtime dependency: if it failed to import,
-# fail LOUD here at daemon startup instead of silently returning 503 from every
-# /pair/psk-claim while legacy is closed — which would brick pairing entirely. Set
-# PAIRLING_PSK_REQUIRED=0 to fall back to legacy plaintext pairing when crypto is absent.
-if _psk is None and _psk_required():
+# PSK-authenticated ECDH is the only pairing protocol. The cryptography module
+# is therefore a hard runtime dependency, with no plaintext downgrade mode.
+if _psk is None:
     raise RuntimeError(
-        "Pairling pairing requires the 'cryptography' package (pairling_psk failed to "
-        "import) because PAIRLING_PSK_REQUIRED is on by default. Install cryptography, or "
-        "set PAIRLING_PSK_REQUIRED=0 to permit the legacy plaintext claim."
+        "Pairling pairing requires the 'cryptography' package because pairling_psk "
+        "could not be imported. Install the runtime's cryptography dependency."
     )
 
 
@@ -403,10 +390,6 @@ def pair_claim_result_canonical(payload: dict) -> bytes:
     return "\n".join(lines).encode("utf-8")
 
 
-def _nonce_required() -> bool:
-    return os.environ.get("PAIRLING_NONCE_REQUIRED", "").strip().lower() in {"1", "true", "yes", "on"}
-
-
 def verify_p256_signature(point_b64: str, message: bytes, signature_der: bytes) -> bool:
     """Verify an ECDSA-P256-SHA256 signature from the iOS Secure Enclave.
 
@@ -520,7 +503,6 @@ class PairStart:
     install_id: str
     service_type: str
     txt: dict[str, str]
-    pairing_nonce: str = ""
     attest_challenge: str = ""
     mac_ake_pub: str = ""
     purpose: str | None = None
@@ -1081,30 +1063,19 @@ class PairingStore:
         ttl = max(MIN_PAIR_TTL_SECONDS, min(int(ttl_seconds), MAX_PAIR_TTL_SECONDS))
         pair_id = "pair_" + secrets.token_hex(8)
         secret = secrets.token_urlsafe(24)
-        # P0-A: the nonce now lives in the on-disk record (it used to be
-        # generated only into the Bonjour TXT, so claim_pair() could never
-        # verify it). Both the Bonjour TXT and the QR claim payload carry it,
-        # so either path can present it back.
-        pairing_nonce = secrets.token_urlsafe(9)
         # WS2: per-invitation App Attest challenge. The iOS app binds its
         # attestation to canonical(pair_id, attest_challenge); the Mac verifies
         # against this stored value, so a MITM cannot swap it (Blocker #6).
         attest_challenge = secrets.token_hex(32)
-        # WS3: per-invitation Mac ephemeral ECDH key. A_pub goes in the OOB
-        # payload (QR/paste); the private half is stored in this mode-600 record
-        # so the claim can run a PSK-authenticated ECDH and the secret is never
-        # transmitted. Absent when the crypto module is unavailable (legacy only).
-        mac_ake_pub = ""
-        mac_ake_priv_b64 = ""
-        if _psk is not None:
-            _ake_priv, _ake_pub = _psk.mac_keygen()
-            mac_ake_pub = base64.urlsafe_b64encode(_ake_pub).rstrip(b"=").decode("ascii")
-            mac_ake_priv_b64 = base64.b64encode(_psk.dump_private(_ake_priv)).decode("ascii")
+        # Per-invitation Mac ephemeral ECDH key. A_pub goes in the out-of-band
+        # QR or pairing link; the private half stays in this mode-600 record.
+        _ake_priv, _ake_pub = _psk.mac_keygen()
+        mac_ake_pub = base64.urlsafe_b64encode(_ake_pub).rstrip(b"=").decode("ascii")
+        mac_ake_priv_b64 = base64.b64encode(_psk.dump_private(_ake_priv)).decode("ascii")
         expires_at = time.time() + ttl
         record = {
             "pair_id": pair_id,
             "secret": secret,
-            "pairing_nonce": pairing_nonce,
             "attest_challenge": attest_challenge,
             "mac_ake_pub": mac_ake_pub,
             "mac_ake_priv": mac_ake_priv_b64,
@@ -1174,12 +1145,11 @@ class PairingStore:
             "mac_name": self._computer_name(),
             "mac_model": self._mac_model(),
             "runtime_version": self._runtime_version(),
-            "pairing_nonce": pairing_nonce,
             "route_hint": os.environ.get("PAIRLING_ROUTE_HINT", "lan,bonjour,tailnet")[:64],
         }
         return PairStart(
             pair_id, secret, expires_at, self.install_id, PAIR_SERVICE_TYPE, txt,
-            pairing_nonce, attest_challenge, mac_ake_pub,
+            attest_challenge, mac_ake_pub,
             normalized_purpose or None,
             (time.time() + smoke_lease_ttl) if smoke_lease_ttl is not None else None,
         )
@@ -1233,55 +1203,6 @@ class PairingStore:
         if not isinstance(record, dict):
             raise PairingError("pair_corrupt", 500, "pair record is not an object")
         return record, path
-
-    def claim_pair(
-        self,
-        *,
-        pair_id: str,
-        secret: str,
-        device_name: str,
-        host_chain: Iterable[str],
-        scopes: Iterable[str] | None = None,
-        cert_pin: str | None = None,
-        pairing_nonce: str = "",
-        se_public_key_der: str = "",
-        attest_object: dict | None = None,
-        attest_key_id: str = "",
-        attest_environment: str = "",
-        attested_claim_ticket: str | None = None,
-        relay_device_id: str | None = None,
-        relay_required: bool = False,
-        relay_claim_verifier=None,
-        require_direct_attest: bool = False,
-    ) -> PairClaim:
-        with self._claim_lock:
-            # WS3: once PSK pairing is mandatory, reject legacy plaintext-secret
-            # claims before looking up a pair id or charging its attempt budget.
-            # This path can never succeed, so it must not be an invitation oracle
-            # or a lockout primitive.
-            if _psk_required():
-                raise PairingError("psk_required", 403, "psk-authenticated pairing required")
-            record, path, now = self._precheck_claim(pair_id)
-            if not secrets.compare_digest(str(record.get("secret") or ""), secret or ""):
-                raise PairingError("invalid_secret", 403, "invalid pair secret")
-            # P0-A: nonce gate (default off via PAIRLING_NONCE_REQUIRED). Both
-            # the QR claim payload and the Bonjour TXT carry pairing_nonce, so
-            # legitimate claims on either path present it; an attacker who only
-            # hit /pair/start blind (never saw the TXT/QR) cannot.
-            if _nonce_required():
-                if not secrets.compare_digest(str(record.get("pairing_nonce") or ""), pairing_nonce or ""):
-                    raise PairingError("invalid_pairing_nonce", 403, "invalid pairing nonce")
-            return self._finalize_claim(
-                pair_id=pair_id, record=record, path=path, now=now,
-                device_name=device_name, host_chain=host_chain, scopes=scopes,
-                cert_pin=cert_pin, se_public_key_der=se_public_key_der,
-                attest_object=attest_object, attest_key_id=attest_key_id,
-                attest_environment=attest_environment,
-                attested_claim_ticket=attested_claim_ticket,
-                relay_device_id=relay_device_id, relay_required=relay_required,
-                relay_claim_verifier=relay_claim_verifier,
-                require_direct_attest=require_direct_attest,
-            )
 
     def _precheck_claim(self, pair_id: str) -> tuple[dict, Path, float]:
         """Shared front-matter for both claim paths (caller holds _claim_lock):
@@ -1358,176 +1279,6 @@ class PairingStore:
             raise PairingError("direct_attest_invalid", 403, "app attest validation failed")
         return True
 
-    def _finalize_claim(
-        self,
-        *,
-        pair_id: str,
-        record: dict,
-        path: Path,
-        now: float,
-        device_name: str,
-        host_chain: Iterable[str],
-        scopes: Iterable[str] | None,
-        cert_pin: str | None,
-        se_public_key_der: str,
-        attest_object: dict | None,
-        attest_key_id: str,
-        attest_environment: str,
-        attested_claim_ticket: str | None,
-        relay_device_id: str | None,
-        relay_required: bool,
-        relay_claim_verifier,
-        funnel_origin: bool = False,
-        require_direct_attest: bool = False,
-        attestation_verified: bool | None = None,
-        token: str | None = None,
-        proof_secret: str | None = None,
-        device_id: str | None = None,
-    ) -> PairClaim:
-        """Post-authentication finalize, shared by legacy and PSK claims. The
-        caller holds _claim_lock and has already proven secret-knowledge (legacy
-        compare or PSK key-confirmation): App Attest, relay ticket, device
-        creation, SE pubkey registration, record teardown."""
-        # WS2 + Increment 5: direct App Attest. For a funnel-origin claim it is a
-        # hard, fail-closed requirement (verified earlier, before the derive). For
-        # LAN and tailnet claims it stays opportunistic. attestation_verified
-        # carries a result the caller already computed (the funnel pre-derive
-        # check); otherwise verify here.
-        if attestation_verified is None:
-            attestation_verified = self._verify_claim_attestation(
-                pair_id=pair_id, record=record, attest_object=attest_object,
-                attest_key_id=attest_key_id, attest_environment=attest_environment,
-                require=funnel_origin or require_direct_attest,
-                force_production=funnel_origin or require_direct_attest,
-            )
-        relay_status = "none"
-        # A caller-supplied relay id has no authority by itself. Only a verified
-        # relay ticket may bind the new local credential to an existing phone.
-        verified_relay_device_id = None
-        relay_pair_secret = None
-        relay_pair_secret_ref = None
-        verification = None
-        normalized_hosts = tuple(h for h in host_chain if isinstance(h, str) and h)
-        if not normalized_hosts:
-            raise PairingError("missing_host_chain", 500, "host chain is empty")
-        try:
-            runtime_port = int(record.get("runtime_port") or self.runtime_port)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise PairingError("pair_corrupt", 500, "pair record has an invalid runtime port") from exc
-        relay_ticket_required = (
-            relay_required
-            and str(record.get("purpose") or "").strip() != SMOKE_DEVICE_PURPOSE
-        )
-        if relay_ticket_required or attested_claim_ticket:
-            if not attested_claim_ticket:
-                raise PairingError("attested_claim_required", 403, "relay claim ticket required")
-            if relay_claim_verifier is None:
-                raise PairingError("attested_claim_invalid", 403, "relay claim verifier unavailable")
-            try:
-                verification = relay_claim_verifier.verify(
-                    attested_claim_ticket,
-                    pair_id=pair_id,
-                    relay_device_id=relay_device_id,
-                    device_name=device_name,
-                )
-            except Exception as exc:
-                code = getattr(exc, "code", "attested_claim_invalid")
-                message = getattr(exc, "message", str(exc))
-                raise PairingError(code, 403, message)
-            verified_relay_device_id = verification.relay_device_id
-            relay_status = verification.attestation_status
-            relay_pair_secret = getattr(verification, "relay_pair_secret", None)
-            relay_pair_secret_ref = getattr(verification, "relay_pair_secret_ref", None)
-        marker = None
-        device = None
-        relay_secret_expected = bool(relay_pair_secret and verified_relay_device_id)
-        try:
-            marker = self._create_claim_marker(pair_id)
-            device = self.registry.create_device(
-                device_name=device_name or "Pairling iPhone",
-                install_id=str(record.get("install_id") or self.install_id),
-                scopes=scopes or DEFAULT_DEVICE_SCOPES,
-                relay_device_id=verified_relay_device_id,
-                attestation_status=relay_status,
-                device_display_name=device_name or "Pairling iPhone",
-                relay_pair_secret_ref=relay_pair_secret_ref,
-                se_public_key_der=se_public_key_der,
-                token=token,
-                proof_secret=proof_secret,
-                device_id=device_id,
-            )
-            if relay_secret_expected:
-                self._store_relay_pair_secret(
-                    device_id=device.device_id,
-                    relay_device_id=verified_relay_device_id,
-                    mac_install_id=str(record.get("install_id") or self.install_id),
-                    relay_pair_secret=str(relay_pair_secret),
-                    relay_pair_secret_ref=str(relay_pair_secret_ref or ""),
-                )
-            # Consume the record name before removing its hard-linked claim
-            # marker. A competing store can never recreate the marker from a
-            # cached record after the invitation name has gone away.
-            self._delete_record(path)
-            self._claim_attempts.pop(pair_id, None)
-            result = PairClaim(
-                device,
-                normalized_hosts,
-                runtime_port,
-                cert_pin,
-                verified_relay_device_id,
-                relay_status,
-                bool(attestation_verified),
-            )
-        except Exception as exc:
-            compensation_errors = []
-            if device is not None and relay_secret_expected:
-                try:
-                    self._delete_relay_pair_secret(device.device_id)
-                except Exception as cleanup_exc:
-                    compensation_errors.append(cleanup_exc)
-            if device is not None:
-                try:
-                    if not self.registry.rollback_created_device(
-                        device.device_id,
-                        reason=f"pair_finalize_failed:{type(exc).__name__}",
-                    ):
-                        compensation_errors.append(RuntimeError("created device was not found"))
-                except Exception as cleanup_exc:
-                    compensation_errors.append(cleanup_exc)
-            if not compensation_errors and verification is not None:
-                release_verification = getattr(relay_claim_verifier, "release", None)
-                if callable(release_verification):
-                    try:
-                        release_verification(verification)
-                    except Exception as cleanup_exc:
-                        compensation_errors.append(cleanup_exc)
-            if not compensation_errors and marker is not None:
-                try:
-                    self._delete_record(marker)
-                except Exception as cleanup_exc:
-                    compensation_errors.append(cleanup_exc)
-            if compensation_errors:
-                raise PairingError(
-                    "pair_finalize_rollback_failed",
-                    503,
-                    "pairing failed and cleanup could not be completed",
-                ) from exc
-            if isinstance(exc, PairingError):
-                raise
-            raise PairingError(
-                "pair_finalize_failed",
-                503,
-                "pairing could not be finalized",
-            ) from exc
-        # The invitation name is already gone, so a leftover hard-link marker
-        # cannot be claimed. Expiry pruning will remove it if this unlink fails.
-        if marker is not None:
-            try:
-                self._delete_record(marker)
-            except Exception:
-                pass
-        return result
-
     @staticmethod
     def _psk_claim_request_hash(
         *,
@@ -1541,7 +1292,6 @@ class PairingStore:
         attest_object: dict | None,
         attest_key_id: str,
         attest_environment: str,
-        attested_claim_ticket: str | None,
         relay_device_id: str | None,
         relay_required: bool,
         funnel_origin: bool,
@@ -1549,9 +1299,6 @@ class PairingStore:
         seal_proof_secret: bool,
         request_binding: str,
     ) -> str:
-        ticket_digest = hashlib.sha256(
-            str(attested_claim_ticket or "").encode("utf-8")
-        ).hexdigest()
         canonical = {
             "pair_id": pair_id,
             "b_pub": base64.b64encode(b_pub).decode("ascii"),
@@ -1563,7 +1310,6 @@ class PairingStore:
             "attest_object": attest_object or {},
             "attest_key_id": attest_key_id,
             "attest_environment": attest_environment,
-            "attested_claim_ticket_sha256": ticket_digest,
             "relay_device_id": relay_device_id or "",
             "relay_required": bool(relay_required),
             "funnel_origin": bool(funnel_origin),
@@ -1894,7 +1640,6 @@ class PairingStore:
         attest_object: dict | None = None,
         attest_key_id: str | None = None,
         attest_environment: str | None = None,
-        attested_claim_ticket: str | None = None,
         enc_attested_claim_ticket: str | None = None,
         attested_claim_ticket_nonce: str | None = None,
         relay_device_id: str | None = None,
@@ -1907,7 +1652,6 @@ class PairingStore:
         request_binding: str | None = None,
         protocol_version: int = 2,
         activation_contract: str = "pairling.psk.activate.v1",
-        require_request_binding: bool = False,
         runtime_routes: Iterable[dict] | None = None,
         transport: str = "http-local",
     ) -> SealedPSKPairClaim:
@@ -1924,58 +1668,41 @@ class PairingStore:
                 426,
                 "this Pairling version requires sealed proof credentials",
             )
-        accepted_request_binding = ""
-        if require_request_binding:
-            if attested_claim_ticket is not None:
-                raise PairingError(
-                    "plaintext_attested_claim_forbidden",
-                    400,
-                    "v2 pairing requires an encrypted relay claim ticket",
-                )
-            if protocol_version != 2:
-                raise PairingError(
-                    "upgrade_required", 426, "unsupported pairing protocol version"
-                )
-            try:
-                expected_request_binding = pair_claim_request_binding(
-                    request_contract=request_contract,
-                    pair_id=pair_id,
-                    device_name=device_name,
-                    protocol_version=protocol_version,
-                    seal_proof_secret=seal_proof_secret,
-                    activation_contract=activation_contract,
-                    se_public_key_der=se_public_key_der,
-                    direct_attest_object=attest_object,
-                    attest_key_id=attest_key_id,
-                    attest_environment=attest_environment,
-                    enc_attested_claim_ticket=enc_attested_claim_ticket,
-                    attested_claim_ticket_nonce=attested_claim_ticket_nonce,
-                    relay_device_id=relay_device_id,
-                )
-            except ValueError as exc:
-                raise PairingError(
-                    "psk_request_binding_invalid",
-                    400,
-                    "pairing request binding is invalid",
-                ) from exc
-            if not isinstance(request_binding, str) or not secrets.compare_digest(
-                expected_request_binding, request_binding
-            ):
-                raise PairingError(
-                    "psk_request_binding_invalid",
-                    403,
-                    "pairing request binding could not be verified",
-                )
-            accepted_request_binding = expected_request_binding
-        elif (
-            enc_attested_claim_ticket is not None
-            or attested_claim_ticket_nonce is not None
+        if protocol_version != 2:
+            raise PairingError(
+                "upgrade_required", 426, "unsupported pairing protocol version"
+            )
+        try:
+            expected_request_binding = pair_claim_request_binding(
+                request_contract=request_contract,
+                pair_id=pair_id,
+                device_name=device_name,
+                protocol_version=protocol_version,
+                seal_proof_secret=seal_proof_secret,
+                activation_contract=activation_contract,
+                se_public_key_der=se_public_key_der,
+                direct_attest_object=attest_object,
+                attest_key_id=attest_key_id,
+                attest_environment=attest_environment,
+                enc_attested_claim_ticket=enc_attested_claim_ticket,
+                attested_claim_ticket_nonce=attested_claim_ticket_nonce,
+                relay_device_id=relay_device_id,
+            )
+        except ValueError as exc:
+            raise PairingError(
+                "psk_request_binding_invalid",
+                400,
+                "pairing request binding is invalid",
+            ) from exc
+        if not isinstance(request_binding, str) or not secrets.compare_digest(
+            expected_request_binding, request_binding
         ):
             raise PairingError(
-                "psk_request_binding_required",
-                426,
-                "encrypted relay claims require the v2 request binding",
+                "psk_request_binding_invalid",
+                403,
+                "pairing request binding could not be verified",
             )
+        accepted_request_binding = expected_request_binding
         try:
             b_pub = base64.b64decode(b_pub_b64, validate=True)
             confirm = base64.b64decode(confirm_b64, validate=True)
@@ -1992,9 +1719,6 @@ class PairingStore:
             attest_object=attest_object,
             attest_key_id=attest_key_id or "",
             attest_environment=attest_environment or "",
-            attested_claim_ticket=(
-                None if require_request_binding else attested_claim_ticket
-            ),
             relay_device_id=relay_device_id,
             relay_required=relay_required,
             funnel_origin=funnel_origin,
@@ -2044,23 +1768,18 @@ class PairingStore:
                 raise
             except Exception:
                 raise PairingError("psk_bad_key", 400, "invalid psk material")
-            if require_request_binding:
-                expected = pair_claim_phone_confirm_v2(
-                    k_confirm=k_confirm,
-                    pair_id=pair_id,
-                    a_pub=a_pub,
-                    b_pub=b_pub,
-                    request_binding=accepted_request_binding,
-                )
-            else:
-                expected = _psk.confirm_tag(
-                    k_confirm, _psk.CONFIRM_PHONE, pair_id, a_pub, b_pub
-                )
+            expected = pair_claim_phone_confirm_v2(
+                k_confirm=k_confirm,
+                pair_id=pair_id,
+                a_pub=a_pub,
+                b_pub=b_pub,
+                request_binding=accepted_request_binding,
+            )
             if not secrets.compare_digest(expected, confirm):
                 raise PairingError("psk_confirm_invalid", 403, "psk confirmation invalid")
             aad = _psk.transcript(pair_id, a_pub, b_pub)
-            effective_attested_claim_ticket = attested_claim_ticket
-            if require_request_binding and enc_attested_claim_ticket is not None:
+            effective_attested_claim_ticket = None
+            if enc_attested_claim_ticket is not None:
                 try:
                     relay_ticket_ciphertext = base64.b64decode(
                         enc_attested_claim_ticket, validate=True
@@ -2234,73 +1953,3 @@ class PairingStore:
                 503,
                 "relay pairing secret could not be removed",
             ) from exc
-
-
-class PairingAdvertiser:
-    """Pair-only Bonjour advertiser backed by macOS dns-sd."""
-
-    def __init__(
-        self,
-        *,
-        dns_sd_path: str = "/usr/bin/dns-sd",
-        popen_factory: Callable[..., subprocess.Popen] = subprocess.Popen,
-    ):
-        self.dns_sd_path = dns_sd_path
-        self.popen_factory = popen_factory
-        self._lock = threading.Lock()
-        self._proc = None
-        self._timer: threading.Timer | None = None
-
-    def start(self, started: PairStart, *, port: int) -> dict:
-        # When PSK pairing is required (the default), the Bonjour-advertised
-        # phone-initiated path can no longer complete a claim — legacy /pair/claim
-        # returns 403 — so publishing the service is dead surface and a needless
-        # LAN signal. Self-disable here rather than editing the pairlingd.py call
-        # site. PAIRLING_PSK_REQUIRED=0 (the legacy break-glass) re-enables it.
-        if _psk_required():
-            return {"ok": False, "reason": "psk_required"}
-        if os.environ.get("PAIRLING_DISABLE_BONJOUR") in {"1", "true", "TRUE"}:
-            return {"ok": False, "reason": "disabled"}
-        if not Path(self.dns_sd_path).exists():
-            return {"ok": False, "reason": "dns-sd_missing"}
-        txt_args = [f"{key}={value}" for key, value in sorted(started.txt.items())]
-        cmd = [
-            self.dns_sd_path,
-            "-R",
-            "Pairling",
-            started.service_type,
-            "local",
-            str(port),
-            *txt_args,
-        ]
-        with self._lock:
-            self.stop()
-            try:
-                proc = self.popen_factory(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except OSError as exc:
-                return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
-            self._proc = proc
-            ttl = max(1.0, started.expires_at - time.time())
-            self._timer = threading.Timer(ttl, self.stop)
-            self._timer.daemon = True
-            self._timer.start()
-        return {
-            "ok": True,
-            "service_type": started.service_type,
-            "runtime_api_advertised": False,
-            "pid": getattr(proc, "pid", None),
-        }
-
-    def stop(self) -> None:
-        timer = self._timer
-        self._timer = None
-        if timer is not None:
-            timer.cancel()
-        proc = self._proc
-        self._proc = None
-        if proc is not None and proc.poll() is None:
-            proc.terminate()

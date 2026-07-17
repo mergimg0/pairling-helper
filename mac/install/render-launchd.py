@@ -58,6 +58,7 @@ def daemon_plist(
         "RunAtLoad": True,
         "KeepAlive": True,
         "ThrottleInterval": 10,
+        "Umask": 0o077,
         "StandardOutPath": str(logs / "companiond.log"),
         "StandardErrorPath": str(logs / "companiond.err"),
     }
@@ -92,6 +93,7 @@ def connectd_plist(current: Path, logs: Path, ssh_gateway: bool = False) -> dict
         "RunAtLoad": True,
         "KeepAlive": True,
         "ThrottleInterval": 10,
+        "Umask": 0o077,
         "StandardOutPath": str(logs / "connectd.log"),
         "StandardErrorPath": str(logs / "connectd.err"),
     }
@@ -114,6 +116,7 @@ def ptybroker_plist(current: Path, logs: Path, python_bin: str) -> dict:
         "RunAtLoad": True,
         "KeepAlive": True,
         "ThrottleInterval": 10,
+        "Umask": 0o077,
         "StandardOutPath": str(logs / "ptybroker.log"),
         "StandardErrorPath": str(logs / "ptybroker.err"),
     }

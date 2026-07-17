@@ -36,6 +36,13 @@ COMPLETION_TOMBSTONE_TTL_SECONDS = 10 * 60
 MAX_TRACKED_PHONE_DEVICES = 64
 MAX_REVOKED_WORKERS = 256
 MAX_COMPLETION_TOMBSTONES = 256
+CURRENT_WORKER_ID_PATTERN = re.compile(r"v3:[A-Za-z0-9][A-Za-z0-9._-]{0,96}\Z")
+
+
+def current_worker_id(value: Any) -> str | None:
+    if not isinstance(value, str) or value != value.strip():
+        return None
+    return value if CURRENT_WORKER_ID_PATTERN.fullmatch(value) is not None else None
 
 
 @dataclass(frozen=True)
@@ -58,9 +65,7 @@ class PhoneToolAvailabilityStore:
         *,
         device_id: str | None = None,
         now: float | None = None,
-        reactivate: bool = True,
     ) -> dict[str, Any]:
-        del reactivate  # Worker activation truth belongs to PhoneToolWorkQueue.
         current = time.time() if now is None else now
         normalized_device = str(device_id or payload.get("device_id") or "").strip()[:160]
         if not normalized_device:
@@ -75,7 +80,9 @@ class PhoneToolAvailabilityStore:
         if not isinstance(tools, list):
             tools = PHONE_TOOL_LIST
         normalized_tools = sorted({str(tool) for tool in tools if str(tool) in ALLOWED_TOOLS})
-        worker_id = str(payload.get("worker_id") or "legacy")[:100]
+        worker_id = current_worker_id(payload.get("worker_id"))
+        if worker_id is None:
+            return self.snapshot(device_id=normalized_device, now=current)
         with self._lock:
             self._prune_locked(current)
             active_worker = str(self._states.get(normalized_device, {}).get("worker_id") or "")
@@ -145,7 +152,11 @@ class PhoneToolAvailabilityStore:
 
     @staticmethod
     def _state_is_fresh(state: dict[str, Any], current: float) -> bool:
-        return bool(state.get("listener_running")) and float(state.get("expires_at") or 0) > current
+        return (
+            current_worker_id(state.get("worker_id")) is not None
+            and bool(state.get("listener_running"))
+            and float(state.get("expires_at") or 0) > current
+        )
 
     def _prune_locked(self, current: float) -> None:
         stale_before = current - REVOKED_WORKER_TTL_SECONDS
@@ -181,8 +192,8 @@ class PhoneToolWorkQueue:
         self._completion_tombstones: OrderedDict[str, float] = OrderedDict()
 
     @staticmethod
-    def _worker_id(worker_id: str | None) -> str:
-        return str(worker_id or "legacy")[:100]
+    def _worker_id(worker_id: str | None) -> str | None:
+        return current_worker_id(worker_id)
 
     @staticmethod
     def _device_id(device_id: str | None) -> str:
@@ -197,10 +208,14 @@ class PhoneToolWorkQueue:
         now: float | None = None,
     ) -> bool:
         normalized_device = self._device_id(device_id)
-        if not normalized_device:
-            return False
         normalized_worker = self._worker_id(worker_id)
-        supersedes = str(supersedes_worker_id or "").strip()[:100]
+        if not normalized_device or normalized_worker is None:
+            return False
+        supersedes = None
+        if supersedes_worker_id is not None:
+            supersedes = self._worker_id(supersedes_worker_id)
+            if supersedes is None:
+                return False
         current = time.time() if now is None else now
         with self._condition:
             self._prune_lifecycle_locked(current)
@@ -210,19 +225,14 @@ class PhoneToolWorkQueue:
             if active_worker == normalized_worker:
                 active_state["last_seen_at"] = current
                 return True
-            if normalized_worker != "legacy" and worker_key in self._revoked_workers:
+            if worker_key in self._revoked_workers:
                 return False
             # Replacement is a compare-and-swap against the worker lifecycle
             # remembered by the phone. A delayed start for an older lifecycle
             # cannot replace a newer worker merely because its request arrived
             # last.
             if active_worker:
-                migrating_predecessorless_v3 = (
-                    normalized_worker.startswith("v3:")
-                    and not active_worker.startswith("v3:")
-                    and not supersedes
-                )
-                if not migrating_predecessorless_v3 and (not supersedes or supersedes != active_worker):
+                if supersedes != active_worker:
                     return False
                 self._revoke_worker_locked(normalized_device, active_worker, current)
                 self._cancel_worker_locked(
@@ -247,9 +257,9 @@ class PhoneToolWorkQueue:
         now: float | None = None,
     ) -> bool:
         normalized_device = self._device_id(device_id)
-        if not normalized_device:
-            return False
         normalized_worker = self._worker_id(worker_id)
+        if not normalized_device or normalized_worker is None:
+            return False
         current = time.time() if now is None else now
         with self._condition:
             self._prune_lifecycle_locked(current)
@@ -270,7 +280,7 @@ class PhoneToolWorkQueue:
             active = self._active_workers.pop(normalized_device, None)
             self._pollers.pop(normalized_device, None)
             if active:
-                worker_id = str(active.get("worker_id") or "legacy")
+                worker_id = str(active.get("worker_id") or "")
                 self._revoke_worker_locked(normalized_device, worker_id, time.time())
                 self._cancel_worker_locked(normalized_device, worker_id, reason=reason)
             # Credential invalidation is device-wide. Clear any stale request
@@ -319,10 +329,11 @@ class PhoneToolWorkQueue:
 
     def _cancel_device_requests_locked(self, device_id: str, *, reason: str) -> None:
         workers = {
-            str(request.get("assigned_worker_id") or request.get("target_worker_id") or "legacy")
+            str(request.get("assigned_worker_id") or request.get("target_worker_id") or "")
             for request in [*self._pending, *self._inflight.values()]
             if request.get("assigned_device_id") == device_id or request.get("target_device_id") == device_id
         }
+        workers.discard("")
         for worker_id in workers:
             self._cancel_worker_locked(device_id, worker_id, reason=reason)
 
@@ -330,6 +341,8 @@ class PhoneToolWorkQueue:
         if not device_id:
             return False
         normalized_worker = self._worker_id(worker_id)
+        if normalized_worker is None:
+            return False
         with self._condition:
             self._prune_lifecycle_locked(time.time())
             active = self._active_workers.get(self._device_id(device_id))
@@ -352,7 +365,12 @@ class PhoneToolWorkQueue:
         with self._condition:
             self._prune_lifecycle_locked(current)
             active = self._active_workers.get(normalized_device)
-            if not normalized_device or not active or active.get("worker_id") != normalized_worker:
+            if (
+                normalized_worker is None
+                or not normalized_device
+                or not active
+                or active.get("worker_id") != normalized_worker
+            ):
                 return self.snapshot(device_id=normalized_device, now=current)
             active["last_seen_at"] = current
             self._pollers[normalized_device] = {
@@ -421,6 +439,8 @@ class PhoneToolWorkQueue:
         wait_seconds = max(1, min(int(wait_seconds or 10), 25))
         deadline = now() + wait_seconds
         normalized_worker = self._worker_id(worker_id)
+        if normalized_worker is None:
+            return None
         with self._condition:
             self.report_poller(
                 device_id=device_id,
@@ -472,6 +492,9 @@ class PhoneToolWorkQueue:
         request_id = str(request_id or "")
         if not request_id:
             return "stale"
+        normalized_worker = self._worker_id(worker_id)
+        if normalized_worker is None:
+            return "wrong_owner"
         with self._condition:
             self._prune_requests_locked(time.time())
             request = self._inflight.get(request_id)
@@ -479,7 +502,7 @@ class PhoneToolWorkQueue:
                 return "stale"
             if device_id is not None and request.get("assigned_device_id") != device_id:
                 return "wrong_owner"
-            if worker_id is not None and request.get("assigned_worker_id") != self._worker_id(worker_id):
+            if request.get("assigned_worker_id") != normalized_worker:
                 return "wrong_owner"
             self._inflight.pop(request_id, None)
             self._results[request_id] = ToolResult(
@@ -564,7 +587,11 @@ class PhoneToolWorkQueue:
 
     @staticmethod
     def _poller_is_fresh_locked(state: dict[str, Any], current: float) -> bool:
-        return bool(state.get("device_id")) and float(state.get("expires_at") or 0) > current
+        return (
+            bool(state.get("device_id"))
+            and current_worker_id(state.get("worker_id")) is not None
+            and float(state.get("expires_at") or 0) > current
+        )
 
     def _worker_has_work_locked(self, device_id: str, worker_id: str) -> bool:
         return any(
@@ -603,7 +630,7 @@ class PhoneToolWorkQueue:
         for device_id in expired_pollers:
             self._pollers.pop(device_id, None)
         expired_workers = [
-            (device_id, str(state.get("worker_id") or "legacy"))
+            (device_id, str(state.get("worker_id") or ""))
             for device_id, state in self._active_workers.items()
             if float(state.get("last_seen_at") or state.get("activated_at") or 0) + WORKER_LEASE_SECONDS <= current
         ]
@@ -627,7 +654,7 @@ class PhoneToolWorkQueue:
             self._completion_tombstones.pop(request_id, None)
 
     def _revoke_worker_locked(self, device_id: str, worker_id: str, current: float) -> None:
-        if worker_id == "legacy":
+        if not worker_id:
             return
         key = (device_id, worker_id)
         self._revoked_workers[key] = current
@@ -648,7 +675,7 @@ class PhoneToolWorkQueue:
         )
         for device_id in oldest[: len(self._active_workers) - MAX_TRACKED_PHONE_DEVICES]:
             state = self._active_workers.pop(device_id)
-            worker_id = str(state.get("worker_id") or "legacy")
+            worker_id = str(state.get("worker_id") or "")
             self._revoke_worker_locked(device_id, worker_id, current)
             self._cancel_worker_locked(device_id, worker_id, reason="iphone_worker_evicted")
 

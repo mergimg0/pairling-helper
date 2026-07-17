@@ -43,7 +43,6 @@ func TestFunnelBootstrapAllowlist(t *testing.T) {
 		{http.MethodGet, "/readyz", false},
 		{http.MethodGet, "/manifest", false},
 		{http.MethodPost, "/pair/psk-activate", false},
-		{http.MethodPost, "/pair/psk-claim", false},
 		{http.MethodPost, "/pair/psk-claim-v2", false},
 	}
 
@@ -52,6 +51,7 @@ func TestFunnelBootstrapAllowlist(t *testing.T) {
 	denied := []tc{
 		{http.MethodPost, "/pair/start", false},
 		{http.MethodPost, "/pair/claim", false},
+		{http.MethodPost, "/pair/psk-claim", false},
 		{http.MethodPost, "/pair/reauth-challenge", false},
 		{http.MethodPost, "/pair/reauth-claim", false},
 		{http.MethodGet, "/routez", false},
@@ -99,8 +99,8 @@ func TestFunnelBootstrapAllowlist(t *testing.T) {
 }
 
 // TestFunnelBootstrapIsStrictSubsetOfPrePair asserts the funnel set never admits
-// a path the pre-pair set denies, and is strictly smaller (excludes /routez and
-// /pair/claim). This guards against the funnel mode drifting wider than pre-pair.
+// a path the pre-pair set denies, and is strictly smaller because it excludes
+// /routez. This guards against the funnel mode drifting wider than pre-pair.
 func TestFunnelBootstrapIsStrictSubsetOfPrePair(t *testing.T) {
 	for _, m := range []string{http.MethodGet, http.MethodPost} {
 		for path := range funnelBootstrapGetPaths {
@@ -116,9 +116,6 @@ func TestFunnelBootstrapIsStrictSubsetOfPrePair(t *testing.T) {
 	}
 	if funnelBootstrapGetPaths["/routez"] {
 		t.Error("/routez must be excluded from the funnel surface")
-	}
-	if funnelBootstrapPostPaths["/pair/claim"] {
-		t.Error("/pair/claim must be excluded from the funnel surface")
 	}
 	if funnelBootstrapPostPaths["/pair/start"] {
 		t.Error("/pair/start must never be on the funnel surface")

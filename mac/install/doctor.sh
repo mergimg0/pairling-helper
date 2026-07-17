@@ -481,7 +481,8 @@ def desired_ptybroker_identity() -> dict:
         "runtime_root": str(desired_root),
         "script_path": str(desired_root / "companiond" / "pty_broker_service.py"),
         "source_revision": revision,
-        "protocol_version": 1,
+        "protocol_version": 2,
+        "code_version": "pty-broker-v2",
     }
 
 
@@ -541,6 +542,8 @@ def ptybroker_deployment_status(*, launchd_loaded: bool) -> dict:
         "desired_source_revision": desired.get("source_revision"),
         "desired_runtime_root": desired.get("runtime_root"),
         "desired_script_path": desired.get("script_path"),
+        "desired_protocol_version": desired.get("protocol_version"),
+        "desired_code_version": desired.get("code_version"),
         "evidence": None,
     }
     if not MANIFEST_PATH.is_file() and not CURRENT.exists():
@@ -893,15 +896,15 @@ ptybroker_deployment = ptybroker_deployment_status(launchd_loaded=ptybroker_laun
 add(
     "ptybroker_deployment_state",
     ptybroker_deployment["state"] == "current",
-    "warning",
+    "error",
     f"Pairling PTY broker deployment state is {ptybroker_deployment['state']}.",
     ptybroker_deployment,
 )
 add(
     "ptybroker_activation_ready",
-    ptybroker_deployment["state"] in {"current", "stale_deferred"},
+    ptybroker_deployment["state"] == "current",
     "error",
-    "Pairling PTY broker answered its status check.",
+    "Pairling PTY broker is running the exact current runtime.",
     ptybroker_deployment,
 )
 

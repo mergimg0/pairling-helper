@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 
-PENDING_INPUT_PARSER_VERSION = "terminal_pending_input_v2_2026_06_08"
+PENDING_INPUT_PARSER_VERSION = "terminal_pending_input_v3_2026_07_16"
 
 
 @dataclass(frozen=True)
@@ -44,7 +44,20 @@ class TerminalCursor:
 
 def detect_terminal_pending_input(rows: list[str]) -> dict[str, Any] | None:
     choice_re = re.compile(r"^\s*(?P<selected>[>›❯]?)\s*(?P<id>\d+)[.)]\s+(?P<body>.+?)\s*$")
+    active_progress_re = re.compile(
+        r"^[•✻].*\besc to interrupt\b.*$",
+        re.IGNORECASE,
+    )
+
+    def has_later_active_progress(index: int) -> bool:
+        return any(
+            active_progress_re.fullmatch(row.strip())
+            for row in rows[index + 1:]
+            if row.strip()
+        )
+
     choices: list[dict[str, Any]] = []
+    choice_indexes: list[int] = []
     prompt = ""
     for idx, row in enumerate(rows):
         match = choice_re.match(row)
@@ -62,6 +75,7 @@ def detect_terminal_pending_input(rows: list[str]) -> dict[str, Any] | None:
             "description": description,
             "selected": bool(match.group("selected")),
         })
+        choice_indexes.append(idx)
         if not prompt:
             for prev in reversed(rows[:idx]):
                 prev = prev.strip()
@@ -69,13 +83,24 @@ def detect_terminal_pending_input(rows: list[str]) -> dict[str, Any] | None:
                     prompt = prev
                     break
 
-    lowered = "\n".join(rows).lower()
-    update_prompt = next((row.strip() for row in rows if "update available" in row.lower()), "")
-    if update_prompt:
+    choice_ids = [int(choice["id"]) for choice in choices]
+    consecutive_choices = choice_ids == list(range(1, len(choice_ids) + 1))
+    has_choice_cursor = any(choice["selected"] for choice in choices)
+
+    update_pattern = re.compile(r"^update available(?:\s*:\s*.+)?$", re.IGNORECASE)
+    update_match = next(
+        (
+            (index, row.strip())
+            for index, row in enumerate(rows)
+            if update_pattern.fullmatch(row.strip()) and not has_later_active_progress(index)
+        ),
+        None,
+    )
+    if update_match and len(choices) >= 2 and consecutive_choices and has_choice_cursor:
         return {
             "state": "maintenance_update",
-            "confidence": "high" if choices else "medium",
-            "prompt": update_prompt,
+            "confidence": "high",
+            "prompt": update_match[1],
             "kind": "codex_update",
             "choices": choices,
         }
@@ -86,11 +111,12 @@ def detect_terminal_pending_input(rows: list[str]) -> dict[str, Any] | None:
     # explicit selection cursor or a question-shaped prompt line before
     # treating the screen as awaiting a selection.
     if len(choices) >= 2:
-        ids = [int(choice["id"]) for choice in choices]
-        consecutive_from_one = ids == list(range(1, len(ids) + 1))
-        has_cursor = any(choice["selected"] for choice in choices)
         question_prompt = prompt.rstrip().endswith("?")
-        if consecutive_from_one and (has_cursor or question_prompt):
+        if (
+            consecutive_choices
+            and (has_choice_cursor or question_prompt)
+            and not has_later_active_progress(max(choice_indexes))
+        ):
             return {
                 "state": "awaiting_selection",
                 "confidence": "high",
@@ -98,28 +124,41 @@ def detect_terminal_pending_input(rows: list[str]) -> dict[str, Any] | None:
                 "choices": choices,
             }
 
-    if "press enter" in lowered or "confirm to continue" in lowered:
+    confirmation_patterns = (
+        re.compile(r"^press enter(?:\s+to\s+(?:confirm|continue|proceed))?\s*[.!]?$", re.IGNORECASE),
+        re.compile(r"^confirm to continue\s*[.!]?$", re.IGNORECASE),
+    )
+    confirmation_match = next(
+        (
+            (index, row.strip())
+            for index, row in enumerate(rows)
+            if any(pattern.fullmatch(row.strip()) for pattern in confirmation_patterns)
+            and not has_later_active_progress(index)
+        ),
+        None,
+    )
+    if confirmation_match:
         return {
             "state": "awaiting_confirmation",
             "confidence": "medium",
-            "prompt": next((r.strip() for r in rows if r.strip()), ""),
+            "prompt": confirmation_match[1],
             "choices": [],
         }
 
-    text_prompt_markers = (
-        "enter new goal",
-        "new goal",
-        "what should the goal be",
-        "type your response",
-        "resume from",
+    text_prompt_patterns = (
+        re.compile(r"^enter (?:a )?new goal\s*:\s*$", re.IGNORECASE),
+        re.compile(r"^new goal\s*:\s*$", re.IGNORECASE),
+        re.compile(r"^what should the (?:new )?goal be\s*[:?]\s*$", re.IGNORECASE),
+        re.compile(r"^type your response\s*:\s*$", re.IGNORECASE),
+        re.compile(r"^resume from\s*:\s*$", re.IGNORECASE),
     )
-    for row in rows:
+    for index, row in enumerate(rows):
         stripped = row.strip()
-        lowered_row = stripped.lower()
         if not stripped:
             continue
-        if any(marker in lowered_row for marker in text_prompt_markers) or (
-            stripped.endswith(":") and any(marker in lowered for marker in ("goal", "resume", "prompt"))
+        if (
+            any(pattern.fullmatch(stripped) for pattern in text_prompt_patterns)
+            and not has_later_active_progress(index)
         ):
             return {
                 "state": "awaiting_text",

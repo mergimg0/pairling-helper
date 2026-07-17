@@ -435,15 +435,12 @@ def mutate_posture(
     original_slug: str | None = None,
     expected_revision: str | None = None,
     create_only: bool = False,
-    legacy_upsert: bool = False,
     checkpoint: Callable[[str, Path], None] | None = None,
 ) -> dict:
     """Create, edit, or rename a posture as one checked server operation.
 
-    New clients use ``create_only`` for creation and provide ``original_slug``
-    plus ``expected_revision`` for edits. ``legacy_upsert`` exists only for old
-    clients that used POST /postures as an upsert. It remains atomic and its
-    response still says whether it replaced a file.
+    Creation requires ``create_only``. Edits provide ``original_slug`` and
+    ``expected_revision`` so an external Mac edit cannot be overwritten.
     """
 
     target_slug = slug_for_name(name)
@@ -451,11 +448,9 @@ def mutate_posture(
         raise ValueError("posture name yields no usable slug")
     if original_slug is not None and not valid_slug(original_slug):
         raise ValueError("original posture slug is invalid")
-    if legacy_upsert and (create_only or original_slug is not None):
-        raise ValueError("legacy upsert cannot be combined with versioned mutation fields")
     if original_slug is not None and not expected_revision:
         raise ValueError("expected_revision is required when editing a posture")
-    if not legacy_upsert and original_slug is None and not create_only:
+    if original_slug is None and not create_only:
         raise ValueError("create_only is required when creating a posture")
 
     source = _encoded_source(name=name, description=description, body=body)
@@ -508,8 +503,6 @@ def mutate_posture(
                     ) from exc
                 temp_path.unlink()
                 overwrote = False
-            elif legacy_upsert:
-                os.replace(temp_path, target_path)
             elif original_path is not None and original_slug is not None and expected_revision is not None:
                 if checkpoint is not None:
                     checkpoint("before_revalidate", original_path)
@@ -681,53 +674,30 @@ def mutate_posture(
             **written,
             "overwrote": overwrote,
             "renamed_from": original_slug if renaming else None,
-            "legacy_upsert": legacy_upsert,
         }
-
-
-def write_posture(root: Path, *, name: str, description: str, body: str) -> dict:
-    """Backward-compatible atomic upsert used by older callers and tests."""
-
-    return mutate_posture(
-        root,
-        name=name,
-        description=description,
-        body=body,
-        legacy_upsert=True,
-    )
 
 
 def delete_posture(
     root: Path,
     slug: str,
     *,
-    expected_revision: str | None = None,
-    require_revision: bool = False,
+    expected_revision: str,
     checkpoint: Callable[[str, Path], None] | None = None,
 ) -> bool:
     if not valid_slug(slug):
         return False
-    if require_revision and not expected_revision:
+    if not expected_revision:
         raise ValueError("expected_revision is required when deleting a posture")
     path = root / f"{slug}.md"
     with _store_lock(root):
         current = _read_path(path, slug, include_source=True)
         if current is None:
-            if require_revision:
-                raise PostureNotFound("This posture was removed from your Mac. Reload the posture list.")
-            return False
-        if expected_revision is not None and current["revision"] != expected_revision:
+            raise PostureNotFound("This posture was removed from your Mac. Reload the posture list.")
+        if current["revision"] != expected_revision:
             raise PostureConflict(
                 "This posture changed on your Mac. Reload it before deleting.",
                 current=current,
             )
-        if not require_revision:
-            try:
-                path.unlink()
-                _fsync_directory(root)
-                return True
-            except FileNotFoundError:
-                return False
 
         if checkpoint is not None:
             checkpoint("before_revalidate", path)

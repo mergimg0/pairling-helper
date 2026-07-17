@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""WS2: direct-LAN Apple App Attest verification for /pair/claim.
+"""Direct-LAN Apple App Attest verification for `/pair/psk-claim-v2`.
 
 Reuses the canonical AppleAppAttestValidator (relay/app_attest_validator.py) so
 the intricate attestation crypto (CBOR parse, X.509 chain to Apple's App Attest

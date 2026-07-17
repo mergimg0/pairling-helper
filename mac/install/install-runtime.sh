@@ -1706,6 +1706,26 @@ with sqlite3.connect(path) as db:
     """)
 PY
   chmod 600 "$DEVICES_DB" 2>/dev/null || true
+  "$PYTHON3_BIN" - \
+    "$REPO_ROOT/mac/companiond" \
+    "$HOME/.claude/companion" \
+    "$HOME/.claude/companion/terminal-capture" \
+    "$HOME/.claude/audit" \
+    "$LOGS_ROOT" <<'PY'
+import sys
+from pathlib import Path
+
+module_root, companion, capture, audit, logs = sys.argv[1:]
+sys.path.insert(0, module_root)
+from pty_broker import secure_sensitive_local_storage
+
+secure_sensitive_local_storage(
+    Path(companion),
+    Path(capture),
+    audit_dir=Path(audit),
+    logs_dir=Path(logs),
+)
+PY
 }
 
 ensure_local_mcp_bridge() {
@@ -4223,14 +4243,15 @@ PY
 }
 
 ptybroker_deployment_state_json() {
-  "$PYTHON3_BIN" - "$CURRENT_LINK" "${1:-{}}" <<'PY'
+  "$PYTHON3_BIN" - "$REPO_ROOT/mac/companiond" "${2:-$CURRENT_LINK}" "${1:-{}}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-current = Path(sys.argv[1])
-sys.path.insert(0, str(current / "companiond"))
-from runtime_manifest import classify_ptybroker_identity
+module_root = Path(sys.argv[1])
+current = Path(sys.argv[2])
+sys.path.insert(0, str(module_root))
+from runtime_manifest import classify_ptybroker_identity, ptybroker_payload_sha256
 
 def load_json_arg(raw):
     text = str(raw or "").strip()
@@ -4245,7 +4266,7 @@ def load_json_arg(raw):
             continue
     return {}
 
-payload = load_json_arg(sys.argv[2])
+payload = load_json_arg(sys.argv[3])
 live = payload.get("status") if isinstance(payload, dict) and isinstance(payload.get("status"), dict) else payload
 
 def read_revision(root: Path):
@@ -4266,7 +4287,9 @@ desired = {
     "runtime_root": str(desired_root),
     "script_path": str(desired_root / "companiond" / "pty_broker_service.py"),
     "source_revision": read_revision(desired_root),
-    "protocol_version": 1,
+    "protocol_version": 2,
+    "code_version": "pty-broker-v2",
+    "payload_sha256": ptybroker_payload_sha256(desired_root),
 }
 state, reasons = classify_ptybroker_identity(live, desired)
 print(json.dumps({
@@ -4313,7 +4336,7 @@ if state.get("state") != "stale_deferred":
 live = state.get("live") if isinstance(state.get("live"), dict) else {}
 desired = state.get("desired") if isinstance(state.get("desired"), dict) else {}
 print(
-    "WARNING: ptybroker running older code; normal install preserved live PTYs; "
+    "WARNING: ptybroker is running a different verified payload; normal install preserved live PTYs; "
     "broker restart is deferred; "
     f"live_source_revision={live.get('source_revision')} "
     f"desired_source_revision={desired.get('source_revision')} "
@@ -4352,6 +4375,62 @@ print("" if value is None else value)
 PY
 }
 
+ptybroker_restart_blocker_count() {
+  "$PYTHON3_BIN" - "$1" "$2" <<'PY'
+import json
+import sys
+
+raw = str(sys.argv[1] or "").strip()
+payload = None
+decoder = json.JSONDecoder()
+for index, char in enumerate(raw):
+    if char not in "{[":
+        continue
+    try:
+        payload, _ = decoder.raw_decode(raw[index:])
+        break
+    except json.JSONDecodeError:
+        continue
+if not isinstance(payload, dict):
+    raise SystemExit(1)
+value = payload
+for part in sys.argv[2].split(".") if sys.argv[2] else []:
+    if not isinstance(value, dict):
+        raise SystemExit(1)
+    value = value.get(part)
+if not isinstance(value, dict):
+    raise SystemExit(1)
+
+blockers = value.get("restart_blocker_count")
+if type(blockers) is int and blockers >= 0:
+    print(blockers)
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+require_idle_ptybroker_for_runtime_change() {
+  if launchd_skipped || ! launchctl print "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1; then
+    return 0
+  fi
+  local status_json state_json state live_count blocker_count
+  if ! status_json="$(ptybroker_status_json 2>/dev/null)"; then
+    log "ERROR: the loaded PTY broker cannot prove whether it owns live sessions; current runtime was not changed." >&2
+    return 1
+  fi
+  state_json="$(ptybroker_deployment_state_json "$status_json" "$RELEASE_ROOT")"
+  state="$(ptybroker_state_field "$state_json" "state")"
+  live_count="$(ptybroker_state_field "$state_json" "live.live_session_count")"
+  if ! blocker_count="$(ptybroker_restart_blocker_count "$state_json" "live")"; then
+    log "ERROR: the loaded PTY broker returned an invalid restart-blocker count; current runtime was not changed." >&2
+    return 1
+  fi
+  if [[ "$blocker_count" != "0" && "$state" != "current" ]]; then
+    log "ERROR: Pairling cannot update the PTY broker while it owns active work (restart_blocker_count=$blocker_count live_session_count=${live_count:-unknown} live_pid=$(ptybroker_state_field "$status_json" "status.pid")). Finish or close those sessions, then run setup again. The current runtime was not changed." >&2
+    return 1
+  fi
+}
+
 ensure_ptybroker_agent() {
   mkdir -p "$HOME/Library/LaunchAgents"
   local rendered="$PLIST_BUILD_DIR/$PAIRLING_PTYBROKER_LABEL.plist"
@@ -4373,9 +4452,57 @@ ensure_ptybroker_agent() {
     reload_launch_agent "$PAIRLING_PTYBROKER_LABEL" "$PTYBROKER_USER_PLIST"
     return
   fi
-  local status_json
+  local status_json state_json state live_count blocker_count live_pid
   if status_json="$(ptybroker_status_json 2>/dev/null)"; then
-    ptybroker_report_deferred_restart "$status_json"
+    state_json="$(ptybroker_deployment_state_json "$status_json")"
+    state="$(ptybroker_state_field "$state_json" "state")"
+    live_count="$(ptybroker_state_field "$state_json" "live.live_session_count")"
+    blocker_count="$(ptybroker_state_field "$state_json" "live.restart_blocker_count")"
+    live_pid="$(ptybroker_state_field "$state_json" "live.pid")"
+    if ! blocker_count="$(ptybroker_restart_blocker_count "$state_json" "live")"; then
+      log "ERROR: ptybroker status did not prove its restart blockers." >&2
+      return 1
+    fi
+    if [[ ( "$state" == "stale_deferred" || "$state" == "incompatible" ) && "$blocker_count" == "0" ]]; then
+      local handover_state="$state"
+      sleep 0.1
+      status_json="$(ptybroker_status_json)"
+      state_json="$(ptybroker_deployment_state_json "$status_json")"
+      state="$(ptybroker_state_field "$state_json" "state")"
+      live_count="$(ptybroker_state_field "$state_json" "live.live_session_count")"
+      blocker_count="$(ptybroker_state_field "$state_json" "live.restart_blocker_count")"
+      if ! blocker_count="$(ptybroker_restart_blocker_count "$state_json" "live")"; then
+        log "ERROR: ptybroker status did not prove its restart blockers on the confirmation sample." >&2
+        return 1
+      fi
+      if [[ "$state" != "$handover_state" || "$blocker_count" != "0" || "$(ptybroker_state_field "$state_json" "live.pid")" != "$live_pid" ]]; then
+        log "ERROR: ptybroker stopped being safely idle before handover; preserving it and refusing activation: $state_json" >&2
+        return 1
+      fi
+      log "Replacing idle non-current ptybroker now (state=$handover_state live_pid=$live_pid restart_blocker_count=0)"
+      reload_launch_agent "$PAIRLING_PTYBROKER_LABEL" "$PTYBROKER_USER_PLIST"
+      local attempt new_pid
+      state=""
+      for attempt in $(seq 1 50); do
+        if status_json="$(ptybroker_status_json 2>/dev/null)"; then
+          state_json="$(ptybroker_deployment_state_json "$status_json")"
+          state="$(ptybroker_state_field "$state_json" "state")"
+          new_pid="$(ptybroker_state_field "$state_json" "live.pid")"
+          if [[ "$state" == "current" && "$new_pid" != "$live_pid" ]]; then
+            break
+          fi
+        fi
+        sleep 0.1
+      done
+      if [[ "$state" != "current" || -z "${new_pid:-}" || "$new_pid" == "$live_pid" ]]; then
+        log "ERROR: idle ptybroker replacement did not activate a new current process: ${state_json:-unreachable}" >&2
+        return 1
+      fi
+      log "Activated current ptybroker after an idle handover"
+      return
+    else
+      ptybroker_report_deferred_restart "$status_json"
+    fi
   else
     log "WARNING: ptybroker status unreachable_socket; normal install preserved live PTYs but broker freshness is unknown; broker restart is deferred"
   fi
@@ -4390,6 +4517,23 @@ ensure_ptybroker_agent() {
 }
 
 reconcile_ptybroker() {
+  local expected_pid=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --expected-pid)
+        expected_pid="${2:-}"
+        shift 2
+        ;;
+      *)
+        log "ERROR: unknown reconcile-ptybroker option: $1" >&2
+        return 2
+        ;;
+    esac
+  done
+  if [[ -n "$expected_pid" && ! "$expected_pid" =~ ^[0-9]+$ ]]; then
+    log "ERROR: --expected-pid must be a positive process id." >&2
+    return 2
+  fi
   trap install_mutation_on_exit EXIT
   acquire_install_lock
   recover_pending_install_transaction
@@ -4405,29 +4549,75 @@ reconcile_ptybroker() {
   if ! launchctl print "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1; then
     reload_launch_agent "$PAIRLING_PTYBROKER_LABEL" "$PTYBROKER_USER_PLIST"
     log "Started $PAIRLING_PTYBROKER_LABEL"
+    release_install_lock
+    trap - EXIT
     return
   fi
-  local status_json state_json live_count live_pid
+  local status_json state_json state live_count blocker_count live_pid
   if ! status_json="$(ptybroker_status_json 2>/dev/null)"; then
     log "ERROR: ptybroker is loaded but status RPC is unreachable; refusing reconcile until socket is reachable or broker is manually stopped." >&2
     exit 1
   fi
   state_json="$(ptybroker_deployment_state_json "$status_json")"
+  state="$(ptybroker_state_field "$state_json" "state")"
   live_count="$(ptybroker_state_field "$state_json" "live.live_session_count")"
+  blocker_count="$(ptybroker_state_field "$state_json" "live.restart_blocker_count")"
   live_pid="$(ptybroker_state_field "$state_json" "live.pid")"
-  if [[ "${live_count:-0}" != "0" ]]; then
-    log "ERROR: ptybroker restart deferred: live_session_count=$live_count live_pid=$live_pid; close/drain live PTYs before broker code can be updated." >&2
+  if ! blocker_count="$(ptybroker_restart_blocker_count "$state_json" "live")"; then
+    log "ERROR: ptybroker status did not prove its restart blockers." >&2
+    return 1
+  fi
+  if [[ "$state" == "current" ]]; then
+    log "PTY broker is already current"
+    release_install_lock
+    trap - EXIT
+    return
+  fi
+  if [[ "$state" != "stale_deferred" ]]; then
+    log "ERROR: ptybroker reconcile requires exact stale_deferred identity, got $state: $state_json" >&2
     exit 1
   fi
-  log "Operator requested idle ptybroker reconcile; restarting broker live_pid=$live_pid live_session_count=0"
-  launchctl bootout "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL" >/dev/null 2>&1 || true
-  launchctl bootout "gui/$(id -u)" "$PTYBROKER_USER_PLIST" >/dev/null 2>&1 || true
-  launchctl bootstrap "gui/$(id -u)" "$PTYBROKER_USER_PLIST" >/dev/null 2>&1 || true
-  launchctl kickstart -k "gui/$(id -u)/$PAIRLING_PTYBROKER_LABEL"
+  if [[ -n "$expected_pid" && "$live_pid" != "$expected_pid" ]]; then
+    log "ERROR: ptybroker PID changed before reconcile (expected=$expected_pid live=$live_pid); refusing restart." >&2
+    exit 1
+  fi
+  if [[ "$blocker_count" != "0" ]]; then
+    log "ERROR: ptybroker restart deferred: restart_blocker_count=$blocker_count live_session_count=$live_count live_pid=$live_pid; close or drain live PTYs before broker code can be updated." >&2
+    exit 1
+  fi
+  # Re-read under the install lock immediately before mutation. The daemon's
+  # expected PID closes the gap between its idle observation and this reload.
   status_json="$(ptybroker_status_json)"
   state_json="$(ptybroker_deployment_state_json "$status_json")"
-  if [[ "$(ptybroker_state_field "$state_json" "state")" != "current" ]]; then
-    log "ERROR: ptybroker restart completed but status is not current: $state_json" >&2
+  state="$(ptybroker_state_field "$state_json" "state")"
+  live_pid="$(ptybroker_state_field "$state_json" "live.pid")"
+  live_count="$(ptybroker_state_field "$state_json" "live.live_session_count")"
+  blocker_count="$(ptybroker_state_field "$state_json" "live.restart_blocker_count")"
+  if ! blocker_count="$(ptybroker_restart_blocker_count "$state_json" "live")"; then
+    log "ERROR: ptybroker status did not prove its restart blockers on the final sample." >&2
+    return 1
+  fi
+  if [[ "$state" != "stale_deferred" || "$blocker_count" != "0" || ( -n "$expected_pid" && "$live_pid" != "$expected_pid" ) ]]; then
+    log "ERROR: ptybroker handover state changed before reload; refusing restart: $state_json" >&2
+    exit 1
+  fi
+  log "Reconciling idle ptybroker live_pid=$live_pid restart_blocker_count=0"
+  reload_launch_agent "$PAIRLING_PTYBROKER_LABEL" "$PTYBROKER_USER_PLIST"
+  local attempt new_pid
+  state=""
+  for attempt in $(seq 1 50); do
+    if status_json="$(ptybroker_status_json 2>/dev/null)"; then
+      state_json="$(ptybroker_deployment_state_json "$status_json")"
+      state="$(ptybroker_state_field "$state_json" "state")"
+      new_pid="$(ptybroker_state_field "$state_json" "live.pid")"
+      if [[ "$state" == "current" && "$new_pid" != "$live_pid" ]]; then
+        break
+      fi
+    fi
+    sleep 0.1
+  done
+  if [[ "$state" != "current" || -z "${new_pid:-}" || "$new_pid" == "$live_pid" ]]; then
+    log "ERROR: ptybroker restart completed without a new current process: ${state_json:-unreachable}" >&2
     exit 1
   fi
   log "Reconciled $PAIRLING_PTYBROKER_LABEL with current runtime"
@@ -4749,6 +4939,7 @@ required = {
     "connectd_loaded_from_current",
     "ptybroker_launchagent_loaded",
     "ptybroker_loaded_from_current",
+    "ptybroker_deployment_state",
     "ptybroker_activation_ready",
     "port_7773_listener",
     "legacy_port_7723_clear",
@@ -4810,8 +5001,8 @@ rollback() {
   atomic_symlink_switch "$rollback_root" "$CURRENT_LINK"
   install_transaction_fault_point rollback_links_switched
   render_plists
-  ensure_ptybroker_agent
   start_user_agent
+  ensure_ptybroker_agent
   start_connectd_agent
   install_transaction_fault_point rollback_services_started
   verify_runtime_activation "$rollback_version" "$rollback_revision" "$rollback_dirty"
@@ -4955,6 +5146,7 @@ install_runtime() {
     log "ERROR: forced test failure after PairDrop configuration persistence" >&2
     false
   fi
+  require_idle_ptybroker_for_runtime_change
   switch_current
   install_transaction_fault_point current_link_switched
   adopt_current_release_sources
@@ -4965,8 +5157,8 @@ install_runtime() {
 
   stage_begin "Starting Pairling services"
   render_plists
-  ensure_ptybroker_agent
   start_user_agent
+  ensure_ptybroker_agent
   start_connectd_agent
   install_transaction_fault_point services_started
   verify_runtime_activation
@@ -5046,8 +5238,8 @@ status_runtime() {
 start_runtime() {
   ensure_state
   render_plists
-  ensure_ptybroker_agent
   start_user_agent
+  ensure_ptybroker_agent
   start_connectd_agent
   log "Started $PAIRLING_DAEMON_LABEL"
 }
@@ -5156,11 +5348,20 @@ secret = str(
 )
 install_id = str(payload.get("install_id") or "")
 mac_name = str(((payload.get("pair_service") or {}).get("txt") or {}).get("mac_name") or socket.gethostname())
-# WS3: the Mac ephemeral ECDH public key (base64url) from /pair/start. Carrying it in the
-# pair URL is what lets the phone run PSK-authenticated ECDH from the OUT-OF-BAND (QR/paste)
-# payload — the secret never goes on the wire. Without it the phone falls back to the legacy
-# plaintext claim, so this field is the bridge that actually makes WS3 engage.
+# The Mac ephemeral ECDH public key from /pair/start is required in the QR or
+# pairing link. The secret stays out of the network request and there is no
+# plaintext downgrade path.
 mac_ake_pub = str(payload.get("mac_ake_pub") or (payload.get("claim") or {}).get("mac_ake_pub") or "")
+if not mac_ake_pub:
+    print(json.dumps({
+        "ok": False,
+        "error": {
+            "code": "pairing_protocol_unavailable",
+            "message": "The Mac did not produce the v2 pairing key. Run setup again.",
+        },
+        "repair": "Run `pairling setup`, then retry `pairling pair`.",
+    }, indent=2, sort_keys=True), file=sys.stderr)
+    raise SystemExit(1)
 
 def is_ats_local_ipv4(value: str) -> bool:
     try:
@@ -5289,13 +5490,8 @@ if pair_id and secret:
         "pair_id": pair_id,
         "secret": secret,
     }
-    if mac_ake_pub:
-        # WS3: out-of-band delivery of the Mac ECDH key + protocol marker. The phone routes
-        # to PSK-authenticated ECDH (secret never transmitted) when both are present; their
-        # absence is the legacy plaintext claim. pv=2 is the PSK-only marker.
-        pair_params["mac_ake_pub"] = mac_ake_pub
-        # pv is always 2 when the Mac ECDH key is present (PSK-authenticated ECDH).
-        pair_params["pv"] = "2"
+    pair_params["mac_ake_pub"] = mac_ake_pub
+    pair_params["pv"] = "2"
     if pair_route.get("source") == "pairling_connectd" and pair_route.get("status") == "ready":
         pair_params["route_source"] = "pairling_connectd"
         pair_params["route_status"] = "ready"
@@ -5767,7 +5963,7 @@ case "$cmd" in
     PAIRLING_DAEMON_PYTHON="$PYTHON3_BIN" "$REPO_ROOT/mac/install/doctor.sh" "$@"
     ;;
   reconcile-ptybroker|--reconcile-ptybroker|--restart-ptybroker-if-idle)
-    reconcile_ptybroker
+    reconcile_ptybroker "$@"
     ;;
   pair)
     pair_runtime "$@"

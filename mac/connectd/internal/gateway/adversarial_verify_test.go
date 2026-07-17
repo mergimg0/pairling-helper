@@ -71,9 +71,9 @@ func TestAdversarialPairlingConnectBypass(t *testing.T) {
 		{"readyz allowed", "GET", "/readyz", true},
 		{"routez allowed", "GET", "/routez", true},
 		{"manifest allowed", "GET", "/manifest", true},
-		{"pair claim allowed", "POST", "/pair/claim", true},
+		{"retired pair claim denied", "POST", "/pair/claim", false},
 		{"pair psk-activate allowed", "POST", "/pair/psk-activate", true},
-		{"pair psk-claim allowed", "POST", "/pair/psk-claim", true},
+		{"retired pair psk-claim denied", "POST", "/pair/psk-claim", false},
 		{"pair psk-claim-v2 allowed", "POST", "/pair/psk-claim-v2", true},
 	}
 
