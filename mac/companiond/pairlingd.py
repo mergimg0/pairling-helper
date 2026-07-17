@@ -1514,6 +1514,7 @@ def _broker_runtime_relation(status_override: dict | None = None) -> str:
             "script_sha256",
             "payload_sha256",
             "live_session_count",
+            "restart_blocker_count",
         )
     )
     now = _time.monotonic()
@@ -9838,6 +9839,16 @@ def _terminal_surface_capabilities(raw_session: str) -> dict:
     }
 
 
+def _broker_snapshot_or_none(broker_id: object) -> dict | None:
+    if PTY_BROKER is None or not broker_id:
+        return None
+    try:
+        snapshot = PTY_BROKER.snapshot(str(broker_id))
+    except Exception:
+        return None
+    return snapshot if isinstance(snapshot, dict) else None
+
+
 def _terminal_attention_from_snapshot(snapshot: dict | None) -> dict | None:
     if not snapshot:
         return None
@@ -9893,10 +9904,7 @@ def _session_terminal_title(row: dict) -> str | None:
     broker_id = str(source.get("broker_id") or "").strip()
     if source.get("source") != "broker_vt" or not broker_id:
         return None
-    try:
-        snapshot = PTY_BROKER.snapshot(broker_id)
-    except Exception:
-        return None
+    snapshot = _broker_snapshot_or_none(broker_id)
     return cleaned((snapshot or {}).get("title"))
 
 
@@ -12432,7 +12440,7 @@ def _codex_control_overlay(row: dict, observed_mtime: float | None = None, *, ve
     row["capabilities"] = [cap for cap in CODEX_CONTROL_CAPABILITIES if cap in caps]
     if surface_caps.get("source") == "broker_vt":
         row["terminal_attention"] = _terminal_attention_from_snapshot(
-            PTY_BROKER.snapshot(surface_caps.get("broker_id")) if PTY_BROKER and surface_caps.get("broker_id") else None
+            _broker_snapshot_or_none(surface_caps.get("broker_id"))
         )
     row["controllability"] = {
         "can_send_text": can_send,
@@ -12533,7 +12541,7 @@ def _codex_pending_registry_rows(seen: set[str], live_only: bool, active_within_
             row["launch_context"] = launch_context
         if surface_caps.get("source") == "broker_vt":
             row["terminal_attention"] = _terminal_attention_from_snapshot(
-                PTY_BROKER.snapshot(surface_caps.get("broker_id")) if PTY_BROKER and surface_caps.get("broker_id") else None
+                _broker_snapshot_or_none(surface_caps.get("broker_id"))
             )
         rows.append(row)
     return rows

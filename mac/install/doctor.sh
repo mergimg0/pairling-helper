@@ -124,6 +124,7 @@ sys.path.insert(0, str(repo_root / "mac" / "companiond"))
 from pairling_connectd_status import fetch_connectd_status, redacted_connectd_summary
 from runtime_manifest import (
     classify_ptybroker_identity,
+    ptybroker_payload_sha256,
     verified_managed_release_identity,
 )
 
@@ -467,7 +468,7 @@ def active_pair_records(pair_root: Path) -> list[dict]:
     return records
 
 
-def desired_ptybroker_identity() -> dict:
+def desired_ptybroker_identity(verified_release_root: Path | None) -> dict:
     revision = None
     if manifest and manifest.get("source_revision"):
         revision = str(manifest.get("source_revision"))
@@ -476,13 +477,18 @@ def desired_ptybroker_identity() -> dict:
             revision = (CURRENT / "mac" / "SOURCE_REVISION").read_text().strip() or None
         except Exception:
             revision = None
-    desired_root = CURRENT.resolve() if CURRENT.exists() else CURRENT
+    desired_root = (
+        verified_release_root
+        if verified_release_root is not None
+        else (CURRENT.resolve() if CURRENT.exists() else CURRENT)
+    )
     return {
         "runtime_root": str(desired_root),
         "script_path": str(desired_root / "companiond" / "pty_broker_service.py"),
         "source_revision": revision,
         "protocol_version": 2,
         "code_version": "pty-broker-v2",
+        "payload_sha256": ptybroker_payload_sha256(desired_root),
     }
 
 
@@ -530,8 +536,8 @@ def safety_monitor_status() -> dict:
         }
 
 
-def ptybroker_deployment_status(*, launchd_loaded: bool) -> dict:
-    desired = desired_ptybroker_identity()
+def ptybroker_deployment_status(*, launchd_loaded: bool, verified_release_root: Path | None) -> dict:
+    desired = desired_ptybroker_identity(verified_release_root)
     base = {
         "label": PAIRLING_PTYBROKER_LABEL,
         "state": "unknown",
@@ -544,6 +550,7 @@ def ptybroker_deployment_status(*, launchd_loaded: bool) -> dict:
         "desired_script_path": desired.get("script_path"),
         "desired_protocol_version": desired.get("protocol_version"),
         "desired_code_version": desired.get("code_version"),
+        "desired_payload_sha256": desired.get("payload_sha256"),
         "evidence": None,
     }
     if not MANIFEST_PATH.is_file() and not CURRENT.exists():
@@ -892,7 +899,10 @@ code, out, err = run(["launchctl", "print", f"gui/{os.getuid()}/{PAIRLING_PTYBRO
 ptybroker_launchd_loaded = code == 0 and "state = running" in out
 add("ptybroker_launchagent_loaded", ptybroker_launchd_loaded, "error", "Pairling PTY broker LaunchAgent is running." if code == 0 else "Pairling PTY broker LaunchAgent is not loaded.", (out or err)[:2000])
 add("ptybroker_loaded_from_current", str(CURRENT / "companiond" / "pty_broker_service.py") in out, "error", "Loaded Pairling PTY broker uses runtime/current.", out[:2000])
-ptybroker_deployment = ptybroker_deployment_status(launchd_loaded=ptybroker_launchd_loaded)
+ptybroker_deployment = ptybroker_deployment_status(
+    launchd_loaded=ptybroker_launchd_loaded,
+    verified_release_root=release_root,
+)
 add(
     "ptybroker_deployment_state",
     ptybroker_deployment["state"] == "current",
