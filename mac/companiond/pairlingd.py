@@ -51,6 +51,7 @@ import atexit
 import base64
 import codecs
 import errno
+import fcntl
 import hashlib
 import html
 import json
@@ -4425,8 +4426,17 @@ def _race_prepare(project: str) -> dict:
             return {"ok": False, "status": 500, "code": "worktree_failed", "message": err.strip()[:200]}
         try:
             _pretrust_claude_project(path)
-        except Exception:
-            pass
+        except ClaudeProjectTrustError as error:
+            current = {"path": path, "branch": branch}
+            for done in [current, *sides.values()]:
+                _race_git(project, ["worktree", "remove", "--force", done["path"]], timeout=30.0)
+                _race_git(project, ["branch", "-D", done["branch"]])
+            return {
+                "ok": False,
+                "status": error.status,
+                "code": error.code,
+                "message": str(error),
+            }
         sides[side] = {"path": path, "branch": branch}
 
     with _RACES_LOCK:
@@ -4640,7 +4650,17 @@ def _pending_approval_resolve_terminal(request_nonce: str, new_state: str) -> bo
         return False
 
 
-def _pretrust_claude_project(project: str) -> None:
+_CLAUDE_CONFIG_LOCK = threading.RLock()
+
+
+class ClaudeProjectTrustError(RuntimeError):
+    def __init__(self, code: str, message: str, *, status: int) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
+def _pretrust_claude_project(project: str) -> bool:
     """Mark `project` trusted in ~/.claude.json before a headless claude spawn.
 
     Broker-owned PTYs have no human at the keyboard, so Claude Code's
@@ -4653,45 +4673,98 @@ def _pretrust_claude_project(project: str) -> None:
     and preserves every other key in the file.
     """
     path = HOME / ".claude.json"
+    lock_path = path.with_name(path.name + ".pairling-lock")
+    tmp_path: Path | None = None
+    lock_fd: int | None = None
     try:
-        if path.exists():
-            with open(path, "r") as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                return
-        else:
-            data = {}
-        projects = data.get("projects")
-        if not isinstance(projects, dict):
-            projects = {}
-            data["projects"] = projects
-        # Claude Code canonicalizes the cwd before the trust lookup
-        # (e.g. /tmp/x -> /private/tmp/x on macOS), so trust both the
-        # literal path and its resolved form.
-        candidates = {project}
-        try:
-            candidates.add(os.path.realpath(project))
-        except OSError:
-            pass
-        changed = False
-        for key in candidates:
-            entry = projects.get(key)
-            if not isinstance(entry, dict):
-                entry = {}
-                projects[key] = entry
-            if entry.get("hasTrustDialogAccepted") is not True:
-                entry["hasTrustDialogAccepted"] = True
-                changed = True
-        if not changed:
-            return
-        tmp_path = path.with_name(path.name + ".pairling-tmp")
-        with open(tmp_path, "w") as f:
-            json.dump(data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    except (OSError, ValueError, json.JSONDecodeError):
-        return
+        with _CLAUDE_CONFIG_LOCK:
+            lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+            if path.exists():
+                original_mode = path.stat().st_mode & 0o777
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    raise ClaudeProjectTrustError(
+                        "claude_config_invalid",
+                        "Claude's local configuration is not a JSON object. Repair ~/.claude.json on this Mac, then try again.",
+                        status=409,
+                    )
+            else:
+                original_mode = 0o600
+                data = {}
+            projects = data.get("projects")
+            if not isinstance(projects, dict):
+                projects = {}
+                data["projects"] = projects
+            # Claude Code canonicalizes the cwd before the trust lookup
+            # (e.g. /tmp/x -> /private/tmp/x on macOS), so trust both the
+            # literal path and its resolved form.
+            candidates = {project}
+            try:
+                candidates.add(os.path.realpath(project))
+            except OSError:
+                pass
+            changed = False
+            for key in candidates:
+                entry = projects.get(key)
+                if not isinstance(entry, dict):
+                    entry = {}
+                    projects[key] = entry
+                if entry.get("hasTrustDialogAccepted") is not True:
+                    entry["hasTrustDialogAccepted"] = True
+                    changed = True
+            if not changed:
+                return True
+
+            tmp_path = path.with_name(
+                f"{path.name}.pairling-tmp.{os.getpid()}."
+                f"{threading.get_ident()}.{secrets.token_hex(4)}"
+            )
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, original_mode)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp_path, original_mode)
+            os.replace(tmp_path, path)
+            tmp_path = None
+
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            return True
+    except ClaudeProjectTrustError:
+        raise
+    except json.JSONDecodeError as error:
+        raise ClaudeProjectTrustError(
+            "claude_config_invalid",
+            "Claude's local configuration is not valid JSON. Repair ~/.claude.json on this Mac, then try again.",
+            status=409,
+        ) from error
+    except (OSError, ValueError) as error:
+        raise ClaudeProjectTrustError(
+            "claude_project_trust_unavailable",
+            "Pairling could not safely update Claude's project trust on this Mac. Check the Claude configuration file, then try again.",
+            status=503,
+        ) from error
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(lock_fd)
 
 
 def _agent_registry_upsert(provider: str, native_id: str, project: str, *,
@@ -26201,7 +26274,29 @@ Worker instructions:
         if provider == "claude":
             # Headless PTY: nobody can answer the folder-trust prompt, so
             # accept it up front (the phone user's spawn IS the trust gesture).
-            _pretrust_claude_project(project)
+            try:
+                _pretrust_claude_project(project)
+            except ClaudeProjectTrustError as error:
+                receipt = _finalize_spawn_action(
+                    device_id=spawn_device_id,
+                    provider=provider,
+                    client_action_id=spawn_action_id or None,
+                    body_hash=spawn_body_hash,
+                    state="rejected" if error.status == 409 else "failed",
+                    http_status=error.status,
+                    backend="claude_config",
+                    error_code=error.code,
+                    error_message=str(error),
+                    fields={"outcome_indeterminate": False},
+                )
+                self._send_json({
+                    "ok": False,
+                    "error": {"code": error.code, "message": str(error)},
+                    "error_code": error.code,
+                    "outcome_indeterminate": False,
+                    "receipt": receipt,
+                }, status=error.status)
+                return
 
         ok = False
         reason = None
