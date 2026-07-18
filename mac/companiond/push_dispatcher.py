@@ -1744,6 +1744,10 @@ class PairlingPushDispatcher:
     def status(self, *, device_id: str | None = None) -> dict[str, Any]:
         payload = self._read()
         devices = payload.get("devices", [])
+        try:
+            secret_devices = self._read_secrets().get("devices", {})
+        except PushDispatcherError:
+            secret_devices = {}
         outbox = payload.get("delivery_outbox", [])
         deliveries = payload.get("deliveries", [])
         if device_id:
@@ -1754,7 +1758,13 @@ class PairlingPushDispatcher:
             "ok": True,
             "contract_version": CONTRACT_VERSION,
             "provider": self._provider_status(),
-            "devices": [_public_push_device(item) for item in devices],
+            "devices": [
+                _public_push_device(
+                    item,
+                    secret_device=secret_devices.get(str(item.get("device_id") or "")),
+                )
+                for item in devices
+            ],
             "delivery_outbox": outbox[-50:],
             "deliveries": deliveries[-100:],
             "events": payload.get("events", [])[-20:],
@@ -1786,6 +1796,10 @@ class PairlingPushDispatcher:
             }
         configured = bool(provider.get("configured"))
         data = self._read()
+        try:
+            secret_devices = self._read_secrets().get("devices", {})
+        except PushDispatcherError:
+            secret_devices = {}
         attempts = [
             event
             for event in data.get("events", [])
@@ -1806,8 +1820,24 @@ class PairlingPushDispatcher:
                     or bool(device.get("live_activity_enabled"))
                 )
                 and (
-                    not str(device.get("relay_device_id") or "").strip()
-                    or not str(device.get("relay_pair_secret_ref") or "").strip()
+                    not str(
+                        device.get("relay_device_id")
+                        or secret_devices.get(str(device.get("device_id") or ""), {}).get("relay_device_id")
+                        or ""
+                    ).strip()
+                    or not str(
+                        secret_devices.get(str(device.get("device_id") or ""), {}).get("relay_pair_secret")
+                        or ""
+                    ).strip()
+                    or not str(
+                        secret_devices.get(str(device.get("device_id") or ""), {}).get("relay_pair_secret_ref")
+                        or ""
+                    ).strip()
+                    or not str(
+                        secret_devices.get(str(device.get("device_id") or ""), {}).get("mac_install_id")
+                        or device.get("mac_install_id")
+                        or ""
+                    ).strip()
                 )
                 for device in data.get("devices", [])
             )
@@ -3994,10 +4024,17 @@ class PairlingPushDispatcher:
                 pass
 
 
-def _public_push_device(device: dict[str, Any]) -> dict[str, Any]:
+def _public_push_device(
+    device: dict[str, Any],
+    *,
+    secret_device: Any = None,
+) -> dict[str, Any]:
     public = dict(device)
+    public.pop("relay_pair_secret_ref", None)
+    private = secret_device if isinstance(secret_device, dict) else {}
     public["relay_pair_secret_configured"] = bool(
-        str(public.pop("relay_pair_secret_ref", "") or "").strip()
+        str(private.get("relay_pair_secret") or "").strip()
+        and str(private.get("relay_pair_secret_ref") or "").strip()
     )
     return public
 

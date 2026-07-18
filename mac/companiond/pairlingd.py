@@ -5501,9 +5501,82 @@ def _agent_registry_update_control(provider: str, native_id: str, *,
         pass
 
 
+def _close_codex_terminal_placeholders(tty: str, canonical_native_id: str) -> None:
+    if not tty:
+        return
+    for row in _agent_registry_live("codex"):
+        native_id = str(row.get("native_id") or "")
+        if (
+            native_id != canonical_native_id
+            and native_id.startswith("terminal-")
+            and row.get("terminal_tty") == tty
+        ):
+            _agent_registry_mark_closed("codex", native_id)
+
+
+def _bind_codex_registry_to_terminal(
+    native_id: str,
+    project: str,
+    discovered: dict,
+    *,
+    discovered_by: str,
+) -> dict | None:
+    exact = _agent_registry_get("codex", native_id)
+    tty = str(discovered.get("tty") or "")
+    pid = int(discovered.get("pid") or 0)
+    canonical_project = str(discovered.get("project") or project or "")
+    output_path = str(discovered.get("output_path") or "")
+    metadata = _registry_metadata_from_row(exact)
+    already_bound = bool(
+        exact
+        and not exact.get("closed_at")
+        and int(exact.get("pid") or 0) == pid
+        and str(exact.get("terminal_tty") or "") == tty
+        and str(exact.get("project") or "") == canonical_project
+        and (not output_path or metadata.get("output_path") == output_path)
+    )
+    _close_codex_terminal_placeholders(tty, native_id)
+    if already_bound:
+        return exact
+
+    metadata.pop("terminal_only", None)
+    metadata.update({
+        "discovered_by": discovered_by,
+        "command": str(discovered.get("command") or metadata.get("command") or "")[:500],
+    })
+    if output_path:
+        metadata["output_path"] = output_path
+    process_project = str(discovered.get("process_project") or "")
+    if process_project and process_project != canonical_project:
+        metadata["process_project"] = process_project
+    _agent_registry_upsert(
+        "codex",
+        native_id,
+        canonical_project,
+        pid=pid,
+        terminal_tty=tty,
+        state=str((exact or {}).get("state") or "running"),
+        metadata=metadata,
+        working_on=str((exact or {}).get("working_on") or ""),
+    )
+    return _agent_registry_get("codex", native_id) or exact
+
+
 def _agent_registry_promote_codex(native_id: str, project: str, observed_started_at: float) -> dict | None:
     exact = _agent_registry_get("codex", native_id)
     observed_started_at = float(observed_started_at or 0)
+    exact_terminal = _codex_discover_terminal_control_for_session(native_id)
+    if exact_terminal:
+        exact = _bind_codex_registry_to_terminal(
+            native_id,
+            project,
+            exact_terminal,
+            discovered_by="open_rollout",
+        )
+        pending_project = str(exact_terminal.get("project") or project or "")
+        for row in _codex_spawn_pending_registry_rows(pending_project, observed_started_at):
+            _agent_registry_mark_closed("codex", row["native_id"])
+        return exact
     if observed_started_at <= 0:
         return exact
     if exact:
@@ -5515,29 +5588,24 @@ def _agent_registry_promote_codex(native_id: str, project: str, observed_started
             return exact
         discovered = _codex_discover_terminal_control(project, observed_started_at)
         if discovered:
-            _agent_registry_upsert(
-                "codex",
+            exact = _bind_codex_registry_to_terminal(
                 native_id,
                 project,
-                pid=int(discovered.get("pid") or 0),
-                terminal_tty=discovered.get("tty") or "",
-                metadata={"discovered_by": "terminal_scan"},
+                discovered,
+                discovered_by="terminal_scan_fallback",
             )
             for row in _codex_spawn_pending_registry_rows(project, observed_started_at):
                 _agent_registry_mark_closed("codex", row["native_id"])
-            return _agent_registry_get("codex", native_id) or exact
+            return exact
         return exact
     discovered = _codex_discover_terminal_control(project, observed_started_at)
     if discovered:
-        _agent_registry_upsert(
-            "codex",
+        return _bind_codex_registry_to_terminal(
             native_id,
             project,
-            pid=int(discovered.get("pid") or 0),
-            terminal_tty=discovered.get("tty") or "",
-            metadata={"discovered_by": "terminal_scan"},
+            discovered,
+            discovered_by="terminal_scan_fallback",
         )
-        return _agent_registry_get("codex", native_id)
     pending = _codex_spawn_pending_registry_rows(project, observed_started_at)
     if not pending:
         return None
@@ -6415,7 +6483,14 @@ def _pid_for_tty_command(tty: str, command_name: str) -> int:
         if len(parts) < 2 or not parts[0].isdigit():
             continue
         haystack = " ".join(parts[1:]).lower()
-        if command_name.lower() in haystack:
+        normalized_name = command_name.lower()
+        if normalized_name == "codex":
+            matches = _is_codex_cli_command(haystack)
+        elif normalized_name == "claude":
+            matches = _is_claude_cli_command(haystack)
+        else:
+            matches = normalized_name in haystack
+        if matches:
             return int(parts[0])
     return 0
 
@@ -6445,6 +6520,8 @@ def _process_cwd(pid: int) -> str:
 
 def _is_codex_cli_command(command: str) -> bool:
     lower = (command or "").lower()
+    if "codex-code-mode-host" in lower:
+        return False
     return (
         "/usr/local/bin/codex" in lower
         or "@openai/codex" in lower
@@ -6456,6 +6533,51 @@ def _is_codex_cli_command(command: str) -> bool:
 def _is_claude_cli_command(command: str) -> bool:
     lower = (command or "").lower()
     return re.search(r"(^|/)claude(\s|$)", lower) is not None
+
+
+def _codex_open_rollouts_by_pid(pids: list[int]) -> dict[int, list[dict]]:
+    unique_pids = sorted({int(pid) for pid in pids if int(pid or 0) > 0})
+    if not unique_pids:
+        return {}
+    try:
+        proc = subprocess.run(
+            ["lsof", "-a", "-p", ",".join(str(pid) for pid in unique_pids), "-Fpn"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return {}
+    if proc.returncode != 0:
+        return {}
+
+    root_text = str(CODEX_SESSIONS_DIR)
+    current_pid = 0
+    by_pid: dict[int, list[dict]] = {}
+    for line in proc.stdout.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            current_pid = int(line[1:])
+            continue
+        if current_pid <= 0 or not line.startswith("n"):
+            continue
+        raw_path = line[1:]
+        if not raw_path.startswith(root_text + os.sep):
+            continue
+        path = Path(raw_path)
+        if path.suffix != ".jsonl" or not path.name.startswith("rollout-"):
+            continue
+        meta = _codex_rollout_meta(path)
+        if meta is None or meta.get("source") != "cli":
+            continue
+        approved = _approved_codex_transcript_path(path, str(meta.get("id") or ""))
+        if approved is None:
+            continue
+        by_pid.setdefault(current_pid, []).append({
+            "native_id": meta["id"],
+            "output_path": str(approved),
+            "project": meta["cwd"],
+        })
+    return by_pid
 
 
 def _codex_live_terminal_rows() -> list[dict]:
@@ -6496,14 +6618,43 @@ def _codex_live_terminal_rows() -> list[dict]:
         current = by_tty.get(tty)
         # The Node wrapper is the process we want for signals; it is usually
         # the lower pid on the same tty, while the native binary is its child.
-        if current is None or pid < int(current.get("pid") or 0):
-            by_tty[tty] = {
+        if current is None:
+            current = {
                 "pid": pid,
                 "tty": tty,
                 "project": cwd,
                 "started_at": started,
                 "command": command,
+                "provider_pids": [pid],
             }
+            by_tty[tty] = current
+        else:
+            current.setdefault("provider_pids", []).append(pid)
+            if pid < int(current.get("pid") or 0):
+                current.update({
+                    "pid": pid,
+                    "project": cwd,
+                    "started_at": started,
+                    "command": command,
+                })
+
+    rollout_map = _codex_open_rollouts_by_pid([
+        pid
+        for row in by_tty.values()
+        for pid in row.get("provider_pids") or []
+    ])
+    for row in by_tty.values():
+        candidates: dict[str, dict] = {}
+        for pid in row.get("provider_pids") or []:
+            for candidate in rollout_map.get(int(pid), []):
+                candidates[candidate["native_id"]] = candidate
+        if len(candidates) != 1:
+            continue
+        transcript = next(iter(candidates.values()))
+        row["native_id"] = transcript["native_id"]
+        row["output_path"] = transcript["output_path"]
+        row["process_project"] = row.get("project") or ""
+        row["project"] = transcript["project"]
     rows = list(by_tty.values())
     _codex_terminal_scan_cache["ts"] = now
     _codex_terminal_scan_cache["rows"] = rows
@@ -6565,7 +6716,7 @@ def _codex_discover_terminal_control(project: str, observed_started_at: float) -
         return None
     candidates = [
         row for row in _codex_live_terminal_rows()
-        if row.get("project") == project
+        if row.get("project") == project and not row.get("native_id")
     ]
     if not candidates:
         return None
@@ -6573,6 +6724,16 @@ def _codex_discover_terminal_control(project: str, observed_started_at: float) -
     best = candidates[0]
     delta = abs(float(best.get("started_at") or 0) - observed_started_at)
     return best if delta <= 600 else None
+
+
+def _codex_discover_terminal_control_for_session(native_id: str) -> dict | None:
+    if not native_id:
+        return None
+    matches = [
+        row for row in _codex_live_terminal_rows()
+        if row.get("native_id") == native_id
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _codex_terminal_native_id(row: dict) -> str:
@@ -6598,20 +6759,28 @@ def _codex_register_terminal_only_rows(seen: set[str]) -> None:
         pid = int(terminal.get("pid") or 0)
         if not project or not pid or not re.match(r"^/dev/ttys[0-9]{3,}$", tty):
             continue
+        exact_native_id = str(terminal.get("native_id") or "")
+        if exact_native_id:
+            _agent_registry_promote_codex(exact_native_id, project, 0)
+            continue
         existing = _agent_registry_get_by_tty("codex", tty)
         if existing and not existing.get("closed_at"):
             native_id = existing.get("native_id") or ""
             if native_id in seen:
                 continue
-            _agent_registry_update_control(
-                "codex",
-                native_id,
-                pid=pid,
-                terminal_tty=tty,
-                state="running",
-                reopen=True,
-            )
-            continue
+            if native_id.startswith("terminal-") and str(existing.get("project") or "") != project:
+                _agent_registry_mark_closed("codex", native_id)
+                existing = None
+            else:
+                _agent_registry_update_control(
+                    "codex",
+                    native_id,
+                    pid=pid,
+                    terminal_tty=tty,
+                    state="running",
+                    reopen=True,
+                )
+                continue
         native_id = _codex_terminal_native_id(terminal)
         if native_id in seen:
             continue
@@ -10384,17 +10553,27 @@ def _session_runtime_truth_from_parts(
             for name in ("can_send_text", "can_interrupt", "can_terminate")
         )
     )
-    if selected_surface == "v2" and terminal_state in {"live", "needs_input"}:
+    if terminal_state == "contradictory":
+        control_state = "blocked"
+        blocked_reason = contradictions[0]["code"] if contradictions else "terminal_surface_contradictory"
+    elif direct_terminal_actions and selected_surface in {"v2", "text_snapshot", "live_events"}:
+        # Terminal.app and script captures are visually text-only, but their
+        # direct action profile separately proves the exact provider PID and
+        # TTY. A v2 wrapper around that text must not erase those verified
+        # controls merely because the visual surface is degraded.
+        control_state = "eligible"
+        blocked_reason = None
+    elif selected_surface == "v2" and terminal_state in {"live", "needs_input"}:
         control_state = "eligible" if (
             native_broker_v2 and selected.get("screen_hash") and selected.get("nonce")
-        ) or direct_terminal_actions else "read_only"
+        ) else "read_only"
         blocked_reason = None if control_state == "eligible" else "surface_not_controllable"
     elif selected_surface == "live_events" and terminal_state in {"live", "needs_input"}:
         control_state = "eligible" if direct_terminal_actions else "read_only"
         blocked_reason = None if control_state == "eligible" else "live_events_read_only"
-    elif terminal_state in {"contradictory", "degraded"}:
+    elif terminal_state == "degraded":
         control_state = "blocked"
-        blocked_reason = contradictions[0]["code"] if contradictions else "terminal_surface_degraded"
+        blocked_reason = "terminal_surface_degraded"
     elif selected_surface == "text_snapshot":
         control_state = "eligible" if direct_terminal_actions else "read_only"
         blocked_reason = None if control_state == "eligible" else "text_snapshot_read_only"
@@ -10469,12 +10648,18 @@ def _session_runtime_truth_from_parts(
     elif any(issue["code"] == "terminal_surface_unavailable" for issue in degradations):
         primary = str(registry.get("working_on") or "Terminal unavailable")
         tone = "warning"
-    elif terminal_state == "degraded":
+    elif terminal_state == "degraded" and transcript_state not in {"live", "archived", "stale"}:
         primary = "Terminal degraded"
         tone = "warning"
     elif registry.get("working_on"):
         primary = str(registry.get("working_on"))
         tone = "normal"
+    elif transcript_state in {"live", "archived", "stale"}:
+        primary = "Live transcript" if transcript_state == "live" else "Transcript available"
+        tone = "normal"
+    elif terminal_state == "degraded":
+        primary = "Terminal degraded"
+        tone = "warning"
     elif terminal_state == "live":
         primary = "Live terminal"
         tone = "normal"
@@ -12227,6 +12412,8 @@ def _codex_rollout_meta(path: Path) -> dict | None:
         "cwd": cwd,
         "timestamp": payload.get("timestamp") or obj.get("timestamp"),
         "model": payload.get("model"),
+        "source": payload.get("source") or obj.get("source"),
+        "originator": payload.get("originator") or obj.get("originator"),
     }
 
 
@@ -12737,12 +12924,25 @@ def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> li
     cutoff = _time.time() - max(1, active_within_min) * 60
     rows: list[dict] = []
     seen: set[str] = set()
-    for path in _codex_rollout_paths():
+    live_terminal_rows = _codex_live_terminal_rows()
+    live_transcript_paths = {
+        str(terminal.get("output_path"))
+        for terminal in live_terminal_rows
+        if terminal.get("native_id") and terminal.get("output_path")
+    }
+    rollout_paths = _codex_rollout_paths()
+    known_paths = {str(path) for path in rollout_paths}
+    rollout_paths.extend(
+        Path(path)
+        for path in live_transcript_paths
+        if path not in known_paths
+    )
+    for path in rollout_paths:
         try:
             st = path.stat()
         except OSError:
             continue
-        if st.st_mtime < cutoff:
+        if st.st_mtime < cutoff and str(path) not in live_transcript_paths:
             continue
         meta = _codex_rollout_meta(path)
         if not meta:
