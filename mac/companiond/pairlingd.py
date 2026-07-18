@@ -10260,11 +10260,10 @@ def _runtime_freshness_truth(expected_source_revision: str | None = None) -> dic
     if expected:
         if not revision_matches:
             if source_dirty is False:
-                # Lockstep relaxation: a CLEAN tree on a different revision is
-                # drift, not a hard mismatch. The app renders a warning banner
-                # instead of quarantining, so a runtime install from a newer
-                # commit no longer breaks the installed app until the matching
-                # TestFlight build ships. Dirty trees stay hard mismatches.
+                # A clean tree on a different revision is diagnostic drift,
+                # not a hard mismatch. It remains visible in technical truth
+                # without making a healthy session look degraded. Dirty trees
+                # stay hard mismatches.
                 matches = None
                 confidence = "revision_drift"
                 mismatch_reason = "runtime_revision_drift"
@@ -10642,9 +10641,6 @@ def _session_runtime_truth_from_parts(
     elif runtime.get("runtime_matches_app_source") is False:
         primary = "Runtime stale"
         tone = "warning"
-    elif any(issue["code"] == "runtime_revision_drift" for issue in degradations):
-        primary = str(registry.get("working_on") or "Runtime revision drift")
-        tone = "warning"
     elif any(issue["code"] == "terminal_surface_unavailable" for issue in degradations):
         primary = str(registry.get("working_on") or "Terminal unavailable")
         tone = "warning"
@@ -10671,8 +10667,6 @@ def _session_runtime_truth_from_parts(
         if issue["code"] == "terminal_surface_unavailable" and issue.get("user_message"):
             secondary_parts.append(str(issue["user_message"]))
         if issue["code"] == "terminal_surface_v2_unavailable" and issue.get("user_message"):
-            secondary_parts.append(str(issue["user_message"]))
-        if issue["code"] == "runtime_revision_drift" and issue.get("user_message"):
             secondary_parts.append(str(issue["user_message"]))
     if transcript.get("user_message"):
         secondary_parts.append(str(transcript.get("user_message")))
