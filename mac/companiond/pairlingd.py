@@ -26509,8 +26509,13 @@ Worker instructions:
             # approval card is opportunistic: it surfaces ONLY if the user's own
             # config prompts (codex approval detection is the Phase 5 screen-scrape,
             # which touches no config).
+            #
+            # The broker has no local keyboard, so it cannot answer Codex's
+            # interactive update screen. Disable only that startup check for this
+            # process. Visible Terminal sessions still keep the user's normal
+            # update behavior.
             command = (
-                f"exec codex "
+                f"exec codex -c check_for_update_on_startup=false "
                 f"-C {shlex.quote(project)} --add-dir {shlex.quote(project)}"
             )
         else:
