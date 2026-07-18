@@ -17029,12 +17029,13 @@ class Handler(BaseHTTPRequestHandler):
     def _strict_live_projection(cls, row: dict) -> dict | None:
         if not cls._session_row_is_strictly_live(row):
             return None
+        projected = dict(row)
+        projected["readable_state"] = "live"
         pid = int(row.get("pid") or row.get("claude_pid") or 0)
         tty = str(row.get("terminal_tty") or "")
         if pid > 0 or re.match(r"^/dev/ttys[0-9]{3,}$", tty):
-            return row
+            return projected
 
-        projected = dict(row)
         reason = "Live hook seen; process control is not verified yet."
         projected["control_state"] = "read_only"
         projected["control_reason"] = reason
@@ -17096,12 +17097,21 @@ class Handler(BaseHTTPRequestHandler):
                 or controllability.get("can_terminate")
             )
         )
+        has_verified_process = can_control
+        if not closed_at and not has_verified_process:
+            try:
+                has_verified_process = _session_has_verified_provider_process(
+                    row,
+                    str(row.get("provider") or "claude"),
+                )
+            except Exception:
+                has_verified_process = False
 
         if closed_at:
             readable_state = "closed"
-        elif age <= 60 * 60:
+        elif has_verified_process or age <= 60 * 60:
             readable_state = "live"
-        elif can_control or age <= 60 * 24 * 60:
+        elif age <= 60 * 24 * 60:
             readable_state = "stale"
         else:
             readable_state = "offline"
@@ -19434,9 +19444,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if closed_at:
             readable_state = "closed"
-        elif stale_seconds <= 60 * 60:
+        elif has_live_control or stale_seconds <= 60 * 60:
             readable_state = "live"
-        elif has_live_control or stale_seconds <= 60 * 24 * 60:
+        elif stale_seconds <= 60 * 24 * 60:
             readable_state = "stale"
         else:
             readable_state = "offline"
