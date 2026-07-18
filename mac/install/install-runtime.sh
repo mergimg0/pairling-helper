@@ -19,7 +19,7 @@ read_source_stamp() {
 }
 REVISION="${PAIRLING_SOURCE_REVISION:-$(read_source_stamp "$REPO_ROOT/mac/SOURCE_REVISION")}"
 if [[ -z "$REVISION" ]]; then
-  REVISION="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || true)"
+  REVISION="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
 fi
 REVISION="${REVISION:-unknown}"
 BRANCH="${PAIRLING_SOURCE_BRANCH:-$(read_source_stamp "$REPO_ROOT/mac/SOURCE_BRANCH")}"
