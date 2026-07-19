@@ -519,12 +519,17 @@ class _BrokerOutputListener(threading.Thread):
                     if kind == "output":
                         session_id = str(frame.get("session_id") or "")
                         if session_id:
-                            self._hub.publish(f"terminal:{session_id}", {
+                            event = {
                                 "type": "broker_output",
                                 "session_id": session_id,
                                 "raw_offset": int(frame.get("raw_offset") or 0),
                                 "feed_at": frame.get("feed_at"),
-                            })
+                            }
+                            identities = _session_event_identity_keys(None, session_id)
+                            if not identities:
+                                identities = {session_id}
+                            for identity in identities:
+                                self._hub.publish(f"terminal:{identity}", event)
                     elif kind == "output_gap":
                         self._hub.publish(BROKER_GLOBAL_TOPIC, {
                             "type": "broker_gap",
@@ -832,8 +837,6 @@ def _session_mutation_receipt_identity(handler, raw_session: str) -> tuple[str, 
     if not native_id:
         return "", None
     registry_row = _agent_registry_get(provider, native_id)
-    if registry_row is not None and registry_row.get("closed_at"):
-        registry_row = None
     if registry_row is None:
         registry_row = _agent_registry_row_for_send_scope_id(
             provider,
@@ -1414,12 +1417,18 @@ def _stable_sessions_stream_rows(rows: list[dict]) -> list[dict]:
 
 
 def _invalidate_session_list_caches() -> None:
+    global _runtime_snapshot_cache_generation
     with _runtime_snapshot_cache_lock:
+        _runtime_snapshot_cache_generation += 1
         _runtime_snapshot_cache.clear()
-        _runtime_snapshot_key_locks.clear()
     _SESSION_TRANSCRIPT_STATS_CACHE.clear()
-    _codex_rollout_paths_cache["ts"] = 0.0
-    _codex_rollout_paths_cache["paths"] = []
+    _clear_codex_rollout_caches()
+    # A loader can begin after the first generation change but before the
+    # dependent transcript caches finish clearing. Advance the generation
+    # again so that loader cannot publish data derived from the old inputs.
+    with _runtime_snapshot_cache_lock:
+        _runtime_snapshot_cache_generation += 1
+        _runtime_snapshot_cache.clear()
 
 
 def _broker_value(session, key: str, default=None):
@@ -1444,6 +1453,24 @@ def _broker_pid(session) -> int:
         return 0
 
 
+def _broker_session_matches_spawn_request(
+    session,
+    *,
+    broker_id: str,
+    provider: str,
+    native_id: str,
+) -> bool:
+    """Verify the broker result before its durable registry row exists."""
+    return bool(
+        broker_id
+        and provider
+        and native_id
+        and _broker_session_id(session) == broker_id
+        and str(_broker_value(session, "provider", "") or "").lower() == provider
+        and str(_broker_value(session, "native_id", "") or "") == native_id
+    )
+
+
 def _broker_session_owns_identity(session, provider: str, native_id: str) -> bool:
     """Prove that a broker session is owned by the requested provider session."""
     broker_id = _broker_session_id(session)
@@ -1451,16 +1478,29 @@ def _broker_session_owns_identity(session, provider: str, native_id: str) -> boo
         return False
     session_provider = str(_broker_value(session, "provider", "") or "").lower()
     session_native_id = str(_broker_value(session, "native_id", "") or "")
-    if session_provider == provider and session_native_id == native_id:
-        return True
-    row = _agent_registry_get(provider, native_id)
-    if not row or row.get("closed_at") is not None:
+    canonical_native_id = _agent_registry_resolve_native_alias(provider, native_id)
+    row = _agent_registry_get(provider, canonical_native_id)
+    if row is None or row.get("closed_at") is not None:
         return False
-    try:
-        metadata = json.loads(row.get("metadata_json") or "{}")
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return False
-    return str(metadata.get("broker_id") or "") == broker_id
+    metadata = _registry_metadata_from_row(row)
+    durable_broker_id = str(metadata.get("broker_id") or "")
+    durable_native_ids = {
+        str(value or "")
+        for value in (
+            native_id,
+            canonical_native_id,
+            row.get("native_id"),
+            metadata.get("broker_native_id"),
+            metadata.get("pending_native_id"),
+        )
+        if str(value or "")
+    }
+    return bool(
+        durable_broker_id
+        and durable_broker_id == broker_id
+        and session_provider == provider
+        and session_native_id in durable_native_ids
+    )
 
 
 def _broker_interrupt_for_draining_runtime(broker_id: str) -> dict:
@@ -1658,8 +1698,11 @@ def _broker_reconcile_session_after_unknown(
             session = PTY_BROKER.get(broker_id) if PTY_BROKER is not None else None
         except Exception:
             session = None
-        if session is not None and _broker_session_owns_identity(
-            session, provider, native_id
+        if session is not None and _broker_session_matches_spawn_request(
+            session,
+            broker_id=broker_id,
+            provider=provider,
+            native_id=native_id,
         ):
             return session
         if _time.monotonic() >= deadline:
@@ -2297,9 +2340,18 @@ _health_probe_cache_lock = threading.Lock()
 _health_probe_cache: dict[str, tuple[float, object]] = {}
 _health_payload_cache_lock = threading.Lock()
 _health_payload_cache: dict[tuple, tuple[float, dict]] = {}
+
+
+class _RuntimeSnapshotKeyLock:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.users = 0
+
+
 _runtime_snapshot_cache_lock = threading.Lock()
 _runtime_snapshot_cache: dict[tuple, tuple[float, object]] = {}
-_runtime_snapshot_key_locks: dict[tuple, threading.Lock] = {}
+_runtime_snapshot_key_locks: dict[tuple, _RuntimeSnapshotKeyLock] = {}
+_runtime_snapshot_cache_generation = 0
 _auth_result_cache_lock = threading.Lock()
 _auth_result_cache: dict[tuple, tuple[float, object]] = {}
 _auth_result_cache_generation = 0
@@ -3816,6 +3868,15 @@ def _pending_approval_record(*, request_nonce: str, provider: str, session_id: s
     AUTHORITATIVE live broker session id — far more reliable than registry
     reconciliation, since the SessionStart tty capture fails for broker PTYs (the
     claude_uuid and the broker tty land on two unlinked rows)."""
+    if provider == "codex":
+        _requested_provider, requested_native_id = _parse_agent_session_ref(
+            session_id
+        )
+        canonical_native_id = _agent_registry_resolve_native_alias(
+            "codex", requested_native_id
+        )
+        if canonical_native_id:
+            session_id = _qualified_session_id("codex", canonical_native_id)
     now = _time.time()
     native_id, resolved_broker, terminal_tty = _approval_resolve_session(provider, session_id)
     if not broker_id:
@@ -4133,6 +4194,19 @@ def _send_terminal_app_text_exact(tty: str, text: str) -> dict:
 def _deliver_first_prompt_now(handler, *, provider: str, native_id: str, text: str) -> dict:
     """Deliver to the exact broker session or Terminal tty created by spawn."""
     raw_session = _qualified_session_id(provider, native_id)
+    control_native_id = _agent_registry_resolve_native_alias(provider, native_id)
+    reg = _agent_registry_get(provider, native_id) or _agent_registry_get(
+        provider, control_native_id
+    )
+    if reg is not None and reg.get("closed_at") is not None:
+        return {
+            "ok": False,
+            "reason": "provider process identity is no longer available",
+            "error_code": "process_identity_unverified",
+            "status": 409,
+            "pty_written": False,
+            "write_outcome": "none",
+        }
     broker_found = handler._broker_session_for(raw_session)
     if broker_found and PTY_BROKER:
         _public_id, session = broker_found
@@ -4145,7 +4219,6 @@ def _deliver_first_prompt_now(handler, *, provider: str, native_id: str, text: s
             public_session_id=raw_session,
         )
         if result.get("ok"):
-            control_native_id = _agent_registry_resolve_native_alias(provider, native_id)
             _agent_registry_update_control(
                 provider,
                 control_native_id,
@@ -4161,10 +4234,7 @@ def _deliver_first_prompt_now(handler, *, provider: str, native_id: str, text: s
                 )
         return result
 
-    control_native_id = _agent_registry_resolve_native_alias(provider, native_id)
-    reg = _agent_registry_get(provider, native_id) or _agent_registry_get(
-        provider, control_native_id
-    ) or {}
+    reg = reg or {}
     durable_broker_id = _durable_broker_id_from_registry_row(
         reg,
         provider=provider,
@@ -4180,16 +4250,38 @@ def _deliver_first_prompt_now(handler, *, provider: str, native_id: str, text: s
             "write_outcome": "none",
             "broker_id": durable_broker_id,
         }
-    if provider == "claude":
-        tty = handler._lookup_terminal_tty(native_id)
-    else:
-        tty = str(reg.get("terminal_tty") or "")
+    if not reg or reg.get("closed_at") is not None:
+        return {
+            "ok": False,
+            "reason": "provider process identity is no longer available",
+            "error_code": "process_identity_unverified",
+            "status": 409,
+            "pty_written": False,
+            "write_outcome": "none",
+        }
+    pid = int(reg.get("pid") or reg.get("claude_pid") or 0)
+    tty = str(reg.get("terminal_tty") or "")
+    if (
+        pid <= 0
+        or not _process_alive(pid)
+        or not _registry_process_birth_matches(reg, pid)
+        or not _session_signal_target_is_verified(reg, provider, pid)
+        or not _direct_terminal_binding_is_verified(reg, provider, pid)
+    ):
+        return {
+            "ok": False,
+            "reason": "provider process identity changed before prompt delivery",
+            "error_code": "process_identity_unverified",
+            "status": 409,
+            "pty_written": False,
+            "write_outcome": "none",
+        }
     result = _send_terminal_app_text_exact(tty, text)
     if result.get("ok"):
         _agent_registry_update_control(
             provider,
             control_native_id,
-            pid=int(reg.get("pid") or 0) or None,
+            pid=pid,
             terminal_tty=tty,
             state="running",
             reopen=True,
@@ -4830,6 +4922,11 @@ def _agent_registry_upsert(provider: str, native_id: str, project: str, *,
     # claude_uuid/tty/pid COALESCE so an empty re-register never blanks them,
     # started_at is preserved from the original insert.
     now = _time.time()
+    stored_metadata = dict(metadata or {})
+    if provider in {"claude", "codex"} and int(pid or 0) > 0:
+        process_started_at = _process_start_epoch(int(pid))
+        if process_started_at > 0:
+            stored_metadata.setdefault("process_started_at", process_started_at)
     try:
         # Serialize reopen with durable removal. If a registration arrives
         # during removal, it runs afterwards and clears the old receipt.
@@ -4863,7 +4960,7 @@ def _agent_registry_upsert(provider: str, native_id: str, project: str, *,
                         state,
                         now,
                         now,
-                        json.dumps(metadata or {}, sort_keys=True),
+                        json.dumps(stored_metadata, sort_keys=True),
                         claude_uuid or "",
                         working_on or "",
                     ),
@@ -5288,6 +5385,9 @@ def _agent_registry_link_claude_launch_registration(
                 )
                 if existing_send_scope_id:
                     expected_pid = int(existing.get("pid") or 0) if existing else 0
+                    existing_provider_tty = str(
+                        existing_metadata.get("provider_tty") or ""
+                    )
                     if (
                         str(existing.get("project") or "") != project
                         or (expected_pid and expected_pid != pid)
@@ -5295,6 +5395,7 @@ def _agent_registry_link_claude_launch_registration(
                             terminal_tty
                             and str(existing.get("terminal_tty") or "")
                             not in {"", terminal_tty}
+                            and terminal_tty != existing_provider_tty
                         )
                         or str(existing.get("claude_uuid") or "") not in {"", claude_uuid}
                     ):
@@ -5305,6 +5406,13 @@ def _agent_registry_link_claude_launch_registration(
                         "canonical_native_id": canonical_native_id,
                         "registered_by": "internal_session_register",
                     })
+                    stored_terminal_tty = str(existing.get("terminal_tty") or "")
+                    next_terminal_tty = (
+                        stored_terminal_tty
+                        if existing_provider_tty
+                        and terminal_tty == existing_provider_tty
+                        else terminal_tty
+                    )
                     conn.execute(
                         "UPDATE agent_sessions SET project=?, pid=?, "
                         "terminal_tty=COALESCE(NULLIF(?, ''), terminal_tty), "
@@ -5314,7 +5422,7 @@ def _agent_registry_link_claude_launch_registration(
                         (
                             project,
                             pid,
-                            terminal_tty,
+                            next_terminal_tty,
                             now,
                             json.dumps(merged_metadata, sort_keys=True),
                             claude_uuid,
@@ -5360,9 +5468,21 @@ def _agent_registry_link_claude_launch_registration(
                             "claude", metadata.get("broker_id")
                         )
                         capture_backend = str(metadata.get("capture_backend") or "")
+                        script_binding = bool(
+                            capture_backend == "script"
+                            and str(metadata.get("provider_tty") or "")
+                            == terminal_tty
+                            and _direct_terminal_binding_is_verified(
+                                row,
+                                "claude",
+                                pid,
+                                provider_tty=terminal_tty,
+                            )
+                        )
                         exact_tty = (
                             not terminal_tty
                             or str(row.get("terminal_tty") or "") == terminal_tty
+                            or script_binding
                         )
                         if (
                             send_scope_id == expected_scope
@@ -5412,11 +5532,15 @@ def _agent_registry_link_claude_launch_registration(
                             "broker_id": broker_id,
                             "broker_native_id": pending_native_id,
                         })
-                    chosen_tty = (
-                        terminal_tty
-                        or str(pending.get("terminal_tty") or "")
-                        or str((existing or {}).get("terminal_tty") or "")
+                    pending_tty = str(pending.get("terminal_tty") or "")
+                    capture_backend = str(
+                        pending_metadata.get("capture_backend") or ""
                     )
+                    chosen_tty = (
+                        pending_tty
+                        if capture_backend == "script"
+                        else terminal_tty or pending_tty
+                    ) or str((existing or {}).get("terminal_tty") or "")
                     started_at = float(
                         (existing or {}).get("started_at")
                         or pending.get("started_at")
@@ -5618,10 +5742,19 @@ def _agent_registry_recent(provider: str, since_min: int = 60 * 24, limit: int =
         return []
 
 
-def _codex_spawn_pending_registry_rows(project: str, observed_started_at: float) -> list[dict]:
+def _codex_spawn_pending_registry_rows(
+    project: str,
+    observed_started_at: float,
+    *,
+    registry_rows: list[dict] | None = None,
+) -> list[dict]:
     observed_started_at = float(observed_started_at or 0)
     return [
-        row for row in _agent_registry_live("codex")
+        row for row in (
+            registry_rows
+            if registry_rows is not None
+            else _agent_registry_live("codex", limit=1000)
+        )
         if row.get("native_id", "").startswith("pending-")
         and row.get("project") == project
         and (
@@ -5719,7 +5852,7 @@ def _bind_codex_registry_to_terminal(
     by a partial failure.
     """
     native_id = str(native_id or "").strip()
-    tty = str(discovered.get("tty") or "")
+    provider_tty = str(discovered.get("tty") or "")
     pid = int(discovered.get("pid") or 0)
     canonical_project = str(discovered.get("project") or project or "")
     output_path = str(discovered.get("output_path") or "")
@@ -5727,13 +5860,23 @@ def _bind_codex_registry_to_terminal(
         not _safe_agent_native_id(native_id)
         or not canonical_project
         or pid <= 0
-        or not tty
+        or not provider_tty
     ):
         return _agent_registry_get("codex", native_id)
+    approved_output_path = (
+        _approved_codex_transcript_path(Path(output_path), native_id)
+        if output_path
+        else None
+    )
+    if approved_output_path is None:
+        return _agent_registry_get("codex", native_id)
+    output_path = str(approved_output_path)
 
     now = _time.time()
     linked_send_scope_id = ""
     linked_broker_id = ""
+    registry_changed = False
+    tombstone_cleared = False
     try:
         with _session_tombstone_reopen_guard() as track_reopen:
             track_reopen("codex", native_id)
@@ -5751,20 +5894,44 @@ def _bind_codex_registry_to_terminal(
                     provider="codex",
                     native_id=native_id,
                 )
+                closed_exact_rebind = bool(
+                    exact is not None
+                    and exact.get("closed_at") is not None
+                    and approved_output_path is not None
+                )
                 if exact is not None:
                     exact_project = str(exact.get("project") or "")
                     exact_pid = int(exact.get("pid") or 0)
                     exact_tty = str(exact.get("terminal_tty") or "")
+                    exact_provider_tty = str(
+                        exact_metadata.get("provider_tty") or ""
+                    )
+                    exact_script_binding = bool(
+                        exact.get("closed_at") is None
+                        and exact_provider_tty == provider_tty
+                        and _direct_terminal_binding_is_verified(
+                            exact,
+                            "codex",
+                            pid,
+                            provider_tty=provider_tty,
+                        )
+                    )
                     identity_conflict = (
                         bool(exact_project and exact_project != canonical_project)
-                        or bool(exact_tty and exact_tty != tty)
+                        or bool(
+                            exact_tty
+                            and exact_tty != provider_tty
+                            and not exact_script_binding
+                        )
                         or bool(
                             not exact_tty
                             and exact_pid not in {0, pid}
                             and _process_alive(exact_pid)
                         )
                     )
-                    if identity_conflict:
+                    if exact.get("closed_at") is not None and not closed_exact_rebind:
+                        return exact
+                    if identity_conflict and not closed_exact_rebind:
                         return exact
 
                 pending_rows = [
@@ -5772,15 +5939,15 @@ def _bind_codex_registry_to_terminal(
                     for row in conn.execute(
                         "SELECT * FROM agent_sessions WHERE provider='codex' "
                         "AND native_id LIKE 'pending-%' AND project=? AND pid=? "
-                        "AND terminal_tty=? AND closed_at IS NULL "
+                        "AND closed_at IS NULL "
                         "ORDER BY started_at DESC LIMIT 3",
-                        (canonical_project, pid, tty),
+                        (canonical_project, pid),
                     ).fetchall()
                 ]
                 pending_owner = None
                 pending_metadata: dict = {}
-                if len(pending_rows) == 1:
-                    candidate = pending_rows[0]
+                valid_pending_rows: list[tuple[dict, dict]] = []
+                for candidate in pending_rows:
                     candidate_native_id = str(candidate.get("native_id") or "")
                     candidate_metadata = _registry_metadata_from_row(candidate)
                     candidate_scope = _durable_send_scope_id_from_registry_row(
@@ -5802,13 +5969,37 @@ def _bind_codex_registry_to_terminal(
                         capture_backend != "pty_broker"
                         or candidate_broker_id == expected_scope
                     )
+                    candidate_terminal_tty = str(
+                        candidate.get("terminal_tty") or ""
+                    )
+                    exact_terminal_topology = bool(
+                        (
+                            capture_backend == "pty_broker"
+                            and candidate_terminal_tty == provider_tty
+                        )
+                        or (
+                            capture_backend == "script"
+                            and str(candidate_metadata.get("provider_tty") or "")
+                            == provider_tty
+                            and _direct_terminal_binding_is_verified(
+                                candidate,
+                                "codex",
+                                pid,
+                                provider_tty=provider_tty,
+                            )
+                        )
+                    )
                     if (
                         candidate_scope == expected_scope
                         and valid_capture
                         and valid_broker
+                        and exact_terminal_topology
                     ):
-                        pending_owner = candidate
-                        pending_metadata = candidate_metadata
+                        valid_pending_rows.append((candidate, candidate_metadata))
+                if pending_rows and len(valid_pending_rows) != 1:
+                    return exact
+                if len(valid_pending_rows) == 1:
+                    pending_owner, pending_metadata = valid_pending_rows[0]
 
                 pending_send_scope_id = _durable_send_scope_id_from_registry_row(
                     pending_owner,
@@ -5819,10 +6010,26 @@ def _bind_codex_registry_to_terminal(
                     pending_send_scope_id
                     and exact_send_scope_id
                     and pending_send_scope_id != exact_send_scope_id
+                    and not closed_exact_rebind
                 ):
                     return exact
 
                 metadata = dict(exact_metadata)
+                if closed_exact_rebind:
+                    for stale_key in (
+                        "broker_id",
+                        "broker_native_id",
+                        "capture_backend",
+                        "terminal_source",
+                        "terminal_capture_log",
+                        "send_scope_id",
+                        "pending_native_id",
+                        "provider_tty",
+                        "terminal_owner_pid",
+                        "terminal_owner_process_started_at",
+                        "process_started_at",
+                    ):
+                        metadata.pop(stale_key, None)
                 metadata.update(pending_metadata)
                 metadata.pop("terminal_only", None)
                 if pending_owner is not None:
@@ -5835,7 +6042,7 @@ def _bind_codex_registry_to_terminal(
                         "send_scope_id": linked_send_scope_id,
                         "pending_native_id": pending_native_id,
                         "canonical_native_id": native_id,
-                        "identity_link": "exact_pid_tty_project",
+                        "identity_link": "exact_pid_project_terminal_topology",
                     })
                     if linked_broker_id:
                         metadata.update({
@@ -5849,10 +6056,16 @@ def _bind_codex_registry_to_terminal(
                         })
                 metadata.update({
                     "discovered_by": discovered_by,
+                    "provider_tty": provider_tty,
                     "command": str(
                         discovered.get("command") or metadata.get("command") or ""
                     )[:500],
                 })
+                process_started_at = float(
+                    discovered.get("started_at") or _process_start_epoch(pid) or 0
+                )
+                if process_started_at > 0:
+                    metadata["process_started_at"] = process_started_at
                 if output_path:
                     metadata["output_path"] = output_path
                 elif exact_metadata.get("output_path"):
@@ -5861,40 +6074,71 @@ def _bind_codex_registry_to_terminal(
                 if process_project and process_project != canonical_project:
                     metadata["process_project"] = process_project
 
+                canonical_tty = provider_tty
+                if pending_owner is not None:
+                    canonical_tty = str(
+                        pending_owner.get("terminal_tty") or provider_tty
+                    )
+                elif exact is not None and not closed_exact_rebind:
+                    exact_provider_tty = str(
+                        exact_metadata.get("provider_tty") or ""
+                    )
+                    if exact_provider_tty == provider_tty:
+                        canonical_tty = str(
+                            exact.get("terminal_tty") or provider_tty
+                        )
+
                 started_at = float(
                     (exact or {}).get("started_at")
                     or (pending_owner or {}).get("started_at")
                     or now
                 )
-                conn.execute(
-                    """
-                    INSERT INTO agent_sessions
-                        (provider, native_id, project, pid, terminal_tty, state,
-                         started_at, last_heartbeat, closed_at, metadata_json,
-                         claude_uuid, working_on)
-                    VALUES ('codex', ?, ?, ?, ?, ?, ?, ?, NULL, ?, '', ?)
-                    ON CONFLICT(provider, native_id) DO UPDATE SET
-                        project=excluded.project,
-                        pid=excluded.pid,
-                        terminal_tty=excluded.terminal_tty,
-                        state=excluded.state,
-                        last_heartbeat=excluded.last_heartbeat,
-                        closed_at=NULL,
-                        metadata_json=excluded.metadata_json,
-                        working_on=excluded.working_on
-                    """,
-                    (
-                        native_id,
-                        canonical_project,
-                        pid,
-                        tty,
-                        str((exact or {}).get("state") or "running"),
-                        started_at,
-                        now,
-                        json.dumps(metadata, sort_keys=True),
-                        str((exact or {}).get("working_on") or ""),
-                    ),
+                next_state = (
+                    "running"
+                    if closed_exact_rebind
+                    else str((exact or {}).get("state") or "running")
                 )
+                next_working_on = str((exact or {}).get("working_on") or "")
+                registry_changed = bool(
+                    exact is None
+                    or pending_owner is not None
+                    or str(exact.get("project") or "") != canonical_project
+                    or int(exact.get("pid") or 0) != pid
+                    or str(exact.get("terminal_tty") or "") != canonical_tty
+                    or str(exact.get("state") or "") != next_state
+                    or exact.get("closed_at") is not None
+                    or exact_metadata != metadata
+                )
+                if registry_changed:
+                    conn.execute(
+                        """
+                        INSERT INTO agent_sessions
+                            (provider, native_id, project, pid, terminal_tty, state,
+                             started_at, last_heartbeat, closed_at, metadata_json,
+                             claude_uuid, working_on)
+                        VALUES ('codex', ?, ?, ?, ?, ?, ?, ?, NULL, ?, '', ?)
+                        ON CONFLICT(provider, native_id) DO UPDATE SET
+                            project=excluded.project,
+                            pid=excluded.pid,
+                            terminal_tty=excluded.terminal_tty,
+                            state=excluded.state,
+                            last_heartbeat=excluded.last_heartbeat,
+                            closed_at=NULL,
+                            metadata_json=excluded.metadata_json,
+                            working_on=excluded.working_on
+                        """,
+                        (
+                            native_id,
+                            canonical_project,
+                            pid,
+                            canonical_tty,
+                            next_state,
+                            started_at,
+                            now,
+                            json.dumps(metadata, sort_keys=True),
+                            next_working_on,
+                        ),
+                    )
                 if pending_owner is not None:
                     deleted = conn.execute(
                         "DELETE FROM agent_sessions WHERE provider='codex' "
@@ -5905,7 +6149,7 @@ def _bind_codex_registry_to_terminal(
                             str(pending_owner.get("native_id") or ""),
                             canonical_project,
                             pid,
-                            tty,
+                            str(pending_owner.get("terminal_tty") or ""),
                             str(pending_owner.get("metadata_json") or ""),
                         ),
                     )
@@ -5913,14 +6157,18 @@ def _bind_codex_registry_to_terminal(
                         raise RuntimeError(
                             "pending Codex identity changed during promotion"
                         )
-                _clear_session_tombstone_for_reopen("codex", native_id)
+                tombstone_cleared = _clear_session_tombstone_for_reopen(
+                    "codex", native_id
+                )
     except Exception:
         return _agent_registry_get("codex", native_id)
 
     promoted = _agent_registry_get("codex", native_id)
     if promoted is None:
         return None
-    _close_codex_terminal_placeholders(tty, native_id)
+    if not registry_changed and not tombstone_cleared:
+        return promoted
+    _close_codex_terminal_placeholders(canonical_tty, native_id)
     _invalidate_session_list_caches()
     if linked_send_scope_id:
         identity_event = {
@@ -5965,141 +6213,135 @@ def _agent_registry_promote_codex(native_id: str, project: str, observed_started
     if observed_started_at <= 0:
         return exact
     if exact:
-        stored_pid = int(exact.get("pid") or 0)
-        tty = exact.get("terminal_tty") or ""
-        live_pid = stored_pid if stored_pid and _process_alive(stored_pid) else (
-            _pid_for_tty_command(tty, "codex") if tty else 0
-        )
-        if not exact.get("closed_at") and live_pid:
-            exact_metadata = _registry_metadata_from_row(exact)
-            exact = _bind_codex_registry_to_terminal(
-                native_id,
-                str(exact.get("project") or project or ""),
-                {
-                    "pid": live_pid,
-                    "tty": tty,
-                    "project": str(exact.get("project") or project or ""),
-                    "command": exact_metadata.get("command"),
-                    "output_path": exact_metadata.get("output_path"),
-                },
-                discovered_by=str(exact_metadata.get("discovered_by") or "registry_exact"),
-            )
-            return exact
-        discovered = _codex_discover_terminal_control(project, observed_started_at)
-        if discovered:
-            exact = _bind_codex_registry_to_terminal(
-                native_id,
-                project,
-                discovered,
-                discovered_by="terminal_scan_fallback",
-            )
-            return exact
         return exact
-    discovered = _codex_discover_terminal_control(project, observed_started_at)
-    if discovered:
-        promoted = _bind_codex_registry_to_terminal(
-            native_id,
-            project,
-            discovered,
-            discovered_by="terminal_scan_fallback",
-        )
-        return promoted
-    pending = _codex_spawn_pending_registry_rows(project, observed_started_at)
-    if len(pending) != 1:
+    process_probe_ok, process_rows = _scan_provider_process_rows("codex")
+    if not process_probe_ok:
         return None
-    row = pending[0]
-    pending_metadata = _registry_metadata_from_row(row)
-    pending_native_id = str(row.get("native_id") or "")
-    pending_send_scope_id = _durable_send_scope_id_from_registry_row(
-        row,
-        provider="codex",
-        native_id=pending_native_id,
-    )
-    if (
-        pending_metadata.get("capture_backend") != "script"
-        or pending_metadata.get("broker_id")
-        or pending_send_scope_id
-        != _qualified_session_id("codex", pending_native_id)
-    ):
-        return None
-    pending_metadata.update({
-        "send_scope_id": pending_send_scope_id,
-        "pending_native_id": pending_native_id,
-        "canonical_native_id": native_id,
-        "identity_link": "single_visible_terminal_project_start_time",
-    })
-    now = _time.time()
-    try:
-        with _session_tombstone_reopen_guard() as track_reopen:
-            track_reopen("codex", native_id)
-            with _agent_registry_conn() as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                changed = conn.execute(
-                    "UPDATE agent_sessions SET native_id = ?, metadata_json = ?, "
-                    "last_heartbeat = ? WHERE provider = 'codex' "
-                    "AND native_id = ? AND project = ? AND pid = ? "
-                    "AND terminal_tty = ? AND metadata_json = ? "
-                    "AND closed_at IS NULL",
-                    (
-                        native_id,
-                        json.dumps(pending_metadata, sort_keys=True),
-                        now,
-                        pending_native_id,
-                        str(row.get("project") or ""),
-                        int(row.get("pid") or 0),
-                        str(row.get("terminal_tty") or ""),
-                        str(row.get("metadata_json") or ""),
-                    ),
-                )
-                if changed.rowcount != 1:
-                    raise RuntimeError(
-                        "pending Codex identity changed during fallback promotion"
-                    )
-                _clear_session_tombstone_for_reopen("codex", native_id)
-        row["native_id"] = native_id
-        row["metadata_json"] = json.dumps(pending_metadata, sort_keys=True)
-        row["last_heartbeat"] = now
-        _invalidate_session_list_caches()
-        identity_event = {
-            "type": "session_identity_linked",
-            "provider": "codex",
-            "native_id": native_id,
-            "send_scope_id": pending_send_scope_id,
-            "broker_id": None,
-            "project": project,
-            "heartbeat_at": now,
-        }
-        _publish_session_event(SESSION_SUMMARIES_TOPIC, identity_event)
-        _publish_session_event(
-            f"terminal:{pending_send_scope_id}",
-            dict(identity_event),
-        )
-        return row
-    except sqlite3.IntegrityError:
-        current = _agent_registry_get("codex", native_id)
+    pending_proofs: list[tuple[dict, str, dict]] = []
+    for candidate in _codex_spawn_pending_registry_rows(project, 0):
         if (
-            current is None
-            or str(current.get("project") or "") != str(row.get("project") or "")
-            or int(current.get("pid") or 0) not in {0, int(row.get("pid") or 0)}
-            or str(current.get("terminal_tty") or "")
-            not in {"", str(row.get("terminal_tty") or "")}
+            str(candidate.get("provider") or "") != "codex"
+            or str(candidate.get("project") or "") != project
+            or candidate.get("closed_at") is not None
         ):
-            return current
-        promoted = _bind_codex_registry_to_terminal(
-            native_id,
-            project,
-            {
-                "pid": int(row.get("pid") or 0),
-                "tty": str(row.get("terminal_tty") or ""),
-                "project": str(row.get("project") or project or ""),
-                "command": pending_metadata.get("command"),
-                "output_path": pending_metadata.get("output_path"),
-            },
-            discovered_by="registry_conflict",
+            continue
+        candidate_pid = int(candidate.get("pid") or 0)
+        candidate_tty = str(candidate.get("terminal_tty") or "")
+        candidate_metadata = _registry_metadata_from_row(candidate)
+        provider_tty = str(
+            candidate_metadata.get("provider_tty") or candidate_tty
         )
-        return promoted
-    except Exception:
+        if (
+            candidate_pid <= 0
+            or re.fullmatch(r"/dev/ttys[0-9]{3,}", candidate_tty) is None
+            or re.fullmatch(r"/dev/ttys[0-9]{3,}", provider_tty) is None
+            or not _process_alive(candidate_pid)
+        ):
+            continue
+        candidate_started_at = float(candidate.get("started_at") or 0)
+        process_started_at = _process_start_epoch(candidate_pid)
+        if (
+            candidate_started_at <= 0
+            or process_started_at <= 0
+            or process_started_at > candidate_started_at + 5
+            or candidate_started_at - process_started_at > 60
+        ):
+            continue
+        if (
+            not _codex_registry_process_birth_matches(candidate, candidate_pid)
+            or not _direct_terminal_binding_is_verified(
+                candidate,
+                "codex",
+                candidate_pid,
+                provider_tty=provider_tty,
+            )
+        ):
+            continue
+        family_rows = [
+            process
+            for process in process_rows
+            if str(process.get("tty") or "") == provider_tty
+            and str(process.get("project") or "") == project
+            and _process_is_descendant_of(
+                int(process.get("pid") or 0), candidate_pid
+            )
+        ]
+        verified_family_pids = sorted({
+            int(process.get("pid") or 0)
+            for process in family_rows
+            if int(process.get("pid") or 0) > 0
+        })
+        control_row = next(
+            (
+                process
+                for process in family_rows
+                if int(process.get("pid") or 0) == candidate_pid
+            ),
+            None,
+        )
+        if control_row is None or not verified_family_pids:
+            continue
+        rollout_probe = _codex_open_rollouts_by_pid(
+            verified_family_pids,
+            include_probe_status=True,
+        )
+        if isinstance(rollout_probe, tuple):
+            rollout_probe_ok, open_rollouts_by_pid = rollout_probe
+        else:
+            # Keep compatibility with injected test scanners while the real
+            # implementation always returns the status tuple requested above.
+            rollout_probe_ok, open_rollouts_by_pid = True, rollout_probe
+        if not rollout_probe_ok:
+            continue
+        family_rollouts = {
+            (
+                str(rollout.get("native_id") or ""),
+                str(rollout.get("project") or ""),
+                str(rollout.get("output_path") or ""),
+            )
+            for provider_pid in verified_family_pids
+            for rollout in (open_rollouts_by_pid.get(provider_pid) or [])
+            if str(rollout.get("project") or "") == project
+            and rollout.get("output_path")
+        }
+        if len(family_rollouts) != 1:
+            continue
+        rollout_native_id, _, exact_output_path = next(iter(family_rollouts))
+        if rollout_native_id != native_id:
+            continue
+        pending_proofs.append((candidate, exact_output_path, control_row))
+    if len(pending_proofs) != 1:
         return None
+    row, exact_output_path, control_row = pending_proofs[0]
+    pid = int(row.get("pid") or 0)
+    pending_metadata = _registry_metadata_from_row(row)
+    provider_tty = str(
+        pending_metadata.get("provider_tty")
+        or control_row.get("tty")
+        or ""
+    )
+    return _bind_codex_registry_to_terminal(
+        native_id,
+        project,
+        {
+            "pid": pid,
+            "tty": provider_tty,
+            "project": project,
+            "started_at": float(
+                control_row.get("started_at")
+                or row.get("started_at")
+                or observed_started_at
+            ),
+            "command": str(
+                control_row.get("command")
+                or pending_metadata.get("command")
+                or ""
+            ),
+            "native_id": native_id,
+            "output_path": exact_output_path,
+        },
+        discovered_by="registry_open_rollout",
+    )
 
 
 def _process_alive(pid: int) -> bool:
@@ -6328,34 +6570,48 @@ def _cached_runtime_snapshot(key: tuple, ttl_seconds: float, loader):
         cached = _runtime_snapshot_cache.get(key)
         if cached is not None and now - cached[0] < ttl_seconds:
             return _copy_cache_value(cached[1])
-        key_lock = _runtime_snapshot_key_locks.get(key)
-        if key_lock is None:
-            key_lock = threading.Lock()
-            _runtime_snapshot_key_locks[key] = key_lock
-    with key_lock:
-        now = _time.time()
+        key_lock_entry = _runtime_snapshot_key_locks.get(key)
+        if key_lock_entry is None:
+            key_lock_entry = _RuntimeSnapshotKeyLock()
+            _runtime_snapshot_key_locks[key] = key_lock_entry
+        key_lock_entry.users += 1
+    try:
+        with key_lock_entry.lock:
+            now = _time.time()
+            with _runtime_snapshot_cache_lock:
+                cached = _runtime_snapshot_cache.get(key)
+                if cached is not None and now - cached[0] < ttl_seconds:
+                    return _copy_cache_value(cached[1])
+                load_generation = _runtime_snapshot_cache_generation
+            value = loader()
+            stored_at = _time.time()
+            with _runtime_snapshot_cache_lock:
+                if load_generation == _runtime_snapshot_cache_generation:
+                    _runtime_snapshot_cache[key] = (
+                        stored_at,
+                        _copy_cache_value(value),
+                    )
+                    if len(_runtime_snapshot_cache) > 256:
+                        for old_key in list(_runtime_snapshot_cache.keys())[:64]:
+                            _runtime_snapshot_cache.pop(old_key, None)
+            return _copy_cache_value(value)
+    finally:
         with _runtime_snapshot_cache_lock:
-            cached = _runtime_snapshot_cache.get(key)
-            if cached is not None and now - cached[0] < ttl_seconds:
-                return _copy_cache_value(cached[1])
-        value = loader()
-        with _runtime_snapshot_cache_lock:
-            _runtime_snapshot_cache[key] = (now, _copy_cache_value(value))
-            if len(_runtime_snapshot_cache) > 256:
-                for old_key in list(_runtime_snapshot_cache.keys())[:64]:
-                    _runtime_snapshot_cache.pop(old_key, None)
-                    _runtime_snapshot_key_locks.pop(old_key, None)
-        return _copy_cache_value(value)
+            current_entry = _runtime_snapshot_key_locks.get(key)
+            if current_entry is key_lock_entry:
+                key_lock_entry.users -= 1
+                if key_lock_entry.users == 0:
+                    _runtime_snapshot_key_locks.pop(key, None)
 
 
 def _clear_runtime_load_caches_for_tests() -> None:
+    global _runtime_snapshot_cache_generation
     with _runtime_snapshot_cache_lock:
+        _runtime_snapshot_cache_generation += 1
         _runtime_snapshot_cache.clear()
-        _runtime_snapshot_key_locks.clear()
     _clear_auth_result_cache()
     _SESSION_TRANSCRIPT_STATS_CACHE.clear()
-    _codex_rollout_paths_cache["ts"] = 0.0
-    _codex_rollout_paths_cache["paths"] = []
+    _clear_codex_rollout_caches()
 
 
 def _cached_probe(key: str, ttl_seconds: float, loader):
@@ -6397,6 +6653,56 @@ def _process_parent_pid(pid: int) -> int:
         return 0
 
 
+def _process_start_epoch(pid: int) -> float:
+    if not pid:
+        return 0.0
+    ok, out, _ = _run_text(
+        ["/bin/ps", "-o", "lstart=", "-p", str(int(pid))],
+        timeout=2,
+    )
+    if not ok:
+        return 0.0
+    started = " ".join((out.strip().splitlines() or [""])[0].split())
+    try:
+        return datetime.strptime(started, "%a %b %d %H:%M:%S %Y").timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _registry_process_birth_matches(reg: dict | None, pid: int) -> bool:
+    if not reg or int(pid or 0) <= 0:
+        return False
+    metadata = _registry_metadata_from_row(reg)
+    try:
+        expected = float(metadata.get("process_started_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    actual = _process_start_epoch(int(pid))
+    return expected > 0 and actual > 0 and abs(expected - actual) <= 2
+
+
+def _codex_registry_process_birth_matches(reg: dict | None, pid: int) -> bool:
+    return _registry_process_birth_matches(reg, pid)
+
+
+def _process_is_descendant_of(pid: int, ancestor_pid: int) -> bool:
+    current = int(pid or 0)
+    ancestor_pid = int(ancestor_pid or 0)
+    if current <= 0 or ancestor_pid <= 0:
+        return False
+    seen: set[int] = set()
+    for _ in range(8):
+        if current == ancestor_pid:
+            return True
+        if current in seen:
+            return False
+        seen.add(current)
+        current = _process_parent_pid(current)
+        if current <= 0:
+            return False
+    return False
+
+
 def _process_tty(pid: int) -> str:
     if not pid:
         return ""
@@ -6418,8 +6724,84 @@ def _process_command(pid: int) -> str:
     return (out.strip().splitlines() or [""])[0].strip()
 
 
+def _terminal_script_owner_pid(provider_pid: int, terminal_tty: str) -> int:
+    """Return the exact script ancestor that owns one visible Terminal tab."""
+    provider_pid = int(provider_pid or 0)
+    if (
+        provider_pid <= 0
+        or re.fullmatch(r"/dev/ttys[0-9]{3,}", terminal_tty or "") is None
+    ):
+        return 0
+    current = _process_parent_pid(provider_pid)
+    seen: set[int] = set()
+    for _ in range(8):
+        if current <= 0 or current in seen:
+            return 0
+        seen.add(current)
+        command = _process_command(current)
+        if (
+            "/usr/bin/script" in command
+            and _process_tty(current) == terminal_tty
+        ):
+            return current
+        current = _process_parent_pid(current)
+    return 0
+
+
+def _direct_terminal_binding_is_verified(
+    row: dict | None,
+    provider: str,
+    pid: int,
+    *,
+    provider_tty: str | None = None,
+) -> bool:
+    """Prove how one provider PID maps to its visible Terminal tab."""
+    if not isinstance(row, dict) or int(pid or 0) <= 0:
+        return False
+    terminal_tty = str(row.get("terminal_tty") or "")
+    if re.fullmatch(r"/dev/ttys[0-9]{3,}", terminal_tty) is None:
+        return False
+    metadata = _registry_metadata_from_row(row)
+    expected_provider_tty = str(metadata.get("provider_tty") or "")
+    actual_provider_tty = str(provider_tty or _process_tty(pid) or "")
+    if expected_provider_tty and actual_provider_tty != expected_provider_tty:
+        return False
+    if actual_provider_tty == terminal_tty:
+        return True
+    owner_pid = _terminal_script_owner_pid(pid, terminal_tty)
+    if owner_pid <= 0:
+        return False
+    try:
+        stored_owner_pid = int(metadata.get("terminal_owner_pid") or 0)
+        stored_owner_started_at = float(
+            metadata.get("terminal_owner_process_started_at") or 0
+        )
+    except (TypeError, ValueError):
+        return False
+    if stored_owner_pid <= 0 or stored_owner_started_at <= 0:
+        return False
+    if stored_owner_pid != owner_pid:
+        return False
+    actual_owner_started_at = _process_start_epoch(owner_pid)
+    if (
+        actual_owner_started_at <= 0
+        or abs(actual_owner_started_at - stored_owner_started_at) > 2
+    ):
+        return False
+    return True
+
+
 def _codex_terminal_tty_candidates(reg: dict | None) -> list[str]:
     if not reg:
+        return []
+    pid = int(reg.get("pid") or 0)
+    if (
+        reg.get("closed_at") is not None
+        or pid <= 0
+        or not _process_alive(pid)
+        or not _registry_process_birth_matches(reg, pid)
+        or not _session_signal_target_is_verified(reg, "codex", pid)
+    ):
         return []
     candidates: list[str] = []
 
@@ -6427,9 +6809,6 @@ def _codex_terminal_tty_candidates(reg: dict | None) -> list[str]:
         if tty and re.match(r"^/dev/ttys[0-9]{3,}$", tty) and tty not in candidates:
             candidates.append(tty)
 
-    project = reg.get("project") or ""
-    original_tty = reg.get("terminal_tty") or ""
-    pid = int(reg.get("pid") or 0)
     chain: list[tuple[int, str, str]] = []
     seen: set[int] = set()
     current = pid
@@ -6440,19 +6819,18 @@ def _codex_terminal_tty_candidates(reg: dict | None) -> list[str]:
         chain.append((current, _process_tty(current), _process_command(current)))
         current = _process_parent_pid(current)
 
-    # Phone-spawned Codex runs under /usr/bin/script. The real Codex child owns
-    # a pseudo-tty, but Terminal.app only exposes the parent script tab tty.
-    for _, tty, command in chain:
-        if "/usr/bin/script" in command:
-            add(tty)
-
-    for row in _agent_registry_live("codex"):
-        if row.get("native_id", "").startswith("pending-") and row.get("project") == project:
-            add(row.get("terminal_tty") or "")
-
-    for _, tty, _ in chain:
-        add(tty)
-    add(original_tty)
+    # The provider's own tty is not always the tty that Terminal.app exposes.
+    # A visible Pairling launch runs below /usr/bin/script. Only the current,
+    # re-proved script ancestry may add the outer Terminal tab as a target.
+    metadata = _registry_metadata_from_row(reg)
+    provider_tty = str(metadata.get("provider_tty") or (chain[0][1] if chain else ""))
+    terminal_tty = str(reg.get("terminal_tty") or "")
+    if _direct_terminal_binding_is_verified(
+        reg, "codex", pid, provider_tty=provider_tty
+    ):
+        add(terminal_tty)
+    if terminal_tty == provider_tty:
+        add(provider_tty)
     return candidates
 
 
@@ -6938,10 +7316,10 @@ def _mirror_cli_json(args: list[str], timeout: int = 45) -> tuple[int, dict]:
     return proc.returncode, payload
 
 
-def _pid_for_tty_command(tty: str, command_name: str) -> int:
+def _pids_for_tty_command(tty: str, command_name: str) -> list[int]:
     tty_name = os.path.basename(tty or "")
     if not tty_name:
-        return 0
+        return []
     try:
         proc = subprocess.run(
             ["ps", "-t", tty_name, "-o", "pid=,comm=,args="],
@@ -6950,27 +7328,172 @@ def _pid_for_tty_command(tty: str, command_name: str) -> int:
             timeout=2,
         )
     except Exception:
-        return 0
+        return []
     if proc.returncode != 0:
-        return 0
+        return []
+    matching_pids: list[int] = []
     for line in proc.stdout.splitlines():
         parts = line.strip().split(None, 2)
         if len(parts) < 2 or not parts[0].isdigit():
             continue
-        haystack = " ".join(parts[1:]).lower()
+        # ``comm`` and ``args`` both begin with the executable on macOS. Use
+        # the full argv column when present so the command matcher sees one
+        # real process command instead of a duplicated executable token.
+        haystack = (parts[2] if len(parts) == 3 else parts[1]).lower()
         normalized_name = command_name.lower()
         if normalized_name == "codex":
-            matches = _is_codex_cli_command(haystack)
+            command_matches = _is_codex_cli_command(haystack)
         elif normalized_name == "claude":
-            matches = _is_claude_cli_command(haystack)
+            command_matches = _is_claude_cli_command(haystack)
         else:
-            matches = normalized_name in haystack
-        if matches:
-            return int(parts[0])
-    return 0
+            command_matches = normalized_name in haystack
+        if command_matches:
+            matching_pids.append(int(parts[0]))
+    return matching_pids
 
 
-_codex_terminal_scan_cache: dict[str, object] = {"ts": 0.0, "rows": []}
+def _pid_for_tty_command(tty: str, command_name: str) -> int:
+    matches = _pids_for_tty_command(tty, command_name)
+    return matches[0] if matches else 0
+
+
+def _scan_provider_process_rows(provider: str) -> tuple[bool, list[dict]]:
+    """Read provider processes once, including their own inner tty."""
+    if provider not in {"claude", "codex"}:
+        return False, []
+    try:
+        proc = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,tty=,lstart=,command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return False, []
+    if proc.returncode != 0:
+        return False, []
+    rows: list[dict] = []
+    cwd_probe_failed = False
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(None, 7)
+        if len(parts) < 8 or not parts[0].isdigit():
+            continue
+        tty_name = parts[1]
+        command = parts[7]
+        command_matches = (
+            _is_codex_cli_command(command)
+            if provider == "codex"
+            else _is_claude_cli_command(command)
+        )
+        if tty_name == "??" or not command_matches:
+            continue
+        try:
+            started = datetime.strptime(
+                " ".join(parts[2:7]), "%a %b %d %H:%M:%S %Y"
+            ).timestamp()
+        except Exception:
+            started = 0.0
+        pid = int(parts[0])
+        cwd = _process_cwd(pid)
+        if not cwd:
+            cwd_probe_failed = True
+            continue
+        rows.append({
+            "pid": pid,
+            "tty": f"/dev/{tty_name}",
+            "project": cwd,
+            "started_at": started,
+            "command": command,
+        })
+    # A partial process scan is not exact identity evidence. Returning a
+    # successful partial list would make a real session disappear or let the
+    # registry act on a subset while lsof is temporarily unavailable.
+    return not cwd_probe_failed, rows
+
+
+def _provider_terminal_identity_for_tab(
+    terminal_tty: str, provider: str
+) -> dict | None:
+    """Resolve one provider process below one exact visible Terminal tab."""
+    if re.fullmatch(r"/dev/ttys[0-9]{3,}", terminal_tty or "") is None:
+        return None
+    probe_ok, processes = _scan_provider_process_rows(provider)
+    if not probe_ok:
+        return None
+    groups: dict[tuple[str, int], list[dict]] = {}
+    for process in processes:
+        pid = int(process.get("pid") or 0)
+        provider_tty = str(process.get("tty") or "")
+        owner_pid = 0
+        if provider_tty != terminal_tty:
+            owner_pid = _terminal_script_owner_pid(pid, terminal_tty)
+            if owner_pid <= 0:
+                continue
+        groups.setdefault((provider_tty, owner_pid), []).append(process)
+    if len(groups) != 1:
+        return None
+    (provider_tty, owner_pid), candidates = next(iter(groups.items()))
+    control = min(candidates, key=lambda item: int(item.get("pid") or 0))
+    control_pid = int(control.get("pid") or 0)
+    family_pids = [
+        int(item.get("pid") or 0)
+        for item in candidates
+        if _process_is_descendant_of(int(item.get("pid") or 0), control_pid)
+    ]
+    if not family_pids:
+        return None
+    owner_started_at = _process_start_epoch(owner_pid) if owner_pid else 0.0
+    return {
+        **control,
+        "pid": control_pid,
+        "tty": terminal_tty,
+        "provider_tty": provider_tty,
+        "provider_pids": family_pids,
+        "terminal_owner_pid": owner_pid,
+        "terminal_owner_process_started_at": owner_started_at,
+    }
+
+
+def _wait_for_provider_terminal_identity(
+    terminal_tty: str,
+    provider: str,
+    timeout_seconds: float = 3.0,
+) -> dict | None:
+    deadline = _time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        identity = _provider_terminal_identity_for_tab(terminal_tty, provider)
+        if identity:
+            return identity
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            return None
+        _time.sleep(min(0.1, remaining))
+
+
+def _provider_terminal_identity_metadata(identity: dict | None) -> dict:
+    if not isinstance(identity, dict):
+        return {}
+    return {
+        "provider_tty": str(identity.get("provider_tty") or "") or None,
+        "terminal_owner_pid": int(identity.get("terminal_owner_pid") or 0) or None,
+        "terminal_owner_process_started_at": (
+            float(identity.get("terminal_owner_process_started_at") or 0)
+            or None
+        ),
+    }
+
+
+_CODEX_TERMINAL_VISIBILITY_GRACE_SECONDS = 15.0
+_codex_terminal_scan_cache: dict[str, object] = {
+    "ts": 0.0,
+    "rows": [],
+    "last_exact_ts": 0.0,
+    "last_exact_rows": [],
+    "probe_state": "unknown",
+    "probe_reason": None,
+    "membership_complete": False,
+}
+_codex_terminal_scan_lock = threading.Lock()
 _claude_terminal_scan_cache: dict[str, object] = {"ts": 0.0, "rows": []}
 _codex_task_boundary_cache: dict[str, dict[str, object]] = {}
 
@@ -6994,26 +7517,71 @@ def _process_cwd(pid: int) -> str:
 
 
 def _is_codex_cli_command(command: str) -> bool:
-    lower = (command or "").lower()
+    try:
+        argv = shlex.split(command or "")
+    except ValueError:
+        return False
+    if not argv:
+        return False
+    lower = " ".join(argv).lower()
     if "codex-code-mode-host" in lower:
         return False
-    return (
-        "/usr/local/bin/codex" in lower
-        or "@openai/codex" in lower
-        or "/codex/codex" in lower
-        or re.search(r"(^|/)codex(\s|$)", lower) is not None
-    )
+
+    def is_entrypoint(value: str) -> bool:
+        normalized = value.strip().lower()
+        basename = os.path.basename(normalized)
+        if basename == "codex":
+            return True
+        return (
+            "/@openai/codex/" in normalized
+            and basename in {"codex.js", "index.js"}
+        )
+
+    if is_entrypoint(argv[0]):
+        return True
+    launcher = os.path.basename(argv[0]).lower()
+    if launcher not in {"node", "nodejs", "bun"}:
+        return False
+    entrypoint = next((arg for arg in argv[1:] if not arg.startswith("-")), "")
+    return is_entrypoint(entrypoint)
 
 
 def _is_claude_cli_command(command: str) -> bool:
-    lower = (command or "").lower()
-    return re.search(r"(^|/)claude(\s|$)", lower) is not None
+    try:
+        argv = shlex.split(command or "")
+    except ValueError:
+        return False
+    if not argv:
+        return False
+
+    def is_entrypoint(value: str) -> bool:
+        normalized = value.strip().lower()
+        basename = os.path.basename(normalized)
+        if basename == "claude":
+            return True
+        return (
+            "/@anthropic-ai/claude-code/" in normalized
+            and basename in {"claude.js", "cli.js", "index.js"}
+        )
+
+    if is_entrypoint(argv[0]):
+        return True
+    launcher = os.path.basename(argv[0]).lower()
+    if launcher not in {"node", "nodejs", "bun"}:
+        return False
+    entrypoint = next((arg for arg in argv[1:] if not arg.startswith("-")), "")
+    return is_entrypoint(entrypoint)
 
 
-def _codex_open_rollouts_by_pid(pids: list[int]) -> dict[int, list[dict]]:
+def _codex_open_rollouts_by_pid(
+    pids: list[int],
+    *,
+    include_probe_status: bool = False,
+) -> dict[int, list[dict]] | tuple[bool, dict[int, list[dict]]]:
     unique_pids = sorted({int(pid) for pid in pids if int(pid or 0) > 0})
     if not unique_pids:
-        return {}
+        result: dict[int, list[dict]] = {}
+        return (True, result) if include_probe_status else result
     try:
         proc = subprocess.run(
             ["lsof", "-a", "-p", ",".join(str(pid) for pid in unique_pids), "-Fpn"],
@@ -7022,9 +7590,11 @@ def _codex_open_rollouts_by_pid(pids: list[int]) -> dict[int, list[dict]]:
             timeout=2,
         )
     except Exception:
-        return {}
+        result = {}
+        return (False, result) if include_probe_status else result
     if proc.returncode != 0:
-        return {}
+        result = {}
+        return (False, result) if include_probe_status else result
 
     root_text = str(CODEX_SESSIONS_DIR)
     current_pid = 0
@@ -7052,44 +7622,66 @@ def _codex_open_rollouts_by_pid(pids: list[int]) -> dict[int, list[dict]]:
             "output_path": str(approved),
             "project": meta["cwd"],
         })
-    return by_pid
+    return (True, by_pid) if include_probe_status else by_pid
 
 
 def _codex_live_terminal_rows() -> list[dict]:
+    with _codex_terminal_scan_lock:
+        return _codex_live_terminal_rows_locked()
+
+
+def _codex_live_terminal_rows_locked() -> list[dict]:
     now = _time.time()
     cached_ts = float(_codex_terminal_scan_cache.get("ts") or 0)
     if now - cached_ts < 2:
-        return list(_codex_terminal_scan_cache.get("rows") or [])
-    try:
-        proc = subprocess.run(
-            ["ps", "-axo", "pid=,tty=,lstart=,command="],
-            capture_output=True,
-            text=True,
-            timeout=2,
+        return copy.deepcopy(_codex_terminal_scan_cache.get("rows") or [])
+
+    def degraded_rows(reason: str) -> list[dict]:
+        exact_ts = float(_codex_terminal_scan_cache.get("last_exact_ts") or 0)
+        last_exact_rows = copy.deepcopy(
+            _codex_terminal_scan_cache.get("last_exact_rows") or []
         )
-    except Exception:
-        return []
-    if proc.returncode != 0:
-        return []
+        within_visibility_grace = (
+            now - exact_ts <= _CODEX_TERMINAL_VISIBILITY_GRACE_SECONDS
+        )
+        if within_visibility_grace:
+            rows = last_exact_rows
+        else:
+            rows = []
+            for row in last_exact_rows:
+                pid = int(row.get("pid") or 0)
+                expected_started_at = float(row.get("started_at") or 0)
+                actual_started_at = _process_start_epoch(pid)
+                if (
+                    pid > 0
+                    and expected_started_at > 0
+                    and _process_alive(pid)
+                    and actual_started_at > 0
+                    and abs(actual_started_at - expected_started_at) <= 2
+                ):
+                    rows.append(row)
+        for row in rows:
+            row["identity_probe_state"] = "failed"
+            row["identity_probe_reason"] = reason
+        _codex_terminal_scan_cache["ts"] = now
+        _codex_terminal_scan_cache["rows"] = copy.deepcopy(rows)
+        _codex_terminal_scan_cache["probe_state"] = "failed"
+        _codex_terminal_scan_cache["probe_reason"] = reason
+        _codex_terminal_scan_cache["membership_complete"] = (
+            within_visibility_grace
+            and len(rows) == len(last_exact_rows)
+            and bool(last_exact_rows)
+        )
+        return rows
+
+    ps_ok, process_rows = _scan_provider_process_rows("codex")
+    if not ps_ok:
+        return degraded_rows("process_scan_failed")
 
     by_tty: dict[str, dict] = {}
-    for line in proc.stdout.splitlines():
-        parts = line.strip().split(None, 7)
-        if len(parts) < 8 or not parts[0].isdigit():
-            continue
-        tty_name = parts[1]
-        command = parts[7]
-        if tty_name == "??" or not _is_codex_cli_command(command):
-            continue
-        try:
-            started = datetime.strptime(" ".join(parts[2:7]), "%a %b %d %H:%M:%S %Y").timestamp()
-        except Exception:
-            started = 0.0
-        pid = int(parts[0])
-        tty = f"/dev/{tty_name}"
-        cwd = _process_cwd(pid)
-        if not cwd:
-            continue
+    for process in process_rows:
+        pid = int(process.get("pid") or 0)
+        tty = str(process.get("tty") or "")
         current = by_tty.get(tty)
         # The Node wrapper is the process we want for signals; it is usually
         # the lower pid on the same tty, while the native binary is its child.
@@ -7097,9 +7689,9 @@ def _codex_live_terminal_rows() -> list[dict]:
             current = {
                 "pid": pid,
                 "tty": tty,
-                "project": cwd,
-                "started_at": started,
-                "command": command,
+                "project": process.get("project"),
+                "started_at": process.get("started_at"),
+                "command": process.get("command"),
                 "provider_pids": [pid],
             }
             by_tty[tty] = current
@@ -7108,21 +7700,44 @@ def _codex_live_terminal_rows() -> list[dict]:
             if pid < int(current.get("pid") or 0):
                 current.update({
                     "pid": pid,
-                    "project": cwd,
-                    "started_at": started,
-                    "command": command,
+                    "project": process.get("project"),
+                    "started_at": process.get("started_at"),
+                    "command": process.get("command"),
                 })
 
-    rollout_map = _codex_open_rollouts_by_pid([
-        pid
-        for row in by_tty.values()
-        for pid in row.get("provider_pids") or []
-    ])
+    rollout_probe = _codex_open_rollouts_by_pid(
+        [
+            pid
+            for row in by_tty.values()
+            for pid in row.get("provider_pids") or []
+        ],
+        include_probe_status=True,
+    )
+    if isinstance(rollout_probe, tuple):
+        rollout_probe_ok, rollout_map = rollout_probe
+    else:
+        # Test doubles written against the older helper contract return only
+        # the exact map. Production calls always use the status tuple.
+        rollout_probe_ok, rollout_map = True, rollout_probe
+    if not rollout_probe_ok:
+        return degraded_rows("rollout_identity_probe_failed")
     for row in by_tty.values():
-        candidates: dict[str, dict] = {}
-        for pid in row.get("provider_pids") or []:
+        candidates: dict[tuple[str, str, str], dict] = {}
+        control_pid = int(row.get("pid") or 0)
+        verified_provider_pids = [
+            pid
+            for pid in (row.get("provider_pids") or [])
+            if _process_is_descendant_of(int(pid), control_pid)
+        ]
+        for pid in verified_provider_pids:
             for candidate in rollout_map.get(int(pid), []):
-                candidates[candidate["native_id"]] = candidate
+                identity = (
+                    str(candidate.get("native_id") or ""),
+                    str(candidate.get("project") or ""),
+                    str(candidate.get("output_path") or ""),
+                )
+                if all(identity):
+                    candidates[identity] = candidate
         if len(candidates) != 1:
             continue
         transcript = next(iter(candidates.values()))
@@ -7131,9 +7746,16 @@ def _codex_live_terminal_rows() -> list[dict]:
         row["process_project"] = row.get("project") or ""
         row["project"] = transcript["project"]
     rows = list(by_tty.values())
+    for row in rows:
+        row["identity_probe_state"] = "exact"
     _codex_terminal_scan_cache["ts"] = now
-    _codex_terminal_scan_cache["rows"] = rows
-    return rows
+    _codex_terminal_scan_cache["rows"] = copy.deepcopy(rows)
+    _codex_terminal_scan_cache["last_exact_ts"] = now
+    _codex_terminal_scan_cache["last_exact_rows"] = copy.deepcopy(rows)
+    _codex_terminal_scan_cache["probe_state"] = "exact"
+    _codex_terminal_scan_cache["probe_reason"] = None
+    _codex_terminal_scan_cache["membership_complete"] = True
+    return copy.deepcopy(rows)
 
 
 def _claude_live_terminal_rows() -> list[dict]:
@@ -7141,64 +7763,28 @@ def _claude_live_terminal_rows() -> list[dict]:
     cached_ts = float(_claude_terminal_scan_cache.get("ts") or 0)
     if now - cached_ts < 2:
         return list(_claude_terminal_scan_cache.get("rows") or [])
-    try:
-        proc = subprocess.run(
-            ["ps", "-axo", "pid=,tty=,lstart=,command="],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-    except Exception:
-        return []
-    if proc.returncode != 0:
+    ps_ok, process_rows = _scan_provider_process_rows("claude")
+    if not ps_ok:
         return []
 
     by_tty: dict[str, dict] = {}
-    for line in proc.stdout.splitlines():
-        parts = line.strip().split(None, 7)
-        if len(parts) < 8 or not parts[0].isdigit():
-            continue
-        tty_name = parts[1]
-        command = parts[7]
-        if tty_name == "??" or not _is_claude_cli_command(command):
-            continue
-        try:
-            started = datetime.strptime(" ".join(parts[2:7]), "%a %b %d %H:%M:%S %Y").timestamp()
-        except Exception:
-            started = 0.0
-        pid = int(parts[0])
-        tty = f"/dev/{tty_name}"
-        cwd = _process_cwd(pid)
-        if not cwd:
-            continue
+    for process in process_rows:
+        pid = int(process.get("pid") or 0)
+        tty = str(process.get("tty") or "")
         current = by_tty.get(tty)
         if current is None or pid < int(current.get("pid") or 0):
             by_tty[tty] = {
                 "pid": pid,
                 "tty": tty,
-                "project": cwd,
-                "started_at": started,
-                "command": command,
+                "project": process.get("project"),
+                "started_at": process.get("started_at"),
+                "command": process.get("command"),
+                "identity_probe_state": "exact",
             }
     rows = list(by_tty.values())
     _claude_terminal_scan_cache["ts"] = now
     _claude_terminal_scan_cache["rows"] = rows
     return rows
-
-
-def _codex_discover_terminal_control(project: str, observed_started_at: float) -> dict | None:
-    if not project or observed_started_at <= 0:
-        return None
-    candidates = [
-        row for row in _codex_live_terminal_rows()
-        if row.get("project") == project and not row.get("native_id")
-    ]
-    if not candidates:
-        return None
-    candidates.sort(key=lambda row: abs(float(row.get("started_at") or 0) - observed_started_at))
-    best = candidates[0]
-    delta = abs(float(best.get("started_at") or 0) - observed_started_at)
-    return best if delta <= 600 else None
 
 
 def _codex_discover_terminal_control_for_session(native_id: str) -> dict | None:
@@ -7207,6 +7793,7 @@ def _codex_discover_terminal_control_for_session(native_id: str) -> dict | None:
     matches = [
         row for row in _codex_live_terminal_rows()
         if row.get("native_id") == native_id
+        and str(row.get("identity_probe_state") or "exact") == "exact"
     ]
     return matches[0] if len(matches) == 1 else None
 
@@ -7229,6 +7816,8 @@ def _claude_terminal_native_id(row: dict) -> str:
 
 def _codex_register_terminal_only_rows(seen: set[str]) -> None:
     for terminal in _codex_live_terminal_rows():
+        if str(terminal.get("identity_probe_state") or "exact") != "exact":
+            continue
         tty = str(terminal.get("tty") or "")
         project = str(terminal.get("project") or "")
         pid = int(terminal.get("pid") or 0)
@@ -7240,22 +7829,34 @@ def _codex_register_terminal_only_rows(seen: set[str]) -> None:
             continue
         existing = _agent_registry_get_by_tty("codex", tty)
         if existing and not existing.get("closed_at"):
-            native_id = existing.get("native_id") or ""
-            if native_id in seen:
-                continue
-            if native_id.startswith("terminal-") and str(existing.get("project") or "") != project:
-                _agent_registry_mark_closed("codex", native_id)
-                existing = None
-            else:
-                _agent_registry_update_control(
+            native_id = str(existing.get("native_id") or "")
+            existing_pid = int(existing.get("pid") or 0)
+            expected_terminal_native_id = _codex_terminal_native_id(terminal)
+            if (
+                native_id == expected_terminal_native_id
+                and str(existing.get("project") or "") == project
+            ):
+                existing_metadata = _registry_metadata_from_row(existing)
+                _agent_registry_upsert(
                     "codex",
                     native_id,
+                    project,
                     pid=pid,
                     terminal_tty=tty,
                     state="running",
-                    reopen=True,
+                    metadata=existing_metadata,
+                    working_on=str(existing.get("working_on") or "Live Codex terminal"),
                 )
                 continue
+            if (
+                native_id.startswith("pending-")
+                and existing_pid == pid
+                and str(existing.get("project") or "") == project
+                and _codex_registry_process_birth_matches(existing, pid)
+            ):
+                continue
+            if native_id.startswith("terminal-") or existing_pid <= 0 or not _process_alive(existing_pid):
+                _agent_registry_mark_closed("codex", native_id)
         native_id = _codex_terminal_native_id(terminal)
         if native_id in seen:
             continue
@@ -7289,6 +7890,9 @@ def _session_has_verified_provider_process(row: dict, provider: str | None = Non
     pid = int(row.get("pid") or row.get("claude_pid") or 0)
     tty = str(row.get("terminal_tty") or "")
     project = str(row.get("project") or "")
+    native_id = str(row.get("native_id") or "")
+    if provider == "codex" and not _codex_registry_process_birth_matches(row, pid):
+        return False
 
     candidates = (
         _codex_live_terminal_rows() if provider == "codex"
@@ -7305,32 +7909,31 @@ def _session_has_verified_provider_process(row: dict, provider: str | None = Non
         except OSError:
             return candidate_project == project
 
-    if re.match(r"^/dev/ttys[0-9]{3,}$", tty):
-        for candidate in candidates:
-            if str(candidate.get("tty") or "") != tty:
-                continue
-            candidate_project = str(candidate.get("project") or "")
-            if not project_matches(candidate_project):
-                continue
-            return True
-        return False
-
     if pid <= 0 or not _process_alive(pid):
         return False
     for candidate in candidates:
+        if str(candidate.get("identity_probe_state") or "exact") != "exact":
+            continue
         if int(candidate.get("pid") or 0) != pid:
             continue
-        if project_matches(str(candidate.get("project") or "")):
-            return True
-    command = _process_command(pid)
-    provider_matches = (
-        _is_codex_cli_command(command)
-        if provider == "codex"
-        else _is_claude_cli_command(command)
-    )
-    if not provider_matches:
-        return False
-    return project_matches(_process_cwd(pid))
+        if (
+            provider == "codex"
+            and native_id
+            and not native_id.startswith(("pending-", "terminal-"))
+            and str(candidate.get("native_id") or "") != native_id
+        ):
+            continue
+        if not project_matches(str(candidate.get("project") or "")):
+            continue
+        if tty and not _direct_terminal_binding_is_verified(
+            row,
+            provider,
+            pid,
+            provider_tty=str(candidate.get("tty") or ""),
+        ):
+            continue
+        return True
+    return False
 
 
 def _session_signal_target_is_verified(row: dict, provider: str, pid: int) -> bool:
@@ -7363,6 +7966,7 @@ def _verified_session_signal_target(
 ) -> tuple[dict | None, int, str | None]:
     """Resolve and verify the exact live process that may receive a signal."""
     if provider == "codex":
+        native_id = _agent_registry_resolve_native_alias("codex", native_id)
         row = _agent_registry_get("codex", native_id)
     elif provider == "claude":
         row = _claude_sessions_backend().session_record(native_id)
@@ -8681,7 +9285,26 @@ CODEX_CONTROL_CAPABILITIES = [
 ]
 
 _SESSION_TRANSCRIPT_STATS_CACHE: dict[tuple[str, str, str, int, int], dict] = {}
+_codex_rollout_paths_lock = threading.Lock()
 _codex_rollout_paths_cache: dict[str, object] = {"ts": 0.0, "paths": []}
+_codex_rollout_index_lock = threading.Lock()
+_codex_rollout_index_cache: dict[str, object] = {
+    "signature": (),
+    "meta_by_file": {},
+    "entries": [],
+    "by_id": {},
+}
+
+
+def _clear_codex_rollout_caches() -> None:
+    with _codex_rollout_paths_lock:
+        _codex_rollout_paths_cache["ts"] = 0.0
+        _codex_rollout_paths_cache["paths"] = []
+    with _codex_rollout_index_lock:
+        _codex_rollout_index_cache["signature"] = ()
+        _codex_rollout_index_cache["meta_by_file"] = {}
+        _codex_rollout_index_cache["entries"] = []
+        _codex_rollout_index_cache["by_id"] = {}
 _MEANINGFUL_LINE_PARSE_MAX_BYTES = 1024 * 1024
 _MEANINGFUL_LINE_PREFIX_BYTES = 128 * 1024
 _REVERSE_JSONL_CHUNK_BYTES = 64 * 1024
@@ -10379,9 +11002,12 @@ def _direct_terminal_action_profile(
     if pid <= 0 or not _process_alive(pid):
         return read_only
     # Bind the recorded provider process to the exact Terminal tab before
-    # advertising any action. The endpoints repeat the identity check before
-    # signals leave the daemon, and send_text targets this exact TTY.
-    if _pid_for_tty_command(tty, provider) != pid:
+    # advertising any action. A script-backed launch has separate provider and
+    # visible-tab ttys, so this proves their current ancestry instead of
+    # assuming they are the same device.
+    if not _direct_terminal_binding_is_verified(
+        registry_row, provider, pid
+    ):
         return read_only
     if not _session_signal_target_is_verified(registry_row, provider, pid):
         return read_only
@@ -10486,6 +11112,15 @@ def _terminal_surface_source(raw_session: str) -> dict:
         direct_actions = _direct_terminal_action_profile(
             "codex", reg, tty, allowed=not broker_id
         )
+        if direct_actions.get("control_profile") == "read_only":
+            return {
+                "available": False,
+                "source": "unavailable",
+                "reason": "process_identity_unverified",
+                "tty": tty,
+                "pid": int(reg.get("pid") or 0),
+                **direct_actions,
+            }
         return {
             "available": True,
             "source": "terminal_app_contents",
@@ -10568,6 +11203,15 @@ def _terminal_surface_source(raw_session: str) -> dict:
         direct_actions = _direct_terminal_action_profile(
             "claude", reg, tty, allowed=not broker_id
         )
+        if direct_actions.get("control_profile") == "read_only":
+            return {
+                "available": False,
+                "source": "unavailable",
+                "reason": "process_identity_unverified",
+                "tty": tty,
+                "pid": int(reg.get("pid") or 0),
+                **direct_actions,
+            }
         return {
             "available": True,
             "source": "terminal_app_contents",
@@ -11699,31 +12343,36 @@ def _session_live_pending_approval(provider: str, native_id: str) -> dict | None
     native_id = (native_id or "").strip()
     if not provider or not native_id:
         return None
-    qualified = _qualified_session_id(provider, native_id)
     try:
         canonical_native_id = str(
             _agent_registry_resolve_native_alias(provider, native_id) or native_id
         ).strip()
     except Exception:
         canonical_native_id = native_id
-    canonical_qualified = _qualified_session_id(provider, canonical_native_id)
+    identity_values = {native_id, canonical_native_id}
+    for identity in _session_event_identity_keys(
+        None, _qualified_session_id(provider, canonical_native_id)
+    ):
+        identity_provider, identity_native_id = _parse_agent_session_ref(identity)
+        if identity_provider == provider and identity_native_id:
+            identity_values.add(identity_native_id)
+            identity_values.add(
+                _qualified_session_id(identity_provider, identity_native_id)
+            )
+    identity_values.add(_qualified_session_id(provider, native_id))
+    identity_values.add(_qualified_session_id(provider, canonical_native_id))
+    ordered_identities = sorted(value for value in identity_values if value)
+    native_placeholders = ", ".join("?" for _ in ordered_identities)
+    session_placeholders = ", ".join("?" for _ in ordered_identities)
     try:
         with _agent_registry_conn() as conn:
             row = conn.execute(
                 "SELECT * FROM pending_approvals "
                 "WHERE provider=? AND state IN ('pending', 'attention') "
-                "AND (native_id IN (?, ?) "
-                "OR session_id IN (?, ?, ?, ?)) "
+                f"AND (native_id IN ({native_placeholders}) "
+                f"OR session_id IN ({session_placeholders})) "
                 "ORDER BY created_at ASC LIMIT 1",
-                (
-                    provider,
-                    native_id,
-                    canonical_native_id,
-                    native_id,
-                    qualified,
-                    canonical_native_id,
-                    canonical_qualified,
-                ),
+                (provider, *ordered_identities, *ordered_identities),
             ).fetchone()
     except Exception:
         return None
@@ -12562,6 +13211,8 @@ def _write_agent_turn_state(provider: str, native_id: str, state: str, *,
                             event: str = "daemon",
                             request_nonce: str | None = None,
                             mac_install_id: str | None = None) -> dict:
+    if provider == "codex":
+        native_id = _agent_registry_resolve_native_alias(provider, native_id)
     now = _time.time()
     prior: dict = {}
     path = _turn_state_path(provider, native_id)
@@ -12636,7 +13287,9 @@ def _approval_screen_key(snapshot: dict | None) -> str:
 def _clear_codex_approval(broker_id: str, session: dict) -> None:
     nonce = _CODEX_APPROVAL_NONCES.pop(broker_id, None)
     _CODEX_APPROVAL_SCREEN_KEYS.pop(broker_id, None)
-    native_id = str(session.get("native_id") or "")
+    native_id = _agent_registry_resolve_native_alias(
+        "codex", str(session.get("native_id") or "")
+    )
     if nonce:
         row = _pending_approval_get(nonce)
         row_state = str((row or {}).get("state") or "")
@@ -12688,7 +13341,9 @@ def _scan_codex_approvals_once() -> None:
         _CODEX_APPROVAL_SCREEN_KEYS[broker_id] = screen_key
         if _CODEX_APPROVAL_NONCES.get(broker_id) == nonce:
             continue
-        native_id = str(session.get("native_id") or "")
+        native_id = _agent_registry_resolve_native_alias(
+            "codex", str(session.get("native_id") or "")
+        )
         _pending_approval_record(
             request_nonce=nonce,
             provider="codex",
@@ -12961,23 +13616,185 @@ def _codex_rollout_meta(path: Path) -> dict | None:
 
 
 def _codex_rollout_paths() -> list[Path]:
-    if not CODEX_SESSIONS_DIR.is_dir():
-        return []
-    now = _time.time()
-    cached_ts = float(_codex_rollout_paths_cache.get("ts") or 0)
-    if now - cached_ts < CODEX_ROLLOUT_PATHS_CACHE_SECONDS:
-        return list(_codex_rollout_paths_cache.get("paths") or [])
-    paths: list[Path] = []
+    with _codex_rollout_paths_lock:
+        if not CODEX_SESSIONS_DIR.is_dir():
+            _codex_rollout_paths_cache["ts"] = 0.0
+            _codex_rollout_paths_cache["paths"] = []
+            return []
+        now = _time.time()
+        cached_ts = float(_codex_rollout_paths_cache.get("ts") or 0)
+        if now - cached_ts < CODEX_ROLLOUT_PATHS_CACHE_SECONDS:
+            return list(_codex_rollout_paths_cache.get("paths") or [])
+        try:
+            root = CODEX_SESSIONS_DIR.resolve(strict=True)
+        except OSError:
+            return []
+        paths: list[Path] = []
+        try:
+            for path in root.rglob("rollout-*.jsonl"):
+                try:
+                    if path.is_symlink():
+                        continue
+                    resolved = path.resolve(strict=True)
+                    resolved.relative_to(root)
+                    if resolved.is_file():
+                        paths.append(resolved)
+                except (OSError, ValueError):
+                    continue
+        except OSError:
+            return []
+
+        def modified_at(path: Path) -> float:
+            try:
+                return path.stat().st_mtime
+            except OSError:
+                return 0.0
+
+        paths.sort(key=modified_at, reverse=True)
+        _codex_rollout_paths_cache["ts"] = _time.time()
+        _codex_rollout_paths_cache["paths"] = paths
+        return list(paths)
+
+
+def _codex_rollout_file_identity(path: Path) -> tuple[str, int, int, int, int, int] | None:
     try:
-        for p in CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"):
-            if p.is_file():
-                paths.append(p)
+        link_stat = path.lstat()
+        target_stat = path.stat()
     except OSError:
-        return []
-    paths.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
-    _codex_rollout_paths_cache["ts"] = now
-    _codex_rollout_paths_cache["paths"] = paths
-    return paths
+        return None
+    return (
+        str(path),
+        int(link_stat.st_dev),
+        int(link_stat.st_ino),
+        int(link_stat.st_mode),
+        int(target_stat.st_dev),
+        int(target_stat.st_ino),
+    )
+
+
+def _codex_rollout_index(paths: list[Path]) -> tuple[list[tuple[Path, dict]], dict[str, Path]]:
+    """Index immutable rollout identities without repeatedly opening every file."""
+    fingerprinted_paths = [
+        (path, identity)
+        for path in paths
+        if (identity := _codex_rollout_file_identity(path)) is not None
+    ]
+    signature = tuple(identity for _, identity in fingerprinted_paths)
+    with _codex_rollout_index_lock:
+        cached_meta = _codex_rollout_index_cache.get("meta_by_file")
+        cached_meta_by_file = dict(cached_meta) if isinstance(cached_meta, dict) else {}
+        has_incomplete_entry = any(
+            not isinstance(cached_meta_by_file.get(identity), dict)
+            for identity in signature
+        )
+        if (
+            signature == _codex_rollout_index_cache.get("signature")
+            and not has_incomplete_entry
+        ):
+            cached_entries = _codex_rollout_index_cache.get("entries") or []
+            return (
+                [(path, copy.deepcopy(meta)) for path, meta in cached_entries],
+                dict(_codex_rollout_index_cache.get("by_id") or {}),
+            )
+
+        previous_by_file = cached_meta_by_file
+        meta_by_file: dict[tuple[str, int, int, int, int, int], dict | None] = {}
+        entries: list[tuple[Path, dict]] = []
+        by_id: dict[str, Path] = {}
+        for path, identity in fingerprinted_paths:
+            cached_meta = previous_by_file.get(identity)
+            meta = cached_meta if isinstance(cached_meta, dict) else _codex_rollout_meta(path)
+            if not isinstance(meta, dict):
+                meta_by_file[identity] = None
+                continue
+            native_id = str(meta.get("id") or "")
+            if not _safe_agent_native_id(native_id):
+                meta_by_file[identity] = None
+                continue
+            approved = _approved_codex_transcript_path(path, native_id)
+            if approved is None:
+                meta_by_file[identity] = None
+                continue
+            stored_meta = copy.deepcopy(meta)
+            meta_by_file[identity] = stored_meta
+            entries.append((approved, copy.deepcopy(stored_meta)))
+            by_id.setdefault(native_id, approved)
+
+        _codex_rollout_index_cache["signature"] = signature
+        _codex_rollout_index_cache["meta_by_file"] = meta_by_file
+        _codex_rollout_index_cache["entries"] = entries
+        _codex_rollout_index_cache["by_id"] = by_id
+        return (
+            [(path, copy.deepcopy(meta)) for path, meta in entries],
+            dict(by_id),
+        )
+
+
+def _codex_selected_rollout_entries() -> list[tuple[Path, dict]]:
+    """Select one verified transcript path for each Codex session identity."""
+    indexed, _ = _codex_rollout_index(_codex_rollout_paths())
+    selected: dict[str, tuple[Path, dict]] = {}
+
+    def select(native_id: str, candidate: Path) -> None:
+        if native_id in selected:
+            return
+        approved = _approved_codex_transcript_path(candidate, native_id)
+        if approved is None:
+            return
+        meta = _codex_rollout_meta(approved)
+        if not isinstance(meta, dict) or meta.get("id") != native_id:
+            return
+        selected[native_id] = (approved, meta)
+
+    exact_live_paths: dict[str, set[Path]] = {}
+    for terminal in _codex_live_terminal_rows():
+        if str(terminal.get("identity_probe_state") or "exact") != "exact":
+            continue
+        native_id = str(terminal.get("native_id") or "")
+        output_path = str(terminal.get("output_path") or "")
+        if not _safe_agent_native_id(native_id) or not output_path:
+            continue
+        approved = _approved_codex_transcript_path(Path(output_path), native_id)
+        if approved is not None:
+            exact_live_paths.setdefault(native_id, set()).add(approved)
+    for native_id, paths in exact_live_paths.items():
+        if len(paths) == 1:
+            select(native_id, next(iter(paths)))
+
+    registry_rows = [
+        *_agent_registry_live("codex", limit=1000),
+        *_agent_registry_recent("codex", since_min=60 * 24 * 3650, limit=5000),
+    ]
+    for row in registry_rows:
+        native_id = str(row.get("native_id") or "")
+        if not _safe_agent_native_id(native_id):
+            continue
+        if _agent_registry_resolve_native_alias("codex", native_id) != native_id:
+            continue
+        output_path = _registry_metadata_from_row(row).get("output_path")
+        if isinstance(output_path, str) and output_path:
+            select(native_id, Path(output_path))
+
+    def indexed_modified_at(entry: tuple[Path, dict]) -> float:
+        try:
+            return entry[0].stat().st_mtime
+        except OSError:
+            return 0.0
+
+    for path, meta in sorted(indexed, key=indexed_modified_at, reverse=True):
+        native_id = str(meta.get("id") or "")
+        if _safe_agent_native_id(native_id):
+            select(native_id, path)
+
+    def selected_order(entry: tuple[Path, dict]) -> tuple[float, str]:
+        path, meta = entry
+        try:
+            modified_at = path.stat().st_mtime
+        except OSError:
+            modified_at = 0.0
+        return (-modified_at, str(meta.get("id") or ""))
+
+    return sorted(selected.values(), key=selected_order)
 
 
 def _approved_codex_transcript_path(path: Path, native_id: str) -> Path | None:
@@ -13139,6 +13956,9 @@ def _apply_codex_task_boundary(native_id: str, payload: dict, state_path: Path) 
 def _codex_turn_state_payload(native_id: str, *, apply_boundary: bool = True) -> dict | None:
     if not _safe_agent_native_id(native_id):
         return None
+    native_id = _agent_registry_resolve_native_alias("codex", native_id)
+    if not _safe_agent_native_id(native_id):
+        return None
     path = _turn_state_path("codex", native_id)
     if path.is_file():
         try:
@@ -13254,20 +14074,21 @@ def _codex_control_overlay(row: dict, observed_mtime: float | None = None, *, ve
         return row
     pid = int(reg.get("pid") or 0)
     tty = reg.get("terminal_tty") or ""
-    if verify_process and tty and (not pid or not _process_alive(pid)):
-        fresh_pid = _pid_for_tty_command(tty, "codex")
-        if fresh_pid:
-            pid = fresh_pid
-            _agent_registry_update_control(
-                "codex",
-                row["native_id"],
-                pid=pid,
-                terminal_tty=tty,
-                state="running",
-                reopen=True,
-            )
     if verify_process and pid and not _process_alive(pid):
         _agent_registry_mark_closed("codex", row["native_id"])
+        row["closed_at"] = int(_time.time())
+        row["state"] = "terminated"
+        row["capabilities"] = [
+            cap
+            for cap in (row.get("capabilities") or [])
+            if cap in {"transcript", "export", "live_state"}
+        ]
+        row["controllability"] = {
+            "can_send_text": False,
+            "can_interrupt": False,
+            "can_terminate": False,
+            "reason": "Session is closed; transcript remains readable.",
+        }
         return row
     state_payload = _codex_turn_state_payload(row.get("native_id") or "", apply_boundary=False)
     surface_caps = _terminal_surface_capabilities(
@@ -13349,8 +14170,6 @@ def _codex_pending_registry_rows(seen: set[str], live_only: bool, active_within_
             _agent_registry_mark_closed("codex", native_id)
             continue
         process_alive = bool(pid and _process_alive(pid))
-        if live_only and heartbeat < cutoff and not process_alive:
-            continue
         stale_seconds = max(0, int(_time.time() - heartbeat)) if heartbeat else 0
         surface_caps = _terminal_surface_capabilities(
             _qualified_session_id("codex", native_id)
@@ -13358,6 +14177,15 @@ def _codex_pending_registry_rows(seen: set[str], live_only: bool, active_within_
         can_send = bool(surface_caps.get("can_send_text"))
         can_interrupt = bool(surface_caps.get("can_interrupt"))
         can_terminate = bool(surface_caps.get("can_terminate"))
+        process_verified = bool(
+            process_alive and _session_has_verified_provider_process(reg, "codex")
+        )
+        broker_verified = bool(
+            surface_caps.get("source") == "broker_vt"
+            and (can_send or can_interrupt or can_terminate)
+        )
+        if live_only and not (process_verified or broker_verified):
+            continue
         caps = (
             ["live_state"]
             + (["send_text", "upload", "commands"] if can_send else [])
@@ -13398,7 +14226,15 @@ def _codex_pending_registry_rows(seen: set[str], live_only: bool, active_within_
             "started_at": int(reg.get("started_at") or _time.time()),
             "last_heartbeat": int(heartbeat or _time.time()),
             "stale_seconds": stale_seconds,
-            "source_freshness": "registry_stale_process_alive" if heartbeat < cutoff and process_alive else "registry_live",
+            "source_freshness": (
+                "registry_stale_process_verified"
+                if heartbeat < cutoff and process_verified
+                else (
+                    "registry_live"
+                    if process_verified or broker_verified
+                    else "registry_unverified"
+                )
+            ),
             "terminal_tty": tty,
             "pid": pid,
             "terminal_title": metadata.get("terminal_title"),
@@ -13435,13 +14271,28 @@ def _codex_pending_registry_rows(seen: set[str], live_only: bool, active_within_
     return rows
 
 
-def _codex_recent_closed_registry_rows(seen: set[str], active_within_min: int) -> list[dict]:
+def _codex_recent_closed_registry_rows(
+    seen: set[str],
+    active_within_min: int,
+    transcript_paths_by_id: dict[str, Path] | None = None,
+) -> list[dict]:
     rows: list[dict] = []
-    for reg in _agent_registry_recent("codex", since_min=active_within_min, limit=1000):
-        if not reg.get("closed_at"):
-            continue
+    recent = [
+        reg
+        for reg in _agent_registry_recent(
+            "codex", since_min=active_within_min, limit=1000
+        )
+        if reg.get("closed_at")
+    ]
+    recent.sort(
+        key=lambda reg: (
+            str(reg.get("native_id") or "").startswith(("pending-", "terminal-")),
+            -float(reg.get("closed_at") or 0),
+        )
+    )
+    for reg in recent:
         native_id = reg.get("native_id") or ""
-        if not native_id or native_id in seen:
+        if not native_id:
             continue
         try:
             metadata = json.loads(reg.get("metadata_json") or "{}")
@@ -13452,18 +14303,39 @@ def _codex_recent_closed_registry_rows(seen: set[str], active_within_min: int) -
         started_at = int(float(reg.get("started_at") or reg.get("last_heartbeat") or _time.time()))
         last_heartbeat = int(float(reg.get("last_heartbeat") or started_at))
         closed_at = int(float(reg.get("closed_at") or last_heartbeat))
-        transcript_path = _resolve_codex_transcript(native_id)
-        turn_stats = _session_transcript_stats(transcript_path, "codex", native_id)
+        resolved_native_id = _agent_registry_resolve_native_alias("codex", native_id)
+        if not resolved_native_id or resolved_native_id in seen:
+            continue
+        if transcript_paths_by_id is None:
+            transcript_path = _resolve_codex_transcript(resolved_native_id)
+        else:
+            transcript_path = None
+            recorded_path = metadata.get("output_path")
+            if isinstance(recorded_path, str) and recorded_path:
+                transcript_path = _approved_codex_transcript_path(
+                    Path(recorded_path), resolved_native_id
+                )
+            if transcript_path is None:
+                candidate = transcript_paths_by_id.get(resolved_native_id)
+                if candidate is not None:
+                    transcript_path = _approved_codex_transcript_path(
+                        candidate, resolved_native_id
+                    )
+        turn_stats = _session_transcript_stats(
+            transcript_path, "codex", resolved_native_id
+        )
         first_prompt = metadata.get("first_prompt")
         if not first_prompt and transcript_path:
-            first_prompt = _codex_first_prompt(transcript_path, native_id, _codex_history_map())
+            first_prompt = _codex_first_prompt(
+                transcript_path, resolved_native_id, _codex_history_map()
+            )
         capabilities = ["live_state"]
         if transcript_path:
             capabilities = CODEX_READ_ONLY_CAPABILITIES + ["live_state"]
         row = {
-            "id": _qualified_session_id("codex", native_id),
+            "id": _qualified_session_id("codex", resolved_native_id),
             "provider": "codex",
-            "native_id": native_id,
+            "native_id": resolved_native_id,
             "project": reg.get("project") or str(HOME),
             "working_on": metadata.get("working_on") or "Closed Codex session",
             "started_at": started_at,
@@ -13491,7 +14363,7 @@ def _codex_recent_closed_registry_rows(seen: set[str], active_within_min: int) -
         }
         _apply_launch_context_to_session_row(row, metadata)
         rows.append(row)
-        seen.add(native_id)
+        seen.add(resolved_native_id)
     return rows
 
 
@@ -13511,28 +14383,148 @@ def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> li
     rows: list[dict] = []
     seen: set[str] = set()
     live_terminal_rows = _codex_live_terminal_rows()
-    live_transcript_paths = {
-        str(terminal.get("output_path"))
-        for terminal in live_terminal_rows
-        if terminal.get("native_id") and terminal.get("output_path")
+    live_registry_rows = _agent_registry_live("codex", limit=1000)
+    exact_live_native_counts: dict[str, int] = {}
+    for terminal in live_terminal_rows:
+        native_id = str(terminal.get("native_id") or "")
+        if (
+            native_id
+            and str(terminal.get("identity_probe_state") or "exact") == "exact"
+        ):
+            exact_live_native_counts[native_id] = (
+                exact_live_native_counts.get(native_id, 0) + 1
+            )
+    exact_live_native_ids = set(exact_live_native_counts)
+    ambiguous_live_native_ids = {
+        native_id
+        for native_id, count in exact_live_native_counts.items()
+        if count > 1
     }
-    rollout_paths = _codex_rollout_paths()
-    known_paths = {str(path) for path in rollout_paths}
+    degraded_live_native_ids = {
+        str(terminal.get("native_id") or "")
+        for terminal in live_terminal_rows
+        if terminal.get("native_id")
+        and str(terminal.get("identity_probe_state") or "exact") != "exact"
+    }
+    live_registry_ids = {
+        str(reg.get("native_id") or "")
+        for reg in live_registry_rows
+        if reg.get("native_id")
+    }
+    live_transcript_paths: list[str] = []
+    live_transcript_path_set: set[str] = set()
+    priority_transcript_paths: list[str] = []
+    priority_transcript_path_set: set[str] = set()
+
+    def add_priority_transcript_path(path: Path) -> None:
+        path_text = str(path)
+        if path_text not in priority_transcript_path_set:
+            priority_transcript_path_set.add(path_text)
+            priority_transcript_paths.append(path_text)
+
+    def add_live_transcript_path(path: Path) -> None:
+        path_text = str(path)
+        if path_text not in live_transcript_path_set:
+            live_transcript_path_set.add(path_text)
+            live_transcript_paths.append(path_text)
+        add_priority_transcript_path(path)
+
+    for terminal in live_terminal_rows:
+        native_id = str(terminal.get("native_id") or "")
+        output_path = str(terminal.get("output_path") or "")
+        if not native_id or not output_path:
+            continue
+        approved = _approved_codex_transcript_path(Path(output_path), native_id)
+        if approved is not None:
+            add_live_transcript_path(approved)
+    for reg in live_registry_rows:
+        native_id = str(reg.get("native_id") or "")
+        if not native_id or native_id.startswith("pending-"):
+            continue
+        metadata = _registry_metadata_from_row(reg)
+        output_path = metadata.get("output_path")
+        if not isinstance(output_path, str) or not output_path:
+            continue
+        approved = _approved_codex_transcript_path(Path(output_path), native_id)
+        if approved is not None:
+            add_live_transcript_path(approved)
+    if not live_only:
+        closed_rows_by_canonical: dict[str, list[dict]] = {}
+        for reg in _agent_registry_recent(
+            "codex", since_min=active_within_min, limit=1000
+        ):
+            if not reg.get("closed_at"):
+                continue
+            native_id = str(reg.get("native_id") or "")
+            resolved_native_id = _agent_registry_resolve_native_alias(
+                "codex", native_id
+            )
+            if not resolved_native_id:
+                continue
+            closed_rows_by_canonical.setdefault(resolved_native_id, []).append(reg)
+        for resolved_native_id, grouped_rows in closed_rows_by_canonical.items():
+            canonical_rows = [
+                reg
+                for reg in grouped_rows
+                if str(reg.get("native_id") or "") == resolved_native_id
+            ]
+            alias_rows = [
+                reg
+                for reg in grouped_rows
+                if str(reg.get("native_id") or "") != resolved_native_id
+            ]
+            for reg in [*canonical_rows, *alias_rows]:
+                output_path = _registry_metadata_from_row(reg).get("output_path")
+                if not isinstance(output_path, str) or not output_path:
+                    continue
+                approved = _approved_codex_transcript_path(
+                    Path(output_path), resolved_native_id
+                )
+                if approved is not None:
+                    add_priority_transcript_path(approved)
+                    break
+    discovered_rollout_paths = _codex_rollout_paths()
+    rollout_paths = [Path(path) for path in priority_transcript_paths]
     rollout_paths.extend(
-        Path(path)
-        for path in live_transcript_paths
-        if path not in known_paths
+        path
+        for path in discovered_rollout_paths
+        if str(path) not in priority_transcript_path_set
     )
-    for path in rollout_paths:
+    indexed_rollouts, transcript_paths_by_id = _codex_rollout_index(rollout_paths)
+    rollout_entries: list[tuple[Path, os.stat_result, dict]] = []
+    for path, meta in indexed_rollouts:
         try:
             st = path.stat()
         except OSError:
             continue
-        if st.st_mtime < cutoff and str(path) not in live_transcript_paths:
+        native_id = str(meta.get("id") or "")
+        if (
+            st.st_mtime < cutoff
+            and str(path) not in live_transcript_path_set
+            and native_id not in live_registry_ids
+        ):
             continue
-        meta = _codex_rollout_meta(path)
-        if not meta:
+        rollout_entries.append((path, st, meta))
+
+    pending_matches_by_rollout: dict[str, list[dict]] = {}
+    rollout_ids_by_pending: dict[str, set[str]] = {}
+    for _path, st, meta in rollout_entries:
+        sid = str(meta.get("id") or "")
+        if not sid or sid in pending_matches_by_rollout:
             continue
+        started = int(_iso_to_epoch(meta.get("timestamp")) or st.st_mtime)
+        matches = _codex_spawn_pending_registry_rows(
+            meta["cwd"],
+            started,
+            registry_rows=live_registry_rows,
+        )
+        pending_matches_by_rollout[sid] = matches
+        for pending in matches:
+            pending_id = str(pending.get("native_id") or "")
+            if pending_id:
+                rollout_ids_by_pending.setdefault(pending_id, set()).add(sid)
+
+    for path, st, meta in rollout_entries:
         sid = meta["id"]
         if sid in seen:
             continue
@@ -13574,29 +14566,94 @@ def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> li
             row["tool"] = state_payload.get("tool")
             row["turn_started_at"] = state_payload.get("started_at")
             row["effort"] = state_payload.get("effort")
-        row = _codex_control_overlay(row, st.st_mtime, verify_process=True)
+        matches_unidentified_terminal = any(
+            not terminal.get("native_id")
+            and str(terminal.get("identity_probe_state") or "exact") == "exact"
+            and terminal.get("project") == meta["cwd"]
+            and abs(float(terminal.get("started_at") or 0) - started) <= 600
+            for terminal in live_terminal_rows
+        )
+        pending_matches = pending_matches_by_rollout.get(sid) or []
+        pending_match_id = (
+            str(pending_matches[0].get("native_id") or "")
+            if len(pending_matches) == 1
+            else ""
+        )
+        matches_single_pending_registry = bool(
+            pending_match_id
+            and len(rollout_ids_by_pending.get(pending_match_id) or set()) == 1
+        )
+        verify_process = (
+            sid not in degraded_live_native_ids
+            and sid not in ambiguous_live_native_ids
+        ) and (
+            sid in exact_live_native_ids
+            or sid in live_registry_ids
+            or str(path) in live_transcript_path_set
+            or matches_unidentified_terminal
+            or matches_single_pending_registry
+        )
+        row = _codex_control_overlay(row, st.st_mtime, verify_process=verify_process)
+        if sid in ambiguous_live_native_ids:
+            reason = (
+                "More than one live terminal claims this Codex session; "
+                "control is disabled until the identity conflict clears."
+            )
+            row["source_freshness"] = "identity_ambiguous"
+            row["identity_conflict_count"] = exact_live_native_counts[sid]
+            row["controllability"] = {
+                "can_send_text": False,
+                "can_interrupt": False,
+                "can_terminate": False,
+                "reason": reason,
+            }
+            row["capabilities"] = [
+                capability
+                for capability in (row.get("capabilities") or [])
+                if capability not in {
+                    "send_text",
+                    "interrupt",
+                    "terminate",
+                    "terminal_control",
+                }
+            ]
         if live_only:
             control = row.get("controllability") or {}
             has_verified_action = any(
                 bool(control.get(key))
                 for key in ("can_send_text", "can_interrupt", "can_terminate")
             )
-            pid = int(row.get("pid") or 0)
-            tty = str(row.get("terminal_tty") or "")
-            has_verified_process = (
-                pid > 0
-                and _process_alive(pid)
-                and bool(re.match(r"^/dev/ttys[0-9]{3,}$", tty))
+            control_reg = _agent_registry_get("codex", sid)
+            has_verified_process = bool(
+                control_reg
+                and _session_has_verified_provider_process(control_reg, "codex")
             )
             if row.get("closed_at") is not None or not (
-                has_verified_action or has_verified_process
+                has_verified_action
+                or has_verified_process
+                or sid in degraded_live_native_ids
+                or sid in ambiguous_live_native_ids
             ):
                 continue
+            if sid in degraded_live_native_ids and not (
+                has_verified_action or has_verified_process
+            ):
+                row["source_freshness"] = "identity_probe_degraded"
+                row["controllability"] = {
+                    "can_send_text": False,
+                    "can_interrupt": False,
+                    "can_terminate": False,
+                    "reason": "Live identity is being rechecked; this session is temporarily read-only.",
+                }
         rows.append(row)
     _codex_register_terminal_only_rows(seen)
     rows.extend(_codex_pending_registry_rows(seen, live_only, active_within_min))
     if not live_only:
-        rows.extend(_codex_recent_closed_registry_rows(seen, active_within_min))
+        rows.extend(_codex_recent_closed_registry_rows(
+            seen,
+            active_within_min,
+            transcript_paths_by_id,
+        ))
     rows = _filter_tombstoned_session_rows(rows)
     rows = _collapse_live_session_rows_by_terminal(rows)
     rows.sort(key=_session_meaningful_sort_key)
@@ -14279,7 +15336,26 @@ def _remove_session(provider_ref: str, *, delete_transcript: bool) -> dict:
     provider, native_id, error = _parse_session_removal_ref(provider_ref)
     if error is not None:
         return error
-    session_id = _qualified_session_id(provider, native_id)
+    requested_native_id = native_id
+    session_id = _qualified_session_id(provider, requested_native_id)
+    if provider == "codex":
+        native_id = _agent_registry_resolve_native_alias(provider, native_id)
+        if not native_id:
+            return _session_removal_error(
+                "session_not_found",
+                "Pairling could not find this session in the Mac registry or transcript store.",
+                404,
+                session_id=session_id,
+            )
+
+    def externalize(result: dict) -> dict:
+        if requested_native_id == native_id:
+            return result
+        response = dict(result)
+        response["session_id"] = session_id
+        if "native_id" in response:
+            response["native_id"] = requested_native_id
+        return response
 
     with _SESSION_TOMBSTONES_LOCK:
         try:
@@ -14292,7 +15368,9 @@ def _remove_session(provider_ref: str, *, delete_transcript: bool) -> dict:
                 session_id=session_id,
             )
         if delete_transcript and existing and existing.get("action") == "delete_pending":
-            return _complete_pending_session_delete(provider, native_id, existing)
+            return externalize(
+                _complete_pending_session_delete(provider, native_id, existing)
+            )
         record = _session_mutation_record(provider, native_id)
         if record is None:
             if existing and (not delete_transcript or existing.get("transcript_deleted_at")):
@@ -14301,7 +15379,7 @@ def _remove_session(provider_ref: str, *, delete_transcript: bool) -> dict:
                     "status": 200,
                     "session_id": session_id,
                     "provider": provider,
-                    "native_id": native_id,
+                    "native_id": requested_native_id,
                     "removed": True,
                     "transcript": "moved_to_trash" if existing.get("transcript_deleted_at") else "kept",
                     "trash_name": existing.get("trash_name"),
@@ -14346,7 +15424,7 @@ def _remove_session(provider_ref: str, *, delete_transcript: bool) -> dict:
                 "status": 200,
                 "session_id": session_id,
                 "provider": provider,
-                "native_id": native_id,
+                "native_id": requested_native_id,
                 "removed": True,
                 "transcript": "kept",
             }
@@ -14359,7 +15437,7 @@ def _remove_session(provider_ref: str, *, delete_transcript: bool) -> dict:
                 "status": 200,
                 "session_id": session_id,
                 "provider": provider,
-                "native_id": native_id,
+                "native_id": requested_native_id,
                 "removed": True,
                 "transcript": "moved_to_trash",
                 "trash_name": existing.get("trash_name"),
@@ -14402,7 +15480,9 @@ def _remove_session(provider_ref: str, *, delete_transcript: bool) -> dict:
                 500,
                 session_id=session_id,
             )
-        return _complete_pending_session_delete(provider, native_id, pending)
+        return externalize(
+            _complete_pending_session_delete(provider, native_id, pending)
+        )
 
 
 def _text_from_codex_value(value) -> str:
@@ -17550,7 +18630,9 @@ class Handler(BaseHTTPRequestHandler):
             "contradiction_codes": [],
         }
 
-    def _sessions_backend_degradation(self) -> dict | None:
+    def _sessions_backend_degradation(
+        self, provider_filter: str = "all"
+    ) -> dict | None:
         """Cheap cached probe distinguishing "PG answered: zero sessions"
         from "PG unreachable" (Docker down). Without it the sessions stream
         emitted an empty snapshot during outages and the phone wiped its
@@ -17565,6 +18647,24 @@ class Handler(BaseHTTPRequestHandler):
                 "reason": "session_tombstone_store_unavailable",
                 "detail": str(error),
             }
+        codex_relevant = (
+            provider_filter in {"all", "codex"}
+            and "codex" in _visible_agent_provider_ids()
+        )
+        if codex_relevant:
+            with _codex_terminal_scan_lock:
+                codex_probe_state = _codex_terminal_scan_cache.get("probe_state")
+                codex_membership_complete = bool(
+                    _codex_terminal_scan_cache.get("membership_complete")
+                )
+            if codex_probe_state == "failed" and not codex_membership_complete:
+                return {
+                    "reason": "codex_process_scan_unavailable",
+                    "detail": (
+                        "Pairling could not verify the full Codex process list on "
+                        "the Mac. The last trusted session list is being kept."
+                    ),
+                }
         if _session_backend() == "sqlite":
             return None
 
@@ -17604,9 +18704,28 @@ class Handler(BaseHTTPRequestHandler):
     def _session_row_is_strictly_live(row: dict) -> bool:
         if row.get("closed_at") is not None:
             return False
+        if (
+            row.get("provider") == "codex"
+            and row.get("source_freshness") == "identity_ambiguous"
+            and int(row.get("identity_conflict_count") or 0) > 1
+        ):
+            # The Codex scanner found more than one exact live terminal for
+            # the same transcript identity. Membership is real, but choosing
+            # a mutation target would be unsafe.
+            return True
         pid = int(row.get("pid") or row.get("claude_pid") or 0)
         tty = str(row.get("terminal_tty") or "")
         has_real_tty = bool(re.match(r"^/dev/ttys[0-9]{3,}$", tty))
+        if (
+            row.get("provider") == "codex"
+            and row.get("source_freshness") == "identity_probe_degraded"
+            and pid > 0
+            and has_real_tty
+        ):
+            # The Codex provider list only emits this marker for a row that
+            # was exact during the scanner grace window. Preserve membership
+            # while removing every mutation capability until the probe heals.
+            return True
         if pid > 0 or has_real_tty:
             return _session_has_verified_provider_process(row)
         # Older Claude hook rows may not have a pid yet. A fresh hook-backed
@@ -17625,6 +18744,39 @@ class Handler(BaseHTTPRequestHandler):
         projected["readable_state"] = "live"
         pid = int(row.get("pid") or row.get("claude_pid") or 0)
         tty = str(row.get("terminal_tty") or "")
+        if (
+            row.get("provider") == "codex"
+            and row.get("source_freshness") in {
+                "identity_probe_degraded",
+                "identity_ambiguous",
+            }
+        ):
+            if row.get("source_freshness") == "identity_ambiguous":
+                reason = (
+                    "More than one live terminal claims this Codex session; "
+                    "control is disabled until the identity conflict clears."
+                )
+            else:
+                reason = "Live identity is being rechecked; this session is temporarily read-only."
+            projected["control_state"] = "read_only"
+            projected["control_reason"] = reason
+            projected["controllability"] = {
+                "can_send_text": False,
+                "can_interrupt": False,
+                "can_terminate": False,
+                "reason": reason,
+            }
+            projected["capabilities"] = [
+                capability
+                for capability in (row.get("capabilities") or [])
+                if capability not in {
+                    "send_text",
+                    "interrupt",
+                    "terminate",
+                    "terminal_control",
+                }
+            ]
+            return projected
         if pid > 0 or re.match(r"^/dev/ttys[0-9]{3,}$", tty):
             return projected
 
@@ -18033,7 +19185,7 @@ class Handler(BaseHTTPRequestHandler):
             ).hexdigest()
 
         def snapshot_payload(rows: list[dict]) -> tuple[bytes, str]:
-            degraded = self._sessions_backend_degradation()
+            degraded = self._sessions_backend_degradation(provider_filter)
             source = _sessions_stream_source()
             body: dict = {"source": source, "items": rows, "ts": _time.time()}
             if degraded is not None:
@@ -20546,6 +21698,7 @@ class Handler(BaseHTTPRequestHandler):
         if not native_id:
             self.send_error(400, "session required")
             return
+        registry_native_id = _agent_registry_resolve_native_alias(provider, native_id)
         raw_since = q.get("since", ["0"])[0]
         try:
             since = -1 if raw_since in ("end", "tail") else int(raw_since)
@@ -20638,7 +21791,7 @@ class Handler(BaseHTTPRequestHandler):
             project = self._lookup_pg_project(session_id)
             log_path = _terminal_capture_for_tty(tty, project)
         elif provider == "codex":
-            reg = _agent_registry_get("codex", native_id) or {}
+            reg = _agent_registry_get("codex", registry_native_id) or {}
             try:
                 metadata = json.loads(reg.get("metadata_json") or "{}")
             except Exception:
@@ -20914,19 +22067,28 @@ class Handler(BaseHTTPRequestHandler):
         provider, native_id = _parse_agent_session_ref(raw_session)
         if not native_id:
             return provider, "", ""
-        if provider == "claude":
-            session_id = _claude_native_session_id(raw_session)
-            return provider, session_id, self._lookup_terminal_tty(session_id)
-        if provider == "codex":
-            registry_session_id = _agent_registry_resolve_native_alias(
-                "codex", native_id
+        if provider in {"claude", "codex"}:
+            session_id = (
+                _claude_native_session_id(raw_session)
+                if provider == "claude"
+                else native_id
             )
-            reg = _agent_registry_get("codex", registry_session_id) or {}
-            tty = reg.get("terminal_tty") or ""
-            if not tty:
-                candidates = _codex_terminal_tty_candidates(reg)
-                tty = candidates[0] if candidates else ""
-            return provider, native_id, tty
+            registry_session_id = _agent_registry_resolve_native_alias(
+                provider, session_id
+            )
+            reg = _agent_registry_get(provider, registry_session_id) or {}
+            pid = int(reg.get("pid") or reg.get("claude_pid") or 0)
+            tty = str(reg.get("terminal_tty") or "")
+            if (
+                reg.get("closed_at") is not None
+                or pid <= 0
+                or not _process_alive(pid)
+                or not _registry_process_birth_matches(reg, pid)
+                or not _session_signal_target_is_verified(reg, provider, pid)
+                or not _direct_terminal_binding_is_verified(reg, provider, pid)
+            ):
+                return provider, session_id, ""
+            return provider, session_id, tty
         return provider, native_id, ""
 
     def _terminal_app_surface_snapshot(self, raw_session: str, *, osascript_timeout: float = 15.0) -> dict:
@@ -21266,10 +22428,14 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError(f"unknown provider: {provider}")
         if provider not in _agent_provider_ids():
             raise ValueError(f"unsupported provider: {provider}")
+        requested_native_id = native_id
+        native_id = _agent_registry_resolve_native_alias(provider, native_id)
         broker_found = self._broker_session_for(raw_session)
         if broker_found:
             public_session_id, session = broker_found
-            if not _broker_session_owns_identity(session, provider, native_id):
+            if not _broker_session_owns_identity(
+                session, provider, requested_native_id
+            ):
                 raise ProcessIdentityDriftError("broker ownership changed; refresh before sending control")
             return {
                 "source": "broker_vt",
@@ -21302,22 +22468,38 @@ class Handler(BaseHTTPRequestHandler):
             }
 
         reg = _agent_registry_get("codex", native_id)
-        if not reg or reg.get("closed_at"):
+        if not reg:
             raise FileNotFoundError("no Codex control registry row for session")
+        if reg.get("closed_at"):
+            raise ProcessIdentityDriftError(
+                "Codex session is closed; refresh before sending control"
+            )
+        reg = _agent_registry_promote_codex(
+            native_id,
+            str(reg.get("project") or ""),
+            float(reg.get("started_at") or 0),
+        ) or reg
+        promoted_native_id = str(reg.get("native_id") or "")
+        if promoted_native_id:
+            native_id = promoted_native_id
         tty = reg.get("terminal_tty") or ""
         pid = int(reg.get("pid") or 0)
-        if (not pid or not _process_alive(pid)) and tty:
-            fresh_pid = _pid_for_tty_command(tty, "codex")
-            if fresh_pid:
-                pid = fresh_pid
-                _agent_registry_update_control("codex", native_id, pid=pid, terminal_tty=tty, reopen=True)
-        tty_candidates = _codex_terminal_tty_candidates({**reg, "pid": pid, "terminal_tty": tty})
-        if not tty and tty_candidates:
-            tty = tty_candidates[0]
-            _agent_registry_update_control("codex", native_id, pid=pid, terminal_tty=tty, reopen=True)
-        tty_candidates = tty_candidates or ([tty] if tty else [])
-        if not tty:
-            raise FileNotFoundError("no terminal_tty for Codex session")
+        if (
+            not pid
+            or not _process_alive(pid)
+            or not _session_signal_target_is_verified(reg, "codex", pid)
+        ):
+            raise ProcessIdentityDriftError(
+                "Codex process identity changed; refresh before sending control"
+            )
+        tty_candidates = _codex_terminal_tty_candidates(
+            {**reg, "pid": pid, "terminal_tty": tty}
+        )
+        if not tty_candidates:
+            raise ProcessIdentityDriftError(
+                "Codex Terminal tab identity could not be verified"
+            )
+        tty = tty_candidates[0]
         if not re.match(r'^/dev/ttys[0-9]{3,}$', tty):
             raise PermissionError("invalid terminal_tty")
         return {
@@ -21525,6 +22707,21 @@ class Handler(BaseHTTPRequestHandler):
             body["receipt"] = receipt
             self._send_json(body, status=status)
 
+        def terminal_target_or_reject() -> dict | None:
+            try:
+                return self._terminal_control_target(session_key)
+            except ProcessIdentityDriftError as exc:
+                reject("process_identity_unverified", str(exc), 409)
+            except ValueError as exc:
+                reject("bad_session", str(exc), 400)
+            except PermissionError as exc:
+                reject("invalid_tty", str(exc), 403)
+            except FileNotFoundError as exc:
+                reject("terminal_not_found", str(exc), 404)
+            except Exception as exc:
+                reject("surface_unavailable", str(exc)[:200], 502)
+            return None
+
         if payload_error is not None:
             reject(payload_error[0], payload_error[1], 400)
             return
@@ -21576,10 +22773,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             broker_id = str((existing or {}).get("broker_id") or "")
             if not broker_id:
-                try:
-                    exit_target = self._terminal_control_target(session_key)
-                except Exception as exc:
-                    reject("terminal_not_found", str(exc)[:200], 404)
+                exit_target = terminal_target_or_reject()
+                if exit_target is None:
                     return
                 if (
                     exit_target.get("source") != "broker_vt"
@@ -21681,10 +22876,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, **response_fields, "receipt": receipt})
             return
 
-        try:
-            target = self._terminal_control_target(session_key)
-        except Exception as e:
-            reject("terminal_not_found", str(e)[:200], 404)
+        target = terminal_target_or_reject()
+        if target is None:
             return
         if target.get("source") != "broker_vt" or not target.get("broker_id"):
             reject("type_mode_unavailable", "Type mode needs a Pairling-owned PTY; this session runs in a Terminal window (steer stays available).", 409)
@@ -23223,45 +24416,53 @@ class Handler(BaseHTTPRequestHandler):
         since_min = max(1, min(int(since_min), 60 * 24 * 14))
         limit = max(1, min(int(limit), 500))
         cache_key = ("collect-session-rows", since_min, bool(live_only), limit, bool(include_first_prompt))
-        now = _time.time()
-        with _runtime_snapshot_cache_lock:
-            cached = _runtime_snapshot_cache.get(cache_key)
-            if cached is not None and now - cached[0] < RUNTIME_SNAPSHOT_CACHE_SECONDS:
-                return _copy_cache_value(cached[1])
-        _claude_register_terminal_only_rows(set())
-        backend_rows = _claude_sessions_backend().collect_rows(since_min, live_only, limit)
 
-        rows: list[dict] = []
-        try:
-            _session_tombstone_keys()
-        except SessionTombstoneStoreError:
-            return []
-        for raw in backend_rows:
-            session_id, project = raw["id"], raw["project"]
-            if _is_excluded_project(project):
-                continue
-            claude_uuid = raw.get("claude_uuid") or ""
-            row = dict(raw)
-            row["first_prompt"] = None
-            row.update(self._turn_state_summary(claude_uuid))
-            _refresh_claude_observed_activity(row, project, claude_uuid)
-            if include_first_prompt and project and claude_uuid:
-                transcript = (
-                    HOME / ".claude" / "projects" / _encode_project_dir(project)
-                    / f"{claude_uuid}.jsonl"
-                )
-                if transcript.is_file():
-                    row["first_prompt"] = _peek_first_prompt(transcript)
-            if project and claude_uuid:
-                transcript = HOME / ".claude" / "projects" / _encode_project_dir(project) / f"{claude_uuid}.jsonl"
-                stats = _session_transcript_stats(transcript, "claude", session_id)
-                row["turn_count"] = stats.get("turn_count")
-                row["last_meaningful_turn_at"] = stats.get("last_meaningful_turn_at")
-            rows.append(row)
-        rows = _filter_tombstoned_session_rows(rows)
-        with _runtime_snapshot_cache_lock:
-            _runtime_snapshot_cache[cache_key] = (_time.time(), _copy_cache_value(rows))
-        return rows
+        def load_rows() -> list[dict]:
+            _claude_register_terminal_only_rows(set())
+            backend_rows = _claude_sessions_backend().collect_rows(
+                since_min, live_only, limit
+            )
+            rows: list[dict] = []
+            try:
+                _session_tombstone_keys()
+            except SessionTombstoneStoreError:
+                return []
+            for raw in backend_rows:
+                session_id, project = raw["id"], raw["project"]
+                if _is_excluded_project(project):
+                    continue
+                claude_uuid = raw.get("claude_uuid") or ""
+                row = dict(raw)
+                row["first_prompt"] = None
+                row.update(self._turn_state_summary(claude_uuid))
+                _refresh_claude_observed_activity(row, project, claude_uuid)
+                if include_first_prompt and project and claude_uuid:
+                    transcript = (
+                        HOME / ".claude" / "projects" / _encode_project_dir(project)
+                        / f"{claude_uuid}.jsonl"
+                    )
+                    if transcript.is_file():
+                        row["first_prompt"] = _peek_first_prompt(transcript)
+                if project and claude_uuid:
+                    transcript = (
+                        HOME / ".claude" / "projects" / _encode_project_dir(project)
+                        / f"{claude_uuid}.jsonl"
+                    )
+                    stats = _session_transcript_stats(
+                        transcript, "claude", session_id
+                    )
+                    row["turn_count"] = stats.get("turn_count")
+                    row["last_meaningful_turn_at"] = stats.get(
+                        "last_meaningful_turn_at"
+                    )
+                rows.append(row)
+            return _filter_tombstoned_session_rows(rows)
+
+        return _cached_runtime_snapshot(
+            cache_key,
+            RUNTIME_SNAPSHOT_CACHE_SECONDS,
+            load_rows,
+        )
 
     def _recent_session_signal(self, session_id: str, project: str | None = None, claude_uuid: str | None = None) -> dict:
         """Cheap parse of the tail of a transcript for Activity/Workers rows."""
@@ -25581,6 +26782,7 @@ Worker instructions:
                     _, native_id = _parse_agent_session_ref(session_id)
                 if not native_id:
                     continue
+                native_id = _agent_registry_resolve_native_alias("codex", native_id)
                 reg = _agent_registry_get("codex", native_id) or {}
                 metadata = self._registry_metadata(reg) if reg else {}
                 pid = int((reg or {}).get("pid") or launch.get("pid") or 0)
@@ -25698,6 +26900,7 @@ Worker instructions:
                     _, native_id = _parse_agent_session_ref(session_id)
                 if not native_id:
                     continue
+                native_id = _agent_registry_resolve_native_alias("codex", native_id)
                 reg = _agent_registry_get("codex", native_id) or {}
                 metadata = self._registry_metadata(reg) if reg else {}
                 pid = int((reg or {}).get("pid") or launch.get("pid") or 0)
@@ -26288,6 +27491,16 @@ Worker instructions:
                 if s.get("is_active"):
                     errors.append(f"{sid}: active orchestration session has no native session id")
                 continue
+            if session_provider == "codex":
+                native_id = _agent_registry_resolve_native_alias(
+                    "codex", native_id
+                )
+                if not native_id:
+                    if s.get("is_active"):
+                        errors.append(
+                            f"{sid}: active orchestration session has no canonical session id"
+                        )
+                    continue
             target_key = (session_provider, native_id)
             represented_session_targets.add(target_key)
             if not s.get("is_active"):
@@ -26800,6 +28013,7 @@ Worker instructions:
                 continue
 
             if provider == "codex":
+                sid = _agent_registry_resolve_native_alias("codex", sid)
                 if not _safe_agent_native_id(sid):
                     skipped.append(str(raw_sid))
                     continue
@@ -27224,7 +28438,12 @@ Worker instructions:
         try:
             session = PTY_BROKER.get(broker_session_id)
             if session is not None:
-                if not _broker_session_owns_identity(session, provider, native_id):
+                if not _broker_session_matches_spawn_request(
+                    session,
+                    broker_id=broker_session_id,
+                    provider=provider,
+                    native_id=native_id,
+                ):
                     raise ProcessIdentityDriftError("existing broker session identity does not match spawn action")
                 ok = True
                 reconciled_existing = True
@@ -27243,6 +28462,15 @@ Worker instructions:
                     env={**(broker_env or {}), "PAIRLING_PHONE_SESSION": "1",
                          "PAIRLING_BROKER_SESSION_ID": broker_session_id},
                 )
+                if not _broker_session_matches_spawn_request(
+                    session,
+                    broker_id=broker_session_id,
+                    provider=provider,
+                    native_id=native_id,
+                ):
+                    raise ProcessIdentityDriftError(
+                        "spawned broker session identity does not match spawn action"
+                    )
                 ok = True
         except PTYBrokerOutcomeUnknownError as exc:
             session = _broker_reconcile_session_after_unknown(
@@ -27936,10 +29164,23 @@ Worker instructions:
                     break
                 _time.sleep(0.1)
         pid = 0
+        terminal_identity: dict | None = None
+        registry_written = False
         native_id = deterministic_native_id
         if result.get("ok"):
-            _time.sleep(0.75)
-            pid = _pid_for_tty_command(tty, provider) if tty else 0
+            terminal_identity = _wait_for_provider_terminal_identity(
+                tty, provider
+            ) if tty else None
+            pid = int((terminal_identity or {}).get("pid") or 0)
+            if pid <= 0:
+                result = {
+                    "ok": False,
+                    "reason": "Terminal opened, but the provider process identity could not be verified.",
+                    "outcome_indeterminate": True,
+                    "pty_written": None,
+                    "write_outcome": "unknown",
+                }
+        if result.get("ok"):
             if tty and capture_log_path is not None:
                 _write_terminal_capture_mapping(
                     tty,
@@ -27948,7 +29189,7 @@ Worker instructions:
                     project=project,
                     capture_id=capture_id,
                 )
-            _agent_registry_upsert(
+            registry_written = _agent_registry_upsert(
                 provider,
                 native_id,
                 project,
@@ -27966,10 +29207,23 @@ Worker instructions:
                     "send_scope_id": _qualified_session_id(provider, native_id),
                     "spawn_action_id": client_action_id,
                     "spawn_body_hash": spawn_body_hash,
+                    **_provider_terminal_identity_metadata(terminal_identity),
                 },
                 working_on=f"New {provider.title()} session",
             )
-            if provider == "codex":
+            if not registry_written:
+                result = {
+                    "ok": False,
+                    "reason": (
+                        "Terminal opened, but Pairling could not store its "
+                        "control identity. Do not launch it again."
+                    ),
+                    "outcome_indeterminate": True,
+                    "registry_unavailable": True,
+                    "pty_written": None,
+                    "write_outcome": "unknown",
+                }
+            elif provider == "codex":
                 _write_agent_turn_state("codex", native_id, "idle", event="spawn")
 
         # Audit log — append-only, JSONL, includes failures.
@@ -27995,11 +29249,12 @@ Worker instructions:
 
         if not result.get("ok"):
             outcome_indeterminate = bool(result.get("outcome_indeterminate"))
-            error_code = (
-                "terminal_spawn_outcome_unknown"
-                if outcome_indeterminate
-                else "terminal_spawn_failed"
-            )
+            if result.get("registry_unavailable"):
+                error_code = "terminal_spawn_registry_unavailable"
+            elif outcome_indeterminate:
+                error_code = "terminal_spawn_outcome_unknown"
+            else:
+                error_code = "terminal_spawn_failed"
             message = str(result.get("reason") or "Terminal session launch failed.")
             receipt = _finalize_spawn_action(
                 device_id=device_id,
@@ -28167,11 +29422,15 @@ Worker instructions:
         pid = 0
         native_id = None
         send_scope_id = None
+        registry_unavailable = False
         if provider == "codex" and launch_ok:
             native_id = "pending-" + secrets.token_hex(8)
             send_scope_id = _qualified_session_id("codex", native_id)
-            _time.sleep(0.75)
-            pid = _pid_for_tty_command(tty, "codex")
+            terminal_identity = _wait_for_provider_terminal_identity(tty, "codex")
+            pid = int((terminal_identity or {}).get("pid") or 0)
+            if pid <= 0:
+                launch_ok = False
+                outcome_indeterminate = True
             reg_meta = dict(metadata)
             reg_meta.update({
                 "spawned_by": "phone-companion",
@@ -28181,9 +29440,25 @@ Worker instructions:
                 "terminal_source": "terminal_app_contents",
                 "launch_strategy": "direct_pairling",
                 "send_scope_id": send_scope_id,
+                **_provider_terminal_identity_metadata(terminal_identity),
             })
-            _agent_registry_upsert("codex", native_id, project, pid=pid, terminal_tty=tty, metadata=reg_meta)
-            _write_agent_turn_state("codex", native_id, "thinking", event="cross_provider")
+            if launch_ok:
+                registry_written = _agent_registry_upsert(
+                    "codex",
+                    native_id,
+                    project,
+                    pid=pid,
+                    terminal_tty=tty,
+                    metadata=reg_meta,
+                )
+                if registry_written:
+                    _write_agent_turn_state(
+                        "codex", native_id, "thinking", event="cross_provider"
+                    )
+                else:
+                    launch_ok = False
+                    outcome_indeterminate = True
+                    registry_unavailable = True
         return {
             "provider": provider,
             "ok": launch_ok,
@@ -28192,10 +29467,19 @@ Worker instructions:
             "send_scope_id": send_scope_id,
             "tty": tty,
             "pid": pid,
+            "error_code": (
+                "cross_provider_registry_unavailable"
+                if registry_unavailable
+                else None
+            ),
             "error": (
                 None
                 if launch_ok
                 else (
+                    "Terminal launched the provider, but Pairling could not "
+                    "store its control identity. Do not launch it again."
+                    if registry_unavailable
+                    else
                     "Terminal launch identity could not be confirmed"
                     if result.get("ok")
                     else result.get("reason", "unknown")
@@ -28418,6 +29702,11 @@ Worker instructions:
 
         successful = [launch for launch in launches if launch.get("ok")]
         unknown = [launch for launch in launches if launch.get("outcome_indeterminate")]
+        registry_unknown = [
+            launch
+            for launch in unknown
+            if launch.get("error_code") == "cross_provider_registry_unavailable"
+        ]
         all_applied = len(successful) == len(launches)
         partial = bool(successful) and not all_applied
         outcome_indeterminate = bool(unknown or partial or not artifact_persisted)
@@ -28430,8 +29719,15 @@ Worker instructions:
         elif outcome_indeterminate:
             state = "indeterminate"
             status = 502
-            error_code = "cross_provider_launch_outcome_unknown"
-            error_message = "The provider launch or its workflow record could not be confirmed. Do not retry this action."
+            if registry_unknown and len(registry_unknown) == len(unknown):
+                error_code = "cross_provider_registry_unavailable"
+                error_message = (
+                    "Terminal launched the provider, but Pairling could not "
+                    "store its control identity. Do not retry this action."
+                )
+            else:
+                error_code = "cross_provider_launch_outcome_unknown"
+                error_message = "The provider launch or its workflow record could not be confirmed. Do not retry this action."
         else:
             state = "failed"
             status = 502
@@ -28587,6 +29883,15 @@ Worker instructions:
                 env={"PAIRLING_PHONE_SESSION": "1",
                      "PAIRLING_BROKER_SESSION_ID": broker_session_id},
             )
+            if not _broker_session_matches_spawn_request(
+                session,
+                broker_id=broker_session_id,
+                provider=provider,
+                native_id=native_id,
+            ):
+                raise ProcessIdentityDriftError(
+                    "spawned broker session identity does not match resume action"
+                )
             ok = True
         except PTYBrokerOutcomeUnknownError as exc:
             session = _broker_reconcile_session_after_unknown(
@@ -28965,10 +30270,22 @@ Worker instructions:
                 tty = parts[1].strip()
         valid_tty = re.fullmatch(r"/dev/ttys[0-9]{3,}", tty)
         pid = 0
+        terminal_identity: dict | None = None
         registry_written = False
         if result.get("ok") and valid_tty is not None:
-            _time.sleep(0.75)
-            pid = _pid_for_tty_command(tty, "codex") if tty else 0
+            terminal_identity = _wait_for_provider_terminal_identity(
+                tty, "codex"
+            ) if tty else None
+            pid = int((terminal_identity or {}).get("pid") or 0)
+            if pid <= 0:
+                result = {
+                    "ok": False,
+                    "reason": "Terminal resumed Codex, but its process identity could not be verified.",
+                    "outcome_indeterminate": True,
+                    "pty_written": None,
+                    "write_outcome": "unknown",
+                }
+        if result.get("ok") and valid_tty is not None:
             if tty:
                 _write_terminal_capture_mapping(
                     tty,
@@ -28997,6 +30314,7 @@ Worker instructions:
                     "canonical_native_id": native_id,
                     "identity_link": "visible_resume_launch",
                     "resume_action_id": receipt_context["client_action_id"],
+                    **_provider_terminal_identity_metadata(terminal_identity),
                 },
             )
             if registry_written:
@@ -29177,31 +30495,38 @@ Worker instructions:
     def _send_text_to_codex_registry(self, native_id: str, text: str, receipt_context: dict | None = None) -> None:
         # Precondition: callers pass text through _sanitize_terminal_text_input.
         receipt_context = receipt_context or {}
+        requested_native_id = native_id
+        native_id = _agent_registry_resolve_native_alias("codex", native_id)
         client_action_id = receipt_context.get("client_action_id")
         device_id = receipt_context.get("device_id")
         body_hash = receipt_context.get("body_hash") or _receipt_body_hash(text)
         receipt_session_id = receipt_context.get("session_id") or _qualified_session_id("codex", native_id)
         public_session_id = receipt_context.get("public_session_id") or _qualified_session_id("codex", native_id)
-        if "registry_row" in receipt_context:
+        if (
+            "registry_row" in receipt_context
+            and str((receipt_context.get("registry_row") or {}).get("native_id") or "")
+            == native_id
+        ):
             reg = receipt_context.get("registry_row")
         else:
             reg = _agent_registry_get("codex", native_id)
-        if reg and reg.get("closed_at"):
-            pid = int(reg.get("pid") or 0)
-            if pid and _process_alive(pid):
-                _agent_registry_update_control(
-                    "codex",
-                    native_id,
-                    pid=pid,
-                    terminal_tty=reg.get("terminal_tty") or "",
-                    state="running",
-                    reopen=True,
-                )
-                reg = _agent_registry_get("codex", native_id)
-        if not reg or reg.get("closed_at"):
+        if not reg:
             reason = "no Codex control registry row for session"
             self._finish_send_text_failure(
                 receipt_context, text, status=404, reason=reason,
+            )
+            return
+
+        if reg.get("closed_at") is not None:
+            self._finish_send_text_failure(
+                receipt_context,
+                text,
+                status=409,
+                reason="Codex session is closed and its process identity is no longer verified.",
+                backend="terminal_app",
+                tty=str(reg.get("terminal_tty") or "") or None,
+                pid=int(reg.get("pid") or 0) or None,
+                error_code="process_identity_unverified",
             )
             return
 
@@ -29211,7 +30536,9 @@ Worker instructions:
             native_id=native_id,
         )
 
-        broker_found = self._broker_session_for(_qualified_session_id("codex", native_id))
+        broker_found = self._broker_session_for(
+            _qualified_session_id("codex", requested_native_id)
+        )
         if broker_found and PTY_BROKER:
             _public_id, session = broker_found
             broker_id = _broker_session_id(session)
@@ -29314,6 +30641,11 @@ Worker instructions:
             )
             return
 
+        reg = _agent_registry_promote_codex(
+            native_id,
+            str(reg.get("project") or ""),
+            float(reg.get("started_at") or 0),
+        ) or reg
         tty = reg.get("terminal_tty") or ""
         if not tty:
             reason = "no terminal_tty for Codex session"
@@ -29343,13 +30675,38 @@ Worker instructions:
             return
 
         pid = int(reg.get("pid") or 0)
-        if not pid or not _process_alive(pid):
-            fresh_pid = _pid_for_tty_command(tty, "codex")
-            if fresh_pid:
-                pid = fresh_pid
-                _agent_registry_update_control("codex", native_id, pid=pid, terminal_tty=tty, reopen=True)
+        if (
+            not pid
+            or not _process_alive(pid)
+            or not _session_signal_target_is_verified(reg, "codex", pid)
+        ):
+            self._finish_send_text_failure(
+                receipt_context,
+                text,
+                status=409,
+                reason="Codex process identity changed; refresh before sending text.",
+                backend="terminal_app",
+                tty=tty,
+                pid=pid or None,
+                error_code="process_identity_unverified",
+            )
+            return
 
-        tty_candidates = _codex_terminal_tty_candidates({**reg, "pid": pid, "terminal_tty": tty}) or [tty]
+        tty_candidates = _codex_terminal_tty_candidates(
+            {**reg, "pid": pid, "terminal_tty": tty}
+        )
+        if not tty_candidates:
+            self._finish_send_text_failure(
+                receipt_context,
+                text,
+                status=409,
+                reason="Codex Terminal tab identity changed; refresh before sending text.",
+                backend="terminal_app",
+                tty=tty,
+                pid=pid,
+                error_code="process_identity_unverified",
+            )
+            return
         safe_ttys = "{" + ", ".join(f'"{_as_escape(candidate)}"' for candidate in tty_candidates) + "}"
         safe_text = _as_escape(text)
         is_slash = _is_direct_slash_invocation_text(text)
@@ -29418,7 +30775,9 @@ Worker instructions:
             stdout = str(result.get("stdout") or "")
             used_tty = stdout.split("\t", 1)[1].strip() if stdout.startswith("ok\t") else tty
             tty = used_tty or tty
-            _agent_registry_update_control("codex", native_id, pid=pid, terminal_tty=used_tty, state="running", reopen=True)
+            _agent_registry_update_control(
+                "codex", native_id, state="running"
+            )
             _write_agent_turn_state("codex", native_id, "thinking", started_at=_time.time(), event="send_text")
         capture_path = _terminal_capture_for_tty(tty, reg.get("project")) if tty else None
         source_offset_after = None
@@ -29714,6 +31073,22 @@ Worker instructions:
                 "claude",
                 _qualified_session_id("claude", session_id),
             )
+        claude_record = _claude_sessions_backend().session_record(session_id)
+        if (
+            (broker_registry_row or {}).get("closed_at") is not None
+            or (claude_record or {}).get("closed_at") is not None
+        ):
+            self._finish_send_text_failure(
+                receipt_context,
+                text,
+                status=409,
+                reason="Claude session is closed and its process identity is no longer verified.",
+                backend="pty_broker" if broker_registry_row else "terminal_app",
+                tty=str((broker_registry_row or {}).get("terminal_tty") or "") or None,
+                pid=int((broker_registry_row or {}).get("pid") or 0) or None,
+                error_code="process_identity_unverified",
+            )
+            return
         durable_broker_id = _durable_broker_id_from_registry_row(
             broker_registry_row,
             provider="claude",
@@ -29735,38 +31110,6 @@ Worker instructions:
                 pid=int((broker_registry_row or {}).get("pid") or 0) or None,
                 error_code="broker_unavailable",
                 extra={"broker_id": durable_broker_id},
-            )
-            return
-
-        tty = self._lookup_terminal_tty(session_id)
-        if not broker_found and not tty:
-            receipt = _make_send_text_receipt(
-                receipt_context,
-                client_action_id=receipt_context["client_action_id"],
-                state="rejected",
-                phases=_receipt_phases(validated=False, applied=False, pty_written=False),
-            )
-            _store_action_receipt(receipt_context["device_id"], receipt_session_id, receipt_context["client_action_id"], receipt_context["body_hash"], receipt, action_kind="send_text", audit_action={"type": "send_text", "chars": len(text)})
-            body = json.dumps({
-                "ok": False,
-                "error": "no terminal_tty for session — wait for next hook fire to backfill, or re-spawn the session",
-                "receipt": receipt,
-            }).encode()
-            self.send_response(404)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-
-        # Validate tty format before AppleScript embed.
-        if not broker_found and not re.match(r'^/dev/ttys[0-9]{3,}$', tty):
-            self._finish_send_text_failure(
-                receipt_context,
-                text,
-                status=500,
-                reason=f"invalid tty in PG row: {tty[:40]}",
-                tty=tty,
             )
             return
 
@@ -29859,6 +31202,42 @@ Worker instructions:
                 _time.sleep(MIN_AGE_S - age)
         except Exception:
             pass  # best effort — proceed even if the lookup fails
+
+        direct_native_id = _agent_registry_resolve_native_alias(
+            "claude",
+            str((broker_registry_row or {}).get("native_id") or session_id),
+        )
+        direct_registry_row = _agent_registry_get("claude", direct_native_id)
+        direct_pid = int((direct_registry_row or {}).get("pid") or 0)
+        tty = str((direct_registry_row or {}).get("terminal_tty") or "")
+        if (
+            not direct_registry_row
+            or direct_registry_row.get("closed_at") is not None
+            or direct_pid <= 0
+            or not _process_alive(direct_pid)
+            or not _registry_process_birth_matches(direct_registry_row, direct_pid)
+            or not _session_signal_target_is_verified(
+                direct_registry_row, "claude", direct_pid
+            )
+            or not _direct_terminal_binding_is_verified(
+                direct_registry_row, "claude", direct_pid
+            )
+        ):
+            self._finish_send_text_failure(
+                receipt_context,
+                text,
+                status=409,
+                reason=(
+                    "Claude terminal process or Terminal binding changed before "
+                    "text delivery. No text was sent."
+                ),
+                backend="terminal_app",
+                tty=tty or None,
+                pid=direct_pid or None,
+                error_code="process_identity_unverified",
+            )
+            return
+        receipt_context["registry_row"] = direct_registry_row
 
         safe_tty = _as_escape(tty)
         safe_text = _as_escape(text)
@@ -30047,6 +31426,10 @@ Worker instructions:
             return
         public_session_id = _qualified_session_id(provider, native_id)
         receipt_session_id = _session_mutation_receipt_scope(self, public_session_id)
+        requested_native_id = native_id
+        control_native_id = _agent_registry_resolve_native_alias(
+            provider, native_id
+        )
         signal_action_kind = "sigterm" if sig == signal.SIGTERM else "sigint"
         client_action_id = str(self.headers.get("X-Pairling-Action-Id") or "").strip()
         if not _valid_client_action_id(client_action_id):
@@ -30162,16 +31545,37 @@ Worker instructions:
             self._send_json(body, status=status)
 
         if provider == "codex":
+            native_id = control_native_id
             reg = _agent_registry_get("codex", native_id)
+            if reg and reg.get("closed_at") is None:
+                reg = _agent_registry_promote_codex(
+                    native_id,
+                    str(reg.get("project") or ""),
+                    float(reg.get("started_at") or 0),
+                ) or reg
+                promoted_native_id = str(reg.get("native_id") or "")
+                if promoted_native_id:
+                    native_id = promoted_native_id
             durable_broker_id = _durable_broker_id_from_registry_row(
                 reg,
                 provider="codex",
                 native_id=native_id,
             )
-            if sig == signal.SIGTERM and reg and reg.get("closed_at") is not None:
-                send_signal_result(True, None, None, 200, already_closed=True)
+            if reg and reg.get("closed_at") is not None:
+                if sig == signal.SIGTERM:
+                    send_signal_result(True, None, None, 200, already_closed=True)
+                else:
+                    send_signal_result(
+                        False,
+                        None,
+                        "Codex session is closed and cannot be interrupted.",
+                        409,
+                        error_code="process_identity_unverified",
+                    )
                 return
-            broker_found = self._broker_session_for(_qualified_session_id("codex", native_id))
+            broker_found = self._broker_session_for(
+                _qualified_session_id("codex", requested_native_id)
+            )
             if broker_found and PTY_BROKER:
                 _, broker_session = broker_found
                 broker_id = _broker_session_id(broker_session)
@@ -30278,24 +31682,14 @@ Worker instructions:
                 send_signal_result(False, None, "no Codex control registry row for session", 404)
                 return
             pid = int(reg.get("pid") or 0)
-            tty = reg.get("terminal_tty") or ""
-            if (not pid or not _process_alive(pid)) and tty:
-                pid = _pid_for_tty_command(tty, "codex")
-                if pid:
-                    _agent_registry_update_control(
-                        "codex",
-                        native_id,
-                        pid=pid,
-                        terminal_tty=tty,
-                        state="running",
-                        reopen=True,
-                    )
-                    reg = _agent_registry_get("codex", native_id) or {
-                        **reg,
-                        "pid": pid,
-                    }
-            if not pid:
-                send_signal_result(False, None, "no codex pid for session", 404)
+            if not pid or not _process_alive(pid):
+                send_signal_result(
+                    False,
+                    pid or None,
+                    "Codex process identity changed; refresh before sending control",
+                    409,
+                    error_code="process_identity_unverified",
+                )
                 return
             if not _session_signal_target_is_verified(reg, "codex", pid):
                 send_signal_result(
@@ -30337,7 +31731,7 @@ Worker instructions:
             )
             return
 
-        session_id = _claude_native_session_id(raw_session)
+        session_id = control_native_id
         if not session_id:
             self.send_error(400, "session required")
             return
@@ -30354,8 +31748,24 @@ Worker instructions:
             provider="claude",
             native_id=session_id,
         )
-        if sig == signal.SIGTERM and record and record.get("closed_at") is not None:
-            send_signal_result(True, None, None, 200, already_closed=True)
+        session_is_closed = bool(
+            (record and record.get("closed_at") is not None)
+            or (
+                broker_registry_row
+                and broker_registry_row.get("closed_at") is not None
+            )
+        )
+        if session_is_closed:
+            if sig == signal.SIGTERM:
+                send_signal_result(True, None, None, 200, already_closed=True)
+            else:
+                send_signal_result(
+                    False,
+                    None,
+                    "Claude session is closed and cannot be interrupted.",
+                    409,
+                    error_code="process_identity_unverified",
+                )
             return
         broker_found = self._broker_session_for(_qualified_session_id("claude", session_id))
         if broker_found and PTY_BROKER:
@@ -30722,85 +32132,84 @@ Worker instructions:
             return
 
         cache_key = ("provider-status", str(HOME), provider)
-        now = _time.time()
-        with _runtime_snapshot_cache_lock:
-            cached = _runtime_snapshot_cache.get(cache_key)
-            if cached is not None and now - cached[0] < PROVIDER_STATUS_CACHE_SECONDS:
-                self._send_json(_copy_cache_value(cached[1]))
-                return
+        def load_provider_status() -> dict:
+            results = _cached_runtime_snapshot(
+                ("provider-probe-all", str(HOME), provider),
+                PROVIDER_STATUS_CACHE_SECONDS,
+                lambda: _provider_probe_all(provider_filter=provider, home=HOME),
+            )
+            enriched_results = []
+            default_models: dict[str, tuple[str | None, bool | None, str | None]] = {}
+            for result in results:
+                provider_name = result.availability.provider_id
+                if provider_name == "claude":
+                    rows = self._collect_session_rows(since_min=60 * 24, live_only=True, limit=200, include_first_prompt=False)
+                    readable_rows = self._collect_session_rows(since_min=60 * 24, live_only=False, limit=200, include_first_prompt=False)
+                    config_path = HOME / ".claude" / "settings.json"
+                    default_model, default_model_is_exact, default_model_source = resolve_default_model_payload("claude", config_path)
+                    default_models[provider_name] = (default_model, default_model_is_exact, default_model_source)
+                    result = result.with_availability(
+                        readable_sessions=len(readable_rows),
+                        live_sessions=len(rows),
+                        controllable_sessions=sum(1 for r in rows if r.get("claude_pid")),
+                    ).with_diagnostics(
+                        registry_count=None,
+                        registry_live_count=None,
+                    )
+                elif provider_name == "codex":
+                    config_path = HOME / ".codex" / "config.toml"
+                    codex_rows = _list_codex_sessions(live_only=False, active_within_min=60 * 24)
+                    live_codex_rows = _list_codex_sessions(live_only=True, active_within_min=60 * 24)
+                    live_registry = _agent_registry_live("codex")
+                    default_model, default_model_is_exact, default_model_source = resolve_default_model_payload("codex", config_path)
+                    default_models[provider_name] = (default_model, default_model_is_exact, default_model_source)
+                    result = result.with_availability(
+                        readable_sessions=len(codex_rows),
+                        live_sessions=len(live_codex_rows),
+                        controllable_sessions=sum(1 for r in codex_rows if (r.get("controllability") or {}).get("can_send_text")),
+                    ).with_diagnostics(
+                        registry_count=registry_total("codex"),
+                        registry_live_count=len(live_registry),
+                    )
+                enriched_results.append(result)
 
-        results = _cached_runtime_snapshot(
-            ("provider-probe-all", str(HOME), provider),
+            providers: list[dict] = []
+            for result in enriched_results:
+                payload = provider_detail_payload(result)
+                default_model, default_model_is_exact, default_model_source = default_models.get(result.availability.provider_id, (None, None, None))
+                payload["default_model"] = default_model
+                payload["default_model_is_exact"] = default_model_is_exact
+                payload["default_model_source"] = default_model_source
+                providers.append(payload)
+
+            ts = _time.time()
+            payload = {
+                "ok": True,
+                "schema_version": 2,
+                "providers": providers,
+                "snapshot": provider_snapshot_payload(enriched_results, observed_at=ts),
+                "ts": ts,
+            }
+            # Visibility + depth annotation (SPEC-p1 §2.2/§2.3). Excluded
+            # providers STAY in the payload — the Settings screen needs the row
+            # to offer the toggle back on; exclusion hides sessions, not truth.
+            excluded_set = _excluded_provider_ids()
+            depth_by_id = {
+                result.availability.provider_id: getattr(result.descriptor, "adapter_depth", "deep")
+                for result in enriched_results
+            }
+            for row in list(payload["providers"]) + list(payload["snapshot"].get("providers") or []):
+                row_id = str(row.get("provider_id") or row.get("provider") or "")
+                row["included"] = row_id not in excluded_set
+                row["adapter_depth"] = depth_by_id.get(row_id, "deep")
+            payload["excluded"] = sorted(excluded_set)
+            return payload
+
+        payload = _cached_runtime_snapshot(
+            cache_key,
             PROVIDER_STATUS_CACHE_SECONDS,
-            lambda: _provider_probe_all(provider_filter=provider, home=HOME),
+            load_provider_status,
         )
-        enriched_results = []
-        default_models: dict[str, tuple[str | None, bool | None, str | None]] = {}
-        for result in results:
-            provider_name = result.availability.provider_id
-            if provider_name == "claude":
-                rows = self._collect_session_rows(since_min=60 * 24, live_only=True, limit=200, include_first_prompt=False)
-                readable_rows = self._collect_session_rows(since_min=60 * 24, live_only=False, limit=200, include_first_prompt=False)
-                config_path = HOME / ".claude" / "settings.json"
-                default_model, default_model_is_exact, default_model_source = resolve_default_model_payload("claude", config_path)
-                default_models[provider_name] = (default_model, default_model_is_exact, default_model_source)
-                result = result.with_availability(
-                    readable_sessions=len(readable_rows),
-                    live_sessions=len(rows),
-                    controllable_sessions=sum(1 for r in rows if r.get("claude_pid")),
-                ).with_diagnostics(
-                    registry_count=None,
-                    registry_live_count=None,
-                )
-            elif provider_name == "codex":
-                config_path = HOME / ".codex" / "config.toml"
-                codex_rows = _list_codex_sessions(live_only=False, active_within_min=60 * 24)
-                live_codex_rows = _list_codex_sessions(live_only=True, active_within_min=60 * 24)
-                live_registry = _agent_registry_live("codex")
-                default_model, default_model_is_exact, default_model_source = resolve_default_model_payload("codex", config_path)
-                default_models[provider_name] = (default_model, default_model_is_exact, default_model_source)
-                result = result.with_availability(
-                    readable_sessions=len(codex_rows),
-                    live_sessions=len(live_codex_rows),
-                    controllable_sessions=sum(1 for r in codex_rows if (r.get("controllability") or {}).get("can_send_text")),
-                ).with_diagnostics(
-                    registry_count=registry_total("codex"),
-                    registry_live_count=len(live_registry),
-                )
-            enriched_results.append(result)
-
-        providers: list[dict] = []
-        for result in enriched_results:
-            payload = provider_detail_payload(result)
-            default_model, default_model_is_exact, default_model_source = default_models.get(result.availability.provider_id, (None, None, None))
-            payload["default_model"] = default_model
-            payload["default_model_is_exact"] = default_model_is_exact
-            payload["default_model_source"] = default_model_source
-            providers.append(payload)
-
-        ts = _time.time()
-        payload = {
-            "ok": True,
-            "schema_version": 2,
-            "providers": providers,
-            "snapshot": provider_snapshot_payload(enriched_results, observed_at=ts),
-            "ts": ts,
-        }
-        # Visibility + depth annotation (SPEC-p1 §2.2/§2.3). Excluded
-        # providers STAY in the payload — the Settings screen needs the row
-        # to offer the toggle back on; exclusion hides sessions, not truth.
-        excluded_set = _excluded_provider_ids()
-        depth_by_id = {
-            result.availability.provider_id: getattr(result.descriptor, "adapter_depth", "deep")
-            for result in enriched_results
-        }
-        for row in list(payload["providers"]) + list(payload["snapshot"].get("providers") or []):
-            row_id = str(row.get("provider_id") or row.get("provider") or "")
-            row["included"] = row_id not in excluded_set
-            row["adapter_depth"] = depth_by_id.get(row_id, "deep")
-        payload["excluded"] = sorted(excluded_set)
-        with _runtime_snapshot_cache_lock:
-            _runtime_snapshot_cache[cache_key] = (ts, _copy_cache_value(payload))
         self._send_json(payload)
 
     # ----- /power-state: the keep-awake truth (SPEC-p7 §2.3) -----
@@ -31008,6 +32417,10 @@ Worker instructions:
         if provider == "codex":
             if not native_id:
                 self.send_error(400, "session required")
+                return
+            native_id = _agent_registry_resolve_native_alias("codex", native_id)
+            if not _safe_agent_native_id(native_id):
+                self.send_error(400, "bad Codex session id")
                 return
             reg = _agent_registry_get("codex", native_id) or {}
             metadata = {}
@@ -31454,13 +32867,12 @@ Worker instructions:
     def _handle_codex_pickers_resume(self, cwd: str):
         items: list[dict] = []
         history = _codex_history_map()
-        for path in _codex_rollout_paths():
+        for path, meta in _codex_selected_rollout_entries():
             try:
                 stat = path.stat()
             except OSError:
                 continue
-            meta = _codex_rollout_meta(path)
-            if not meta or meta.get("cwd") != cwd:
+            if meta.get("cwd") != cwd:
                 continue
             sid = meta["id"]
             preview = _codex_first_prompt(path, sid, history) or ""
@@ -34210,13 +35622,10 @@ Worker instructions:
                             "mtime": st.st_mtime,
                         })
 
-        seen_codex = set()
-        for p in _codex_rollout_paths():
-            meta = _codex_rollout_meta(p)
+        for p, meta in _codex_selected_rollout_entries():
             native_id = str((meta or {}).get("id") or "")
-            if not native_id or native_id in seen_codex:
+            if not native_id:
                 continue
-            seen_codex.add(native_id)
             try:
                 st = p.stat()
             except OSError:
