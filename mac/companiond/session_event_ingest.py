@@ -297,6 +297,55 @@ class SessionLogIngestor:
         self._evict_if_needed(excluding=session_key)
         return result
 
+    def generation_for_open_source(
+        self,
+        session_key: str,
+        provider: str,
+        native_id: str,
+        transcript_path,
+        source_identity: tuple[int, int],
+        observed_size: int,
+    ) -> int | None:
+        """Bind the durable generation to bytes from an already-open file.
+
+        The caller must read from the same descriptor it used to obtain
+        ``source_identity`` and ``observed_size``. This keeps a path replacement
+        from tagging bytes from one inode with another inode's generation.
+        """
+        if not self.ensure(session_key, provider, native_id, transcript_path):
+            return None
+        resolved_path = str(Path(transcript_path).expanduser().resolve(strict=False))
+        with self._lock:
+            entry = self._sessions.get(session_key)
+        if entry is None:
+            return None
+        with entry["drain_lock"]:
+            with self._lock:
+                if (
+                    self._sessions.get(session_key) is not entry
+                    or entry.get("path") != resolved_path
+                ):
+                    return None
+                entry["last_used_at"] = time.monotonic()
+            try:
+                _offset, reset_generation = self._log.reconcile_ingest_source(
+                    session_key,
+                    (int(source_identity[0]), int(source_identity[1])),
+                    observed_size=max(0, int(observed_size)),
+                )
+                generation = int(self._log.get_generation(session_key))
+            except Exception as error:
+                self._record_ingest_error(session_key, error)
+                return None
+            self._clear_ingest_error(session_key)
+            if reset_generation is not None and self._hub is not None:
+                self._hub.publish(f"log:{session_key}", {
+                    "type": "log_reset",
+                    "generation": reset_generation,
+                    "last_seq": self._log.last_seq(session_key),
+                })
+            return generation if generation > 0 else None
+
     def _ensure_locked(self, entry: dict, provider: str, native_id: str, path: str) -> bool:
         if provider not in SUPPORTED_TRANSCRIPT_PROVIDERS:
             return False
@@ -458,6 +507,34 @@ class SessionLogIngestor:
         with self._lock:
             error = self._errors.get(session_key)
             return dict(error) if error is not None else None
+
+    def drain_now(self, session_key: str) -> dict:
+        """Synchronously align one durable log with its transcript head."""
+        with self._lock:
+            entry = self._sessions.get(session_key)
+        if entry is None:
+            return {"ok": False, "reason": "session_not_registered"}
+        with entry["drain_lock"]:
+            for _attempt in range(4):
+                if not self._attempt_drain_locked(entry):
+                    return {"ok": False, "reason": "transcript_ingest_failed"}
+                try:
+                    source_size = int(Path(entry["path"]).stat().st_size)
+                    source_offset = self._log.get_ingest_offset(session_key)
+                    last_seq = self._log.last_seq(session_key)
+                    generation = self._log.get_generation(session_key)
+                except Exception as error:
+                    self._record_ingest_error(session_key, error)
+                    return {"ok": False, "reason": "transcript_inspection_failed"}
+                if source_offset >= source_size:
+                    return {
+                        "ok": True,
+                        "transcript_offset": source_size,
+                        "log_seq": last_seq,
+                        "log_generation": generation,
+                    }
+                time.sleep(0.01)
+        return {"ok": False, "reason": "transcript_changed_during_boundary"}
 
     def _record_ingest_error(self, session_key: str, error: Exception) -> None:
         try:

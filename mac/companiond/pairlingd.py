@@ -790,6 +790,13 @@ def _session_event_identity_keys(handler, raw_session: str) -> set[str]:
     identities.add(canonical)
 
     registry_row = _agent_registry_get(provider, canonical_native_id)
+    durable_send_scope_id = _durable_send_scope_id_from_registry_row(
+        registry_row,
+        provider=provider,
+        native_id=canonical_native_id,
+    )
+    if durable_send_scope_id:
+        identities.add(durable_send_scope_id)
     durable_broker_id = _durable_broker_id_from_registry_row(
         registry_row,
         provider=provider,
@@ -825,6 +832,13 @@ def _session_mutation_receipt_identity(handler, raw_session: str) -> tuple[str, 
     if not native_id:
         return "", None
     registry_row = _agent_registry_get(provider, native_id)
+    if registry_row is not None and registry_row.get("closed_at"):
+        registry_row = None
+    if registry_row is None:
+        registry_row = _agent_registry_row_for_send_scope_id(
+            provider,
+            _qualified_session_id(provider, native_id),
+        )
     if registry_row is None:
         registry_row = _agent_registry_row_for_broker_id(
             provider,
@@ -833,6 +847,13 @@ def _session_mutation_receipt_identity(handler, raw_session: str) -> tuple[str, 
     canonical_native_id = str(
         (registry_row or {}).get("native_id") or native_id
     )
+    durable_send_scope_id = _durable_send_scope_id_from_registry_row(
+        registry_row,
+        provider=provider,
+        native_id=canonical_native_id,
+    )
+    if durable_send_scope_id:
+        return durable_send_scope_id, registry_row
     durable_broker_id = _durable_broker_id_from_registry_row(
         registry_row,
         provider=provider,
@@ -1248,6 +1269,39 @@ def _clear_session_tombstone_for_reopen(provider: str, native_id: str) -> bool:
         payload["items"].pop(key, None)
         _write_session_tombstones_unlocked(payload)
         return True
+
+
+@contextmanager
+def _session_tombstone_reopen_guard():
+    """Restore cleared removal receipts if the paired DB commit fails."""
+    with _SESSION_TOMBSTONES_LOCK:
+        originals: dict[str, dict | None] = {}
+
+        def track(provider: str, native_id: str) -> None:
+            key = _session_tombstone_key(provider, native_id)
+            if key in originals:
+                return
+            item = _read_session_tombstones_unlocked().get("items", {}).get(key)
+            originals[key] = dict(item) if isinstance(item, dict) else None
+
+        try:
+            yield track
+        except Exception:
+            try:
+                payload = _read_session_tombstones_unlocked()
+                items = payload.setdefault("items", {})
+                restored = False
+                for key, item in originals.items():
+                    if isinstance(item, dict) and key not in items:
+                        items[key] = dict(item)
+                        restored = True
+                if restored:
+                    _write_session_tombstones_unlocked(payload)
+            except Exception as restore_error:
+                raise SessionTombstoneStoreError(
+                    "cannot restore durable session removal after registry rollback"
+                ) from restore_error
+            raise
 
 
 def _record_session_tombstone(
@@ -4779,7 +4833,8 @@ def _agent_registry_upsert(provider: str, native_id: str, project: str, *,
     try:
         # Serialize reopen with durable removal. If a registration arrives
         # during removal, it runs afterwards and clears the old receipt.
-        with _SESSION_TOMBSTONES_LOCK:
+        with _session_tombstone_reopen_guard() as track_reopen:
+            track_reopen(provider, native_id)
             with _agent_registry_conn() as conn:
                 conn.execute(
                     """
@@ -4813,7 +4868,7 @@ def _agent_registry_upsert(provider: str, native_id: str, project: str, *,
                         working_on or "",
                     ),
                 )
-            _clear_session_tombstone_for_reopen(provider, native_id)
+                _clear_session_tombstone_for_reopen(provider, native_id)
         _publish_session_event(SESSION_SUMMARIES_TOPIC, {
             "type": "session_registered",
             "provider": provider,
@@ -4935,7 +4990,7 @@ def _agent_registry_heartbeat_by_claude_uuid(provider: str, claude_uuid: str, *,
         return False
     try:
         matched_native_ids: list[str] = []
-        with _SESSION_TOMBSTONES_LOCK:
+        with _session_tombstone_reopen_guard() as track_reopen:
             with _agent_registry_conn() as conn:
                 matched = [dict(row) for row in conn.execute(
                     "SELECT * FROM agent_sessions WHERE provider = ? AND claude_uuid = ?",
@@ -4943,6 +4998,10 @@ def _agent_registry_heartbeat_by_claude_uuid(provider: str, claude_uuid: str, *,
                 ).fetchall()]
                 if not matched:
                     return False
+                for row in matched:
+                    native_id = str(row.get("native_id") or "")
+                    if native_id:
+                        track_reopen(provider, native_id)
                 now = _time.time()
                 cur = conn.execute(
                     "UPDATE agent_sessions SET last_heartbeat = ?, state = 'running', closed_at = NULL, "
@@ -4972,8 +5031,8 @@ def _agent_registry_heartbeat_by_claude_uuid(provider: str, claude_uuid: str, *,
                             "AND native_id != ? AND pid = ? AND closed_at IS NULL",
                             (now, provider, native_id, effective_pid),
                         )
-            for native_id in matched_native_ids:
-                _clear_session_tombstone_for_reopen(provider, native_id)
+                for native_id in matched_native_ids:
+                    _clear_session_tombstone_for_reopen(provider, native_id)
         return cur.rowcount > 0
     except Exception:
         return False
@@ -4984,7 +5043,8 @@ def _agent_registry_heartbeat_by_native_id(provider: str, native_id: str, *,
     if not provider or not native_id:
         return False
     try:
-        with _SESSION_TOMBSTONES_LOCK:
+        with _session_tombstone_reopen_guard() as track_reopen:
+            track_reopen(provider, native_id)
             with _agent_registry_conn() as conn:
                 cur = conn.execute(
                     "UPDATE agent_sessions SET last_heartbeat = ?, state = 'running', closed_at = NULL, "
@@ -4994,8 +5054,8 @@ def _agent_registry_heartbeat_by_native_id(provider: str, native_id: str, *,
                     (_time.time(), terminal_tty or "", int(pid or 0), provider, native_id),
                 )
                 changed = cur.rowcount > 0
-            if changed:
-                _clear_session_tombstone_for_reopen(provider, native_id)
+                if changed:
+                    _clear_session_tombstone_for_reopen(provider, native_id)
             return changed
     except Exception:
         return False
@@ -5073,6 +5133,75 @@ def _agent_registry_row_for_broker_id(provider: str, broker_id: str) -> dict | N
         for row in rows
         if str(_registry_metadata_from_row(dict(row)).get("broker_id") or "") == broker_id
     ]
+    live_matches = [row for row in matches if not row.get("closed_at")]
+    if len(live_matches) == 1:
+        return live_matches[0]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _normalized_send_scope_id(provider: str, value: object) -> str:
+    """Return one valid provider-qualified durable send identity."""
+    provider = str(provider or "").strip().lower()
+    scope_id = str(value or "").strip()
+    scope_provider, scope_native_id = _parse_agent_session_ref(scope_id)
+    if (
+        provider not in {"claude", "codex"}
+        or scope_provider != provider
+        or not scope_native_id
+        or not _safe_agent_native_id(scope_native_id)
+    ):
+        return ""
+    return _qualified_session_id(provider, scope_native_id)
+
+
+def _durable_send_scope_id_from_registry_row(
+    row: dict | None,
+    *,
+    provider: str,
+    native_id: str,
+) -> str:
+    """Return the identity used to retain sends across registry promotion."""
+    metadata = _registry_metadata_from_row(row)
+    send_scope_id = _normalized_send_scope_id(
+        provider,
+        metadata.get("send_scope_id"),
+    )
+    if send_scope_id:
+        return send_scope_id
+    # Broker identity is already provider-qualified and physically stable.
+    # Keeping it as the fallback also repairs active sessions created before
+    # send_scope_id was introduced when the runtime is upgraded in place.
+    return _normalized_send_scope_id(provider, metadata.get("broker_id"))
+
+
+def _agent_registry_row_for_send_scope_id(
+    provider: str,
+    send_scope_id: str,
+) -> dict | None:
+    """Resolve one live registry row from an exact durable send identity."""
+    provider = str(provider or "").strip().lower()
+    send_scope_id = _normalized_send_scope_id(provider, send_scope_id)
+    if not send_scope_id:
+        return None
+    try:
+        with _agent_registry_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM agent_sessions WHERE provider = ? "
+                "AND closed_at IS NULL AND metadata_json LIKE ? "
+                "ORDER BY last_heartbeat DESC",
+                (provider, f"%{send_scope_id}%"),
+            ).fetchall()
+    except Exception:
+        return None
+    matches = [
+        dict(row)
+        for row in rows
+        if _durable_send_scope_id_from_registry_row(
+            dict(row),
+            provider=provider,
+            native_id=str(row["native_id"] or ""),
+        ) == send_scope_id
+    ]
     return matches[0] if len(matches) == 1 else None
 
 
@@ -5096,20 +5225,26 @@ def _durable_broker_id_from_registry_row(
 
 
 def _agent_registry_resolve_native_alias(provider: str, native_id: str) -> str:
-    """Return the canonical native id for an exact broker-backed alias."""
+    """Return the canonical native id for an exact promoted alias."""
     provider = str(provider or "").strip().lower()
     native_id = str(native_id or "").strip()
     if not native_id or provider not in {"claude", "codex"}:
         return native_id
-    if _agent_registry_get(provider, native_id) is not None:
+    direct = _agent_registry_get(provider, native_id)
+    if direct is not None and not direct.get("closed_at"):
         return native_id
+    row = _agent_registry_row_for_send_scope_id(
+        provider, _qualified_session_id(provider, native_id)
+    )
+    if row:
+        return str(row.get("native_id") or native_id)
     row = _agent_registry_row_for_broker_id(
         provider, _qualified_session_id(provider, native_id)
     )
     return str(row.get("native_id") or native_id) if row else native_id
 
 
-def _agent_registry_link_claude_broker_registration(
+def _agent_registry_link_claude_launch_registration(
     canonical_native_id: str,
     project: str,
     *,
@@ -5118,12 +5253,7 @@ def _agent_registry_link_claude_broker_registration(
     claude_uuid: str,
     working_on: str,
 ) -> dict:
-    """Atomically promote one pending Claude broker row to its hook id.
-
-    The link is allowed only when one live pending row matches the hook's exact
-    PID and project and its metadata proves ownership of that broker id.  Any
-    ambiguity fails closed and leaves both identities untouched.
-    """
+    """Atomically promote one exact pending Claude launch to its hook id."""
     canonical_native_id = str(canonical_native_id or "").strip()
     project = str(project or "").strip()
     pid = int(pid or 0)
@@ -5140,8 +5270,10 @@ def _agent_registry_link_claude_broker_registration(
 
     now = _time.time()
     try:
-        with _SESSION_TOMBSTONES_LOCK:
+        with _session_tombstone_reopen_guard() as track_reopen:
+            track_reopen("claude", canonical_native_id)
             with _agent_registry_conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
                 existing_raw = conn.execute(
                     "SELECT * FROM agent_sessions WHERE provider = 'claude' "
                     "AND native_id = ? LIMIT 1",
@@ -5149,17 +5281,27 @@ def _agent_registry_link_claude_broker_registration(
                 ).fetchone()
                 existing = dict(existing_raw) if existing_raw else None
                 existing_metadata = _registry_metadata_from_row(existing)
-                existing_broker_id = str(existing_metadata.get("broker_id") or "")
-                if existing_broker_id:
+                existing_send_scope_id = _durable_send_scope_id_from_registry_row(
+                    existing,
+                    provider="claude",
+                    native_id=canonical_native_id,
+                )
+                if existing_send_scope_id:
                     expected_pid = int(existing.get("pid") or 0) if existing else 0
                     if (
                         str(existing.get("project") or "") != project
                         or (expected_pid and expected_pid != pid)
+                        or (
+                            terminal_tty
+                            and str(existing.get("terminal_tty") or "")
+                            not in {"", terminal_tty}
+                        )
                         or str(existing.get("claude_uuid") or "") not in {"", claude_uuid}
                     ):
                         return {"state": "conflict", "reason": "canonical_identity_changed"}
                     merged_metadata = dict(existing_metadata)
                     merged_metadata.update({
+                        "send_scope_id": existing_send_scope_id,
                         "canonical_native_id": canonical_native_id,
                         "registered_by": "internal_session_register",
                     })
@@ -5183,10 +5325,14 @@ def _agent_registry_link_claude_broker_registration(
                     result = {
                         "state": "already_linked",
                         "canonical_native_id": canonical_native_id,
-                        "broker_native_id": str(
-                            existing_metadata.get("broker_native_id") or ""
+                        "pending_native_id": str(
+                            existing_metadata.get("pending_native_id")
+                            or existing_metadata.get("broker_native_id")
+                            or ""
                         ),
-                        "broker_id": existing_broker_id,
+                        "broker_native_id": str(existing_metadata.get("broker_native_id") or ""),
+                        "broker_id": str(existing_metadata.get("broker_id") or ""),
+                        "send_scope_id": existing_send_scope_id,
                     }
                 else:
                     pending_rows = [
@@ -5200,23 +5346,50 @@ def _agent_registry_link_claude_broker_registration(
                     ]
                     valid_pending = []
                     for row in pending_rows:
-                        native_id = str(row.get("native_id") or "")
+                        pending_native_id = str(row.get("native_id") or "")
                         metadata = _registry_metadata_from_row(row)
-                        broker_id = str(metadata.get("broker_id") or "")
+                        send_scope_id = _durable_send_scope_id_from_registry_row(
+                            row,
+                            provider="claude",
+                            native_id=pending_native_id,
+                        )
+                        expected_scope = _qualified_session_id(
+                            "claude", pending_native_id
+                        )
+                        broker_id = _normalized_send_scope_id(
+                            "claude", metadata.get("broker_id")
+                        )
+                        capture_backend = str(metadata.get("capture_backend") or "")
+                        exact_tty = (
+                            not terminal_tty
+                            or str(row.get("terminal_tty") or "") == terminal_tty
+                        )
                         if (
-                            broker_id == _qualified_session_id("claude", native_id)
-                            and metadata.get("capture_backend") == "pty_broker"
+                            send_scope_id == expected_scope
+                            and exact_tty
+                            and (
+                                (
+                                    capture_backend == "pty_broker"
+                                    and broker_id == expected_scope
+                                )
+                                or (
+                                    capture_backend == "script"
+                                    and not broker_id
+                                )
+                            )
                         ):
-                            valid_pending.append((row, metadata, broker_id))
+                            valid_pending.append(
+                                (row, metadata, send_scope_id, broker_id)
+                            )
                     if len(pending_rows) > 1 or len(valid_pending) != 1:
                         if pending_rows:
                             return {
                                 "state": "ambiguous",
-                                "reason": "pending_broker_identity_unverified",
+                                "reason": "pending_launch_identity_unverified",
                             }
                         return {"state": "not_found"}
 
-                    pending, pending_metadata, broker_id = valid_pending[0]
+                    pending, pending_metadata, send_scope_id, broker_id = valid_pending[0]
                     pending_native_id = str(pending.get("native_id") or "")
                     if existing is not None:
                         if (
@@ -5228,12 +5401,17 @@ def _agent_registry_link_claude_broker_registration(
                     merged_metadata = dict(_registry_metadata_from_row(existing))
                     merged_metadata.update(pending_metadata)
                     merged_metadata.update({
-                        "broker_id": broker_id,
-                        "broker_native_id": pending_native_id,
+                        "send_scope_id": send_scope_id,
+                        "pending_native_id": pending_native_id,
                         "canonical_native_id": canonical_native_id,
                         "identity_link": "exact_pid_project",
                         "registered_by": "internal_session_register",
                     })
+                    if broker_id:
+                        merged_metadata.update({
+                            "broker_id": broker_id,
+                            "broker_native_id": pending_native_id,
+                        })
                     chosen_tty = (
                         terminal_tty
                         or str(pending.get("terminal_tty") or "")
@@ -5276,16 +5454,26 @@ def _agent_registry_link_claude_broker_registration(
                     )
                     deleted = conn.execute(
                         "DELETE FROM agent_sessions WHERE provider='claude' "
-                        "AND native_id=? AND project=? AND pid=? AND closed_at IS NULL",
-                        (pending_native_id, project, pid),
+                        "AND native_id=? AND project=? AND pid=? "
+                        "AND terminal_tty=? AND metadata_json=? "
+                        "AND closed_at IS NULL",
+                        (
+                            pending_native_id,
+                            project,
+                            int(pending.get("pid") or 0),
+                            str(pending.get("terminal_tty") or ""),
+                            str(pending.get("metadata_json") or ""),
+                        ),
                     )
                     if deleted.rowcount != 1:
                         raise RuntimeError("pending broker identity changed during registration")
                     result = {
                         "state": "linked",
                         "canonical_native_id": canonical_native_id,
-                        "broker_native_id": pending_native_id,
+                        "pending_native_id": pending_native_id,
+                        "broker_native_id": pending_native_id if broker_id else "",
                         "broker_id": broker_id,
+                        "send_scope_id": send_scope_id,
                     }
                 # Keep the registry promotion uncommitted until the durable
                 # removal receipt is cleared. A tombstone store failure must
@@ -5300,17 +5488,17 @@ def _agent_registry_link_claude_broker_registration(
         "type": "session_identity_linked",
         "provider": "claude",
         "native_id": canonical_native_id,
+        "send_scope_id": result.get("send_scope_id"),
         "broker_id": result.get("broker_id"),
         "project": project,
         "heartbeat_at": now,
     }
     _publish_session_event(SESSION_SUMMARIES_TOPIC, identity_event)
-    broker_id = str(result.get("broker_id") or "")
-    if broker_id:
-        # Viewers opened against the temporary broker identity do not listen
-        # to the summaries topic. Wake that exact terminal topic so their
-        # truth worker can discover the canonical identity immediately.
-        _publish_session_event(f"terminal:{broker_id}", dict(identity_event))
+    send_scope_id = str(result.get("send_scope_id") or "")
+    if send_scope_id:
+        # Viewers opened against the temporary identity do not listen to the
+        # summaries topic. Wake their exact terminal topic immediately.
+        _publish_session_event(f"terminal:{send_scope_id}", dict(identity_event))
     return result
 
 
@@ -5487,7 +5675,9 @@ def _agent_registry_update_control(provider: str, native_id: str, *,
         assignments.append("closed_at = NULL")
     params.extend([provider, native_id])
     try:
-        with _SESSION_TOMBSTONES_LOCK:
+        with _session_tombstone_reopen_guard() as track_reopen:
+            if reopen:
+                track_reopen(provider, native_id)
             with _agent_registry_conn() as conn:
                 cursor = conn.execute(
                     f"UPDATE agent_sessions SET {', '.join(assignments)} "
@@ -5495,8 +5685,8 @@ def _agent_registry_update_control(provider: str, native_id: str, *,
                     tuple(params),
                 )
                 changed = cursor.rowcount > 0
-            if reopen and changed:
-                _clear_session_tombstone_for_reopen(provider, native_id)
+                if reopen and changed:
+                    _clear_session_tombstone_for_reopen(provider, native_id)
     except Exception:
         pass
 
@@ -5521,45 +5711,243 @@ def _bind_codex_registry_to_terminal(
     *,
     discovered_by: str,
 ) -> dict | None:
-    exact = _agent_registry_get("codex", native_id)
+    """Atomically bind one discovered Codex process to its canonical rollout.
+
+    A pending launch row is consumed only when PID, TTY, project, and its
+    durable send identity all match. The canonical write and pending delete
+    share one SQLite transaction, so neither identity can be lost or doubled
+    by a partial failure.
+    """
+    native_id = str(native_id or "").strip()
     tty = str(discovered.get("tty") or "")
     pid = int(discovered.get("pid") or 0)
     canonical_project = str(discovered.get("project") or project or "")
     output_path = str(discovered.get("output_path") or "")
-    metadata = _registry_metadata_from_row(exact)
-    already_bound = bool(
-        exact
-        and not exact.get("closed_at")
-        and int(exact.get("pid") or 0) == pid
-        and str(exact.get("terminal_tty") or "") == tty
-        and str(exact.get("project") or "") == canonical_project
-        and (not output_path or metadata.get("output_path") == output_path)
-    )
-    _close_codex_terminal_placeholders(tty, native_id)
-    if already_bound:
-        return exact
+    if (
+        not _safe_agent_native_id(native_id)
+        or not canonical_project
+        or pid <= 0
+        or not tty
+    ):
+        return _agent_registry_get("codex", native_id)
 
-    metadata.pop("terminal_only", None)
-    metadata.update({
-        "discovered_by": discovered_by,
-        "command": str(discovered.get("command") or metadata.get("command") or "")[:500],
-    })
-    if output_path:
-        metadata["output_path"] = output_path
-    process_project = str(discovered.get("process_project") or "")
-    if process_project and process_project != canonical_project:
-        metadata["process_project"] = process_project
-    _agent_registry_upsert(
-        "codex",
-        native_id,
-        canonical_project,
-        pid=pid,
-        terminal_tty=tty,
-        state=str((exact or {}).get("state") or "running"),
-        metadata=metadata,
-        working_on=str((exact or {}).get("working_on") or ""),
-    )
-    return _agent_registry_get("codex", native_id) or exact
+    now = _time.time()
+    linked_send_scope_id = ""
+    linked_broker_id = ""
+    try:
+        with _session_tombstone_reopen_guard() as track_reopen:
+            track_reopen("codex", native_id)
+            with _agent_registry_conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                exact_raw = conn.execute(
+                    "SELECT * FROM agent_sessions WHERE provider='codex' "
+                    "AND native_id=? LIMIT 1",
+                    (native_id,),
+                ).fetchone()
+                exact = dict(exact_raw) if exact_raw else None
+                exact_metadata = _registry_metadata_from_row(exact)
+                exact_send_scope_id = _durable_send_scope_id_from_registry_row(
+                    exact,
+                    provider="codex",
+                    native_id=native_id,
+                )
+                if exact is not None:
+                    exact_project = str(exact.get("project") or "")
+                    exact_pid = int(exact.get("pid") or 0)
+                    exact_tty = str(exact.get("terminal_tty") or "")
+                    identity_conflict = (
+                        bool(exact_project and exact_project != canonical_project)
+                        or bool(exact_tty and exact_tty != tty)
+                        or bool(
+                            not exact_tty
+                            and exact_pid not in {0, pid}
+                            and _process_alive(exact_pid)
+                        )
+                    )
+                    if identity_conflict:
+                        return exact
+
+                pending_rows = [
+                    dict(row)
+                    for row in conn.execute(
+                        "SELECT * FROM agent_sessions WHERE provider='codex' "
+                        "AND native_id LIKE 'pending-%' AND project=? AND pid=? "
+                        "AND terminal_tty=? AND closed_at IS NULL "
+                        "ORDER BY started_at DESC LIMIT 3",
+                        (canonical_project, pid, tty),
+                    ).fetchall()
+                ]
+                pending_owner = None
+                pending_metadata: dict = {}
+                if len(pending_rows) == 1:
+                    candidate = pending_rows[0]
+                    candidate_native_id = str(candidate.get("native_id") or "")
+                    candidate_metadata = _registry_metadata_from_row(candidate)
+                    candidate_scope = _durable_send_scope_id_from_registry_row(
+                        candidate,
+                        provider="codex",
+                        native_id=candidate_native_id,
+                    )
+                    expected_scope = _qualified_session_id(
+                        "codex", candidate_native_id
+                    )
+                    capture_backend = str(
+                        candidate_metadata.get("capture_backend") or ""
+                    )
+                    candidate_broker_id = _normalized_send_scope_id(
+                        "codex", candidate_metadata.get("broker_id")
+                    )
+                    valid_capture = capture_backend in {"pty_broker", "script"}
+                    valid_broker = (
+                        capture_backend != "pty_broker"
+                        or candidate_broker_id == expected_scope
+                    )
+                    if (
+                        candidate_scope == expected_scope
+                        and valid_capture
+                        and valid_broker
+                    ):
+                        pending_owner = candidate
+                        pending_metadata = candidate_metadata
+
+                pending_send_scope_id = _durable_send_scope_id_from_registry_row(
+                    pending_owner,
+                    provider="codex",
+                    native_id=str((pending_owner or {}).get("native_id") or ""),
+                )
+                if (
+                    pending_send_scope_id
+                    and exact_send_scope_id
+                    and pending_send_scope_id != exact_send_scope_id
+                ):
+                    return exact
+
+                metadata = dict(exact_metadata)
+                metadata.update(pending_metadata)
+                metadata.pop("terminal_only", None)
+                if pending_owner is not None:
+                    pending_native_id = str(pending_owner.get("native_id") or "")
+                    linked_send_scope_id = pending_send_scope_id
+                    linked_broker_id = _normalized_send_scope_id(
+                        "codex", pending_metadata.get("broker_id")
+                    )
+                    metadata.update({
+                        "send_scope_id": linked_send_scope_id,
+                        "pending_native_id": pending_native_id,
+                        "canonical_native_id": native_id,
+                        "identity_link": "exact_pid_tty_project",
+                    })
+                    if linked_broker_id:
+                        metadata.update({
+                            "broker_id": linked_broker_id,
+                            "broker_native_id": pending_native_id,
+                            "capture_backend": "pty_broker",
+                            "terminal_source": str(
+                                pending_metadata.get("terminal_source")
+                                or "broker_vt"
+                            ),
+                        })
+                metadata.update({
+                    "discovered_by": discovered_by,
+                    "command": str(
+                        discovered.get("command") or metadata.get("command") or ""
+                    )[:500],
+                })
+                if output_path:
+                    metadata["output_path"] = output_path
+                elif exact_metadata.get("output_path"):
+                    metadata["output_path"] = exact_metadata["output_path"]
+                process_project = str(discovered.get("process_project") or "")
+                if process_project and process_project != canonical_project:
+                    metadata["process_project"] = process_project
+
+                started_at = float(
+                    (exact or {}).get("started_at")
+                    or (pending_owner or {}).get("started_at")
+                    or now
+                )
+                conn.execute(
+                    """
+                    INSERT INTO agent_sessions
+                        (provider, native_id, project, pid, terminal_tty, state,
+                         started_at, last_heartbeat, closed_at, metadata_json,
+                         claude_uuid, working_on)
+                    VALUES ('codex', ?, ?, ?, ?, ?, ?, ?, NULL, ?, '', ?)
+                    ON CONFLICT(provider, native_id) DO UPDATE SET
+                        project=excluded.project,
+                        pid=excluded.pid,
+                        terminal_tty=excluded.terminal_tty,
+                        state=excluded.state,
+                        last_heartbeat=excluded.last_heartbeat,
+                        closed_at=NULL,
+                        metadata_json=excluded.metadata_json,
+                        working_on=excluded.working_on
+                    """,
+                    (
+                        native_id,
+                        canonical_project,
+                        pid,
+                        tty,
+                        str((exact or {}).get("state") or "running"),
+                        started_at,
+                        now,
+                        json.dumps(metadata, sort_keys=True),
+                        str((exact or {}).get("working_on") or ""),
+                    ),
+                )
+                if pending_owner is not None:
+                    deleted = conn.execute(
+                        "DELETE FROM agent_sessions WHERE provider='codex' "
+                        "AND native_id=? AND project=? AND pid=? "
+                        "AND terminal_tty=? AND metadata_json=? "
+                        "AND closed_at IS NULL",
+                        (
+                            str(pending_owner.get("native_id") or ""),
+                            canonical_project,
+                            pid,
+                            tty,
+                            str(pending_owner.get("metadata_json") or ""),
+                        ),
+                    )
+                    if deleted.rowcount != 1:
+                        raise RuntimeError(
+                            "pending Codex identity changed during promotion"
+                        )
+                _clear_session_tombstone_for_reopen("codex", native_id)
+    except Exception:
+        return _agent_registry_get("codex", native_id)
+
+    promoted = _agent_registry_get("codex", native_id)
+    if promoted is None:
+        return None
+    _close_codex_terminal_placeholders(tty, native_id)
+    _invalidate_session_list_caches()
+    if linked_send_scope_id:
+        identity_event = {
+            "type": "session_identity_linked",
+            "provider": "codex",
+            "native_id": native_id,
+            "send_scope_id": linked_send_scope_id,
+            "broker_id": linked_broker_id or None,
+            "project": canonical_project,
+            "heartbeat_at": now,
+        }
+        _publish_session_event(SESSION_SUMMARIES_TOPIC, identity_event)
+        _publish_session_event(
+            f"terminal:{linked_send_scope_id}",
+            dict(identity_event),
+        )
+    else:
+        _publish_session_event(SESSION_SUMMARIES_TOPIC, {
+            "type": "session_registered",
+            "provider": "codex",
+            "native_id": native_id,
+            "project": canonical_project,
+            "state": str(promoted.get("state") or "running"),
+            "working_on": str(promoted.get("working_on") or ""),
+            "heartbeat_at": now,
+        })
+    return promoted
 
 
 def _agent_registry_promote_codex(native_id: str, project: str, observed_started_at: float) -> dict | None:
@@ -5573,18 +5961,29 @@ def _agent_registry_promote_codex(native_id: str, project: str, observed_started
             exact_terminal,
             discovered_by="open_rollout",
         )
-        pending_project = str(exact_terminal.get("project") or project or "")
-        for row in _codex_spawn_pending_registry_rows(pending_project, observed_started_at):
-            _agent_registry_mark_closed("codex", row["native_id"])
         return exact
     if observed_started_at <= 0:
         return exact
     if exact:
-        pid = int(exact.get("pid") or 0)
+        stored_pid = int(exact.get("pid") or 0)
         tty = exact.get("terminal_tty") or ""
-        if not exact.get("closed_at") and (pid and _process_alive(pid) or tty and _pid_for_tty_command(tty, "codex")):
-            for row in _codex_spawn_pending_registry_rows(project, observed_started_at):
-                _agent_registry_mark_closed("codex", row["native_id"])
+        live_pid = stored_pid if stored_pid and _process_alive(stored_pid) else (
+            _pid_for_tty_command(tty, "codex") if tty else 0
+        )
+        if not exact.get("closed_at") and live_pid:
+            exact_metadata = _registry_metadata_from_row(exact)
+            exact = _bind_codex_registry_to_terminal(
+                native_id,
+                str(exact.get("project") or project or ""),
+                {
+                    "pid": live_pid,
+                    "tty": tty,
+                    "project": str(exact.get("project") or project or ""),
+                    "command": exact_metadata.get("command"),
+                    "output_path": exact_metadata.get("output_path"),
+                },
+                discovered_by=str(exact_metadata.get("discovered_by") or "registry_exact"),
+            )
             return exact
         discovered = _codex_discover_terminal_control(project, observed_started_at)
         if discovered:
@@ -5594,35 +5993,111 @@ def _agent_registry_promote_codex(native_id: str, project: str, observed_started
                 discovered,
                 discovered_by="terminal_scan_fallback",
             )
-            for row in _codex_spawn_pending_registry_rows(project, observed_started_at):
-                _agent_registry_mark_closed("codex", row["native_id"])
             return exact
         return exact
     discovered = _codex_discover_terminal_control(project, observed_started_at)
     if discovered:
-        return _bind_codex_registry_to_terminal(
+        promoted = _bind_codex_registry_to_terminal(
             native_id,
             project,
             discovered,
             discovered_by="terminal_scan_fallback",
         )
+        return promoted
     pending = _codex_spawn_pending_registry_rows(project, observed_started_at)
-    if not pending:
+    if len(pending) != 1:
         return None
-    row = sorted(pending, key=lambda r: r.get("started_at") or 0, reverse=True)[0]
+    row = pending[0]
+    pending_metadata = _registry_metadata_from_row(row)
+    pending_native_id = str(row.get("native_id") or "")
+    pending_send_scope_id = _durable_send_scope_id_from_registry_row(
+        row,
+        provider="codex",
+        native_id=pending_native_id,
+    )
+    if (
+        pending_metadata.get("capture_backend") != "script"
+        or pending_metadata.get("broker_id")
+        or pending_send_scope_id
+        != _qualified_session_id("codex", pending_native_id)
+    ):
+        return None
+    pending_metadata.update({
+        "send_scope_id": pending_send_scope_id,
+        "pending_native_id": pending_native_id,
+        "canonical_native_id": native_id,
+        "identity_link": "single_visible_terminal_project_start_time",
+    })
+    now = _time.time()
     try:
-        with _agent_registry_conn() as conn:
-            conn.execute(
-                "UPDATE agent_sessions SET native_id = ?, last_heartbeat = ? "
-                "WHERE provider = 'codex' AND native_id = ?",
-                (native_id, _time.time(), row["native_id"]),
-            )
+        with _session_tombstone_reopen_guard() as track_reopen:
+            track_reopen("codex", native_id)
+            with _agent_registry_conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                changed = conn.execute(
+                    "UPDATE agent_sessions SET native_id = ?, metadata_json = ?, "
+                    "last_heartbeat = ? WHERE provider = 'codex' "
+                    "AND native_id = ? AND project = ? AND pid = ? "
+                    "AND terminal_tty = ? AND metadata_json = ? "
+                    "AND closed_at IS NULL",
+                    (
+                        native_id,
+                        json.dumps(pending_metadata, sort_keys=True),
+                        now,
+                        pending_native_id,
+                        str(row.get("project") or ""),
+                        int(row.get("pid") or 0),
+                        str(row.get("terminal_tty") or ""),
+                        str(row.get("metadata_json") or ""),
+                    ),
+                )
+                if changed.rowcount != 1:
+                    raise RuntimeError(
+                        "pending Codex identity changed during fallback promotion"
+                    )
+                _clear_session_tombstone_for_reopen("codex", native_id)
         row["native_id"] = native_id
-        row["last_heartbeat"] = _time.time()
+        row["metadata_json"] = json.dumps(pending_metadata, sort_keys=True)
+        row["last_heartbeat"] = now
+        _invalidate_session_list_caches()
+        identity_event = {
+            "type": "session_identity_linked",
+            "provider": "codex",
+            "native_id": native_id,
+            "send_scope_id": pending_send_scope_id,
+            "broker_id": None,
+            "project": project,
+            "heartbeat_at": now,
+        }
+        _publish_session_event(SESSION_SUMMARIES_TOPIC, identity_event)
+        _publish_session_event(
+            f"terminal:{pending_send_scope_id}",
+            dict(identity_event),
+        )
         return row
     except sqlite3.IntegrityError:
-        _agent_registry_mark_closed("codex", row["native_id"])
-        return _agent_registry_get("codex", native_id)
+        current = _agent_registry_get("codex", native_id)
+        if (
+            current is None
+            or str(current.get("project") or "") != str(row.get("project") or "")
+            or int(current.get("pid") or 0) not in {0, int(row.get("pid") or 0)}
+            or str(current.get("terminal_tty") or "")
+            not in {"", str(row.get("terminal_tty") or "")}
+        ):
+            return current
+        promoted = _bind_codex_registry_to_terminal(
+            native_id,
+            project,
+            {
+                "pid": int(row.get("pid") or 0),
+                "tty": str(row.get("terminal_tty") or ""),
+                "project": str(row.get("project") or project or ""),
+                "command": pending_metadata.get("command"),
+                "output_path": pending_metadata.get("output_path"),
+            },
+            discovered_by="registry_conflict",
+        )
+        return promoted
     except Exception:
         return None
 
@@ -10867,6 +11342,8 @@ _CONTROL_RECEIPT_SCHEMA_LOCK = threading.Lock()
 _CONTROL_RECEIPT_BOOTSTRAPPED_PATHS: set[str] = set()
 _ACTIVE_RECEIPTED_MUTATIONS_LOCK = threading.Lock()
 _ACTIVE_RECEIPTED_MUTATIONS: set[str] = set()
+_VISIBLE_RESUME_RESERVATIONS_LOCK = threading.Lock()
+_VISIBLE_RESUME_RESERVATIONS: dict[tuple[str, str], str] = {}
 _RECEIPTED_REQUEST_LOCAL = threading.local()
 TERMINAL_CONTROL_ALLOWED_KEYS = {
     "enter",
@@ -10904,6 +11381,38 @@ def _receipt_key(device_id: str | None, session_id: str, client_action_id: str) 
     if not normalized_device_id:
         raise ValueError("authenticated device_id is required for mutation receipts")
     return "|".join([normalized_device_id, session_id, client_action_id])
+
+
+def _reserve_visible_resume(
+    context: dict,
+    *,
+    provider: str,
+    canonical_native_id: str,
+) -> bool:
+    """Reserve one visible provider process for a canonical session."""
+    reservation_key = (
+        str(provider or "").strip().lower(),
+        str(canonical_native_id or "").strip(),
+    )
+    owner_key = _receipt_key(
+        context.get("device_id"),
+        str(context.get("receipt_scope") or ""),
+        str(context.get("client_action_id") or ""),
+    )
+    with _VISIBLE_RESUME_RESERVATIONS_LOCK:
+        if reservation_key in _VISIBLE_RESUME_RESERVATIONS:
+            return False
+        _VISIBLE_RESUME_RESERVATIONS[reservation_key] = owner_key
+    return True
+
+
+def _release_visible_resume_reservation(owner_key: str) -> None:
+    if not owner_key:
+        return
+    with _VISIBLE_RESUME_RESERVATIONS_LOCK:
+        for reservation_key, owner in list(_VISIBLE_RESUME_RESERVATIONS.items()):
+            if owner == owner_key:
+                _VISIBLE_RESUME_RESERVATIONS.pop(reservation_key, None)
 
 
 def _valid_client_action_id(value: str) -> bool:
@@ -10980,6 +11489,8 @@ def _clear_control_receipt_ledger() -> None:
     """Test helper. Production code never discards idempotency evidence."""
     with _ACTIVE_RECEIPTED_MUTATIONS_LOCK:
         _ACTIVE_RECEIPTED_MUTATIONS.clear()
+    with _VISIBLE_RESUME_RESERVATIONS_LOCK:
+        _VISIBLE_RESUME_RESERVATIONS.clear()
     reservations = getattr(_RECEIPTED_REQUEST_LOCAL, "reservations", None)
     if isinstance(reservations, dict):
         reservations.clear()
@@ -11297,6 +11808,27 @@ def _receipt_attach_response(
         receipt["response_fields"] = {
             key: value for key, value in fields.items() if value is not None
         }
+    return receipt
+
+
+def _make_send_text_receipt(receipt_context: dict, **kwargs) -> dict:
+    receipt = _make_action_receipt(**kwargs)
+    boundary = receipt_context.get("confirmation_boundary")
+    if isinstance(boundary, dict):
+        transcript_offset = boundary.get("transcript_offset")
+        log_seq = boundary.get("log_seq")
+        log_generation = boundary.get("log_generation")
+        if (
+            isinstance(transcript_offset, int)
+            and isinstance(log_seq, int)
+            and isinstance(log_generation, int)
+            and log_generation > 0
+        ):
+            receipt["confirmation_boundary"] = {
+                "transcript_offset": max(0, transcript_offset),
+                "log_seq": max(0, log_seq),
+                "log_generation": log_generation,
+            }
     return receipt
 
 
@@ -11719,6 +12251,7 @@ def _store_action_receipt(
         finally:
             with _ACTIVE_RECEIPTED_MUTATIONS_LOCK:
                 _ACTIVE_RECEIPTED_MUTATIONS.discard(reservation_key)
+            _release_visible_resume_reservation(reservation_key)
         if stored_durably:
             _untrack_request_receipt_reservation(reservation_key)
     _append_control_receipt_audit({
@@ -12246,6 +12779,22 @@ def _decorate_claude_session_row(row: dict, native_id: str, claude_pid: int = 0,
     row["terminal_tty"] = terminal_tty
     row["pid"] = claude_pid
     surface = _terminal_surface_capabilities(row["id"])
+    broker_id = str(
+        _durable_broker_id_from_registry_row(
+            registry_row,
+            provider="claude",
+            native_id=native_id,
+        )
+        or surface.get("broker_id")
+        or ""
+    ).strip()
+    row["broker_id"] = broker_id or None
+    send_scope_id = _durable_send_scope_id_from_registry_row(
+        registry_row,
+        provider="claude",
+        native_id=native_id,
+    ) or _normalized_send_scope_id("claude", broker_id)
+    row["send_scope_id"] = send_scope_id or None
     can_send_text = bool(surface.get("can_send_text"))
     can_interrupt = bool(surface.get("can_interrupt"))
     can_terminate = bool(surface.get("can_terminate"))
@@ -12709,7 +13258,14 @@ def _codex_control_overlay(row: dict, observed_mtime: float | None = None, *, ve
         fresh_pid = _pid_for_tty_command(tty, "codex")
         if fresh_pid:
             pid = fresh_pid
-            _agent_registry_upsert("codex", row["native_id"], row["project"], pid=pid, terminal_tty=tty)
+            _agent_registry_update_control(
+                "codex",
+                row["native_id"],
+                pid=pid,
+                terminal_tty=tty,
+                state="running",
+                reopen=True,
+            )
     if verify_process and pid and not _process_alive(pid):
         _agent_registry_mark_closed("codex", row["native_id"])
         return row
@@ -12717,6 +13273,22 @@ def _codex_control_overlay(row: dict, observed_mtime: float | None = None, *, ve
     surface_caps = _terminal_surface_capabilities(
         _qualified_session_id("codex", row.get("native_id") or "")
     )
+    broker_id = str(
+        _durable_broker_id_from_registry_row(
+            reg,
+            provider="codex",
+            native_id=str(row.get("native_id") or ""),
+        )
+        or surface_caps.get("broker_id")
+        or ""
+    ).strip()
+    row["broker_id"] = broker_id or None
+    send_scope_id = _durable_send_scope_id_from_registry_row(
+        reg,
+        provider="codex",
+        native_id=str(row.get("native_id") or ""),
+    ) or _normalized_send_scope_id("codex", broker_id)
+    row["send_scope_id"] = send_scope_id or None
     can_send = bool(surface_caps.get("can_send_text"))
     can_interrupt = bool(surface_caps.get("can_interrupt"))
     can_terminate = bool(surface_caps.get("can_terminate"))
@@ -12801,6 +13373,26 @@ def _codex_pending_registry_rows(seen: set[str], live_only: bool, active_within_
             "id": _qualified_session_id("codex", native_id),
             "provider": "codex",
             "native_id": native_id,
+            "send_scope_id": (
+                _durable_send_scope_id_from_registry_row(
+                    reg,
+                    provider="codex",
+                    native_id=native_id,
+                )
+                or _normalized_send_scope_id(
+                    "codex", surface_caps.get("broker_id")
+                )
+                or None
+            ),
+            "broker_id": (
+                _normalized_send_scope_id(
+                    "codex", metadata.get("broker_id")
+                )
+                or _normalized_send_scope_id(
+                    "codex", surface_caps.get("broker_id")
+                )
+                or None
+            ),
             "project": reg.get("project") or str(HOME),
             "working_on": "New Codex session",
             "started_at": int(reg.get("started_at") or _time.time()),
@@ -15187,7 +15779,7 @@ class Handler(BaseHTTPRequestHandler):
         working_on = str(payload.get("working_on") or "")[:500]
         broker_link = {"state": "not_applicable"}
         if provider == "claude" and claude_uuid:
-            broker_link = _agent_registry_link_claude_broker_registration(
+            broker_link = _agent_registry_link_claude_launch_registration(
                 session_id,
                 project,
                 pid=pid,
@@ -15199,8 +15791,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({
                 "ok": False,
                 "error": {
-                    "code": "broker_identity_link_failed",
-                    "message": "Claude broker identity could not be linked safely.",
+                    "code": "launch_identity_link_failed",
+                    "message": "Claude launch identity could not be linked safely.",
                     "reason": broker_link.get("reason"),
                 },
             }, status=409)
@@ -15217,6 +15809,7 @@ class Handler(BaseHTTPRequestHandler):
             metadata={"registered_by": "internal_session_register"},
         )
         broker_id = str(broker_link.get("broker_id") or "")
+        send_scope_id = str(broker_link.get("send_scope_id") or "")
         broker_alias_registered = False
         if linked and broker_id and PTY_BROKER is not None:
             try:
@@ -15233,9 +15826,13 @@ class Handler(BaseHTTPRequestHandler):
         # carries a claude_uuid — that is what /turn-state-stream waits on.
         if provider == "claude" and ok and claude_uuid:
             _signal_session_ready(session_id)
-            broker_native_id = str(broker_link.get("broker_native_id") or "")
-            if broker_native_id:
-                _signal_session_ready(broker_native_id)
+            pending_native_id = str(
+                broker_link.get("pending_native_id")
+                or broker_link.get("broker_native_id")
+                or ""
+            )
+            if pending_native_id:
+                _signal_session_ready(pending_native_id)
         response = {
             "ok": bool(ok),
             "identity_link_state": broker_link.get("state"),
@@ -15243,6 +15840,7 @@ class Handler(BaseHTTPRequestHandler):
         if linked:
             response.update({
                 "session_id": _qualified_session_id("claude", session_id),
+                "send_scope_id": send_scope_id or None,
                 "broker_id": broker_id,
                 "broker_alias_registered": broker_alias_registered,
             })
@@ -17559,29 +18157,45 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404, f"no transcript resolvable for session={session_id}")
             return
 
-        size = path.stat().st_size
-        if max_bytes is not None:
-            # Exact byte-range mode, used to recover regions named by an
-            # oversized notice: no initial-window clamp and no forward line
-            # alignment, and next_since advances by the raw bytes read rather
-            # than jumping to end of file.
-            start = min(since, size)
+        try:
             with open(path, "rb") as f:
-                f.seek(start)
-                data = f.read(min(max_bytes, size - start))
-            next_since = start + len(data)
-        else:
-            start = min(since, size)
-            if since == 0 and size > TRANSCRIPT_INITIAL_STREAM_BYTES:
-                start = max(0, size - TRANSCRIPT_INITIAL_STREAM_BYTES)
-            with open(path, "rb") as f:
-                f.seek(start)
-                data = f.read()
-            if start > 0:
-                first_newline = data.find(b"\n")
-                if first_newline >= 0:
-                    data = data[first_newline + 1:]
-            next_since = size
+                stat = os.fstat(f.fileno())
+                size = max(0, int(stat.st_size))
+                session_key = _qualified_session_id(provider, native_id)
+                ingestor = _ensure_session_log_ingestor()
+                log_generation = None
+                if ingestor is not None:
+                    log_generation = ingestor.generation_for_open_source(
+                        session_key,
+                        provider,
+                        native_id,
+                        path,
+                        (int(stat.st_dev), int(stat.st_ino)),
+                        size,
+                    )
+                if max_bytes is not None:
+                    # Exact byte-range mode, used to recover regions named by an
+                    # oversized notice: no initial-window clamp and no forward line
+                    # alignment, and next_since advances by the raw bytes read rather
+                    # than jumping to end of file.
+                    start = min(since, size)
+                    f.seek(start)
+                    data = f.read(min(max_bytes, size - start))
+                    next_since = start + len(data)
+                else:
+                    start = min(since, size)
+                    if since == 0 and size > TRANSCRIPT_INITIAL_STREAM_BYTES:
+                        start = max(0, size - TRANSCRIPT_INITIAL_STREAM_BYTES)
+                    f.seek(start)
+                    data = f.read()
+                    if start > 0:
+                        first_newline = data.find(b"\n")
+                        if first_newline >= 0:
+                            data = data[first_newline + 1:]
+                    next_since = size
+        except OSError:
+            self.send_error(503, "transcript is temporarily unavailable")
+            return
         if provider == "codex":
             data = _normalize_codex_ndjson(data, native_id).encode("utf-8")
 
@@ -17590,6 +18204,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Total-Bytes", str(size))
         self.send_header("X-Bytes-Read", str(len(data)))
         self.send_header("X-Next-Since", str(next_since))
+        if log_generation is not None:
+            self.send_header("X-Log-Generation", str(log_generation))
         self.send_header("X-Resolved-Path", path.name)
         self.end_headers()
         self.wfile.write(data)
@@ -17863,6 +18479,7 @@ class Handler(BaseHTTPRequestHandler):
         source: str = "session-live-events",
         terminal_offset: int | None = None,
         transcript_offset: int | None = None,
+        log_generation: int | None = None,
     ) -> dict:
         truth = truth or {}
         runtime = truth.get("runtime") if isinstance(truth.get("runtime"), dict) else {}
@@ -17886,6 +18503,7 @@ class Handler(BaseHTTPRequestHandler):
             "terminal_generation": v2.get("generation"),
             "terminal_offset": terminal_offset,
             "transcript_offset": transcript_offset,
+            "log_generation": log_generation,
             "runtime_version": RUNTIME_CONTRACT_VERSION,
             "source_revision": runtime.get("source_revision") or runtime.get("app_source_revision"),
             "payload": payload,
@@ -17900,28 +18518,45 @@ class Handler(BaseHTTPRequestHandler):
         if path is None or not path.exists():
             return None
         try:
-            stat = path.stat()
+            handle = open(path, "rb")
         except OSError:
             return None
-        size = max(0, int(stat.st_size))
-        since = max(0, int(since or 0))
-        if since > size:
-            return {
-                "next_since": 0,
-                "total_bytes": size,
-                "ndjson": "",
-                "reset": True,
-            }
-        start = _bounded_transcript_stream_start(since=since, size=size)
-        if start >= size:
-            return None
-        # Size the read window so the JSON-escaped ndjson plus the event
-        # envelope stays under SSE_TRANSCRIPT_MAX_EVENT_BYTES — escaping can
-        # roughly double the byte count, which used to overflow the writer
-        # ("event_too_large") even though the raw read fit.
-        read_cap = max(16 * 1024, SSE_TRANSCRIPT_MAX_EVENT_BYTES // 2 - 8 * 1024)
-        try:
-            with open(path, "rb") as f:
+        with handle:
+            try:
+                stat = os.fstat(handle.fileno())
+            except OSError:
+                return None
+            size = max(0, int(stat.st_size))
+            session_key = _qualified_session_id(provider, native_id)
+            ingestor = _ensure_session_log_ingestor()
+            log_generation = None
+            if ingestor is not None:
+                log_generation = ingestor.generation_for_open_source(
+                    session_key,
+                    provider,
+                    native_id,
+                    path,
+                    (int(stat.st_dev), int(stat.st_ino)),
+                    size,
+                )
+            since = max(0, int(since or 0))
+            if since > size:
+                return {
+                    "next_since": 0,
+                    "total_bytes": size,
+                    "ndjson": "",
+                    "reset": True,
+                    "log_generation": log_generation,
+                }
+            start = _bounded_transcript_stream_start(since=since, size=size)
+            if start >= size:
+                return None
+            # Size the read window so the JSON-escaped ndjson plus the event
+            # envelope stays under SSE_TRANSCRIPT_MAX_EVENT_BYTES. Escaping can
+            # roughly double the byte count.
+            read_cap = max(16 * 1024, SSE_TRANSCRIPT_MAX_EVENT_BYTES // 2 - 8 * 1024)
+            try:
+                f = handle
                 f.seek(start)
                 data = f.read(min(size - start, read_cap))
                 idx = data.rfind(b"\n")
@@ -17952,6 +18587,7 @@ class Handler(BaseHTTPRequestHandler):
                         "total_bytes": size,
                         "ndjson": "",
                         "reset": start != since,
+                        "log_generation": log_generation,
                         "skipped_oversized_bytes": line_end + 1 - start,
                         # Typed notice: the client renders a truncation card and
                         # recovers the content via GET /transcript with
@@ -17964,22 +18600,23 @@ class Handler(BaseHTTPRequestHandler):
                             "bytes": line_end + 1 - start,
                         },
                     }
-        except OSError:
-            return None
-        if idx < 0:
-            return None
-        complete = data[:idx + 1]
-        if not complete:
-            return None
-        ndjson = complete.decode("utf-8", errors="replace")
-        if provider == "codex":
-            ndjson = _normalize_codex_ndjson(complete, native_id, include_event_fallback=False)
-        return {
-            "next_since": start + len(complete),
-            "total_bytes": size,
-            "ndjson": ndjson,
-            "reset": start != since,
-        }
+            except OSError:
+                return None
+            if idx < 0:
+                return None
+            complete = data[:idx + 1]
+            if not complete:
+                return None
+            ndjson = complete.decode("utf-8", errors="replace")
+            if provider == "codex":
+                ndjson = _normalize_codex_ndjson(complete, native_id, include_event_fallback=False)
+            return {
+                "next_since": start + len(complete),
+                "total_bytes": size,
+                "ndjson": ndjson,
+                "reset": start != since,
+                "log_generation": log_generation,
+            }
 
     def _session_live_terminal_capture_path(self, provider: str, native_id: str, raw_session: str) -> Path | None:
         if provider == "claude":
@@ -18170,6 +18807,11 @@ class Handler(BaseHTTPRequestHandler):
                 source=source,
                 terminal_offset=terminal_offset,
                 transcript_offset=transcript_offset,
+                log_generation=(
+                    payload.get("log_generation")
+                    if event_type == "transcript_entries"
+                    else None
+                ),
             )
             max_bytes = SSE_TRANSCRIPT_MAX_EVENT_BYTES if event_type == "transcript_entries" else SSE_MAX_EVENT_BYTES
             ok = _sse_write_json_event(self.wfile, event_type, envelope, max_bytes=max_bytes, stats_key=event_type)
@@ -26662,6 +27304,7 @@ Worker instructions:
                     "capture_backend": "pty_broker",
                     "capture_id": capture_id,
                     "broker_id": broker_session_id,
+                    "send_scope_id": broker_session_id,
                     "broker_socket": str(PTY_BROKER_SOCKET),
                     "spawn_action_id": spawn_action_id or None,
                     "spawn_body_hash": spawn_body_hash or None,
@@ -26757,6 +27400,7 @@ Worker instructions:
             "provider": provider,
             "native_id": native_id,
             "session_id": broker_session_id,
+            "send_scope_id": broker_session_id,
             "tty": _broker_slave_tty(session),
             "pid": _broker_pid(session),
             "terminal_log": str(_broker_raw_log_path(session)) if _broker_raw_log_path(session) else None,
@@ -27115,6 +27759,14 @@ Worker instructions:
                 "provider": provider,
                 "native_id": deterministic_native_id,
                 "session_id": _qualified_session_id(provider, deterministic_native_id),
+                "send_scope_id": (
+                    _durable_send_scope_id_from_registry_row(
+                        existing_row,
+                        provider=provider,
+                        native_id=deterministic_native_id,
+                    )
+                    or _qualified_session_id(provider, deterministic_native_id)
+                ),
                 "tty": existing_row.get("terminal_tty") or "",
                 "pid": int(existing_row.get("pid") or 0),
                 "terminal_log": existing_metadata.get("terminal_log"),
@@ -27311,6 +27963,7 @@ Worker instructions:
                     "capture_backend": "script" if capture_log_path else None,
                     "terminal_source": "terminal_app_contents",
                     "capture_id": capture_id or None,
+                    "send_scope_id": _qualified_session_id(provider, native_id),
                     "spawn_action_id": client_action_id,
                     "spawn_body_hash": spawn_body_hash,
                 },
@@ -27400,6 +28053,7 @@ Worker instructions:
             "provider": provider,
             "native_id": native_id,
             "session_id": _qualified_session_id(provider, native_id),
+            "send_scope_id": _qualified_session_id(provider, native_id),
             "tty": tty,
             "pid": pid,
             "terminal_log": str(capture_log_path) if capture_log_path else None,
@@ -27512,8 +28166,10 @@ Worker instructions:
         )
         pid = 0
         native_id = None
+        send_scope_id = None
         if provider == "codex" and launch_ok:
             native_id = "pending-" + secrets.token_hex(8)
+            send_scope_id = _qualified_session_id("codex", native_id)
             _time.sleep(0.75)
             pid = _pid_for_tty_command(tty, "codex")
             reg_meta = dict(metadata)
@@ -27521,6 +28177,10 @@ Worker instructions:
                 "spawned_by": "phone-companion",
                 "prompt_path": str(prompt_path),
                 "terminal_title": f"{provider}:{title_suffix}",
+                "capture_backend": "script",
+                "terminal_source": "terminal_app_contents",
+                "launch_strategy": "direct_pairling",
+                "send_scope_id": send_scope_id,
             })
             _agent_registry_upsert("codex", native_id, project, pid=pid, terminal_tty=tty, metadata=reg_meta)
             _write_agent_turn_state("codex", native_id, "thinking", event="cross_provider")
@@ -27529,6 +28189,7 @@ Worker instructions:
             "ok": launch_ok,
             "native_id": native_id,
             "session_id": _qualified_session_id(provider, native_id) if native_id else None,
+            "send_scope_id": send_scope_id,
             "tty": tty,
             "pid": pid,
             "error": (
@@ -27881,6 +28542,7 @@ Worker instructions:
                 "provider": provider,
                 "native_id": native_id,
                 "session_id": broker_session_id,
+                "send_scope_id": broker_session_id,
                 "project": project,
                 "tty": _broker_slave_tty(existing),
                 "pid": _broker_pid(existing),
@@ -27968,6 +28630,7 @@ Worker instructions:
                     "capture_id": capture_id,
                     "terminal_source": "broker_vt",
                     "broker_id": broker_session_id,
+                    "send_scope_id": broker_session_id,
                     "broker_socket": str(PTY_BROKER_SOCKET),
                 },
             )
@@ -28029,6 +28692,7 @@ Worker instructions:
             "provider": provider,
             "native_id": native_id,
             "session_id": broker_session_id,
+            "send_scope_id": broker_session_id,
             "project": project,
             "tty": _broker_slave_tty(session),
             "pid": _broker_pid(session),
@@ -28050,11 +28714,7 @@ Worker instructions:
         self._send_json(response)
 
     def _handle_resume_session(self, q):
-        """Provider-aware app resume. Claude keeps its existing in-terminal
-        `/resume <id>` path; Codex resume launches a resumed interactive TUI
-        in a fresh Terminal tab and records control metadata for the same
-        provider-qualified session id.
-        """
+        """Resume Codex once and bind the new terminal to a durable send scope."""
         try:
             payload = json.loads(self._read_body() or b"{}")
         except json.JSONDecodeError:
@@ -28159,6 +28819,84 @@ Worker instructions:
             }, status=404)
             return
 
+        resume_backend = os.environ.get(
+            "PAIRLING_RESUME_BACKEND", "terminal_app"
+        ).lower()
+        if resume_backend != "broker":
+            if not _reserve_visible_resume(
+                receipt_context,
+                provider=provider,
+                canonical_native_id=native_id,
+            ):
+                message = (
+                    "This Codex session is already being resumed on the Mac. "
+                    "Wait for it to appear instead of starting another resume."
+                )
+                receipt = _finalize_receipted_mutation(
+                    receipt_context,
+                    state="rejected",
+                    http_status=409,
+                    backend="terminal_app",
+                    error_code="resume_in_progress",
+                    error_message=message,
+                    fields={
+                        "session_id": _qualified_session_id("codex", native_id),
+                    },
+                    audit_action={"type": "resume_session", "provider": provider},
+                )
+                self._send_json({
+                    "ok": False,
+                    "error": {
+                        "code": "resume_in_progress",
+                        "message": message,
+                    },
+                    "session_id": _qualified_session_id("codex", native_id),
+                    "receipt": receipt,
+                }, status=409)
+                return
+            existing = _agent_registry_get("codex", native_id)
+            if (
+                existing is not None
+                and not existing.get("closed_at")
+                and _session_has_verified_provider_process(existing, "codex")
+            ):
+                existing_send_scope_id = (
+                    _durable_send_scope_id_from_registry_row(
+                        existing,
+                        provider="codex",
+                        native_id=native_id,
+                    )
+                    or _qualified_session_id("codex", native_id)
+                )
+                message = (
+                    "This Codex session is already running on the Mac. "
+                    "Open its existing Pairling session instead of resuming it again."
+                )
+                receipt = _finalize_receipted_mutation(
+                    receipt_context,
+                    state="rejected",
+                    http_status=409,
+                    backend="terminal_app",
+                    error_code="session_already_live",
+                    error_message=message,
+                    fields={
+                        "session_id": _qualified_session_id("codex", native_id),
+                        "send_scope_id": existing_send_scope_id,
+                    },
+                    audit_action={"type": "resume_session", "provider": provider},
+                )
+                self._send_json({
+                    "ok": False,
+                    "error": {
+                        "code": "session_already_live",
+                        "message": message,
+                    },
+                    "session_id": _qualified_session_id("codex", native_id),
+                    "send_scope_id": existing_send_scope_id,
+                    "receipt": receipt,
+                }, status=409)
+                return
+
         allowed, retry = _inject_rate_check("__resume_session__")
         if not allowed:
             message = f"rate limited, retry in {retry}s"
@@ -28180,7 +28918,7 @@ Worker instructions:
             }, status=429)
             return
 
-        if os.environ.get("PAIRLING_RESUME_BACKEND", "terminal_app").lower() == "broker":
+        if resume_backend == "broker":
             self._handle_resume_session_broker(
                 provider=provider,
                 project=project,
@@ -28190,6 +28928,13 @@ Worker instructions:
             )
             return
 
+        resume_scope_native_id = "pending-" + hashlib.sha256(
+            (
+                f"{receipt_context['device_id']}\0"
+                f"{receipt_context['client_action_id']}\0resume\0{native_id}"
+            ).encode()
+        ).hexdigest()[:16]
+        send_scope_id = _qualified_session_id("codex", resume_scope_native_id)
         capture_id = secrets.token_hex(12)
         capture_log_path = TERMINAL_CAPTURE_DIR / f"codex-{capture_id}.log"
         inner = (
@@ -28220,6 +28965,7 @@ Worker instructions:
                 tty = parts[1].strip()
         valid_tty = re.fullmatch(r"/dev/ttys[0-9]{3,}", tty)
         pid = 0
+        registry_written = False
         if result.get("ok") and valid_tty is not None:
             _time.sleep(0.75)
             pid = _pid_for_tty_command(tty, "codex") if tty else 0
@@ -28231,7 +28977,7 @@ Worker instructions:
                     project=project,
                     capture_id=capture_id,
                 )
-            _agent_registry_upsert(
+            registry_written = _agent_registry_upsert(
                 "codex",
                 native_id,
                 project,
@@ -28246,9 +28992,15 @@ Worker instructions:
                     "terminal_source": "terminal_app_contents",
                     "launch_visibility": "visible_terminal",
                     "capture_id": capture_id,
+                    "send_scope_id": send_scope_id,
+                    "pending_native_id": resume_scope_native_id,
+                    "canonical_native_id": native_id,
+                    "identity_link": "visible_resume_launch",
+                    "resume_action_id": receipt_context["client_action_id"],
                 },
             )
-            _write_agent_turn_state("codex", native_id, "idle", event="resume")
+            if registry_written:
+                _write_agent_turn_state("codex", native_id, "idle", event="resume")
         try:
             audit_path = HOME / ".claude" / "audit" / "resume-sessions.jsonl"
             audit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -28258,10 +29010,12 @@ Worker instructions:
                     "provider": provider,
                     "project": project,
                     "native_id": native_id,
+                    "send_scope_id": send_scope_id,
                     "tty": tty,
                     "pid": pid,
                     "terminal_log": str(capture_log_path),
                     "capture_backend": "script",
+                    "registry_written": registry_written,
                     "ok": result.get("ok", False),
                     "reason": result.get("reason"),
                     "via": "phone-companion",
@@ -28316,11 +29070,44 @@ Worker instructions:
                 "receipt": receipt,
             }, status=502)
             return
+        if not registry_written:
+            message = (
+                "Terminal resumed the Codex session, but Pairling could not store "
+                "its control identity. Do not resume it again."
+            )
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="indeterminate",
+                http_status=502,
+                backend="terminal_app",
+                error_code="resume_registry_unavailable",
+                error_message=message,
+                fields={
+                    "session_id": _qualified_session_id("codex", native_id),
+                    "send_scope_id": send_scope_id,
+                    "outcome_indeterminate": True,
+                },
+                audit_action={"type": "resume_session", "provider": provider},
+                pty_written=None,
+            )
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "resume_registry_unavailable",
+                    "message": message,
+                },
+                "session_id": _qualified_session_id("codex", native_id),
+                "send_scope_id": send_scope_id,
+                "outcome_indeterminate": True,
+                "receipt": receipt,
+            }, status=502)
+            return
         response = {
             "ok": True,
             "provider": "codex",
             "native_id": native_id,
             "session_id": _qualified_session_id("codex", native_id),
+            "send_scope_id": send_scope_id,
             "project": project,
             "tty": tty,
             "pid": pid,
@@ -28355,7 +29142,8 @@ Worker instructions:
         error_code: str | None = None,
         extra: dict | None = None,
     ) -> None:
-        receipt = _make_action_receipt(
+        receipt = _make_send_text_receipt(
+            receipt_context,
             client_action_id=receipt_context.get("client_action_id"),
             state=state,
             phases=_receipt_phases(validated=validated, applied=False, pty_written=False),
@@ -28461,7 +29249,8 @@ Worker instructions:
                 if "pty_written" in result
                 else (None if outcome_indeterminate else bool(result.get("ok")))
             )
-            receipt = _make_action_receipt(
+            receipt = _make_send_text_receipt(
+                receipt_context,
                 client_action_id=client_action_id,
                 state="applied" if result.get("ok") else ("indeterminate" if outcome_indeterminate else "failed"),
                 phases=_receipt_phases(validated=True, applied=bool(result.get("ok")), pty_written=pty_written),
@@ -28528,7 +29317,8 @@ Worker instructions:
         tty = reg.get("terminal_tty") or ""
         if not tty:
             reason = "no terminal_tty for Codex session"
-            receipt = _make_action_receipt(
+            receipt = _make_send_text_receipt(
+                receipt_context,
                 client_action_id=client_action_id,
                 state="rejected",
                 phases=_receipt_phases(validated=False, applied=False, pty_written=False),
@@ -28645,7 +29435,8 @@ Worker instructions:
             if "pty_written" in result
             else (None if outcome_indeterminate else bool(result.get("ok")))
         )
-        receipt = _make_action_receipt(
+        receipt = _make_send_text_receipt(
+            receipt_context,
             client_action_id=client_action_id,
             state=(
                 "applied"
@@ -28702,6 +29493,41 @@ Worker instructions:
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_text_confirmation_boundary(
+        self,
+        provider: str,
+        native_id: str,
+        raw_session: str,
+    ) -> tuple[dict | None, str | None]:
+        session_key = _qualified_session_id(provider, native_id)
+        log = _ensure_session_event_log()
+        ingestor = _ensure_session_log_ingestor()
+        if log is None or ingestor is None:
+            return None, "session_log_unavailable"
+        try:
+            transcript_path = self._resolve_session_transcript_path(
+                provider,
+                native_id,
+                raw_session,
+            )
+        except Exception:
+            return None, "transcript_resolution_failed"
+        if transcript_path is None:
+            return None, "transcript_source_unavailable"
+        if not ingestor.ensure(session_key, provider, native_id, transcript_path):
+            return None, "session_log_registration_failed"
+        drained = ingestor.drain_now(session_key)
+        if drained.get("ok") is not True:
+            return None, str(drained.get("reason") or "session_log_boundary_failed")
+        log_generation = int(drained.get("log_generation") or 0)
+        if log_generation <= 0:
+            return None, "session_log_generation_unavailable"
+        return {
+            "transcript_offset": max(0, int(drained.get("transcript_offset") or 0)),
+            "log_seq": max(0, int(drained.get("log_seq") or 0)),
+            "log_generation": log_generation,
+        }, None
 
     # ----- /send-text: write directly to a Terminal tab's pty (no keystrokes) -----
     def _handle_send_text(self, q):
@@ -28846,6 +29672,25 @@ Worker instructions:
             }, status=429)
             return
 
+        confirmation_boundary, boundary_error = self._send_text_confirmation_boundary(
+            provider,
+            native_id,
+            raw_session,
+        )
+        if confirmation_boundary is None:
+            self._finish_send_text_failure(
+                receipt_context,
+                text,
+                status=503,
+                reason="Pairling could not establish the transcript proof boundary. No text was sent.",
+                state="failed",
+                validated=True,
+                error_code="confirmation_boundary_unavailable",
+                extra={"boundary_reason": boundary_error},
+            )
+            return
+        receipt_context["confirmation_boundary"] = confirmation_boundary
+
         global LAST_HUMAN_ACTIVITY_AT
         LAST_HUMAN_ACTIVITY_AT = _time.time()
 
@@ -28895,7 +29740,8 @@ Worker instructions:
 
         tty = self._lookup_terminal_tty(session_id)
         if not broker_found and not tty:
-            receipt = _make_action_receipt(
+            receipt = _make_send_text_receipt(
+                receipt_context,
                 client_action_id=receipt_context["client_action_id"],
                 state="rejected",
                 phases=_receipt_phases(validated=False, applied=False, pty_written=False),
@@ -28951,7 +29797,8 @@ Worker instructions:
                 if "pty_written" in result
                 else (None if outcome_indeterminate else bool(result.get("ok")))
             )
-            receipt = _make_action_receipt(
+            receipt = _make_send_text_receipt(
+                receipt_context,
                 client_action_id=receipt_context["client_action_id"],
                 state="applied" if result.get("ok") else ("indeterminate" if outcome_indeterminate else "failed"),
                 phases=_receipt_phases(validated=True, applied=bool(result.get("ok")), pty_written=pty_written),
@@ -29098,7 +29945,8 @@ Worker instructions:
             if "pty_written" in result
             else (None if outcome_indeterminate else bool(result.get("ok")))
         )
-        receipt = _make_action_receipt(
+        receipt = _make_send_text_receipt(
+            receipt_context,
             client_action_id=receipt_context["client_action_id"],
             state=(
                 "applied"
@@ -29434,7 +30282,14 @@ Worker instructions:
             if (not pid or not _process_alive(pid)) and tty:
                 pid = _pid_for_tty_command(tty, "codex")
                 if pid:
-                    _agent_registry_upsert("codex", native_id, reg.get("project") or str(HOME), pid=pid, terminal_tty=tty)
+                    _agent_registry_update_control(
+                        "codex",
+                        native_id,
+                        pid=pid,
+                        terminal_tty=tty,
+                        state="running",
+                        reopen=True,
+                    )
                     reg = _agent_registry_get("codex", native_id) or {
                         **reg,
                         "pid": pid,
