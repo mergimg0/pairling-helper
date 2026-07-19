@@ -104,7 +104,6 @@ PAIRLING_LABEL = "dev.pairling.companiond"
 PAIRLING_CONNECTD_LABEL = "dev.pairling.connectd"
 PAIRLING_PTYBROKER_LABEL = "dev.pairling.ptybroker"
 INTERNAL_DEVICE_PURPOSES = ("runtime_truth_smoke", "local_mcp_bridge")
-TEAM_ID = os.environ.get("PAIRLING_TEAM_ID", os.environ.get("PAIRLING_CONNECTD_TEAM_ID", "965AVD34A3"))
 APP_SUPPORT = Path(os.environ.get("PAIRLING_APP_SUPPORT_ROOT", os.environ.get("COMPANION_APP_SUPPORT_ROOT", str(home / "Library" / "Application Support" / "Pairling"))))
 LOGS_ROOT = Path(os.environ.get("PAIRLING_LOGS_ROOT", os.environ.get("COMPANION_LOGS_ROOT", str(home / "Library" / "Logs" / "Pairling"))))
 CURRENT = APP_SUPPORT / "runtime" / "current"
@@ -158,23 +157,6 @@ def connect_query_only_database(path: Path) -> sqlite3.Connection:
                 raise
             time.sleep(QUERY_ONLY_DB_INITIAL_DELAY_SECONDS * (2**attempt))
     raise AssertionError("query-only database retry loop exhausted")
-
-
-def codesigning_identity_summary(output: str) -> dict:
-    lines = [line.strip() for line in output.splitlines() if line.strip()]
-    developer_id_lines = [line for line in lines if "Developer ID Application:" in line]
-    expected_team_present = any(f"({TEAM_ID})" in line for line in developer_id_lines)
-    valid_count = None
-    for line in lines:
-        match = re.search(r"(\d+)\s+valid identities found", line)
-        if match:
-            valid_count = int(match.group(1))
-            break
-    return {
-        "valid_identity_count": valid_count,
-        "developer_id_application_count": len(developer_id_lines),
-        "expected_team_present": expected_team_present,
-    }
 
 
 def run(args, timeout=5):
@@ -1015,35 +997,7 @@ for name in ["claude", "codex"]:
     provider_evidence[name] = out.strip() if code == 0 else None
 add("provider_clis_detected", True, "warning", "Provider CLI detection completed.", provider_evidence)
 
-release_blockers = []
-developer_id_identity = os.environ.get("PAIRLING_DEVELOPER_ID_IDENTITY")
-code, out, err = run(["/usr/bin/security", "find-identity", "-v", "-p", "codesigning"], timeout=5)
-identity_evidence = codesigning_identity_summary(out)
-has_developer_id = code == 0 and (
-    (developer_id_identity in out) if developer_id_identity else identity_evidence["expected_team_present"]
-)
-if not has_developer_id:
-    release_blockers.append("Developer ID Application identity is missing from the login keychain for the expected team.")
-add(
-    "developer_id_identity",
-    has_developer_id,
-    "warning",
-    "Developer ID Application identity is available for public helper signing.",
-    identity_evidence if code == 0 else {"error": (err or "security find-identity failed")[:200]},
-)
-
-notary_profile = os.environ.get("PAIRLING_NOTARY_PROFILE", "pairling-notary")
-code, out, err = run(["/usr/bin/xcrun", "notarytool", "history", "--keychain-profile", notary_profile], timeout=10)
-has_notary_profile = code == 0
-if not has_notary_profile:
-    release_blockers.append(f"Notary credentials are missing or invalid for keychain profile: {notary_profile}")
-add(
-    "notary_profile",
-    has_notary_profile,
-    "warning",
-    "Notary credentials are stored and can authenticate.",
-    {"profile": notary_profile, "authenticated": has_notary_profile, "error": None if has_notary_profile else (err or out)[:200]},
-)
+runtime_artifact_issues = []
 
 # npm distribution: the staged pairling-connectd binary must be a valid
 # Developer ID build from the pinned team. This replaces the retired dmg
@@ -1064,7 +1018,7 @@ if staged_connectd.exists():
     team_id = team_line.split("=", 1)[1] if "=" in team_line else ""
     signed_ok = vcode == 0 and rcode == 0 and (expected_team == "-" or team_id == expected_team)
     if not signed_ok:
-        release_blockers.append("Staged pairling-connectd is not a valid Developer ID build from the expected team.")
+        runtime_artifact_issues.append("Staged pairling-connectd is not a valid Developer ID build from the expected team.")
     add(
         "connectd_signature",
         signed_ok,
@@ -1073,7 +1027,7 @@ if staged_connectd.exists():
         {"binary": str(staged_connectd), "team_id": team_id or None, "expected_team": expected_team, "verify": (vout or verr)[:1000], "developer_id_verify": (rout or rerr)[:1000]},
     )
 else:
-    release_blockers.append("Staged pairling-connectd is not present; run pairling setup.")
+    runtime_artifact_issues.append("Staged pairling-connectd is not present; run pairling setup.")
     add(
         "connectd_signature",
         False,
@@ -1106,7 +1060,7 @@ if staged_python.exists():
         and p_id == expected_python_identifier
     )
     if not python_signed_ok:
-        release_blockers.append("Staged vendored python is not a valid dev.pairling.python Developer ID build.")
+        runtime_artifact_issues.append("Staged vendored python is not a valid dev.pairling.python Developer ID build.")
     add(
         "python_runtime",
         python_signed_ok,
@@ -1153,7 +1107,7 @@ first_run = {
         "running": runtime_running_for_first_run,
         "runtime_health_verified": runtime_running,
         "launchd_label": PAIRLING_LABEL,
-        "artifact_release_blockers": release_blockers,
+        "runtime_artifact_issues": runtime_artifact_issues,
     },
     "runtime": {
         "installed": runtime_installed,
@@ -1219,7 +1173,7 @@ result = {
         "port": 7723,
         "listeners": listeners_7723,
     },
-    "release_blockers": release_blockers,
+    "runtime_artifact_issues": runtime_artifact_issues,
     "checks": checks,
     "warnings": warnings,
     "errors": errors,

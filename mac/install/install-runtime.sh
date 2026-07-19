@@ -284,6 +284,7 @@ verify_package_python_before_execution() {
 verify_package_snapshot_before_execution
 verify_package_python_before_execution
 PYTHON3_BIN="$(resolve_python_bin)"
+CONTROL_PYTHON_BIN="$PYTHON3_BIN"
 
 pin_control_python() {
   local resolved
@@ -302,6 +303,7 @@ PY
     log "ERROR: Pairling control interpreter is not functional: $resolved" >&2
     return 1
   fi
+  CONTROL_PYTHON_BIN="$resolved"
   PYTHON3_BIN="$resolved"
 }
 PAIRDROP_ROOT="$("$PYTHON3_BIN" - "$PAIRDROP_ROOT_WAS_SET" "$PAIRDROP_ROOT_INPUT" "$CONFIG_FILE" "$HOME/PairDrop" <<'PY'
@@ -407,6 +409,8 @@ INSTALL_LOCK_DIR="$RUNTIME_ROOT/.install.lock"
 INSTALL_LOCK_HELD=0
 ACTIVE_STAGING_DIR=""
 ACTIVE_SOURCE_SNAPSHOT=""
+GUIDED_FAILURE_SOURCE_PATH=""
+GUIDED_FAILURE_PATH=""
 
 validate_app_support_root() {
   if [[ "$APP_SUPPORT" != /* || "$APP_SUPPORT" == "/" || "$APP_SUPPORT" == "$HOME" ]]; then
@@ -849,11 +853,9 @@ wizard_splash() {
 # constructs the bridge as SafetyMonitorBridge(APP_SUPPORT_ROOT, HOME), the same
 # construction the daemon uses. It never reads a TCC store and never calls the
 # safety HTTP routes, which need a device bearer token the local wizard does not
-# have. The companiond dir and the app support root are passed as argv, so an
-# install path with a space is passed whole. On any failure it prints
-# installed=false, so the caller fails closed to the not-installed advisory.
+# have. Values are reduced to fixed tokens before they reach the shell.
 safety_status_line() {
-  "$PYTHON3_BIN" - "$CURRENT_LINK/companiond" "$APP_SUPPORT" <<'PY' 2>/dev/null || printf 'installed=false full_disk_access=unknown\n'
+  "$PYTHON3_BIN" - "$CURRENT_LINK/companiond" "$APP_SUPPORT" <<'PY' 2>/dev/null || printf 'installed=unknown system_extension_status=status_unavailable full_disk_access=unknown\n'
 import os
 import sys
 from pathlib import Path
@@ -866,22 +868,28 @@ try:
     bridge = SafetyMonitorBridge(app_support_root, Path(os.path.expanduser("~")))
     status = bridge.status()
     installed = "true" if status.get("installed") else "false"
+    extension = str(status.get("system_extension_status") or "status_unavailable")
     fda = str(status.get("full_disk_access") or "unknown")
 except Exception:
-    installed, fda = "false", "unknown"
-print("installed=%s full_disk_access=%s" % (installed, fda))
+    installed, extension, fda = "unknown", "status_unavailable", "unknown"
+if extension not in {"active", "approval_required", "failed", "not_installed", "status_stale"}:
+    extension = "status_unavailable"
+if fda not in {"validated", "not_validated", "denied", "unknown", "unavailable", "limited"}:
+    fda = "unknown"
+print("installed=%s system_extension_status=%s full_disk_access=%s" % (installed, extension, fda))
 PY
 }
 
-# safety_status_installed: return 0 when the bridge reports installed true, 1
-# when it reports installed false, and the not-installed advisory path handles
-# both 1 and any read failure, which also prints installed=false. The reader is
-# the single source of truth for whether the future PairlingSafety.app is present.
-safety_status_installed() {
-  case "$(safety_status_line)" in
-    *"installed=true"*) return 0 ;;
-    *) return 1 ;;
-  esac
+# safety_status_value reads one fixed key from safety_status_line without eval.
+# The Python reader emits no spaces inside values, so each item is one shell word.
+safety_status_value() {
+  local line="$1" key="$2" item
+  for item in $line; do
+    case "$item" in
+      "$key"=*) printf '%s\n' "${item#*=}"; return 0 ;;
+    esac
+  done
+  return 1
 }
 
 # stage_begin: print the numbered header for one guided stage. The TTY branch keeps
@@ -987,25 +995,32 @@ provider_setup_stage() {
   return 0
 }
 
-# wizard_recovery_menu: a plain bash recovery menu. It uses a plain blocking
-# read with no timeout, which bash 3.2.57 supports, so it works without any
-# python. The recoverable kind offers open Full Disk Access settings, skip, and
-# quit and resume. The fatal kind, an integrity or signature failure,
-# has no retry and no skip, which mirrors the install script that exits with no
-# bypass on a hash mismatch or a code-signature failure. When stdin is not a
-# terminal it prints the options and returns, so a headless or piped run never
-# blocks. open_full_disk_access_pane is defined by the safety step and runs the
-# bridge open_full_disk_access method.
+# wizard_recovery_menu: a plain bash recovery menu. Generic setup failures never
+# offer privacy settings because permissions cannot repair staging, ownership,
+# disk, or service errors. The Safety-specific kind is the only path that can
+# open Full Disk Access, and safety_step calls it only after the installed and
+# active Safety Monitor reports limited file visibility.
 wizard_recovery_menu() {
   local kind="$1" stage="$2"
-  if [ "$kind" = "fatal" ]; then
-    stage_note "Pairling stopped to protect your Mac at the $stage step."
-    stage_note "A file did not match its signed checksum, so setup will not continue. There is no way to skip this check."
-    stage_note "Options: [1] reinstall from a verified copy   [2] view logs   [q] quit"
-  else
-    stage_note "Setup needs your help at the $stage step."
-    stage_note "Options: [o] open Full Disk Access settings   [s] skip for now   [q] quit and resume"
-  fi
+  case "$kind" in
+    fatal)
+      stage_note "Pairling stopped to protect your Mac at the $stage step."
+      stage_note "A file did not match its signed checksum, so setup will not continue. There is no way to skip this check."
+      stage_note "Options: [1] reinstall from a verified copy   [2] inspect with pairling doctor --json   [q] quit"
+      ;;
+    safety_permissions)
+      stage_note "Pairling Safety Monitor is active, but macOS is limiting its file evidence."
+      stage_note "Options: [o] open Full Disk Access settings   [s] skip this optional feature   [q] quit"
+      ;;
+    setup)
+      stage_note "Setup stopped at the $stage step."
+      stage_note "Options: [1] inspect with pairling doctor --json   [2] retry pairling setup   [q] quit"
+      ;;
+    *)
+      stage_note "Setup stopped with an unknown recovery state."
+      return 1
+      ;;
+  esac
   # Off a terminal, print the options and return without blocking.
   [ -t 0 ] || return 0
   local choice=""
@@ -1013,18 +1028,12 @@ wizard_recovery_menu() {
     printf '  Choose an option: '
     read -r choice || return 0
     case "$kind:$choice" in
-      # Retry was removed here because no caller loops on the menu return today.
-      # In guided_on_exit the process is already exiting, and in safety_step the
-      # evidence poll has already timed out before the menu shows, so an [r] key
-      # did nothing. When the future PairlingSafety.app makes the evidence poll
-      # live, add a real retry loop in safety_step with a distinct menu return
-      # code, then reinstate an [r] option that maps to it. An r keypress now
-      # falls through to the reprompt below, which is correct.
-      recoverable:o|recoverable:O) open_full_disk_access_pane ;;
-      recoverable:s|recoverable:S) stage_note "Skipped. You can grant it later and run pairling setup again."; return 0 ;;
+      safety_permissions:o|safety_permissions:O) open_full_disk_access_pane ;;
+      safety_permissions:s|safety_permissions:S) stage_note "Skipped. Pairing will continue without Safety Monitor file evidence."; return 0 ;;
       *:q|*:Q) stage_note "Quitting. Run pairling setup again to resume right here."; return 0 ;;
       fatal:1) stage_note "Reinstall Pairling from a verified copy, then run pairling setup again."; return 0 ;;
-      fatal:2) stage_note "The full details are in the setup log under the audit folder."; return 0 ;;
+      fatal:2|setup:1) stage_note "Run pairling doctor --json and include its failed checks with the setup error above."; return 0 ;;
+      setup:2) stage_note "Run pairling setup again. It will clean its private staging path before retrying."; return 0 ;;
       *) stage_note "Pick one of the listed options." ;;
     esac
   done
@@ -1134,46 +1143,78 @@ wizard_permissions_panel() {
 }
 
 # safety_step: the one safety gate in v1. It reads the live SafetyMonitorBridge
-# status. Today the app is not installed, so the bridge reports installed false,
-# and this prints one plain advisory line that the Safety Monitor is a future
-# feature and is not installed, and that pairing works without it, then continues.
-# It never claims it installed the app. It never shows or blocks on Full Disk
-# Access when the app is absent. When a future PairlingSafety.app reports
-# installed true, the same flow guides System Extension approval, then Full Disk
-# Access, then polls the evidence test until file evidence passes, advancing on
-# pass or showing the recovery menu on timeout. It never blocks pairing and
-# always returns 0.
+# status. The bridge returns typed extension and file-access states. Only an
+# installed, active monitor with limited file evidence may open Full Disk Access.
+# Approval, failed, stale, missing, and already validated states never open that
+# pane. Safety is optional and never blocks pairing.
 safety_step() {
-  if safety_status_installed; then
-    stage_note "Pairling Safety Monitor is installed. Setting it up so it can watch your agent sessions."
-    request_safety_activation
-    open_full_disk_access_pane
-    stage_note "Checking that the Safety Monitor can see process and file evidence. We check every 2 seconds."
-    if poll_evidence_test; then
-      stage_note "The Safety Monitor sees full evidence. Thank you."
-    else
-      stage_note "The Safety Monitor did not reach full file evidence within the time limit."
-      # A skip never blocks pairing. File visibility is the only thing limited
-      # until Full Disk Access is granted.
-      wizard_recovery_menu recoverable "macOS permissions" || true
-    fi
-    # The Pairling Connect advisory. On the guided screen it renders as a rounded
-    # panel. A machine path keeps the plain stage_note, byte identical.
-    if [ "${GUIDED_TTY:-0}" = 1 ]; then
-      wizard_permissions_panel ""
-    else
-      stage_note "Pairling Connect uses its private embedded route. Local Network access and the same Wi-Fi are not required for pairing."
-    fi
-  else
-    # The not-installed advisory. This is today's path. It states the truth: the
-    # Safety Monitor is a future feature, it is not installed, and pairing works
-    # without it. It never claims setup installed anything. On the guided screen the
+  local status_line installed_status extension_status full_disk_access
+  status_line="$(safety_status_line)"
+  installed_status="$(safety_status_value "$status_line" installed || printf 'unknown')"
+  extension_status="$(safety_status_value "$status_line" system_extension_status || printf 'status_unavailable')"
+  full_disk_access="$(safety_status_value "$status_line" full_disk_access || printf 'unknown')"
+  if [ "$installed_status" = "false" ]; then
+    extension_status="not_installed"
+  elif [ "$installed_status" != "true" ]; then
+    extension_status="status_unavailable"
+  fi
+
+  case "$extension_status" in
+    active)
+      case "$full_disk_access" in
+        validated)
+          stage_note "Pairling Safety Monitor is active and already has the file access it needs."
+          ;;
+        denied|limited|not_validated)
+          stage_note "Pairling Safety Monitor is active, but macOS is limiting its optional file evidence."
+          open_full_disk_access_pane
+          stage_note "Checking that the Safety Monitor can see process and file evidence. We check every 2 seconds."
+          if poll_evidence_test; then
+            stage_note "The Safety Monitor sees full evidence. Thank you."
+          else
+            stage_note "The Safety Monitor did not reach full file evidence within the time limit."
+            wizard_recovery_menu safety_permissions "macOS permissions" || true
+          fi
+          ;;
+        *)
+          stage_note "Pairling Safety Monitor is active, but its file-access status could not be confirmed. Pairing can continue."
+          ;;
+      esac
+      ;;
+    approval_required)
+      stage_note "Pairling Safety Monitor is installed and needs System Extension approval. Pairing can continue without it."
+      request_safety_activation
+      ;;
+    failed)
+      stage_note "Pairling Safety Monitor is installed but is not running. Pairing can continue; open its app later to repair it."
+      ;;
+    status_stale)
+      stage_note "Pairling Safety Monitor status is stale. Pairing can continue; reopen its app later to refresh it."
+      ;;
+    not_installed)
+      # The not-installed advisory. This is today's path. It states the truth: the
+      # Safety Monitor is a future feature, it is not installed, and pairing works
+      # without it. It never claims setup installed anything. On the guided screen the
     # advisory and the connection copy render as one rounded panel. A machine
     # path keeps the two plain stage_note lines, byte identical.
     if [ "${GUIDED_TTY:-0}" = 1 ]; then
       wizard_permissions_panel "Pairling Safety Monitor is a future feature and is not installed yet. Pairing works without it."
     else
       stage_note "Pairling Safety Monitor is a future feature and is not installed yet. Pairing works without it."
+        stage_note "Pairling Connect uses its private embedded route. Local Network access and the same Wi-Fi are not required for pairing."
+      fi
+      ;;
+    *)
+      stage_note "Pairling Safety Monitor status could not be read. Pairing can continue without it."
+      ;;
+  esac
+
+  if [ "$extension_status" != "not_installed" ]; then
+    # The Pairling Connect advisory. On the guided screen it renders as a rounded
+    # panel. A machine path keeps the plain stage_note, byte identical.
+    if [ "${GUIDED_TTY:-0}" = 1 ]; then
+      wizard_permissions_panel ""
+    else
       stage_note "Pairling Connect uses its private embedded route. Local Network access and the same Wi-Fi are not required for pairing."
     fi
   fi
@@ -1187,11 +1228,16 @@ safety_step() {
 # always leaves a clear recovery path. Suppressed once setup sets
 # GUIDED_COMPLETE=1, so a clean run prints nothing here.
 guided_on_exit() {
-  local code=$?
+  local code=$? pairing_recovery_ready=0
   if [ "$code" != 0 ]; then
-    rollback_install_transaction || true
+    if ! rollback_install_transaction; then
+      code=1
+    fi
   fi
   cleanup_active_staging || true
+  if [ "$code" != 0 ] && runtime_ready_for_pairing_recovery; then
+    pairing_recovery_ready=1
+  fi
   cleanup_source_snapshot || true
   if ! release_install_lock; then
     code=1
@@ -1204,14 +1250,63 @@ guided_on_exit() {
       if [ "${WIZARD_FATAL:-0}" = 1 ]; then
         wizard_recovery_menu fatal "${GUIDED_STAGE_CURRENT:-startup}" || true
       else
-        wizard_recovery_menu recoverable "${GUIDED_STAGE_CURRENT:-startup}" || true
+        wizard_recovery_menu setup "${GUIDED_STAGE_CURRENT:-startup}" || true
       fi
     fi
     printf '\nSetup did not finish (stage: %s, exit %s).\n' "${GUIDED_STAGE_CURRENT:-startup}" "$code" >&2
+    if [ -n "${GUIDED_FAILURE_SOURCE_PATH:-}" ]; then
+      printf 'Failed source path: %s\n' "$GUIDED_FAILURE_SOURCE_PATH" >&2
+    fi
+    if [ -n "${GUIDED_FAILURE_PATH:-}" ]; then
+      printf 'Failed path: %s\n' "$GUIDED_FAILURE_PATH" >&2
+    fi
     printf 'Recovery: run `pairling doctor --json` to inspect, then re-run `pairling setup`.\n' >&2
-    printf 'Retry pairing only: `pairling pair --qr`. If doctor says Pairling Connect needs sign-in: `pairling connect-auth-open`.\n' >&2
+    if [ "$pairing_recovery_ready" = 1 ]; then
+      printf 'The verified runtime is healthy. Re-show pairing with `pairling pair --qr`. If Pairling Connect needs sign-in, run `pairling connect-auth-open`.\n' >&2
+    else
+      printf 'Pairing is unavailable until `pairling setup` finishes and the runtime is healthy.\n' >&2
+    fi
   fi
   return "$code"
+}
+
+runtime_ready_for_pairing_recovery() {
+  local target="" ready_json=""
+  [[ -L "$CURRENT_LINK" ]] || return 1
+  target="$(readlink "$CURRENT_LINK")"
+  [[ -n "$target" ]] || return 1
+  if ! "$CONTROL_PYTHON_BIN" - \
+    "$MANIFEST_REPO_PATH/mac/companiond" "$target" "$RELEASES_ROOT" <<'PY' >/dev/null 2>&1
+import sys
+
+trusted_source, target, releases_root = sys.argv[1:]
+sys.path.insert(0, trusted_source)
+from runtime_manifest import verified_managed_release_identity
+
+verified_managed_release_identity(target, releases_root)
+PY
+  then
+    return 1
+  fi
+  ready_json="$(mktemp "${TMPDIR:-/tmp}/pairling-ready.XXXXXX")"
+  if ! /usr/bin/curl -fsS --max-time 3 "http://127.0.0.1:$PAIRLING_RUNTIME_PORT/readyz" >"$ready_json" 2>/dev/null; then
+    rm -f "$ready_json"
+    return 1
+  fi
+  if ! "$CONTROL_PYTHON_BIN" - "$ready_json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if payload.get("ok") is not True or payload.get("contract_version") != "pairling-runtime-v1":
+    raise SystemExit(1)
+PY
+  then
+    rm -f "$ready_json"
+    return 1
+  fi
+  rm -f "$ready_json"
 }
 
 install_mutation_on_exit() {
@@ -2204,6 +2299,7 @@ journal = {
     "created_at": time.time(),
     "expected_release_name": expected_release_name,
     "expected_target": expected_target or None,
+    "expected_target_identity": None,
     "releases_root": releases_root,
     "destinations": {
         "config": config,
@@ -2367,7 +2463,11 @@ if created_mcp is not None:
 
 releases_root = Path(releases_root_value)
 target_value = journal.get("expected_target")
-if target_value is not None:
+target_identity = journal.get("expected_target_identity")
+if target_value is None:
+    if target_identity is not None:
+        raise SystemExit("install transaction target identity exists without a target")
+else:
     if not isinstance(target_value, str) or not target_value:
         raise SystemExit("install transaction expected target is malformed")
     target = Path(target_value)
@@ -2375,6 +2475,16 @@ if target_value is not None:
         raise SystemExit("install transaction expected target is unsafe")
     if target.parent.resolve(strict=True) != releases_root.resolve(strict=True):
         raise SystemExit("install transaction expected target is outside releases")
+    if not isinstance(target_identity, dict) or set(target_identity) != {"device", "inode", "uid"}:
+        raise SystemExit("install transaction expected target identity is malformed")
+    if any(
+        not isinstance(target_identity.get(key), int)
+        or isinstance(target_identity.get(key), bool)
+        for key in ("device", "inode", "uid")
+    ):
+        raise SystemExit("install transaction expected target identity values are malformed")
+    if target_identity["uid"] != os.geteuid():
+        raise SystemExit("install transaction expected target owner does not match this user")
 
 install_names = tuple(expected_destinations)
 required_names = {"pairdrop.json", "companiond.loaded", "connectd.loaded", "ptybroker.loaded"}
@@ -2495,25 +2605,44 @@ PY
 }
 
 update_install_transaction_target() {
-  local target="$1"
+  local target="$1" source="$2"
   [[ "$INSTALL_TRANSACTION_ACTIVE" == 1 && "$INSTALL_TRANSACTION_DIR" == "$INSTALL_TRANSACTION_PENDING" ]] || {
     log "ERROR: no pending install transaction can accept a target." >&2
     return 1
   }
   validate_install_transaction_directory "$INSTALL_TRANSACTION_DIR"
-  "$PYTHON3_BIN" - "$INSTALL_TRANSACTION_DIR/journal.json" "$target" "$RELEASES_ROOT" <<'PY'
+  "$PYTHON3_BIN" - "$INSTALL_TRANSACTION_DIR/journal.json" "$target" "$source" "$RELEASES_ROOT" <<'PY'
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
 journal_path = Path(sys.argv[1])
 target = Path(sys.argv[2])
-releases_root = Path(sys.argv[3])
+source = Path(sys.argv[3])
+releases_root = Path(sys.argv[4])
 if not target.is_absolute() or target.parent.resolve(strict=True) != releases_root.resolve(strict=True):
     raise SystemExit("install transaction target is outside releases")
+if target.exists() or target.is_symlink():
+    raise SystemExit("install transaction target already exists")
+source_metadata = source.lstat()
+if (
+    source.parent.resolve(strict=True) != releases_root.resolve(strict=True)
+    or not source.name.startswith(".")
+    or ".staging." not in source.name
+    or stat.S_ISLNK(source_metadata.st_mode)
+    or not stat.S_ISDIR(source_metadata.st_mode)
+    or source_metadata.st_uid != os.geteuid()
+):
+    raise SystemExit("install transaction source is not a managed staging directory")
 payload = json.loads(journal_path.read_text(encoding="utf-8"))
 payload["expected_target"] = str(target)
+payload["expected_target_identity"] = {
+    "device": source_metadata.st_dev,
+    "inode": source_metadata.st_ino,
+    "uid": source_metadata.st_uid,
+}
 temporary = journal_path.with_name(f".{journal_path.name}.tmp-{os.getpid()}")
 with temporary.open("x", encoding="utf-8") as handle:
     json.dump(payload, handle, indent=2, sort_keys=True)
@@ -2529,6 +2658,182 @@ finally:
     os.close(descriptor)
 PY
   validate_install_transaction_directory "$INSTALL_TRANSACTION_DIR"
+}
+
+publish_install_transaction_target() {
+  local source="$1" target="$2"
+  [[ "$INSTALL_TRANSACTION_ACTIVE" == 1 && "$INSTALL_TRANSACTION_DIR" == "$INSTALL_TRANSACTION_PENDING" ]] || {
+    log "ERROR: no pending install transaction can publish a target." >&2
+    return 1
+  }
+  validate_install_transaction_directory "$INSTALL_TRANSACTION_DIR"
+  "${CONTROL_PYTHON_BIN:-$PYTHON3_BIN}" - \
+    "$INSTALL_TRANSACTION_DIR/journal.json" "$source" "$target" "$RELEASES_ROOT" <<'PY'
+import ctypes
+import errno
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+journal_path = Path(sys.argv[1])
+source = Path(sys.argv[2])
+target = Path(sys.argv[3])
+releases_root = Path(sys.argv[4])
+journal = json.loads(journal_path.read_text(encoding="utf-8"))
+identity = journal.get("expected_target_identity")
+
+if (
+    not source.is_absolute()
+    or not target.is_absolute()
+    or source.parent.resolve(strict=True) != releases_root.resolve(strict=True)
+    or target.parent.resolve(strict=True) != releases_root.resolve(strict=True)
+    or journal.get("expected_target") != str(target)
+    or not isinstance(identity, dict)
+    or set(identity) != {"device", "inode", "uid"}
+):
+    raise SystemExit("install transaction publication paths do not match the journal")
+
+source_metadata = source.lstat()
+expected = (identity["device"], identity["inode"], identity["uid"])
+actual = (source_metadata.st_dev, source_metadata.st_ino, source_metadata.st_uid)
+if (
+    stat.S_ISLNK(source_metadata.st_mode)
+    or not stat.S_ISDIR(source_metadata.st_mode)
+    or actual != expected
+):
+    raise SystemExit("staging directory identity changed before publication")
+
+# Deterministic regression mode for filesystems that reject renaming a
+# non-writable source directory. The mode marker proves this branch ran.
+if os.environ.get("PAIRLING_TEST_REJECT_NON_WRITABLE_RENAME") == "1":
+    marker_value = os.environ.get("PAIRLING_TEST_RENAME_MODE_MARKER")
+    if not marker_value:
+        raise SystemExit("PAIRLING_TEST_RENAME_MODE_MARKER is required")
+    marker = Path(marker_value)
+    marker.write_text(f"{stat.S_IMODE(source_metadata.st_mode):03o}\n", encoding="utf-8")
+    if not source_metadata.st_mode & stat.S_IWUSR:
+        raise PermissionError(errno.EACCES, "simulated filesystem rejected non-writable source", str(source))
+
+# Place a different directory at the final path immediately before rename to
+# prove the exclusive publish cannot nest into, seal, or delete it.
+if os.environ.get("PAIRLING_TEST_CREATE_PUBLISH_COLLISION") == "1":
+    target.mkdir(mode=0o700)
+    (target / "collision-sentinel").write_text("do-not-touch\n", encoding="utf-8")
+
+libc = ctypes.CDLL(None, use_errno=True)
+try:
+    rename_exclusive = libc.renamex_np
+except AttributeError as exc:
+    raise SystemExit("macOS exclusive rename API is unavailable") from exc
+rename_exclusive.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+rename_exclusive.restype = ctypes.c_int
+result = rename_exclusive(os.fsencode(source), os.fsencode(target), 0x00000004)  # RENAME_EXCL
+if result != 0:
+    error_number = ctypes.get_errno()
+    raise OSError(error_number, os.strerror(error_number), f"{source} -> {target}")
+
+target_metadata = target.lstat()
+published = (target_metadata.st_dev, target_metadata.st_ino, target_metadata.st_uid)
+if (
+    stat.S_ISLNK(target_metadata.st_mode)
+    or not stat.S_ISDIR(target_metadata.st_mode)
+    or published != expected
+):
+    raise SystemExit("published release identity does not match the recorded staging directory")
+PY
+}
+
+install_transaction_created_target() {
+  # rollback_install_transaction marks the transaction inactive before it starts
+  # restoration so a second EXIT trap cannot enter it again. The pending marker,
+  # not the in-memory active flag, is therefore the cleanup authority here.
+  [[ "$INSTALL_TRANSACTION_DIR" == "$INSTALL_TRANSACTION_PENDING" ]] || return 0
+  validate_install_transaction_directory "$INSTALL_TRANSACTION_DIR"
+  "$PYTHON3_BIN" - "$INSTALL_TRANSACTION_DIR/journal.json" "$RELEASES_ROOT" <<'PY'
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+journal_path = Path(sys.argv[1])
+releases_root = Path(sys.argv[2])
+journal = json.loads(journal_path.read_text(encoding="utf-8"))
+target_value = journal.get("expected_target")
+if target_value is None:
+    raise SystemExit(0)
+target = Path(str(target_value))
+release_name = str(journal.get("expected_release_name") or "")
+target_identity = journal.get("expected_target_identity")
+if (
+    not target.is_absolute()
+    or target.parent.resolve(strict=True) != releases_root.resolve(strict=True)
+    or not release_name
+    or not target.name.startswith(release_name + "-")
+    or not isinstance(target_identity, dict)
+    or set(target_identity) != {"device", "inode", "uid"}
+):
+    raise SystemExit("install transaction created target is outside its managed release name")
+try:
+    metadata = target.lstat()
+except FileNotFoundError:
+    metadata = None
+if metadata is not None and (
+    stat.S_ISLNK(metadata.st_mode)
+    or not stat.S_ISDIR(metadata.st_mode)
+    or metadata.st_uid != os.geteuid()
+    or metadata.st_dev != target_identity.get("device")
+    or metadata.st_ino != target_identity.get("inode")
+    or metadata.st_uid != target_identity.get("uid")
+):
+    raise SystemExit("install transaction target identity does not match the published staging directory")
+print(target)
+PY
+}
+
+# Remove only a final release path that this transaction recorded before it
+# published. Reused content-addressed releases leave expected_target empty, so
+# rollback can never remove them. The old current and previous links are restored
+# before this runs, and both are checked again before deletion.
+cleanup_install_transaction_target() {
+  local target="" owner="" link="" removed=0
+  target="$(install_transaction_created_target)" || return 1
+  [[ -n "$target" ]] || return 0
+  for link in "$CURRENT_LINK" "$PREVIOUS_LINK"; do
+    if [[ -L "$link" && "$(readlink "$link")" == "$target" ]]; then
+      log "ERROR: refusing to remove a transaction release still referenced by $link: $target" >&2
+      return 1
+    fi
+  done
+  if [[ -e "$target" || -L "$target" ]]; then
+    if [[ -L "$target" || ! -d "$target" ]]; then
+      log "ERROR: transaction release is not a real directory: $target" >&2
+      return 1
+    fi
+    owner="$(stat -f '%u' "$target" 2>/dev/null || printf unknown)"
+    if [[ "$owner" != "$(id -u)" ]]; then
+      log "ERROR: transaction release is owned by another user: $target" >&2
+      return 1
+    fi
+    remove_release_tree "$target"
+    if [[ -e "$target" || -L "$target" ]]; then
+      log "ERROR: Pairling could not remove the incomplete transaction release: $target" >&2
+      return 1
+    fi
+    removed=1
+  fi
+  # The parent must be synced even when the target is already absent. A prior
+  # recovery may have removed it and then failed before that deletion became
+  # durable. The pending journal is not safe to clear until this succeeds.
+  if ! fsync_directory "$RELEASES_ROOT"; then
+    log "ERROR: could not make transaction release cleanup durable: $RELEASES_ROOT" >&2
+    return 1
+  fi
+  if [[ "$removed" == 1 ]]; then
+    log "Removed the uncommitted runtime release created by this setup: $target" >&2
+  fi
 }
 
 plan_install_transaction_mcp_credential() {
@@ -3096,7 +3401,7 @@ begin_install_transaction() {
      ! snapshot_launchd_loaded "$PAIRLING_DAEMON_LABEL" companiond ||
      ! snapshot_launchd_loaded "$PAIRLING_CONNECTD_LABEL" connectd ||
      ! snapshot_launchd_loaded "$PAIRLING_PTYBROKER_LABEL" ptybroker ||
-     ! write_install_transaction_journal "$operation" "${RELEASE_ROOT:-}"; then
+     ! write_install_transaction_journal "$operation"; then
     remove_install_transaction_tree "$staging" || true
     INSTALL_TRANSACTION_DIR=""
     INSTALL_TRANSACTION_OPERATION=""
@@ -3139,6 +3444,7 @@ restore_install_transaction_snapshot() {
   restore_ptybroker_launchd_state || rollback_failed=1
   restore_launch_agent_state "$PAIRLING_DAEMON_LABEL" "$USER_PLIST" companiond || rollback_failed=1
   restore_launch_agent_state "$PAIRLING_CONNECTD_LABEL" "$CONNECTD_USER_PLIST" connectd || rollback_failed=1
+  cleanup_install_transaction_target || rollback_failed=1
   [[ "$rollback_failed" == 0 ]]
 }
 
@@ -3161,6 +3467,10 @@ rollback_install_transaction() {
   if [[ "$INSTALL_TRANSACTION_ACTIVE" != 1 || "$INSTALL_TRANSACTION_DIR" != "$INSTALL_TRANSACTION_PENDING" ]]; then
     return
   fi
+  # The active runtime interpreter may live inside the release this rollback is
+  # about to remove. Return all transaction work to the interpreter pinned before
+  # runtime/current changed so cleanup and journal durability can finish.
+  PYTHON3_BIN="${CONTROL_PYTHON_BIN:-$PYTHON3_BIN}"
   if ! validate_install_transaction_directory "$INSTALL_TRANSACTION_DIR"; then
     INSTALL_TRANSACTION_ACTIVE=0
     log "ERROR: refusing to restore a damaged Pairling install transaction." >&2
@@ -3467,6 +3777,8 @@ copy_release() {
   done < <(find -P "$RELEASES_ROOT" -mindepth 1 -maxdepth 1 -type d -name '.*.staging.*' -print0)
   tmp="$(mktemp -d "$RELEASES_ROOT/.${RELEASE_NAME}.staging.XXXXXX")"
   ACTIVE_STAGING_DIR="$tmp"
+  GUIDED_FAILURE_SOURCE_PATH="$tmp"
+  GUIDED_FAILURE_PATH="$tmp"
   snapshot_packaged_sources
   verify_payload_manifest
   verify_platform_runtime_manifest
@@ -3538,6 +3850,7 @@ copy_release() {
   seal_release_payload "$tmp"
   content_digest="$(release_content_digest "$tmp")"
   RELEASE_ROOT="$RELEASES_ROOT/$RELEASE_NAME-${content_digest:0:16}"
+  GUIDED_FAILURE_PATH="$RELEASE_ROOT"
   if [[ -e "$RELEASE_ROOT" || -L "$RELEASE_ROOT" ]]; then
     if [[ -L "$RELEASE_ROOT" || ! -d "$RELEASE_ROOT" ]]; then
       remove_release_tree "$tmp"
@@ -3560,18 +3873,39 @@ copy_release() {
     fi
     remove_release_tree "$tmp"
     ACTIVE_STAGING_DIR=""
+    GUIDED_FAILURE_SOURCE_PATH=""
   else
     write_manifest "$tmp" "$RELEASE_ROOT"
     if [[ "${PAIRLING_TEST_FAIL_AFTER_STAGED_MANIFEST:-0}" == 1 ]]; then
       log "ERROR: forced test failure after staged runtime manifest" >&2
       return 1
     fi
-    seal_release_root "$tmp"
-    verify_release_manifest "$tmp" "$RELEASE_ROOT"
-    fsync_release_tree "$tmp"
-    mv "$tmp" "$RELEASE_ROOT"
-    fsync_directory "$RELEASES_ROOT"
+    # The staging root must remain owner-writable until it has been published.
+    # Some macOS filesystems reject renaming a non-writable source directory.
+    # Record the destination first so rollback can remove only a release created
+    # by this transaction if publication or any later activation step fails.
+    update_install_transaction_target "$RELEASE_ROOT" "$tmp"
+    if ! publish_install_transaction_target "$tmp" "$RELEASE_ROOT"; then
+      log "ERROR: could not publish staged runtime: $tmp -> $RELEASE_ROOT" >&2
+      return 1
+    fi
     ACTIVE_STAGING_DIR=""
+    GUIDED_FAILURE_SOURCE_PATH=""
+    if [[ "${PAIRLING_TEST_FAIL_AFTER_RUNTIME_PUBLISH:-0}" == 1 ]]; then
+      log "ERROR: forced test failure after runtime publication: $RELEASE_ROOT" >&2
+      return 1
+    fi
+    if ! seal_release_root "$RELEASE_ROOT"; then
+      log "ERROR: could not seal the published runtime release: $RELEASE_ROOT" >&2
+      return 1
+    fi
+    if ! verify_release_manifest "$RELEASE_ROOT" "$RELEASE_ROOT"; then
+      log "ERROR: published runtime failed manifest or seal verification: $RELEASE_ROOT" >&2
+      WIZARD_FATAL=1
+      return 1
+    fi
+    fsync_release_tree "$RELEASE_ROOT"
+    fsync_directory "$RELEASES_ROOT"
   fi
 }
 
@@ -3760,7 +4094,11 @@ build_connectd_binary() {
 }
 
 fsync_directory() {
-  "$PYTHON3_BIN" - "$1" <<'PY'
+  if [[ -n "${PAIRLING_TEST_FAIL_FSYNC_DIRECTORY:-}" && "${PAIRLING_TEST_FAIL_FSYNC_DIRECTORY}" == "$1" ]]; then
+    log "ERROR: forced test failure while syncing directory: $1" >&2
+    return 1
+  fi
+  "${CONTROL_PYTHON_BIN:-$PYTHON3_BIN}" - "$1" <<'PY'
 import os
 import sys
 
@@ -5130,13 +5468,14 @@ install_runtime() {
   install_transaction_fault_point mcp_credential_ready
 
   stage_begin "PairDrop folder"
+  GUIDED_FAILURE_PATH="$PAIRDROP_ROOT"
   ensure_pairdrop_folder
   install_transaction_fault_point pairdrop_ready
   stage_ok "$(display_path "$PAIRDROP_ROOT") is ready (private, mode 0700)"
+  GUIDED_FAILURE_PATH=""
 
   stage_begin "Staging runtime"
   copy_release
-  update_install_transaction_target "$RELEASE_ROOT"
   install_transaction_fault_point release_published
   persist_pairdrop_folder
   install_transaction_fault_point pairdrop_config_persisted
@@ -5150,10 +5489,16 @@ install_runtime() {
   switch_current
   install_transaction_fault_point current_link_switched
   adopt_current_release_sources
+  if [[ "${PAIRLING_TEST_FAIL_AFTER_RELEASE_ADOPT:-0}" == 1 ]]; then
+    log "ERROR: forced test failure after adopting the published runtime" >&2
+    false
+  fi
   install_mcp_adapter_shim
   install_shell_wrapper
   install_transaction_fault_point launch_assets_installed
   stage_ok "staged $RELEASE_NAME"
+  GUIDED_FAILURE_SOURCE_PATH=""
+  GUIDED_FAILURE_PATH=""
 
   stage_begin "Starting Pairling services"
   render_plists
