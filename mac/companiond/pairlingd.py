@@ -7765,7 +7765,9 @@ def _scan_provider_process_rows(provider: str) -> tuple[bool, list[dict]]:
         for candidate in raw_candidates
         if candidate["tty_name"] == "??"
     ]
-    stdio_probe_ok, stdio_tty_by_pid = _process_stdio_ttys(missing_tty_pids)
+    stdio_probe_ok, stdio_evidence_by_pid = _process_stdio_tty_evidence(
+        missing_tty_pids
+    )
     if not stdio_probe_ok:
         return False, []
 
@@ -7774,13 +7776,16 @@ def _scan_provider_process_rows(provider: str) -> tuple[bool, list[dict]]:
         pid = int(raw_candidate["pid"])
         tty_name = str(raw_candidate["tty_name"])
         if tty_name == "??":
-            tty = stdio_tty_by_pid.get(pid)
-            if tty is None:
-                # A provider command without one shared PTY across stdin,
-                # stdout, and stderr is not an interactive TUI session.
+            stdio_evidence = stdio_evidence_by_pid.get(pid)
+            if stdio_evidence is None:
+                # A provider command without one trustworthy PTY binding is
+                # not part of an interactive TUI process family.
                 continue
+            tty = str(stdio_evidence["tty"])
+            control_eligible = bool(stdio_evidence["control_eligible"])
         else:
             tty = f"/dev/{tty_name}"
+            control_eligible = True
         try:
             started = datetime.strptime(
                 str(raw_candidate["started_text"]), "%a %b %d %H:%M:%S %Y"
@@ -7794,6 +7799,7 @@ def _scan_provider_process_rows(provider: str) -> tuple[bool, list[dict]]:
             "tty": tty,
             "started_at": started,
             "command": str(raw_candidate["command"]),
+            "control_eligible": control_eligible,
         })
     cwd_probe_ok, cwd_by_pid = _process_cwds([
         int(candidate["pid"]) for candidate in candidates
@@ -7831,7 +7837,16 @@ def _provider_terminal_identity_for_tab(
     if len(groups) != 1:
         return None
     (provider_tty, owner_pid), candidates = next(iter(groups.items()))
-    control = min(candidates, key=lambda item: int(item.get("pid") or 0))
+    control_candidates = [
+        item for item in candidates
+        if bool(item.get("control_eligible", True))
+    ]
+    if not control_candidates:
+        return None
+    control = min(
+        control_candidates,
+        key=lambda item: int(item.get("pid") or 0),
+    )
     control_pid = int(control.get("pid") or 0)
     family_pids = [
         int(item.get("pid") or 0)
@@ -7927,8 +7942,10 @@ def _process_cwds(pids: list[int]) -> tuple[bool, dict[int, str]]:
     return True, cwd_by_pid
 
 
-def _process_stdio_ttys(pids: list[int]) -> tuple[bool, dict[int, str]]:
-    """Return exact shared stdio PTYs for processes without a controlling tty."""
+def _process_stdio_tty_evidence(
+    pids: list[int],
+) -> tuple[bool, dict[int, dict[str, object]]]:
+    """Return control or identity PTY evidence for processes without a tty."""
     unique_pids = sorted({int(pid) for pid in pids if int(pid or 0) > 0})
     if not unique_pids:
         return True, {}
@@ -7966,22 +7983,34 @@ def _process_stdio_ttys(pids: list[int]) -> tuple[bool, dict[int, str]]:
     if any(pid not in seen_pids for pid in unique_pids):
         return False, {}
 
-    tty_by_pid: dict[int, str] = {}
+    evidence_by_pid: dict[int, dict[str, object]] = {}
     for pid in unique_pids:
         fd_paths = stdio_by_pid.get(pid, {})
         if set(fd_paths) != {0, 1, 2}:
             return False, {}
-        paths = {fd_paths[0], fd_paths[1], fd_paths[2]}
-        if len(paths) == 1:
-            path = next(iter(paths))
-            if re.fullmatch(r"/dev/ttys[0-9]{3,}", path):
-                tty_by_pid[pid] = path
+        stdin_path = fd_paths[0]
+        stdout_path = fd_paths[1]
+        stderr_path = fd_paths[2]
+        if (
+            stdin_path == stdout_path
+            and re.fullmatch(r"/dev/ttys[0-9]{3,}", stdin_path)
+        ):
+            if stderr_path == stdin_path:
+                evidence_by_pid[pid] = {
+                    "tty": stdin_path,
+                    "control_eligible": True,
+                }
                 continue
-        if any(path.startswith("/dev/ttys") for path in paths):
-            # Mixed PTY evidence disqualifies this process, but must not erase
-            # a separate wrapper whose three stdio descriptors share one PTY.
-            continue
-    return True, tty_by_pid
+            if not stderr_path.startswith("/dev/ttys"):
+                # Codex's native child can inherit the wrapper's stdin/stdout
+                # PTY while sending stderr to /dev/null. Keep it in the
+                # wrapper's identity family so its open rollout can identify
+                # the session, but never select it as a control process.
+                evidence_by_pid[pid] = {
+                    "tty": stdin_path,
+                    "control_eligible": False,
+                }
+    return True, evidence_by_pid
 
 
 def _is_codex_cli_command(command: str) -> bool:
@@ -8146,32 +8175,37 @@ def _codex_live_terminal_rows_locked() -> list[dict]:
     if not ps_ok:
         return degraded_rows("process_scan_failed")
 
-    by_tty: dict[str, dict] = {}
+    process_groups: dict[str, list[dict]] = {}
     for process in process_rows:
-        pid = int(process.get("pid") or 0)
         tty = str(process.get("tty") or "")
-        current = by_tty.get(tty)
-        # The Node wrapper is the process we want for signals; it is usually
-        # the lower pid on the same tty, while the native binary is its child.
-        if current is None:
-            current = {
-                "pid": pid,
-                "tty": tty,
-                "project": process.get("project"),
-                "started_at": process.get("started_at"),
-                "command": process.get("command"),
-                "provider_pids": [pid],
-            }
-            by_tty[tty] = current
-        else:
-            current.setdefault("provider_pids", []).append(pid)
-            if pid < int(current.get("pid") or 0):
-                current.update({
-                    "pid": pid,
-                    "project": process.get("project"),
-                    "started_at": process.get("started_at"),
-                    "command": process.get("command"),
-                })
+        process_groups.setdefault(tty, []).append(process)
+
+    by_tty: dict[str, dict] = {}
+    for tty, processes in process_groups.items():
+        control_candidates = [
+            process for process in processes
+            if bool(process.get("control_eligible", True))
+        ]
+        if not control_candidates:
+            continue
+        # Only a fully attached process may receive signals. A mixed-stdio
+        # native child stays in provider_pids solely so its open rollout can
+        # identify the wrapper's canonical session.
+        control = min(
+            control_candidates,
+            key=lambda item: int(item.get("pid") or 0),
+        )
+        control_pid = int(control.get("pid") or 0)
+        by_tty[tty] = {
+            "pid": control_pid,
+            "tty": tty,
+            "project": control.get("project"),
+            "started_at": control.get("started_at"),
+            "command": control.get("command"),
+            "provider_pids": sorted(
+                int(process.get("pid") or 0) for process in processes
+            ),
+        }
 
     rollout_probe = _codex_open_rollouts_by_pid(
         [
@@ -8237,6 +8271,8 @@ def _claude_live_terminal_rows() -> list[dict]:
 
     by_tty: dict[str, dict] = {}
     for process in process_rows:
+        if not bool(process.get("control_eligible", True)):
+            continue
         pid = int(process.get("pid") or 0)
         tty = str(process.get("tty") or "")
         current = by_tty.get(tty)
