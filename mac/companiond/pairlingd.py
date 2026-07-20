@@ -6038,11 +6038,16 @@ def _bind_codex_registry_to_terminal(
                     linked_broker_id = _normalized_send_scope_id(
                         "codex", pending_metadata.get("broker_id")
                     )
+                    identity_link = (
+                        "exact_delivered_first_prompt_pid_project_terminal_topology"
+                        if discovered_by == "delivered_first_prompt"
+                        else "exact_pid_project_terminal_topology"
+                    )
                     metadata.update({
                         "send_scope_id": linked_send_scope_id,
                         "pending_native_id": pending_native_id,
                         "canonical_native_id": native_id,
-                        "identity_link": "exact_pid_project_terminal_topology",
+                        "identity_link": identity_link,
                     })
                     if linked_broker_id:
                         metadata.update({
@@ -6198,7 +6203,349 @@ def _bind_codex_registry_to_terminal(
     return promoted
 
 
-def _agent_registry_promote_codex(native_id: str, project: str, observed_started_at: float) -> dict | None:
+def _codex_user_message_hashes_in_window(
+    path: Path,
+    native_id: str,
+    earliest_at: float,
+    latest_at: float,
+) -> set[str] | None:
+    """Hash timestamped user records in one delivery window."""
+    approved = _approved_codex_transcript_path(path, native_id)
+    if approved is None:
+        return None
+    hashes: set[str] = set()
+    try:
+        with approved.open(encoding="utf-8", errors="replace") as transcript:
+            for _, line in zip(range(512), transcript):
+                try:
+                    obj = json.loads(line)
+                except (ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("type") != "response_item":
+                    continue
+                payload = (
+                    obj.get("payload")
+                    if isinstance(obj.get("payload"), dict)
+                    else {}
+                )
+                if (
+                    payload.get("type") != "message"
+                    or payload.get("role") != "user"
+                ):
+                    continue
+                message_at = _iso_to_epoch(
+                    obj.get("timestamp") or payload.get("timestamp")
+                )
+                if message_at < earliest_at or message_at > latest_at:
+                    continue
+                content = payload.get("content")
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    parts: list[str] = []
+                    for item in content:
+                        if isinstance(item, str):
+                            parts.append(item)
+                            continue
+                        if not isinstance(item, dict):
+                            continue
+                        value = item.get("text")
+                        if not isinstance(value, str):
+                            value = item.get("content")
+                        if isinstance(value, str):
+                            parts.append(value)
+                    text = "\n".join(parts)
+                else:
+                    continue
+                if not text:
+                    continue
+                hashes.add(hashlib.sha256(text.encode("utf-8")).hexdigest())
+    except OSError:
+        return None
+    return hashes
+
+
+def _codex_unique_attested_rollout_path(
+    native_id: str,
+    project: str,
+    observed_output_path: str,
+) -> tuple[Path, dict] | None:
+    """Require one exact CLI rollout for the observed canonical identity."""
+    if not observed_output_path:
+        return None
+    approved_observed = _approved_codex_transcript_path(
+        Path(observed_output_path), native_id
+    )
+    if approved_observed is None:
+        return None
+    observed_meta = _codex_rollout_meta(approved_observed)
+    if (
+        not isinstance(observed_meta, dict)
+        or observed_meta.get("id") != native_id
+        or observed_meta.get("cwd") != project
+        or observed_meta.get("source") != "cli"
+    ):
+        return None
+    try:
+        candidates = list(
+            CODEX_SESSIONS_DIR.rglob(f"rollout-*{native_id}.jsonl")
+        )
+    except OSError:
+        return None
+    exact_paths: set[Path] = set()
+    for candidate in candidates:
+        approved = _approved_codex_transcript_path(candidate, native_id)
+        if approved is None:
+            continue
+        meta = _codex_rollout_meta(approved)
+        if (
+            isinstance(meta, dict)
+            and meta.get("id") == native_id
+            and meta.get("cwd") == project
+            and meta.get("source") == "cli"
+        ):
+            exact_paths.add(approved)
+    if exact_paths != {approved_observed}:
+        return None
+    return approved_observed, observed_meta
+
+
+def _codex_attested_prompt_rollout_is_unique(
+    native_id: str,
+    project: str,
+    output_path: Path,
+    prompt_hash: str,
+    earliest_rollout_at: float,
+    latest_rollout_at: float,
+    earliest_message_at: float,
+    latest_message_at: float,
+) -> bool:
+    """Reject a prompt proof that could name another new CLI rollout."""
+    try:
+        candidates = list(CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"))
+    except OSError:
+        return False
+    matches: set[tuple[str, Path]] = set()
+    for candidate in candidates:
+        meta = _codex_rollout_meta(candidate)
+        if not isinstance(meta, dict):
+            continue
+        candidate_native_id = str(meta.get("id") or "")
+        candidate_started_at = _iso_to_epoch(meta.get("timestamp"))
+        if (
+            not _safe_agent_native_id(candidate_native_id)
+            or meta.get("cwd") != project
+            or meta.get("source") != "cli"
+            or candidate_started_at < earliest_rollout_at
+            or candidate_started_at > latest_rollout_at
+        ):
+            continue
+        approved = _approved_codex_transcript_path(
+            candidate, candidate_native_id
+        )
+        if approved is None:
+            return False
+        candidate_hashes = _codex_user_message_hashes_in_window(
+            approved,
+            candidate_native_id,
+            earliest_message_at,
+            latest_message_at,
+        )
+        if candidate_hashes is None:
+            return False
+        if prompt_hash in candidate_hashes:
+            matches.add((candidate_native_id, approved))
+    return matches == {(native_id, output_path)}
+
+
+def _codex_delivered_first_prompt_identity_proof(
+    native_id: str,
+    project: str,
+    observed_started_at: float,
+    observed_output_path: str,
+    process_rows: list[dict],
+) -> dict | None:
+    """Bind a Pairling spawn when its delivered prompt proves the rollout.
+
+    Codex does not keep its rollout open, so lsof can miss the otherwise exact
+    process-to-transcript link. This proof is intentionally narrow: one
+    Pairling-owned broker process, one durable delivered prompt, and one CLI
+    rollout must all agree on action, prompt hash, project, terminal, and time.
+    """
+    rollout = _codex_unique_attested_rollout_path(
+        native_id, project, observed_output_path
+    )
+    if rollout is None:
+        return None
+    output_path, rollout_meta = rollout
+    rollout_started_at = _iso_to_epoch(rollout_meta.get("timestamp"))
+    if (
+        rollout_started_at <= 0
+        or abs(rollout_started_at - float(observed_started_at or 0)) > 2
+    ):
+        return None
+
+    proofs: list[tuple[dict, dict, dict]] = []
+    for candidate in _codex_spawn_pending_registry_rows(
+        project, observed_started_at
+    ):
+        pending_native_id = str(candidate.get("native_id") or "")
+        candidate_pid = int(candidate.get("pid") or 0)
+        candidate_tty = str(candidate.get("terminal_tty") or "")
+        metadata = _registry_metadata_from_row(candidate)
+        expected_scope = _qualified_session_id("codex", pending_native_id)
+        action_id = str(metadata.get("spawn_action_id") or "")
+        if (
+            str(candidate.get("provider") or "") != "codex"
+            or candidate.get("closed_at") is not None
+            or not pending_native_id.startswith("pending-")
+            or metadata.get("spawned_by") != "pairling"
+            or metadata.get("capture_backend") != "pty_broker"
+            or _normalized_send_scope_id(
+                "codex", metadata.get("broker_id")
+            ) != expected_scope
+            or _durable_send_scope_id_from_registry_row(
+                candidate,
+                provider="codex",
+                native_id=pending_native_id,
+            ) != expected_scope
+            or not str(metadata.get("capture_id") or "")
+            or not str(metadata.get("terminal_log") or "")
+            or not _valid_client_action_id(action_id)
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(metadata.get("spawn_body_hash") or "")
+            ) is None
+            or candidate_pid <= 0
+            or re.fullmatch(r"/dev/ttys[0-9]{3,}", candidate_tty) is None
+            or not _process_alive(candidate_pid)
+            or not _codex_registry_process_birth_matches(
+                candidate, candidate_pid
+            )
+            or not _direct_terminal_binding_is_verified(
+                candidate,
+                "codex",
+                candidate_pid,
+                provider_tty=candidate_tty,
+            )
+        ):
+            continue
+
+        delivery = _read_first_prompt_delivery("codex", pending_native_id)
+        if not isinstance(delivery, dict):
+            continue
+        delivery_hash = str(delivery.get("text_hash") or "")
+        if (
+            delivery.get("schema_version") != 1
+            or delivery.get("provider") != "codex"
+            or delivery.get("native_id") != pending_native_id
+            or delivery.get("state") != "delivered"
+            or str(delivery.get("client_action_id") or "") != action_id
+            or not str(delivery.get("device_id") or "")
+            or re.fullmatch(r"[0-9a-f]{64}", delivery_hash) is None
+        ):
+            continue
+
+        try:
+            candidate_started_at = float(candidate.get("started_at") or 0)
+            process_started_at = float(
+                metadata.get("process_started_at") or 0
+            )
+            created_at = float(delivery.get("created_at") or 0)
+            dispatch_started_at = float(
+                delivery.get("dispatch_started_at") or 0
+            )
+            finished_at = float(delivery.get("finished_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not (
+            candidate_started_at > 0
+            and process_started_at > 0
+            and abs(candidate_started_at - process_started_at) <= 60
+            and candidate_started_at - 1 <= created_at <= candidate_started_at + 10
+            and created_at <= dispatch_started_at <= finished_at
+            and finished_at <= (
+                candidate_started_at
+                + FIRST_PROMPT_DELIVERY_TIMEOUT_SECONDS
+                + 15
+            )
+            and process_started_at - 2 <= rollout_started_at <= finished_at + 15
+        ):
+            continue
+        if not _codex_attested_prompt_rollout_is_unique(
+            native_id,
+            project,
+            output_path,
+            delivery_hash,
+            process_started_at - 2,
+            finished_at + 15,
+            dispatch_started_at,
+            finished_at + 120,
+        ):
+            continue
+
+        competing_process = False
+        for process_row in process_rows:
+            if str(process_row.get("project") or "") != project:
+                continue
+            process_tty = str(process_row.get("tty") or "")
+            if not process_tty or process_tty == candidate_tty:
+                continue
+            try:
+                competing_started_at = float(
+                    process_row.get("started_at") or 0
+                )
+            except (TypeError, ValueError):
+                competing_started_at = 0
+            if (
+                competing_started_at <= 0
+                or process_started_at - 2
+                <= competing_started_at
+                <= finished_at + 15
+            ):
+                competing_process = True
+                break
+        if competing_process:
+            continue
+
+        control_rows = [
+            row
+            for row in process_rows
+            if int(row.get("pid") or 0) == candidate_pid
+            and str(row.get("tty") or "") == candidate_tty
+            and str(row.get("project") or "") == project
+        ]
+        if len(control_rows) != 1:
+            continue
+        proofs.append((candidate, metadata, control_rows[0]))
+
+    if len(proofs) != 1:
+        return None
+    candidate, metadata, control_row = proofs[0]
+    return {
+        "pid": int(candidate.get("pid") or 0),
+        "tty": str(candidate.get("terminal_tty") or ""),
+        "project": project,
+        "started_at": float(
+            control_row.get("started_at")
+            or candidate.get("started_at")
+            or observed_started_at
+        ),
+        "command": str(
+            control_row.get("command") or metadata.get("command") or ""
+        ),
+        "native_id": native_id,
+        "output_path": str(output_path),
+    }
+
+
+def _agent_registry_promote_codex(
+    native_id: str,
+    project: str,
+    observed_started_at: float,
+    observed_output_path: str = "",
+) -> dict | None:
     exact = _agent_registry_get("codex", native_id)
     observed_started_at = float(observed_started_at or 0)
     exact_terminal = _codex_discover_terminal_control_for_session(native_id)
@@ -6218,6 +6565,7 @@ def _agent_registry_promote_codex(native_id: str, project: str, observed_started
     if not process_probe_ok:
         return None
     pending_proofs: list[tuple[dict, str, dict]] = []
+    open_rollout_probe_failed = False
     for candidate in _codex_spawn_pending_registry_rows(project, 0):
         if (
             str(candidate.get("provider") or "") != "codex"
@@ -6292,6 +6640,7 @@ def _agent_registry_promote_codex(native_id: str, project: str, observed_started
             # implementation always returns the status tuple requested above.
             rollout_probe_ok, open_rollouts_by_pid = True, rollout_probe
         if not rollout_probe_ok:
+            open_rollout_probe_failed = True
             continue
         family_rollouts = {
             (
@@ -6310,37 +6659,55 @@ def _agent_registry_promote_codex(native_id: str, project: str, observed_started
         if rollout_native_id != native_id:
             continue
         pending_proofs.append((candidate, exact_output_path, control_row))
-    if len(pending_proofs) != 1:
+    if open_rollout_probe_failed:
         return None
-    row, exact_output_path, control_row = pending_proofs[0]
-    pid = int(row.get("pid") or 0)
-    pending_metadata = _registry_metadata_from_row(row)
-    provider_tty = str(
-        pending_metadata.get("provider_tty")
-        or control_row.get("tty")
-        or ""
+    if len(pending_proofs) == 1:
+        row, exact_output_path, control_row = pending_proofs[0]
+        pid = int(row.get("pid") or 0)
+        pending_metadata = _registry_metadata_from_row(row)
+        provider_tty = str(
+            pending_metadata.get("provider_tty")
+            or control_row.get("tty")
+            or ""
+        )
+        return _bind_codex_registry_to_terminal(
+            native_id,
+            project,
+            {
+                "pid": pid,
+                "tty": provider_tty,
+                "project": project,
+                "started_at": float(
+                    control_row.get("started_at")
+                    or row.get("started_at")
+                    or observed_started_at
+                ),
+                "command": str(
+                    control_row.get("command")
+                    or pending_metadata.get("command")
+                    or ""
+                ),
+                "native_id": native_id,
+                "output_path": exact_output_path,
+            },
+            discovered_by="registry_open_rollout",
+        )
+    if pending_proofs:
+        return None
+    attested = _codex_delivered_first_prompt_identity_proof(
+        native_id,
+        project,
+        observed_started_at,
+        observed_output_path,
+        process_rows,
     )
+    if attested is None:
+        return None
     return _bind_codex_registry_to_terminal(
         native_id,
         project,
-        {
-            "pid": pid,
-            "tty": provider_tty,
-            "project": project,
-            "started_at": float(
-                control_row.get("started_at")
-                or row.get("started_at")
-                or observed_started_at
-            ),
-            "command": str(
-                control_row.get("command")
-                or pending_metadata.get("command")
-                or ""
-            ),
-            "native_id": native_id,
-            "output_path": exact_output_path,
-        },
-        discovered_by="registry_open_rollout",
+        attested,
+        discovered_by="delivered_first_prompt",
     )
 
 
@@ -7372,8 +7739,7 @@ def _scan_provider_process_rows(provider: str) -> tuple[bool, list[dict]]:
         return False, []
     if proc.returncode != 0:
         return False, []
-    rows: list[dict] = []
-    cwd_probe_failed = False
+    candidates: list[dict] = []
     for line in proc.stdout.splitlines():
         parts = line.strip().split(None, 7)
         if len(parts) < 8 or not parts[0].isdigit():
@@ -7392,23 +7758,28 @@ def _scan_provider_process_rows(provider: str) -> tuple[bool, list[dict]]:
                 " ".join(parts[2:7]), "%a %b %d %H:%M:%S %Y"
             ).timestamp()
         except Exception:
-            started = 0.0
+            # A process without a trustworthy birth time cannot take part in
+            # an identity decision. Treat the whole snapshot as incomplete.
+            return False, []
         pid = int(parts[0])
-        cwd = _process_cwd(pid)
-        if not cwd:
-            cwd_probe_failed = True
-            continue
-        rows.append({
+        candidates.append({
             "pid": pid,
             "tty": f"/dev/{tty_name}",
-            "project": cwd,
             "started_at": started,
             "command": command,
         })
-    # A partial process scan is not exact identity evidence. Returning a
-    # successful partial list would make a real session disappear or let the
-    # registry act on a subset while lsof is temporarily unavailable.
-    return not cwd_probe_failed, rows
+    cwd_probe_ok, cwd_by_pid = _process_cwds([
+        int(candidate["pid"]) for candidate in candidates
+    ])
+    if not cwd_probe_ok:
+        # A partial process scan is not exact identity evidence. Returning a
+        # successful partial list would make a real session disappear or let
+        # the registry act on a subset while lsof is temporarily unavailable.
+        return False, []
+    return True, [
+        {**candidate, "project": cwd_by_pid[int(candidate["pid"])]}
+        for candidate in candidates
+    ]
 
 
 def _provider_terminal_identity_for_tab(
@@ -7498,22 +7869,35 @@ _claude_terminal_scan_cache: dict[str, object] = {"ts": 0.0, "rows": []}
 _codex_task_boundary_cache: dict[str, dict[str, object]] = {}
 
 
-def _process_cwd(pid: int) -> str:
+def _process_cwds(pids: list[int]) -> tuple[bool, dict[int, str]]:
+    unique_pids = sorted({int(pid) for pid in pids if int(pid or 0) > 0})
+    if not unique_pids:
+        return True, {}
     try:
         proc = subprocess.run(
-            ["lsof", "-a", "-p", str(int(pid)), "-d", "cwd", "-Fn"],
+            [
+                "lsof", "-a", "-p", ",".join(str(pid) for pid in unique_pids),
+                "-d", "cwd", "-Fpn",
+            ],
             capture_output=True,
             text=True,
             timeout=2,
         )
     except Exception:
-        return ""
+        return False, {}
     if proc.returncode != 0:
-        return ""
+        return False, {}
+    current_pid = 0
+    cwd_by_pid: dict[int, str] = {}
     for line in proc.stdout.splitlines():
-        if line.startswith("n/"):
-            return line[1:]
-    return ""
+        if line.startswith("p") and line[1:].isdigit():
+            current_pid = int(line[1:])
+            continue
+        if current_pid > 0 and line.startswith("n/"):
+            cwd_by_pid[current_pid] = line[1:]
+    if any(pid not in cwd_by_pid for pid in unique_pids):
+        return False, {}
+    return True, cwd_by_pid
 
 
 def _is_codex_cli_command(command: str) -> bool:
@@ -13600,6 +13984,8 @@ def _codex_rollout_meta(path: Path) -> dict | None:
         obj = json.loads(first)
     except (OSError, ValueError, json.JSONDecodeError):
         return None
+    if not isinstance(obj, dict):
+        return None
     payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
     sid = payload.get("id") or obj.get("id")
     cwd = payload.get("cwd") or obj.get("cwd")
@@ -14046,12 +14432,19 @@ def _codex_first_prompt(path: Path, session_id: str, history: dict[str, dict]) -
     return None
 
 
-def _codex_control_overlay(row: dict, observed_mtime: float | None = None, *, verify_process: bool = True) -> dict:
+def _codex_control_overlay(
+    row: dict,
+    observed_mtime: float | None = None,
+    *,
+    verify_process: bool = True,
+    observed_output_path: str = "",
+) -> dict:
     if verify_process:
         reg = _agent_registry_promote_codex(
             row.get("native_id") or "",
             row.get("project") or "",
             float(row.get("started_at") or 0),
+            observed_output_path,
         )
     else:
         reg = _agent_registry_get("codex", row.get("native_id") or "")
@@ -14593,7 +14986,12 @@ def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> li
             or matches_unidentified_terminal
             or matches_single_pending_registry
         )
-        row = _codex_control_overlay(row, st.st_mtime, verify_process=verify_process)
+        row = _codex_control_overlay(
+            row,
+            st.st_mtime,
+            verify_process=verify_process,
+            observed_output_path=str(path),
+        )
         if sid in ambiguous_live_native_ids:
             reason = (
                 "More than one live terminal claims this Codex session; "
