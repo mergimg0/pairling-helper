@@ -7978,8 +7978,9 @@ def _process_stdio_ttys(pids: list[int]) -> tuple[bool, dict[int, str]]:
                 tty_by_pid[pid] = path
                 continue
         if any(path.startswith("/dev/ttys") for path in paths):
-            # Mixed or malformed PTY evidence must never establish identity.
-            return False, {}
+            # Mixed PTY evidence disqualifies this process, but must not erase
+            # a separate wrapper whose three stdio descriptors share one PTY.
+            continue
     return True, tty_by_pid
 
 
