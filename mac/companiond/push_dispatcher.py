@@ -1771,9 +1771,12 @@ class PairlingPushDispatcher:
             "updated_at": payload.get("updated_at"),
         }
 
-    def health_axis(self) -> dict[str, Any]:
+    def health_axis(self, *, device_id: str | None = None) -> dict[str, Any]:
         """The push-plane axis for /health: can this Mac deliver pushes, and
         how did the recent deliveries go?
+
+        Provider health is Mac-wide. Credentials, attempts, and registration
+        counts are limited to device_id when an authenticated phone asks.
 
         Exists because the APNs provider died silently for weeks (credentials
         stripped from re-rendered launchd env, then an FD-exhausted daemon)
@@ -1800,6 +1803,12 @@ class PairlingPushDispatcher:
             secret_devices = self._read_secrets().get("devices", {})
         except PushDispatcherError:
             secret_devices = {}
+        devices = [
+            device
+            for device in data.get("devices", [])
+            if isinstance(device, dict)
+            and (not device_id or device.get("device_id") == device_id)
+        ]
         attempts = [
             event
             for event in data.get("events", [])
@@ -1807,6 +1816,7 @@ class PairlingPushDispatcher:
             and isinstance(event.get("sent"), bool)
             and event.get("outcome")
             and event.get("outcome") not in PUSH_HEALTH_NEUTRAL_OUTCOMES
+            and (not device_id or event.get("device_id") == device_id)
         ][-10:]
         last = attempts[-1] if attempts else None
         degraded = False
@@ -1839,7 +1849,7 @@ class PairlingPushDispatcher:
                         or ""
                     ).strip()
                 )
-                for device in data.get("devices", [])
+                for device in devices
             )
         )
         if not configured:
@@ -1853,8 +1863,8 @@ class PairlingPushDispatcher:
             reason = "deliveries_failing"
         registered = [
             device
-            for device in data.get("devices", [])
-            if isinstance(device, dict) and device.get("apns_token_hash")
+            for device in devices
+            if device.get("apns_token_hash")
         ]
         return {
             "contract_version": PUSH_HEALTH_CONTRACT_VERSION,

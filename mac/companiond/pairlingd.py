@@ -7531,7 +7531,8 @@ def _health_payload(authenticated: bool = False, auth_result=None) -> dict:
         # revoked key) is visible at the next health read instead of never.
         if PUSH_DISPATCHER is not None:
             try:
-                payload["push"] = PUSH_DISPATCHER.health_axis()
+                push_device_id = str(getattr(auth_result, "device_id", "") or "") or None
+                payload["push"] = PUSH_DISPATCHER.health_axis(device_id=push_device_id)
             except Exception:
                 payload["push"] = {
                     "contract_version": "pairling-push-health-v1",

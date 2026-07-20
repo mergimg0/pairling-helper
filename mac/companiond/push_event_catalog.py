@@ -24,6 +24,7 @@ SUPPORTED_KINDS = {
     "mac_route_risk",
     "worker_pressure",
     "deploy_result",
+    "remote_join",
     "push_diagnostic",
 }
 CATALOG_KINDS = tuple(sorted(SUPPORTED_KINDS))
@@ -42,6 +43,7 @@ PHASE_BY_KIND = {
     "mac_route_risk": "risk",
     "worker_pressure": "attention",
     "deploy_result": "done",
+    "remote_join": "attention",
     "push_diagnostic": "done",
 }
 
@@ -53,6 +55,7 @@ INTERRUPTION_BY_KIND = {
     "mac_route_risk": "time-sensitive",
     "worker_pressure": "time-sensitive",
     "deploy_result": "active",
+    "remote_join": "time-sensitive",
     "push_diagnostic": "passive",
 }
 
@@ -64,6 +67,7 @@ ALERT_COPY = {
     "mac_route_risk": ("Mac route timed out", "The paired Mac route needs attention."),
     "worker_pressure": ("Pairling worker pressure", "Worker or token pressure needs review."),
     "deploy_result": ("Deploy result ready", "A build or deploy result is available."),
+    "remote_join": ("New device paired remotely", "A device joined your Mac over the internet."),
     "push_diagnostic": ("Pairling push test", "Push delivery is configured for this device."),
 }
 
