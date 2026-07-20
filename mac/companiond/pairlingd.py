@@ -2503,6 +2503,26 @@ def _ensure_spawn_settings() -> None:
 _ensure_spawn_settings()
 
 
+def _claude_interactive_exec_prefix() -> str:
+    """Run an interactive Claude process with its signed-in user credential."""
+    return "exec env -u CLAUDE_CODE_OAUTH_TOKEN"
+
+
+def _direct_claude_phone_command() -> str:
+    """Launch Claude's interactive TUI for a direct phone session.
+
+    CLAUDE_CODE_OAUTH_TOKEN is intended for automated, non-interactive calls.
+    Claude Code can accept that token for print mode while rejecting it in the
+    interactive TUI. Pairling's TUI launches therefore remove only that ambient
+    token and let Claude use the user's normal signed-in credential store.
+    """
+    return (
+        f"{_claude_interactive_exec_prefix()} "
+        "PAIRLING_PHONE_SESSION=1 "
+        f"claude --settings {shlex.quote(str(SPAWN_SETTINGS_PATH))}"
+    )
+
+
 def _session_backend() -> str:
     """Which store serves claude session reads: 'pg' (Docker Postgres) or
     'sqlite' (daemon-owned agent registry). Rollback at any point is
@@ -27082,7 +27102,8 @@ class Handler(BaseHTTPRequestHandler):
             f"export PAIRLING_ORCHESTRATION_ID={self._orchestration_shell_quote(orchestration_id)}\n"
             f"export PAIRLING_ORCHESTRATION_ROLE={self._orchestration_shell_quote(role)}\n"
             f"prompt=$(cat {self._orchestration_shell_quote(str(prompt_path))})\n"
-            f"exec {self._orchestration_shell_quote(str(claude_bin))} {permission_flags} \"$prompt\"\n",
+            f"{_claude_interactive_exec_prefix()} "
+            f"{self._orchestration_shell_quote(str(claude_bin))} {permission_flags} \"$prompt\"\n",
             encoding="utf-8",
         )
         launch_script.chmod(0o700)
@@ -28972,7 +28993,7 @@ Worker instructions:
             # imposed permission flag. The PermissionRequest producer hook is
             # injected PER-SPAWN via --settings (phone sessions only) so the user's
             # global settings stay untouched; the hook is an observer, never a mode.
-            command = f"exec claude --settings {shlex.quote(str(SPAWN_SETTINGS_PATH))}"
+            command = _direct_claude_phone_command()
         if not command:
             message = "Aperture CLI launch command unavailable"
             receipt = _finalize_spawn_action(
@@ -29703,8 +29724,7 @@ Worker instructions:
             capture_log_path = TERMINAL_CAPTURE_DIR / f"claude-{capture_id}.log"
             inner = (
                 f"cd {shlex.quote(project)} && "
-                f"PAIRLING_PHONE_SESSION=1 "
-                f"exec claude --settings {shlex.quote(str(SPAWN_SETTINGS_PATH))}"
+                f"{_direct_claude_phone_command()}"
             )
             shell_cmd = _terminal_script_command(capture_log_path, inner)
         spawn_marker_path = TERMINAL_CAPTURE_DIR / f"spawn-{capture_id}.tty"
@@ -29987,6 +30007,7 @@ Worker instructions:
         else:
             shell_cmd = (
                 f"cd '{shell_safe_path}' && "
+                f"{_claude_interactive_exec_prefix()} "
                 f"claude \"$(cat '{shell_safe_prompt}')\""
             )
         script = f'''

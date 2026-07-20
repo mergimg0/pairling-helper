@@ -453,4 +453,9 @@ def command_for_context(context: dict[str, Any], project: str) -> str:
     args = [str(arg) for arg in generated.get("args") or []]
     if client.get("id") == "codex":
         args = ["-C", project, "--add-dir", project] + args
-    return "exec " + " ".join([shlex.quote(binary), *[shlex.quote(arg) for arg in args]])
+    prefix = ["exec"]
+    if client.get("id") == "claude":
+        # Aperture supplies its own provider credentials. Do not let an
+        # unrelated automation token override them in Claude's interactive TUI.
+        prefix.extend(["env", "-u", "CLAUDE_CODE_OAUTH_TOKEN"])
+    return " ".join([*prefix, shlex.quote(binary), *[shlex.quote(arg) for arg in args]])
