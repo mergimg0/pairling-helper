@@ -7739,7 +7739,7 @@ def _scan_provider_process_rows(provider: str) -> tuple[bool, list[dict]]:
         return False, []
     if proc.returncode != 0:
         return False, []
-    candidates: list[dict] = []
+    raw_candidates: list[dict] = []
     for line in proc.stdout.splitlines():
         parts = line.strip().split(None, 7)
         if len(parts) < 8 or not parts[0].isdigit():
@@ -7751,22 +7751,49 @@ def _scan_provider_process_rows(provider: str) -> tuple[bool, list[dict]]:
             if provider == "codex"
             else _is_claude_cli_command(command)
         )
-        if tty_name == "??" or not command_matches:
+        if not command_matches:
             continue
+        raw_candidates.append({
+            "pid": int(parts[0]),
+            "tty_name": tty_name,
+            "started_text": " ".join(parts[2:7]),
+            "command": command,
+        })
+
+    missing_tty_pids = [
+        int(candidate["pid"])
+        for candidate in raw_candidates
+        if candidate["tty_name"] == "??"
+    ]
+    stdio_probe_ok, stdio_tty_by_pid = _process_stdio_ttys(missing_tty_pids)
+    if not stdio_probe_ok:
+        return False, []
+
+    candidates: list[dict] = []
+    for raw_candidate in raw_candidates:
+        pid = int(raw_candidate["pid"])
+        tty_name = str(raw_candidate["tty_name"])
+        if tty_name == "??":
+            tty = stdio_tty_by_pid.get(pid)
+            if tty is None:
+                # A provider command without one shared PTY across stdin,
+                # stdout, and stderr is not an interactive TUI session.
+                continue
+        else:
+            tty = f"/dev/{tty_name}"
         try:
             started = datetime.strptime(
-                " ".join(parts[2:7]), "%a %b %d %H:%M:%S %Y"
+                str(raw_candidate["started_text"]), "%a %b %d %H:%M:%S %Y"
             ).timestamp()
         except Exception:
             # A process without a trustworthy birth time cannot take part in
             # an identity decision. Treat the whole snapshot as incomplete.
             return False, []
-        pid = int(parts[0])
         candidates.append({
             "pid": pid,
-            "tty": f"/dev/{tty_name}",
+            "tty": tty,
             "started_at": started,
-            "command": command,
+            "command": str(raw_candidate["command"]),
         })
     cwd_probe_ok, cwd_by_pid = _process_cwds([
         int(candidate["pid"]) for candidate in candidates
@@ -7898,6 +7925,62 @@ def _process_cwds(pids: list[int]) -> tuple[bool, dict[int, str]]:
     if any(pid not in cwd_by_pid for pid in unique_pids):
         return False, {}
     return True, cwd_by_pid
+
+
+def _process_stdio_ttys(pids: list[int]) -> tuple[bool, dict[int, str]]:
+    """Return exact shared stdio PTYs for processes without a controlling tty."""
+    unique_pids = sorted({int(pid) for pid in pids if int(pid or 0) > 0})
+    if not unique_pids:
+        return True, {}
+    try:
+        proc = subprocess.run(
+            [
+                "lsof", "-a", "-p", ",".join(str(pid) for pid in unique_pids),
+                "-d", "0,1,2", "-Ffpn",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return False, {}
+    if proc.returncode != 0:
+        return False, {}
+
+    current_pid = 0
+    current_fd = -1
+    seen_pids: set[int] = set()
+    stdio_by_pid: dict[int, dict[int, str]] = {}
+    for line in proc.stdout.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            current_pid = int(line[1:])
+            current_fd = -1
+            seen_pids.add(current_pid)
+            continue
+        if line.startswith("f"):
+            current_fd = int(line[1:]) if line[1:] in {"0", "1", "2"} else -1
+            continue
+        if current_pid > 0 and current_fd >= 0 and line.startswith("n"):
+            stdio_by_pid.setdefault(current_pid, {})[current_fd] = line[1:]
+
+    if any(pid not in seen_pids for pid in unique_pids):
+        return False, {}
+
+    tty_by_pid: dict[int, str] = {}
+    for pid in unique_pids:
+        fd_paths = stdio_by_pid.get(pid, {})
+        if set(fd_paths) != {0, 1, 2}:
+            return False, {}
+        paths = {fd_paths[0], fd_paths[1], fd_paths[2]}
+        if len(paths) == 1:
+            path = next(iter(paths))
+            if re.fullmatch(r"/dev/ttys[0-9]{3,}", path):
+                tty_by_pid[pid] = path
+                continue
+        if any(path.startswith("/dev/ttys") for path in paths):
+            # Mixed or malformed PTY evidence must never establish identity.
+            return False, {}
+    return True, tty_by_pid
 
 
 def _is_codex_cli_command(command: str) -> bool:
