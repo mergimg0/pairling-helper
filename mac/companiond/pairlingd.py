@@ -9669,6 +9669,8 @@ CODEX_CONTROL_CAPABILITIES = [
 ]
 
 _SESSION_TRANSCRIPT_STATS_CACHE: dict[tuple[str, str, str, int, int], dict] = {}
+_SESSION_TRANSCRIPT_STATS_CACHE_MAX_ENTRIES = 2048
+_SESSION_TRANSCRIPT_STATS_CACHE_TRIM_ENTRIES = 256
 _codex_rollout_paths_lock = threading.Lock()
 _codex_rollout_paths_cache: dict[str, object] = {"ts": 0.0, "paths": []}
 _codex_rollout_index_lock = threading.Lock()
@@ -9949,6 +9951,40 @@ def _large_transcript_line_meaningful_at(
     return timestamp
 
 
+def _large_transcript_line_is_provider_text_candidate(
+    prefix: str,
+    provider: str,
+) -> bool:
+    """Return whether a large row can contain provider-authored text.
+
+    Giant tool results and state snapshots can be hundreds of megabytes. Their
+    envelope identifies them before the large value begins, so reading every
+    byte cannot improve the answer and makes the sessions list scale with tool
+    output size.
+    """
+    compact = re.sub(r"\s+", "", prefix)
+    lowered = prefix.lower()
+    if any(f"<{tag}>" in lowered for tag in TRANSCRIPT_HARNESS_BLOCK_TAGS):
+        return False
+    provider = str(provider or "").strip().lower()
+    if provider == "codex":
+        if '"type":"response_item"' not in compact:
+            return False
+        payload_at = compact.find('"payload":')
+        payload = compact[payload_at:] if payload_at >= 0 else ""
+        return (
+            '"type":"message"' in payload
+            and '"role":"assistant"' in payload
+        )
+    if provider == "claude":
+        if '"type":"assistant"' not in compact:
+            return False
+        message_at = compact.find('"message":')
+        message = compact[message_at:] if message_at >= 0 else ""
+        return '"role":"assistant"' in message
+    raise _UnsupportedTranscriptProviderError(provider)
+
+
 def _last_meaningful_transcript_turn_at(
     path: Path,
     provider: str,
@@ -9968,6 +10004,15 @@ def _last_meaningful_transcript_turn_at(
                     prefix = handle.read(min(length, _MEANINGFUL_LINE_PREFIX_BYTES)).decode(
                         "utf-8", errors="replace"
                     )
+                    meaningful = _large_transcript_line_meaningful_at(
+                        prefix, provider
+                    )
+                    if meaningful is not None:
+                        return meaningful
+                    if not _large_transcript_line_is_provider_text_candidate(
+                        prefix, provider
+                    ):
+                        continue
                     block_types = _large_transcript_line_block_types(
                         handle, start, length, provider
                     )
@@ -10167,8 +10212,10 @@ def _session_transcript_stats(path: Path | str | None, provider: str, native_id:
         "last_meaningful_turn_at": last_meaningful_turn_at,
     }
     _SESSION_TRANSCRIPT_STATS_CACHE[key] = stats
-    if len(_SESSION_TRANSCRIPT_STATS_CACHE) > 512:
-        for old_key in list(_SESSION_TRANSCRIPT_STATS_CACHE.keys())[:128]:
+    if len(_SESSION_TRANSCRIPT_STATS_CACHE) > _SESSION_TRANSCRIPT_STATS_CACHE_MAX_ENTRIES:
+        for old_key in list(_SESSION_TRANSCRIPT_STATS_CACHE.keys())[
+            :_SESSION_TRANSCRIPT_STATS_CACHE_TRIM_ENTRIES
+        ]:
             _SESSION_TRANSCRIPT_STATS_CACHE.pop(old_key, None)
     return dict(stats)
 
@@ -11685,6 +11732,17 @@ def _session_terminal_title(row: dict) -> str | None:
     )
     if metadata_title:
         return metadata_title
+    terminal_capabilities = {
+        "terminal_output",
+        "terminal_surface",
+        "terminal_control",
+    }
+    if (
+        registry_row is None
+        and not str(row.get("terminal_tty") or "").strip()
+        and not terminal_capabilities.intersection(row.get("capabilities") or [])
+    ):
+        return None
     if not session_id or PTY_BROKER is None:
         return None
     source = _terminal_surface_capabilities(session_id)
@@ -14901,11 +14959,20 @@ def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> li
 
     pending_matches_by_rollout: dict[str, list[dict]] = {}
     rollout_ids_by_pending: dict[str, set[str]] = {}
+    unidentified_live_rollout_ids: set[str] = set()
     for _path, st, meta in rollout_entries:
         sid = str(meta.get("id") or "")
         if not sid or sid in pending_matches_by_rollout:
             continue
         started = int(_iso_to_epoch(meta.get("timestamp")) or st.st_mtime)
+        if any(
+            not terminal.get("native_id")
+            and str(terminal.get("identity_probe_state") or "exact") == "exact"
+            and terminal.get("project") == meta["cwd"]
+            and abs(float(terminal.get("started_at") or 0) - started) <= 600
+            for terminal in live_terminal_rows
+        ):
+            unidentified_live_rollout_ids.add(sid)
         matches = _codex_spawn_pending_registry_rows(
             meta["cwd"],
             started,
@@ -14916,6 +14983,20 @@ def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> li
             pending_id = str(pending.get("native_id") or "")
             if pending_id:
                 rollout_ids_by_pending.setdefault(pending_id, set()).add(sid)
+
+    if live_only:
+        rollout_entries = [
+            (path, st, meta)
+            for path, st, meta in rollout_entries
+            if (
+                str(meta.get("id") or "") in exact_live_native_ids
+                or str(meta.get("id") or "") in degraded_live_native_ids
+                or str(meta.get("id") or "") in live_registry_ids
+                or str(path) in live_transcript_path_set
+                or str(meta.get("id") or "") in unidentified_live_rollout_ids
+                or bool(pending_matches_by_rollout.get(str(meta.get("id") or "")))
+            )
+        ]
 
     for path, st, meta in rollout_entries:
         sid = meta["id"]
@@ -14959,13 +15040,7 @@ def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> li
             row["tool"] = state_payload.get("tool")
             row["turn_started_at"] = state_payload.get("started_at")
             row["effort"] = state_payload.get("effort")
-        matches_unidentified_terminal = any(
-            not terminal.get("native_id")
-            and str(terminal.get("identity_probe_state") or "exact") == "exact"
-            and terminal.get("project") == meta["cwd"]
-            and abs(float(terminal.get("started_at") or 0) - started) <= 600
-            for terminal in live_terminal_rows
-        )
+        matches_unidentified_terminal = sid in unidentified_live_rollout_ids
         pending_matches = pending_matches_by_rollout.get(sid) or []
         pending_match_id = (
             str(pending_matches[0].get("native_id") or "")
