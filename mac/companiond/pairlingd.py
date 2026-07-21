@@ -50,6 +50,7 @@ from __future__ import annotations
 import atexit
 import base64
 import codecs
+import ctypes
 import errno
 import fcntl
 import hashlib
@@ -1432,6 +1433,7 @@ def _invalidate_session_list_caches() -> None:
     global _runtime_snapshot_cache_generation
     with _runtime_snapshot_cache_lock:
         _runtime_snapshot_cache_generation += 1
+        _record_runtime_snapshot_invalidation_for_current_thread()
         _runtime_snapshot_cache.clear()
     _SESSION_TRANSCRIPT_STATS_CACHE.clear()
     _clear_codex_rollout_caches()
@@ -1440,6 +1442,7 @@ def _invalidate_session_list_caches() -> None:
     # again so that loader cannot publish data derived from the old inputs.
     with _runtime_snapshot_cache_lock:
         _runtime_snapshot_cache_generation += 1
+        _record_runtime_snapshot_invalidation_for_current_thread()
         _runtime_snapshot_cache.clear()
 
 
@@ -2364,6 +2367,7 @@ _runtime_snapshot_cache_lock = threading.Lock()
 _runtime_snapshot_cache: dict[tuple, tuple[float, object]] = {}
 _runtime_snapshot_key_locks: dict[tuple, _RuntimeSnapshotKeyLock] = {}
 _runtime_snapshot_cache_generation = 0
+_runtime_snapshot_thread_state = threading.local()
 _auth_result_cache_lock = threading.Lock()
 _auth_result_cache: dict[tuple, tuple[float, object]] = {}
 _auth_result_cache_generation = 0
@@ -2380,6 +2384,20 @@ _DASHBOARD_STREAM_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_A
 _STREAM_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_STREAMS)
 _AUX_STREAM_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_AUX_STREAMS)
 _CONNECTION_ADMISSION_SEMAPHORE = threading.BoundedSemaphore(RUNTIME_MAX_ACTIVE_CONNECTIONS)
+
+
+def _runtime_snapshot_invalidation_count_for_current_thread() -> int:
+    return int(
+        getattr(_runtime_snapshot_thread_state, "invalidation_count", 0) or 0
+    )
+
+
+def _record_runtime_snapshot_invalidation_for_current_thread() -> None:
+    _runtime_snapshot_thread_state.invalidation_count = (
+        _runtime_snapshot_invalidation_count_for_current_thread() + 1
+    )
+
+
 _STREAM_ENDPOINTS = {
     "/health-stream",
     "/sessions-stream",
@@ -4070,9 +4088,15 @@ def _permission_stale_screen_response(*, state: str, broker_id: str, code: str,
 
 
 FIRST_PROMPT_DELIVERY_TIMEOUT_SECONDS = 600.0
+FIRST_PROMPT_CLOSED_CONFIRMATION_GRACE_SECONDS = 5.0
+FIRST_PROMPT_RECONCILIATION_POLL_SECONDS = 1.0
 FIRST_PROMPT_DELIVERY_DIR = COMPANION_DIR / "first-prompt-deliveries"
 _FIRST_PROMPT_DELIVERY_LOCK = threading.RLock()
 _FIRST_PROMPT_ACTIVE: set[str] = set()
+_FIRST_PROMPT_RECEIPT_RETRY_REQUESTS: dict[str, dict] = {}
+_FIRST_PROMPT_RECEIPT_RETRY_WORKER_ACTIVE = False
+_FIRST_PROMPT_RECEIPT_RETRY_WORKER_GENERATION = 0
+_FIRST_PROMPT_RECEIPT_RETRY_WAKE = threading.Event()
 
 
 def _first_prompt_delivery_path(provider: str, native_id: str) -> Path:
@@ -4121,17 +4145,22 @@ def _publish_first_prompt_delivery_receipt(record: dict) -> None:
         "failed": "failed",
         "indeterminate": "indeterminate",
     }[state]
+    recorded_pty_written = record.get("pty_written")
+    if not isinstance(recorded_pty_written, bool):
+        recorded_pty_written = (
+            True if state == "delivered" else False if state == "failed" else None
+        )
     receipt = _make_action_receipt(
         client_action_id=str(record.get("client_action_id") or "") or None,
         state=receipt_state,
         phases=_receipt_phases(
             validated=True,
             applied=state == "delivered",
-            pty_written=(True if state == "delivered" else (None if state == "indeterminate" else False)),
+            pty_written=recorded_pty_written,
         ),
         backend="first_prompt_delivery",
     )
-    if state == "indeterminate":
+    if state == "indeterminate" and recorded_pty_written is None:
         receipt["phases"]["pty_write_state"] = "unknown"
     _append_session_live_control_receipt(
         device_id=str(record.get("device_id") or "") or None,
@@ -4141,6 +4170,216 @@ def _publish_first_prompt_delivery_receipt(record: dict) -> None:
         audit_action={"type": "first_prompt_delivery", "state": state},
         receipt=receipt,
     )
+
+
+def _run_first_prompt_delivery_receipt_retry_worker(
+    worker_generation: int,
+) -> None:
+    global _FIRST_PROMPT_RECEIPT_RETRY_WORKER_ACTIVE
+
+    try:
+        while True:
+            wait_seconds = 0.0
+            request = None
+            record = None
+            with _FIRST_PROMPT_DELIVERY_LOCK:
+                if not _FIRST_PROMPT_RECEIPT_RETRY_REQUESTS:
+                    _FIRST_PROMPT_RECEIPT_RETRY_WAKE.clear()
+                    if (
+                        _FIRST_PROMPT_RECEIPT_RETRY_WORKER_GENERATION
+                        == worker_generation
+                    ):
+                        _FIRST_PROMPT_RECEIPT_RETRY_WORKER_ACTIVE = False
+                    return
+                now = _time.monotonic()
+                current_key, current_request = min(
+                    _FIRST_PROMPT_RECEIPT_RETRY_REQUESTS.items(),
+                    key=lambda item: float(item[1].get("next_attempt_at") or 0),
+                )
+                next_attempt_at = float(
+                    current_request.get("next_attempt_at") or 0
+                )
+                if next_attempt_at > now:
+                    wait_seconds = next_attempt_at - now
+                    _FIRST_PROMPT_RECEIPT_RETRY_WAKE.clear()
+                else:
+                    request = dict(current_request)
+                    request["retry_key"] = current_key
+                    record = _read_first_prompt_delivery(
+                        str(request.get("provider") or ""),
+                        str(request.get("native_id") or ""),
+                    )
+                    if not isinstance(record, dict) or record.get("state") not in {
+                        "delivered",
+                        "failed",
+                        "indeterminate",
+                    }:
+                        queued = _FIRST_PROMPT_RECEIPT_RETRY_REQUESTS.get(
+                            current_key
+                        )
+                        if queued and queued.get("generation") == request.get(
+                            "generation"
+                        ):
+                            _FIRST_PROMPT_RECEIPT_RETRY_REQUESTS.pop(
+                                current_key, None
+                            )
+                        request = None
+
+            if wait_seconds > 0:
+                _FIRST_PROMPT_RECEIPT_RETRY_WAKE.wait(timeout=wait_seconds)
+                continue
+            if request is None or record is None:
+                continue
+
+            current_key = str(request["retry_key"])
+            provider_value = str(request.get("provider") or "")
+            native_id_value = str(request.get("native_id") or "")
+            try:
+                _publish_first_prompt_delivery_receipt(record)
+            except Exception as exc:  # noqa: BLE001 - receipt retry is isolated
+                print(
+                    "[first-prompt] receipt retry failed for "
+                    f"{provider_value}:{native_id_value}: "
+                    f"{type(exc).__name__}: {str(exc)[:100]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                with _FIRST_PROMPT_DELIVERY_LOCK:
+                    queued = _FIRST_PROMPT_RECEIPT_RETRY_REQUESTS.get(
+                        current_key
+                    )
+                    if queued and queued.get("generation") == request.get(
+                        "generation"
+                    ):
+                        delay = min(
+                            max(float(request.get("delay") or 0.25), 0.25) * 2,
+                            30.0,
+                        )
+                        queued["delay"] = delay
+                        queued["next_attempt_at"] = _time.monotonic() + delay
+                continue
+
+            with _FIRST_PROMPT_DELIVERY_LOCK:
+                queued = _FIRST_PROMPT_RECEIPT_RETRY_REQUESTS.get(current_key)
+                latest = _read_first_prompt_delivery(
+                    provider_value, native_id_value
+                )
+                if (
+                    queued
+                    and queued.get("generation") == request.get("generation")
+                    and latest == record
+                ):
+                    _FIRST_PROMPT_RECEIPT_RETRY_REQUESTS.pop(current_key, None)
+                elif queued:
+                    queued["delay"] = 0.25
+                    queued["next_attempt_at"] = _time.monotonic()
+                    _FIRST_PROMPT_RECEIPT_RETRY_WAKE.set()
+    except Exception as exc:  # noqa: BLE001 - keep queued truth for a later ensure
+        print(
+            "[first-prompt] receipt retry worker stopped unexpectedly: "
+            f"{type(exc).__name__}: {str(exc)[:100]}",
+            file=sys.stderr,
+            flush=True,
+        )
+    finally:
+        with _FIRST_PROMPT_DELIVERY_LOCK:
+            if (
+                _FIRST_PROMPT_RECEIPT_RETRY_WORKER_GENERATION
+                == worker_generation
+            ):
+                _FIRST_PROMPT_RECEIPT_RETRY_WORKER_ACTIVE = False
+                if _FIRST_PROMPT_RECEIPT_RETRY_REQUESTS:
+                    retry_at = _time.monotonic() + 0.25
+                    for queued in _FIRST_PROMPT_RECEIPT_RETRY_REQUESTS.values():
+                        queued["next_attempt_at"] = max(
+                            float(queued.get("next_attempt_at") or 0),
+                            retry_at,
+                        )
+                    try:
+                        _ensure_first_prompt_delivery_receipt_retry_worker_locked()
+                    except Exception as exc:  # noqa: BLE001 - truth stays queued
+                        print(
+                            "[first-prompt] could not restart receipt retry: "
+                            f"{type(exc).__name__}: {str(exc)[:100]}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+            _FIRST_PROMPT_RECEIPT_RETRY_WAKE.set()
+
+
+def _ensure_first_prompt_delivery_receipt_retry_worker_locked() -> None:
+    """Start the one receipt worker while the delivery lock is held."""
+    global _FIRST_PROMPT_RECEIPT_RETRY_WORKER_ACTIVE
+    global _FIRST_PROMPT_RECEIPT_RETRY_WORKER_GENERATION
+
+    if (
+        _FIRST_PROMPT_RECEIPT_RETRY_WORKER_ACTIVE
+        or not _FIRST_PROMPT_RECEIPT_RETRY_REQUESTS
+    ):
+        return
+    _FIRST_PROMPT_RECEIPT_RETRY_WORKER_GENERATION += 1
+    worker_generation = _FIRST_PROMPT_RECEIPT_RETRY_WORKER_GENERATION
+    worker = threading.Thread(
+        target=lambda: _run_first_prompt_delivery_receipt_retry_worker(
+            worker_generation
+        ),
+        name="pairling-first-prompt-receipts",
+        daemon=True,
+    )
+    _FIRST_PROMPT_RECEIPT_RETRY_WORKER_ACTIVE = True
+    try:
+        worker.start()
+    except Exception:
+        _FIRST_PROMPT_RECEIPT_RETRY_WORKER_ACTIVE = False
+        raise
+
+
+def _schedule_first_prompt_delivery_receipt_retry(
+    provider: str,
+    native_id: str,
+) -> None:
+    """Retry receipt storage without changing durable delivery truth."""
+    retry_key = f"{provider}:{native_id}"
+    start_error = None
+    with _FIRST_PROMPT_DELIVERY_LOCK:
+        previous = _FIRST_PROMPT_RECEIPT_RETRY_REQUESTS.get(retry_key) or {}
+        generation = int(previous.get("generation") or 0) + 1
+        _FIRST_PROMPT_RECEIPT_RETRY_REQUESTS[retry_key] = {
+            "provider": provider,
+            "native_id": native_id,
+            "generation": generation,
+            "delay": 0.25,
+            "next_attempt_at": _time.monotonic(),
+        }
+        _FIRST_PROMPT_RECEIPT_RETRY_WAKE.set()
+        try:
+            _ensure_first_prompt_delivery_receipt_retry_worker_locked()
+        except Exception as exc:  # noqa: BLE001 - durable truth remains queued
+            start_error = exc
+
+    if start_error is not None:
+        print(
+            "[first-prompt] could not start receipt retry for "
+            f"{provider}:{native_id}: {type(start_error).__name__}: "
+            f"{str(start_error)[:100]}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _publish_first_prompt_delivery_receipt_or_retry(record: dict) -> None:
+    try:
+        _publish_first_prompt_delivery_receipt(record)
+    except Exception as exc:  # noqa: BLE001 - never roll back provider delivery truth
+        provider = str(record.get("provider") or "")
+        native_id = str(record.get("native_id") or "")
+        print(
+            "[first-prompt] receipt publish failed for "
+            f"{provider}:{native_id}: {type(exc).__name__}: {str(exc)[:100]}",
+            file=sys.stderr,
+            flush=True,
+        )
+        _schedule_first_prompt_delivery_receipt_retry(provider, native_id)
 
 
 def _finish_first_prompt_delivery(
@@ -4156,15 +4395,150 @@ def _finish_first_prompt_delivery(
             "provider": provider,
             "native_id": native_id,
         }
-        record["state"] = state
-        record["reason"] = reason
-        record["finished_at"] = _time.time()
-        # Once delivery is terminal, retaining the prompt text has no recovery
-        # value. Its hash remains useful for audit and replay comparison.
-        record.pop("text", None)
-        _write_first_prompt_delivery(record)
+        recorded_state = str(record.get("state") or "")
+        is_noop_terminal_finish = (
+            recorded_state in {"delivered", "failed"}
+            or (recorded_state == "indeterminate" and state == "indeterminate")
+        )
+        if not is_noop_terminal_finish:
+            record["state"] = state
+            record["reason"] = reason
+            record["finished_at"] = _time.time()
+            # Keep the text for an indeterminate write so a later exact
+            # transcript reconciliation can prove acceptance without resend.
+            if state in {"delivered", "failed"}:
+                record.pop("text", None)
+            _write_first_prompt_delivery(record)
         published_record = dict(record)
-    _publish_first_prompt_delivery_receipt(published_record)
+    _publish_first_prompt_delivery_receipt_or_retry(published_record)
+
+
+def _first_prompt_content_texts(content) -> list[str]:
+    if isinstance(content, str):
+        return [content]
+    if not isinstance(content, list):
+        return []
+    texts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            texts.append(block)
+            continue
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type") or "text")
+        if block_type not in {"text", "input_text"}:
+            continue
+        value = block.get("text") or block.get("content")
+        if isinstance(value, str):
+            texts.append(value)
+    return texts
+
+
+def _first_prompt_line_has_exact_user_text(
+    provider: str,
+    native_id: str,
+    raw_line: bytes,
+    expected_text: str,
+) -> bool:
+    expected = expected_text.strip()
+    if not expected or not raw_line.strip():
+        return False
+    if provider == "codex":
+        rows = _normalize_codex_line(
+            raw_line,
+            native_id,
+            include_event_messages=False,
+        )
+    elif provider == "claude":
+        try:
+            row = json.loads(raw_line)
+        except (ValueError, json.JSONDecodeError):
+            return False
+        message = row.get("message") if isinstance(row.get("message"), dict) else {}
+        rows = [row] if row.get("type") == "user" and message.get("role") == "user" else []
+    else:
+        return False
+    for row in rows:
+        message = row.get("message") if isinstance(row.get("message"), dict) else {}
+        if message.get("role") != "user":
+            continue
+        texts = _first_prompt_content_texts(message.get("content"))
+        candidates = texts + (["\n".join(texts)] if len(texts) > 1 else [])
+        if any(candidate.strip() == expected for candidate in candidates):
+            return True
+    return False
+
+
+def _first_prompt_transcript_boundary(provider: str, native_id: str) -> dict:
+    resolved_native_id = _agent_registry_resolve_native_alias(provider, native_id)
+    raw_session = _qualified_session_id(provider, resolved_native_id)
+    handler = object.__new__(Handler)
+    try:
+        path = handler._resolve_session_transcript_path(
+            provider,
+            resolved_native_id,
+            raw_session,
+        )
+    except (OSError, RuntimeError, _UnsupportedTranscriptProviderError):
+        path = None
+    transcript_session_id = resolved_native_id
+    if provider == "claude":
+        row = _agent_registry_get(provider, resolved_native_id) or {}
+        transcript_session_id = str(row.get("claude_uuid") or "")
+    try:
+        offset = int(path.stat().st_size) if path is not None else 0
+    except OSError:
+        path = None
+        offset = 0
+    return {
+        "resolved_native_id": resolved_native_id,
+        "transcript_session_id": transcript_session_id,
+        "transcript_path": str(path) if path is not None else None,
+        "transcript_offset_before": offset,
+    }
+
+
+def _first_prompt_provider_confirmed(record: dict) -> bool:
+    provider = str(record.get("provider") or "")
+    native_id = str(record.get("native_id") or "")
+    expected_text = str(record.get("text") or "")
+    if provider not in {"claude", "codex"} or not native_id or not expected_text:
+        return False
+    try:
+        boundary = _first_prompt_transcript_boundary(provider, native_id)
+    except (OSError, RuntimeError, _UnsupportedTranscriptProviderError):
+        return False
+    current_identity = str(boundary.get("transcript_session_id") or "")
+    expected_identity = str(record.get("transcript_session_id") or "")
+    if expected_identity and current_identity != expected_identity:
+        exact_codex_promotion = (
+            provider == "codex"
+            and expected_identity.startswith("pending-")
+            and _agent_registry_resolve_native_alias(
+                "codex", expected_identity
+            ) == current_identity
+        )
+        if not exact_codex_promotion:
+            return False
+    current_path = str(boundary.get("transcript_path") or "")
+    expected_path = str(record.get("transcript_path") or "")
+    if not current_path or (expected_path and current_path != expected_path):
+        return False
+    offset = int(record.get("transcript_offset_before") or 0) if expected_path else 0
+    try:
+        with Path(current_path).open("rb") as transcript:
+            transcript.seek(max(0, offset))
+            for raw_line in transcript:
+                if _first_prompt_line_has_exact_user_text(
+                    provider,
+                    str(boundary.get("resolved_native_id") or native_id),
+                    raw_line,
+                    expected_text,
+                ):
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def _first_prompt_surface_is_ready(provider: str, snapshot: dict | None) -> bool:
@@ -4339,6 +4713,7 @@ def _schedule_first_prompt_delivery(
         return False
     delivery_key = f"{provider}:{native_id}"
     text_hash = hashlib.sha256(text.encode()).hexdigest()
+    confirmation_only = False
 
     with _FIRST_PROMPT_DELIVERY_LOCK:
         existing = _read_first_prompt_delivery(provider, native_id)
@@ -4347,16 +4722,17 @@ def _schedule_first_prompt_delivery(
                 return False
             if delivery_key in _FIRST_PROMPT_ACTIVE:
                 return True
-            if existing.get("state") in {"delivered", "indeterminate", "failed"}:
+            existing_state = str(existing.get("state") or "")
+            if existing_state in {"delivered", "failed"}:
                 return False
-            if existing.get("state") == "dispatching":
-                _finish_first_prompt_delivery(
-                    provider,
-                    native_id,
-                    state="indeterminate",
-                    reason="delivery process stopped while terminal dispatch was in flight",
-                )
-                return False
+            if existing_state == "indeterminate":
+                if not existing.get("text") or existing.get("pty_written") is False:
+                    return False
+            confirmation_only = existing_state in {
+                "dispatching",
+                "awaiting_provider",
+                "indeterminate",
+            }
             text = str(existing.get("text") or text)
         else:
             _write_first_prompt_delivery({
@@ -4386,9 +4762,19 @@ def _schedule_first_prompt_delivery(
                 "state": "pending",
                 "reason": reason,
             })
+            for key in (
+                "transcript_path",
+                "transcript_offset_before",
+                "transcript_session_id",
+                "pty_written",
+                "write_outcome",
+                "paste_render_confirmed",
+                "submit_key_written",
+            ):
+                record.pop(key, None)
             _write_first_prompt_delivery(record)
 
-    def mark_dispatching() -> None:
+    def mark_dispatching(boundary: dict) -> None:
         with _FIRST_PROMPT_DELIVERY_LOCK:
             record = _read_first_prompt_delivery(provider, native_id) or {}
             record.update({
@@ -4401,16 +4787,108 @@ def _schedule_first_prompt_delivery(
                 "text_hash": text_hash,
                 "state": "dispatching",
                 "dispatch_started_at": _time.time(),
+                "transcript_path": boundary.get("transcript_path"),
+                "transcript_offset_before": int(
+                    boundary.get("transcript_offset_before") or 0
+                ),
+                "transcript_session_id": boundary.get("transcript_session_id"),
             })
+            _write_first_prompt_delivery(record)
+
+    def copy_write_truth(record: dict, result: dict) -> None:
+        for key in (
+            "pty_written",
+            "bytes_written",
+            "bytes_expected",
+            "write_outcome",
+            "outcome_indeterminate",
+            "paste_render_confirmed",
+            "submit_key_written",
+            "error_code",
+        ):
+            if key in result:
+                record[key] = result.get(key)
+
+    def mark_dispatch_result(result: dict, reason: str) -> None:
+        with _FIRST_PROMPT_DELIVERY_LOCK:
+            record = _read_first_prompt_delivery(provider, native_id) or {}
+            record["reason"] = reason
+            copy_write_truth(record, result)
+            _write_first_prompt_delivery(record)
+
+    def mark_awaiting_provider(result: dict) -> None:
+        with _FIRST_PROMPT_DELIVERY_LOCK:
+            record = _read_first_prompt_delivery(provider, native_id) or {}
+            record.update({
+                "state": "awaiting_provider",
+                "reason": "terminal submit written; waiting for provider transcript",
+                "provider_wait_started_at": _time.time(),
+            })
+            copy_write_truth(record, result)
             _write_first_prompt_delivery(record)
 
     def run() -> None:
         handler = object.__new__(Handler)
-        deadline = _time.time() + FIRST_PROMPT_DELIVERY_TIMEOUT_SECONDS
+        preserved_terminal_record = None
+        starting_record = _read_first_prompt_delivery(provider, native_id) or {}
+        started_at = float(
+            starting_record.get("dispatch_started_at")
+            or starting_record.get("created_at")
+            or _time.time()
+        )
+        deadline = started_at + FIRST_PROMPT_DELIVERY_TIMEOUT_SECONDS
         last_reason = "provider composer not ready"
-        terminal_state = "failed"
+        awaiting_provider = confirmation_only
+        terminal_state = "indeterminate" if awaiting_provider else "failed"
+        indeterminate_published = (
+            str(starting_record.get("state") or "") == "indeterminate"
+        )
+        closed_seen_at = None
         try:
-            while _time.time() < deadline:
+            while True:
+                if awaiting_provider:
+                    record = _read_first_prompt_delivery(provider, native_id) or {}
+                    if _first_prompt_provider_confirmed(record):
+                        _finish_first_prompt_delivery(
+                            provider,
+                            native_id,
+                            state="delivered",
+                            reason="provider transcript confirmed",
+                        )
+                        return
+                    last_reason = "provider transcript confirmation timed out"
+                    now = _time.time()
+                    control_native_id = _agent_registry_resolve_native_alias(
+                        provider, native_id
+                    )
+                    reg = _agent_registry_get(provider, native_id) or _agent_registry_get(
+                        provider, control_native_id
+                    )
+                    if reg and reg.get("closed_at"):
+                        last_reason = "session closed before provider transcript confirmation"
+                        closed_seen_at = closed_seen_at or now
+                        if now >= (
+                            closed_seen_at
+                            + FIRST_PROMPT_CLOSED_CONFIRMATION_GRACE_SECONDS
+                        ):
+                            break
+                    if now >= deadline and not indeterminate_published:
+                        _finish_first_prompt_delivery(
+                            provider,
+                            native_id,
+                            state="indeterminate",
+                            reason=last_reason,
+                        )
+                        indeterminate_published = True
+                    _time.sleep(
+                        FIRST_PROMPT_RECONCILIATION_POLL_SECONDS
+                        if indeterminate_published
+                        else 0.25
+                    )
+                    continue
+
+                if _time.time() >= deadline:
+                    break
                 raw_session = _qualified_session_id(provider, native_id)
                 try:
                     snapshot = (
@@ -4424,23 +4902,22 @@ def _schedule_first_prompt_delivery(
                     last_reason = str(exc)[:120]
                 if _first_prompt_surface_is_ready(provider, snapshot):
                     # Persist this boundary before touching the terminal. A
-                    # restart from dispatching is unknown and never retried.
-                    mark_dispatching()
+                    # restart from dispatching only resumes transcript checks.
+                    boundary = _first_prompt_transcript_boundary(provider, native_id)
+                    mark_dispatching(boundary)
                     result = _deliver_first_prompt_now(
                         handler,
                         provider=provider,
                         native_id=native_id,
                         text=text,
                     )
-                    if result.get("ok"):
-                        _finish_first_prompt_delivery(
-                            provider,
-                            native_id,
-                            state="delivered",
-                            reason="terminal write confirmed",
-                        )
-                        return
                     last_reason = str(result.get("reason") or "delivery failed")[:120]
+                    mark_dispatch_result(result, last_reason)
+                    if result.get("ok"):
+                        mark_awaiting_provider(result)
+                        awaiting_provider = True
+                        terminal_state = "indeterminate"
+                        continue
                     if result.get("outcome_indeterminate") or result.get("write_outcome") in {
                         "partial",
                         "unknown",
@@ -4467,18 +4944,34 @@ def _schedule_first_prompt_delivery(
         except Exception as exc:  # noqa: BLE001 - a delivery worker must not stop the daemon
             last_reason = f"{type(exc).__name__}: {str(exc)[:100]}"
             # If the record reached dispatching, the process may have stopped
-            # after writing. Preserve that uncertainty across restart.
+            # after writing. Preserve that uncertainty across restart. A
+            # durable final result always wins over later bookkeeping errors.
             record = _read_first_prompt_delivery(provider, native_id) or {}
-            terminal_state = "indeterminate" if record.get("state") == "dispatching" else "failed"
+            recorded_state = str(record.get("state") or "")
+            if recorded_state in {"delivered", "failed", "indeterminate"}:
+                terminal_state = recorded_state
+                last_reason = str(record.get("reason") or last_reason)
+                preserved_terminal_record = dict(record)
+            else:
+                terminal_state = (
+                    "indeterminate"
+                    if recorded_state in {"dispatching", "awaiting_provider"}
+                    else "failed"
+                )
         finally:
             with _FIRST_PROMPT_DELIVERY_LOCK:
                 _FIRST_PROMPT_ACTIVE.discard(delivery_key)
-        _finish_first_prompt_delivery(
-            provider,
-            native_id,
-            state=terminal_state,
-            reason=last_reason,
-        )
+        if preserved_terminal_record is not None:
+            _publish_first_prompt_delivery_receipt_or_retry(
+                preserved_terminal_record
+            )
+        else:
+            _finish_first_prompt_delivery(
+                provider,
+                native_id,
+                state=terminal_state,
+                reason=last_reason,
+            )
         print(
             f"[first-prompt] delivery stopped for {provider}:{native_id}: {last_reason}",
             file=sys.stderr,
@@ -4513,16 +5006,18 @@ def _recover_pending_first_prompt_deliveries() -> None:
         provider = str(record.get("provider") or "")
         native_id = str(record.get("native_id") or "")
         state = str(record.get("state") or "")
-        if state == "dispatching":
-            _finish_first_prompt_delivery(
-                provider,
-                native_id,
-                state="indeterminate",
-                reason="daemon restarted while terminal dispatch was in flight",
-            )
-            continue
         text = str(record.get("text") or "")
-        if state == "pending" and text:
+        if state == "indeterminate":
+            _publish_first_prompt_delivery_receipt_or_retry(record)
+            if text and record.get("pty_written") is not False:
+                _schedule_first_prompt_delivery(
+                    provider=provider,
+                    native_id=native_id,
+                    text=text,
+                    client_action_id=str(record.get("client_action_id") or "") or None,
+                    device_id=str(record.get("device_id") or "") or None,
+                )
+        elif state in {"pending", "dispatching", "awaiting_provider"} and text:
             _schedule_first_prompt_delivery(
                 provider=provider,
                 native_id=native_id,
@@ -4530,8 +5025,15 @@ def _recover_pending_first_prompt_deliveries() -> None:
                 client_action_id=str(record.get("client_action_id") or "") or None,
                 device_id=str(record.get("device_id") or "") or None,
             )
-        elif state in {"delivered", "failed", "indeterminate"}:
-            _publish_first_prompt_delivery_receipt(record)
+        elif state in {"dispatching", "awaiting_provider"}:
+            _finish_first_prompt_delivery(
+                provider,
+                native_id,
+                state="indeterminate",
+                reason="daemon restarted without retained transcript confirmation text",
+            )
+        elif state in {"delivered", "failed"}:
+            _publish_first_prompt_delivery_receipt_or_retry(record)
 
 
 RACES_REGISTRY_PATH = APP_SUPPORT_ROOT / "races.json"
@@ -5765,7 +6267,13 @@ def _agent_registry_live(provider: str, *, limit: int = 100) -> list[dict]:
         return []
 
 
-def _agent_registry_recent(provider: str, since_min: int = 60 * 24, limit: int = 300) -> list[dict]:
+def _agent_registry_recent(
+    provider: str,
+    since_min: int = 60 * 24,
+    limit: int = 300,
+    *,
+    strict: bool = False,
+) -> list[dict]:
     cutoff = _time.time() - max(1, int(since_min or 1)) * 60
     limit = max(1, min(int(limit or 300), 1000))
     try:
@@ -5778,6 +6286,8 @@ def _agent_registry_recent(provider: str, since_min: int = 60 * 24, limit: int =
             ).fetchall()
             return [dict(r) for r in rows]
     except Exception:
+        if strict:
+            raise
         return []
 
 
@@ -6522,11 +7032,26 @@ def _codex_delivered_first_prompt_identity_proof(
         if not isinstance(delivery, dict):
             continue
         delivery_hash = str(delivery.get("text_hash") or "")
+        delivery_state = str(delivery.get("state") or "")
+        retained_text = str(delivery.get("text") or "")
+        provider_submit_attested = (
+            delivery_state in {"awaiting_provider", "indeterminate"}
+            and delivery.get("pty_written") is True
+            and delivery.get("write_outcome") == "complete"
+            and delivery.get("paste_render_confirmed") is True
+            and delivery.get("submit_key_written") is True
+            and bool(retained_text)
+            and hashlib.sha256(retained_text.encode("utf-8")).hexdigest()
+            == delivery_hash
+        )
         if (
             delivery.get("schema_version") != 1
             or delivery.get("provider") != "codex"
             or delivery.get("native_id") != pending_native_id
-            or delivery.get("state") != "delivered"
+            or (
+                delivery_state != "delivered"
+                and not provider_submit_attested
+            )
             or str(delivery.get("client_action_id") or "") != action_id
             or not str(delivery.get("device_id") or "")
             or re.fullmatch(r"[0-9a-f]{64}", delivery_hash) is None
@@ -6542,21 +7067,28 @@ def _codex_delivered_first_prompt_identity_proof(
             dispatch_started_at = float(
                 delivery.get("dispatch_started_at") or 0
             )
-            finished_at = float(delivery.get("finished_at") or 0)
+            proof_at = float(
+                delivery.get("finished_at")
+                or delivery.get("provider_wait_started_at")
+                or 0
+            )
         except (TypeError, ValueError):
             continue
+        proof_window_end = proof_at
         if not (
             candidate_started_at > 0
             and process_started_at > 0
             and abs(candidate_started_at - process_started_at) <= 60
             and candidate_started_at - 1 <= created_at <= candidate_started_at + 10
-            and created_at <= dispatch_started_at <= finished_at
-            and finished_at <= (
+            and created_at <= dispatch_started_at <= proof_at
+            and proof_at <= (
                 candidate_started_at
                 + FIRST_PROMPT_DELIVERY_TIMEOUT_SECONDS
                 + 15
             )
-            and process_started_at - 2 <= rollout_started_at <= finished_at + 15
+            and process_started_at - 2
+            <= rollout_started_at
+            <= proof_window_end + 15
         ):
             continue
         if not _codex_attested_prompt_rollout_is_unique(
@@ -6565,9 +7097,9 @@ def _codex_delivered_first_prompt_identity_proof(
             output_path,
             delivery_hash,
             process_started_at - 2,
-            finished_at + 15,
+            proof_window_end + 15,
             dispatch_started_at,
-            finished_at + 120,
+            proof_window_end + 120,
         ):
             continue
 
@@ -6588,7 +7120,7 @@ def _codex_delivered_first_prompt_identity_proof(
                 competing_started_at <= 0
                 or process_started_at - 2
                 <= competing_started_at
-                <= finished_at + 15
+                <= proof_window_end + 15
             ):
                 competing_process = True
                 break
@@ -7017,11 +7549,22 @@ def _runtime_admission_for_path(path: str) -> _RuntimeAdmission:
     return _RuntimeAdmission(None, False, "request_capacity_exceeded")
 
 
-def _cached_runtime_snapshot(key: tuple, ttl_seconds: float, loader):
+def _cached_runtime_snapshot(
+    key: tuple,
+    ttl_seconds: float,
+    loader,
+    *,
+    force_refresh: bool = False,
+    store_after_loader_invalidation: bool = False,
+):
     now = _time.time()
     with _runtime_snapshot_cache_lock:
         cached = _runtime_snapshot_cache.get(key)
-        if cached is not None and now - cached[0] < ttl_seconds:
+        if (
+            not force_refresh
+            and cached is not None
+            and now - cached[0] < ttl_seconds
+        ):
             return _copy_cache_value(cached[1])
         key_lock_entry = _runtime_snapshot_key_locks.get(key)
         if key_lock_entry is None:
@@ -7033,13 +7576,32 @@ def _cached_runtime_snapshot(key: tuple, ttl_seconds: float, loader):
             now = _time.time()
             with _runtime_snapshot_cache_lock:
                 cached = _runtime_snapshot_cache.get(key)
-                if cached is not None and now - cached[0] < ttl_seconds:
+                if (
+                    not force_refresh
+                    and cached is not None
+                    and now - cached[0] < ttl_seconds
+                ):
                     return _copy_cache_value(cached[1])
                 load_generation = _runtime_snapshot_cache_generation
+                loader_invalidation_count = (
+                    _runtime_snapshot_invalidation_count_for_current_thread()
+                )
             value = loader()
             stored_at = _time.time()
             with _runtime_snapshot_cache_lock:
-                if load_generation == _runtime_snapshot_cache_generation:
+                generation_delta = (
+                    _runtime_snapshot_cache_generation - load_generation
+                )
+                loader_invalidation_delta = (
+                    _runtime_snapshot_invalidation_count_for_current_thread()
+                    - loader_invalidation_count
+                )
+                loader_caused_every_invalidation = (
+                    store_after_loader_invalidation
+                    and generation_delta > 0
+                    and generation_delta == loader_invalidation_delta
+                )
+                if generation_delta == 0 or loader_caused_every_invalidation:
                     _runtime_snapshot_cache[key] = (
                         stored_at,
                         _copy_cache_value(value),
@@ -7811,11 +8373,149 @@ def _pid_for_tty_command(tty: str, command_name: str) -> int:
     return matches[0] if matches else 0
 
 
+def _parse_kern_procargs2(payload: bytes) -> list[str] | None:
+    """Decode one macOS KERN_PROCARGS2 payload into its exact argv."""
+    int_size = ctypes.sizeof(ctypes.c_int)
+    if len(payload) < int_size:
+        return None
+    argc = ctypes.c_int.from_buffer_copy(payload[:int_size]).value
+    if argc <= 0 or argc > 65536:
+        return None
+
+    # The executable path precedes argv and is followed by NUL padding.
+    offset = payload.find(b"\0", int_size)
+    if offset < 0:
+        return None
+    offset += 1
+    while offset < len(payload) and payload[offset] == 0:
+        offset += 1
+
+    argv: list[str] = []
+    for _ in range(argc):
+        end = payload.find(b"\0", offset)
+        if end < 0:
+            return None
+        raw_argument = payload[offset:end]
+        if not argv and not raw_argument:
+            return None
+        argv.append(os.fsdecode(raw_argument))
+        offset = end + 1
+    return argv if argv and argv[0] else None
+
+
+def _process_argv(pid: int) -> tuple[bool, list[str]]:
+    """Read one process's exact argv through macOS KERN_PROCARGS2."""
+    pid = int(pid or 0)
+    if pid <= 0 or sys.platform != "darwin":
+        return False, []
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        sysctl = libc.sysctl
+        mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+        payload_size = ctypes.c_size_t(0)
+        if sysctl(mib, 3, None, ctypes.byref(payload_size), None, 0) != 0:
+            return False, []
+        if payload_size.value <= 0 or payload_size.value > 16 * 1024 * 1024:
+            return False, []
+        payload = ctypes.create_string_buffer(payload_size.value)
+        if (
+            sysctl(
+                mib,
+                3,
+                payload,
+                ctypes.byref(payload_size),
+                None,
+                0,
+            )
+            != 0
+        ):
+            return False, []
+        argv = _parse_kern_procargs2(
+            bytes(payload.raw[:payload_size.value])
+        )
+    except (AttributeError, OSError, OverflowError, ValueError):
+        return False, []
+    return (True, argv) if argv is not None else (False, [])
+
+
+def _parse_process_snapshot_line(line: str) -> dict | None:
+    """Parse current process rows and the older focused-test row shape."""
+    stripped = line.strip()
+    if not stripped:
+        return None
+
+    current_parts = stripped.split(None, 11)
+    current_format = (
+        len(current_parts) == 12
+        and current_parts[0].isdigit()
+        and current_parts[1].isdigit()
+        and re.fullmatch(r"-?\d+", current_parts[3]) is not None
+        and re.fullmatch(r"-?\d+", current_parts[4]) is not None
+    )
+    if current_format:
+        pid = int(current_parts[0])
+        ppid = int(current_parts[1])
+        state = current_parts[2]
+        process_group_id = int(current_parts[3])
+        foreground_process_group_id = int(current_parts[4])
+        tty_name = current_parts[5]
+        started_text = " ".join(current_parts[6:11])
+        command = current_parts[11]
+        legacy_fixture_format = False
+        fixture_argv = None
+    else:
+        legacy_parts = stripped.split(None, 8)
+        if (
+            len(legacy_parts) < 9
+            or not legacy_parts[0].isdigit()
+            or not legacy_parts[1].isdigit()
+        ):
+            raise ValueError("process snapshot lacks exact parent identity")
+        pid = int(legacy_parts[0])
+        ppid = int(legacy_parts[1])
+        state = ""
+        process_group_id = 0
+        foreground_process_group_id = 0
+        tty_name = legacy_parts[2]
+        started_text = " ".join(legacy_parts[3:8])
+        command = legacy_parts[8]
+        legacy_fixture_format = True
+        try:
+            fixture_argv = shlex.split(command)
+        except ValueError:
+            fixture_argv = None
+
+    started_at = datetime.strptime(
+        started_text, "%a %b %d %H:%M:%S %Y"
+    ).timestamp()
+    tty = "" if tty_name == "??" else (
+        tty_name if tty_name.startswith("/dev/") else f"/dev/{tty_name}"
+    )
+    return {
+        "pid": pid,
+        "ppid": ppid,
+        "state": state,
+        "process_group_id": process_group_id,
+        "foreground_process_group_id": foreground_process_group_id,
+        "job_control_observed": not legacy_fixture_format,
+        "tty": tty,
+        "started_at": started_at,
+        "command": command,
+        "fixture_argv": fixture_argv,
+        "legacy_fixture_format": legacy_fixture_format,
+        "ppid_observed": True,
+    }
+
+
 def _scan_process_snapshot() -> tuple[bool, dict[int, dict]]:
     """Read the process table once for one inventory scan."""
     try:
         proc = subprocess.run(
-            ["/bin/ps", "-axo", "pid=,ppid=,tty=,lstart=,command="],
+            [
+                "/bin/ps",
+                "-axo",
+                "pid=,ppid=,state=,pgid=,tpgid=,tty=,lstart=,command=",
+            ],
             capture_output=True,
             text=True,
             timeout=2,
@@ -7826,37 +8526,16 @@ def _scan_process_snapshot() -> tuple[bool, dict[int, dict]]:
         return False, {}
 
     snapshot: dict[int, dict] = {}
-    for line in proc.stdout.splitlines():
-        parts = line.strip().split(None, 8)
-        if not parts or not parts[0].isdigit():
-            continue
-        if len(parts) < 9 or not parts[1].isdigit():
-            # Without PPID the snapshot cannot prove process ancestry.
-            return False, {}
-        ppid = int(parts[1])
-        tty_name = parts[2]
-        started_text = " ".join(parts[3:8])
-        command = parts[8]
-        try:
-            started_at = datetime.strptime(
-                started_text, "%a %b %d %H:%M:%S %Y"
-            ).timestamp()
-        except (TypeError, ValueError):
-            # An incomplete snapshot cannot prove ancestry or process birth.
-            return False, {}
-
-        pid = int(parts[0])
-        tty = "" if tty_name == "??" else (
-            tty_name if tty_name.startswith("/dev/") else f"/dev/{tty_name}"
-        )
-        snapshot[pid] = {
-            "pid": pid,
-            "ppid": ppid,
-            "tty": tty,
-            "started_at": started_at,
-            "command": command,
-            "ppid_observed": True,
-        }
+    try:
+        for line in proc.stdout.splitlines():
+            process = _parse_process_snapshot_line(line)
+            if process is None:
+                continue
+            snapshot[int(process["pid"])] = process
+    except (TypeError, ValueError):
+        # Partial process metadata cannot prove ancestry, birth, or foreground
+        # ownership. Fail the inventory instead of publishing a subset.
+        return False, {}
     return True, snapshot
 
 
@@ -7911,6 +8590,75 @@ def _snapshot_terminal_script_owner(
     return None
 
 
+def _is_codex_cli_entrypoint(value: str) -> bool:
+    normalized = value.strip().lower()
+    basename = os.path.basename(normalized)
+    if basename == "codex":
+        return True
+    return (
+        "/@openai/codex/" in normalized
+        and basename in {"codex.js", "index.js"}
+    )
+
+
+def _is_claude_cli_entrypoint(value: str) -> bool:
+    normalized = value.strip().lower()
+    basename = os.path.basename(normalized)
+    if basename == "claude":
+        return True
+    if (
+        "/@anthropic-ai/claude-code/" in normalized
+        and basename in {"claude.js", "cli.js", "index.js"}
+    ):
+        return True
+    return (
+        "/.local/share/claude/versions/" in normalized
+        and re.fullmatch(
+            r"\d+(?:\.\d+)+(?:[-+][a-z0-9._-]+)?",
+            basename,
+        )
+        is not None
+    )
+
+
+def _lossy_command_may_be_provider_entrypoint(
+    command: str, provider: str
+) -> bool:
+    """Use flattened ps text only to bound which PIDs need exact argv."""
+    tokens = (command or "").strip().split()
+    if not tokens:
+        return False
+    is_entrypoint = (
+        _is_codex_cli_entrypoint
+        if provider == "codex"
+        else _is_claude_cli_entrypoint
+    )
+    if is_entrypoint(tokens[0]):
+        return True
+    if os.path.basename(tokens[0]).lower() not in {"node", "nodejs", "bun"}:
+        return False
+    return any(is_entrypoint(token) for token in tokens[1:])
+
+
+def _snapshot_process_is_foreground(process: dict) -> bool:
+    state = str(process.get("state") or "").upper()
+    if state[:1] in {"T", "X", "Z"}:
+        return False
+    if not bool(process.get("job_control_observed")):
+        return True
+    if not str(process.get("tty") or ""):
+        return True
+    process_group_id = int(process.get("process_group_id") or 0)
+    foreground_process_group_id = int(
+        process.get("foreground_process_group_id") or 0
+    )
+    return (
+        process_group_id > 0
+        and foreground_process_group_id > 0
+        and process_group_id == foreground_process_group_id
+    )
+
+
 def _scan_provider_process_rows(
     provider: str,
     *,
@@ -7927,29 +8675,59 @@ def _scan_provider_process_rows(
     raw_candidates: list[dict] = []
     for process in snapshot.values():
         command = str(process.get("command") or "")
+        if not _lossy_command_may_be_provider_entrypoint(command, provider):
+            continue
+        fixture_argv = process.get("fixture_argv")
+        if bool(process.get("legacy_fixture_format")):
+            if not isinstance(fixture_argv, list) or not fixture_argv:
+                return empty
+            argv = [str(argument) for argument in fixture_argv]
+        else:
+            argv_ok, argv = _process_argv(int(process["pid"]))
+            if not argv_ok:
+                # Flattened ps text cannot prove the provider command. A PID
+                # exit or denied argv read invalidates this exact inventory.
+                return empty
         command_matches = (
-            _is_codex_cli_command(command)
+            _is_codex_cli_argv(argv)
             if provider == "codex"
-            else _is_claude_cli_command(command)
+            else _is_claude_cli_argv(argv)
         )
         if not command_matches:
             continue
         raw_candidates.append({
             "pid": int(process["pid"]),
             "ppid": int(process.get("ppid") or 0),
+            "state": str(process.get("state") or ""),
+            "process_group_id": int(process.get("process_group_id") or 0),
+            "foreground_process_group_id": int(
+                process.get("foreground_process_group_id") or 0
+            ),
+            "job_control_observed": bool(
+                process.get("job_control_observed")
+            ),
             "tty": str(process.get("tty") or ""),
             "started_at": float(process.get("started_at") or 0),
-            "command": command,
+            "command": shlex.join(argv),
+            "legacy_fixture_format": bool(
+                process.get("legacy_fixture_format")
+            ),
             "ppid_observed": bool(process.get("ppid_observed")),
         })
 
-    missing_tty_pids = [
+    stdio_probe_pids = [
         int(candidate["pid"])
         for candidate in raw_candidates
-        if not candidate["tty"]
+        if (
+            not candidate["tty"]
+            or (
+                provider == "claude"
+                and not bool(candidate.get("legacy_fixture_format"))
+            )
+        )
     ]
     stdio_probe_ok, stdio_evidence_by_pid = _process_stdio_tty_evidence(
-        missing_tty_pids
+        stdio_probe_pids
     )
     if not stdio_probe_ok:
         return empty
@@ -7958,19 +8736,51 @@ def _scan_provider_process_rows(
     for raw_candidate in raw_candidates:
         pid = int(raw_candidate["pid"])
         tty = str(raw_candidate["tty"])
-        if not tty:
+        foreground_eligible = _snapshot_process_is_foreground(raw_candidate)
+        if (
+            provider == "claude"
+            and not bool(raw_candidate.get("legacy_fixture_format"))
+        ):
+            # Claude becomes a one-shot command whenever stdout is not a TTY,
+            # even without --print. Require exact PTY input/output evidence
+            # for every candidate so redirected jobs cannot become sessions.
+            stdio_evidence = stdio_evidence_by_pid.get(pid)
+            if stdio_evidence is None:
+                continue
+            evidence_tty = str(stdio_evidence["tty"])
+            if tty and tty != evidence_tty:
+                continue
+            tty = evidence_tty
+            control_eligible = (
+                bool(stdio_evidence["control_eligible"])
+                and foreground_eligible
+            )
+        elif not tty:
             stdio_evidence = stdio_evidence_by_pid.get(pid)
             if stdio_evidence is None:
                 # A provider command without one trustworthy PTY binding is
                 # not part of an interactive TUI process family.
                 continue
             tty = str(stdio_evidence["tty"])
-            control_eligible = bool(stdio_evidence["control_eligible"])
+            control_eligible = (
+                bool(stdio_evidence["control_eligible"])
+                and foreground_eligible
+            )
         else:
-            control_eligible = True
+            control_eligible = foreground_eligible
         candidates.append({
             "pid": pid,
             "ppid": int(raw_candidate.get("ppid") or 0),
+            "state": str(raw_candidate.get("state") or ""),
+            "process_group_id": int(
+                raw_candidate.get("process_group_id") or 0
+            ),
+            "foreground_process_group_id": int(
+                raw_candidate.get("foreground_process_group_id") or 0
+            ),
+            "job_control_observed": bool(
+                raw_candidate.get("job_control_observed")
+            ),
             "tty": tty,
             "started_at": float(raw_candidate["started_at"]),
             "command": str(raw_candidate["command"]),
@@ -8106,6 +8916,8 @@ _claude_terminal_scan_cache: dict[str, object] = {
     "membership_complete": False,
 }
 _claude_terminal_scan_lock = threading.Lock()
+_sessions_membership_snapshot_lock = threading.Lock()
+_SESSION_MEMBERSHIP_PROVIDERS = frozenset({"claude", "codex"})
 _codex_task_boundary_cache: dict[str, dict[str, object]] = {}
 
 
@@ -8211,34 +9023,231 @@ def _process_stdio_tty_evidence(
     return True, evidence_by_pid
 
 
-def _is_codex_cli_command(command: str) -> bool:
-    try:
-        argv = shlex.split(command or "")
-    except ValueError:
-        return False
+def _is_codex_cli_argv(argv: list[str]) -> bool:
     if not argv:
         return False
     lower = " ".join(argv).lower()
     if "codex-code-mode-host" in lower:
         return False
 
-    def is_entrypoint(value: str) -> bool:
-        normalized = value.strip().lower()
-        basename = os.path.basename(normalized)
-        if basename == "codex":
-            return True
-        return (
-            "/@openai/codex/" in normalized
-            and basename in {"codex.js", "index.js"}
+    if _is_codex_cli_entrypoint(argv[0]):
+        entrypoint_index = 0
+    else:
+        launcher = os.path.basename(argv[0]).lower()
+        if launcher not in {"node", "nodejs", "bun"}:
+            return False
+        entrypoint_index = next(
+            (
+                index
+                for index, arg in enumerate(argv[1:], start=1)
+                if _is_codex_cli_entrypoint(arg)
+            ),
+            -1,
         )
+        if entrypoint_index < 0:
+            return False
 
-    if is_entrypoint(argv[0]):
-        return True
-    launcher = os.path.basename(argv[0]).lower()
-    if launcher not in {"node", "nodejs", "bun"}:
+    non_session_commands = {
+        "app",
+        "app-server",
+        "apply",
+        "archive",
+        "cloud",
+        "completion",
+        "debug",
+        "delete",
+        "doctor",
+        "e",
+        "exec",
+        "exec-server",
+        "features",
+        "help",
+        "login",
+        "logout",
+        "mcp",
+        "mcp-server",
+        "plugin",
+        "remote-control",
+        "review",
+        "sandbox",
+        "unarchive",
+        "update",
+    }
+    options_with_values = {
+        "-a",
+        "--add-dir",
+        "--ask-for-approval",
+        "-c",
+        "-C",
+        "--cd",
+        "--config",
+        "--disable",
+        "--enable",
+        "-i",
+        "--image",
+        "-m",
+        "--model",
+        "-p",
+        "--profile",
+        "-s",
+        "--sandbox",
+    }
+    trailing = argv[entrypoint_index + 1:]
+    index = 0
+    while index < len(trailing):
+        argument = trailing[index]
+        lowered = argument.lower()
+        if argument == "--":
+            return True
+        if argument.startswith("-"):
+            if "=" not in argument and argument in options_with_values:
+                index += 2
+            else:
+                index += 1
+            continue
+        return lowered not in non_session_commands
+    return not any(
+        argument.lower() in {"-h", "--help", "-v", "--version"}
+        for argument in trailing
+    )
+
+
+def _is_codex_cli_command(command: str) -> bool:
+    try:
+        argv = shlex.split(command or "")
+    except ValueError:
         return False
-    entrypoint = next((arg for arg in argv[1:] if not arg.startswith("-")), "")
-    return is_entrypoint(entrypoint)
+    return _is_codex_cli_argv(argv)
+
+
+def _is_claude_cli_argv(argv: list[str]) -> bool:
+    if not argv:
+        return False
+
+    if _is_claude_cli_entrypoint(argv[0]):
+        entrypoint_index = 0
+    else:
+        launcher = os.path.basename(argv[0]).lower()
+        if launcher not in {"node", "nodejs", "bun"}:
+            return False
+        entrypoint_index = next(
+            (
+                index
+                for index, argument in enumerate(argv[1:], start=1)
+                if _is_claude_cli_entrypoint(argument)
+            ),
+            -1,
+        )
+        if entrypoint_index < 0:
+            return False
+
+    trailing = argv[entrypoint_index + 1:]
+    option_tokens = trailing[:trailing.index("--")] if "--" in trailing else trailing
+    if any(
+        argument in {
+            "-p",
+            "--print",
+            "-v",
+            "--version",
+            "-h",
+            "--help",
+            "--bg",
+            "--background",
+        }
+        or argument.startswith("--print=")
+        for argument in option_tokens
+    ):
+        return False
+
+    non_session_commands = {
+        "agents",
+        "auth",
+        "auto-mode",
+        "doctor",
+        "gateway",
+        "install",
+        "mcp",
+        "plugin",
+        "plugins",
+        "project",
+        "setup-token",
+        "ultrareview",
+        "update",
+        "upgrade",
+    }
+    options_with_values = {
+        "--agent",
+        "--agents",
+        "--append-system-prompt",
+        "--debug-file",
+        "--effort",
+        "--fallback-model",
+        "--input-format",
+        "--json-schema",
+        "--max-budget-usd",
+        "--model",
+        "-m",
+        "--name",
+        "-n",
+        "--output-format",
+        "--permission-mode",
+        "--plugin-dir",
+        "--plugin-url",
+        "--remote-control-session-name-prefix",
+        "--session-id",
+        "--setting-sources",
+        "--settings",
+        "--system-prompt",
+    }
+    variadic_options = {
+        "--add-dir",
+        "--allowedTools",
+        "--allowed-tools",
+        "--betas",
+        "--disallowedTools",
+        "--disallowed-tools",
+        "--file",
+        "--mcp-config",
+        "--tools",
+    }
+    optional_value_options = {
+        "--debug",
+        "-d",
+        "--from-pr",
+        "--prompt-suggestions",
+        "--remote-control",
+        "--resume",
+        "-r",
+        "--worktree",
+        "-w",
+    }
+    index = 0
+    while index < len(trailing):
+        argument = trailing[index]
+        if argument == "--":
+            return True
+        if argument.startswith("-"):
+            option = argument.split("=", 1)[0]
+            if "=" in argument:
+                index += 1
+                continue
+            if option in variadic_options:
+                index += 1
+                while index < len(trailing) and not trailing[index].startswith("-"):
+                    index += 1
+                continue
+            if option in options_with_values:
+                index += 2
+                continue
+            if option in optional_value_options:
+                index += 1
+                if index < len(trailing) and not trailing[index].startswith("-"):
+                    index += 1
+                continue
+            index += 1
+            continue
+        return argument.lower() not in non_session_commands
+    return True
 
 
 def _is_claude_cli_command(command: str) -> bool:
@@ -8246,26 +9255,7 @@ def _is_claude_cli_command(command: str) -> bool:
         argv = shlex.split(command or "")
     except ValueError:
         return False
-    if not argv:
-        return False
-
-    def is_entrypoint(value: str) -> bool:
-        normalized = value.strip().lower()
-        basename = os.path.basename(normalized)
-        if basename == "claude":
-            return True
-        return (
-            "/@anthropic-ai/claude-code/" in normalized
-            and basename in {"claude.js", "cli.js", "index.js"}
-        )
-
-    if is_entrypoint(argv[0]):
-        return True
-    launcher = os.path.basename(argv[0]).lower()
-    if launcher not in {"node", "nodejs", "bun"}:
-        return False
-    entrypoint = next((arg for arg in argv[1:] if not arg.startswith("-")), "")
-    return is_entrypoint(entrypoint)
+    return _is_claude_cli_argv(argv)
 
 
 def _codex_open_rollouts_by_pid(
@@ -8320,15 +9310,17 @@ def _codex_open_rollouts_by_pid(
     return (True, by_pid) if include_probe_status else by_pid
 
 
-def _codex_live_terminal_rows() -> list[dict]:
+def _codex_live_terminal_rows(*, force_refresh: bool = False) -> list[dict]:
     with _codex_terminal_scan_lock:
-        return _codex_live_terminal_rows_locked()
+        return _codex_live_terminal_rows_locked(force_refresh=force_refresh)
 
 
-def _codex_live_terminal_rows_locked() -> list[dict]:
+def _codex_live_terminal_rows_locked(
+    *, force_refresh: bool = False
+) -> list[dict]:
     now = _time.time()
     cached_ts = float(_codex_terminal_scan_cache.get("ts") or 0)
-    if now - cached_ts < 2:
+    if not force_refresh and now - cached_ts < 2:
         return copy.deepcopy(_codex_terminal_scan_cache.get("rows") or [])
 
     def degraded_rows(reason: str) -> list[dict]:
@@ -8466,15 +9458,17 @@ def _codex_live_terminal_rows_locked() -> list[dict]:
     return copy.deepcopy(rows)
 
 
-def _claude_live_terminal_rows() -> list[dict]:
+def _claude_live_terminal_rows(*, force_refresh: bool = False) -> list[dict]:
     with _claude_terminal_scan_lock:
-        return _claude_live_terminal_rows_locked()
+        return _claude_live_terminal_rows_locked(force_refresh=force_refresh)
 
 
-def _claude_live_terminal_rows_locked() -> list[dict]:
+def _claude_live_terminal_rows_locked(
+    *, force_refresh: bool = False
+) -> list[dict]:
     now = _time.time()
     cached_ts = float(_claude_terminal_scan_cache.get("ts") or 0)
-    if now - cached_ts < 2:
+    if not force_refresh and now - cached_ts < 2:
         return copy.deepcopy(_claude_terminal_scan_cache.get("rows") or [])
     ps_ok, process_rows = _scan_provider_process_rows("claude")
     if not ps_ok:
@@ -8510,6 +9504,87 @@ def _claude_live_terminal_rows_locked() -> list[dict]:
     return copy.deepcopy(rows)
 
 
+def _capture_sessions_provider_inventory(provider: str) -> dict:
+    """Capture one provider scan and its proof while holding one scan lock."""
+    if provider == "codex":
+        lock = _codex_terminal_scan_lock
+        cache = _codex_terminal_scan_cache
+        loader = _codex_live_terminal_rows_locked
+    elif provider == "claude":
+        lock = _claude_terminal_scan_lock
+        cache = _claude_terminal_scan_cache
+        loader = _claude_live_terminal_rows_locked
+    else:
+        return {
+            "provider": provider,
+            "rows": [],
+            "probe_state": "unsupported",
+            "membership_complete": False,
+            "checked_at": _time.time(),
+        }
+
+    with lock:
+        rows = loader(force_refresh=True)
+        return {
+            "provider": provider,
+            "rows": copy.deepcopy(rows),
+            "probe_state": str(cache.get("probe_state") or "unknown"),
+            "membership_complete": bool(cache.get("membership_complete")),
+            # The scanner records its cache timestamp before slower process
+            # probes. This timestamp is taken after all probes and row capture.
+            "checked_at": _time.time(),
+        }
+
+
+def _session_inventory_terminal_matches_row(
+    provider: str,
+    terminal: dict,
+    row: dict,
+) -> bool:
+    if str(row.get("provider") or "").strip().lower() != provider:
+        return False
+    if row.get("closed_at") is not None:
+        return False
+    try:
+        terminal_pid = int(terminal.get("pid") or 0)
+        row_pid = int(row.get("pid") or row.get("claude_pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    terminal_tty = str(
+        terminal.get("terminal_tty")
+        or terminal.get("provider_tty")
+        or terminal.get("tty")
+        or ""
+    )
+    row_tty = str(row.get("terminal_tty") or "")
+    if terminal_pid <= 0 or row_pid != terminal_pid or row_tty != terminal_tty:
+        return False
+
+    terminal_project = str(terminal.get("project") or "")
+    row_project = str(row.get("project") or "")
+    if not terminal_project or not row_project:
+        return False
+    try:
+        if os.path.realpath(terminal_project) != os.path.realpath(row_project):
+            return False
+    except OSError:
+        if terminal_project != row_project:
+            return False
+
+    if provider == "claude":
+        native_id = str(row.get("native_id") or "")
+        registry_row = _agent_registry_get("claude", native_id)
+        return _claude_inventory_registry_process_matches(
+            registry_row,
+            [terminal],
+        )
+
+    terminal_native_id = str(terminal.get("native_id") or "")
+    if provider == "codex" and terminal_native_id:
+        return str(row.get("native_id") or "") == terminal_native_id
+    return True
+
+
 def _codex_discover_terminal_control_for_session(native_id: str) -> dict | None:
     if not native_id:
         return None
@@ -8537,8 +9612,16 @@ def _claude_terminal_native_id(row: dict) -> str:
     return "terminal-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
 
 
-def _codex_register_terminal_only_rows(seen: set[str]) -> None:
-    for terminal in _codex_live_terminal_rows():
+def _codex_register_terminal_only_rows(
+    seen: set[str],
+    live_terminal_rows: list[dict] | None = None,
+) -> None:
+    terminals = (
+        live_terminal_rows
+        if live_terminal_rows is not None
+        else _codex_live_terminal_rows()
+    )
+    for terminal in terminals:
         if str(terminal.get("identity_probe_state") or "exact") != "exact":
             continue
         provider_tty = str(
@@ -8658,7 +9741,11 @@ def _registry_row_has_live_terminal(row: dict, command_name: str) -> bool:
     return bool(_pid_for_tty_command(tty, command_name))
 
 
-def _session_has_verified_provider_process(row: dict, provider: str | None = None) -> bool:
+def _session_has_verified_provider_process(
+    row: dict,
+    provider: str | None = None,
+    inventory_rows: list[dict] | None = None,
+) -> bool:
     provider = str(provider or row.get("provider") or "").strip().lower()
     if provider not in {"claude", "codex"}:
         return False
@@ -8666,13 +9753,15 @@ def _session_has_verified_provider_process(row: dict, provider: str | None = Non
     tty = str(row.get("terminal_tty") or "")
     project = str(row.get("project") or "")
     native_id = str(row.get("native_id") or "")
-    if provider == "codex" and not _codex_registry_process_birth_matches(row, pid):
+    if provider in {"claude", "codex"} and not _registry_process_birth_matches(row, pid):
         return False
 
-    candidates = (
-        _codex_live_terminal_rows() if provider == "codex"
-        else _claude_live_terminal_rows()
-    )
+    candidates = inventory_rows
+    if candidates is None:
+        candidates = (
+            _codex_live_terminal_rows() if provider == "codex"
+            else _claude_live_terminal_rows()
+        )
 
     def project_matches(candidate_project: str) -> bool:
         if not project:
@@ -8819,6 +9908,62 @@ def _codex_inventory_registry_process_matches(
     return False
 
 
+def _claude_inventory_registry_process_matches(
+    reg: dict | None,
+    live_terminal_rows: list[dict] | None = None,
+) -> bool:
+    """Bind one Claude registry identity to one exact process inventory row."""
+    if not isinstance(reg, dict) or reg.get("closed_at") is not None:
+        return False
+    if str(reg.get("provider") or "claude").strip().lower() != "claude":
+        return False
+    pid = int(reg.get("pid") or 0)
+    terminal_tty = str(reg.get("terminal_tty") or "")
+    project = str(reg.get("project") or "")
+    metadata = _registry_metadata_from_row(reg)
+    try:
+        expected_started_at = float(metadata.get("process_started_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    if (
+        pid <= 0
+        or expected_started_at <= 0
+        or not project
+        or re.fullmatch(r"/dev/ttys[0-9]{3,}", terminal_tty) is None
+    ):
+        return False
+
+    candidates = (
+        live_terminal_rows
+        if live_terminal_rows is not None
+        else _claude_live_terminal_rows()
+    )
+    for candidate in candidates:
+        if str(candidate.get("identity_probe_state") or "exact") != "exact":
+            continue
+        if int(candidate.get("pid") or 0) != pid:
+            continue
+        if str(candidate.get("tty") or "") != terminal_tty:
+            continue
+        try:
+            actual_started_at = float(candidate.get("started_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if (
+            actual_started_at <= 0
+            or abs(actual_started_at - expected_started_at) > 2
+        ):
+            continue
+        candidate_project = str(candidate.get("project") or "")
+        try:
+            projects_match = os.path.realpath(candidate_project) == os.path.realpath(project)
+        except OSError:
+            projects_match = candidate_project == project
+        if projects_match:
+            return True
+    return False
+
+
 def _codex_registry_row_for_strict_live_display(row: dict) -> dict | None:
     """Resolve private process proof for one public Codex session row.
 
@@ -8906,27 +10051,52 @@ def _verified_session_signal_target(
     return row, pid, None
 
 
-def _claude_register_terminal_only_rows(seen: set[str]) -> None:
-    for terminal in _claude_live_terminal_rows():
+def _claude_register_terminal_only_rows(
+    seen: set[str],
+    live_terminal_rows: list[dict] | None = None,
+) -> None:
+    terminals = (
+        live_terminal_rows
+        if live_terminal_rows is not None
+        else _claude_live_terminal_rows()
+    )
+    for terminal in terminals:
         tty = str(terminal.get("tty") or "")
         project = str(terminal.get("project") or "")
         pid = int(terminal.get("pid") or 0)
-        if not project or not pid or not re.match(r"^/dev/ttys[0-9]{3,}$", tty):
+        try:
+            process_started_at = float(terminal.get("started_at") or 0)
+        except (TypeError, ValueError):
+            process_started_at = 0.0
+        if (
+            not project
+            or pid <= 0
+            or process_started_at <= 0
+            or re.fullmatch(r"/dev/ttys[0-9]{3,}", tty) is None
+        ):
             continue
         existing = _agent_registry_get_by_tty("claude", tty)
         if existing and not existing.get("closed_at"):
-            native_id = existing.get("native_id") or ""
-            if native_id in seen:
+            native_id = str(existing.get("native_id") or "")
+            if (
+                int(existing.get("pid") or 0) == pid
+                and str(existing.get("terminal_tty") or "") == tty
+                and str(existing.get("project") or "") == project
+                and _claude_inventory_registry_process_matches(existing, [terminal])
+            ):
+                if native_id in seen:
+                    continue
+                # Observation renews the stale-sweep lease only. It must never
+                # transplant a prior Claude UUID onto a replacement process.
+                _agent_registry_update_control(
+                    "claude",
+                    native_id,
+                    pid=pid,
+                    terminal_tty=tty,
+                    state="running",
+                )
                 continue
-            _agent_registry_update_control(
-                "claude",
-                native_id,
-                pid=pid,
-                terminal_tty=tty,
-                state="running",
-                reopen=True,
-            )
-            continue
+            _agent_registry_mark_closed("claude", native_id)
         native_id = _claude_terminal_native_id(terminal)
         if native_id in seen:
             continue
@@ -8941,6 +10111,8 @@ def _claude_register_terminal_only_rows(seen: set[str]) -> None:
                 "discovered_by": "terminal_scan",
                 "terminal_only": True,
                 "command": str(terminal.get("command") or "")[:500],
+                "process_started_at": process_started_at,
+                "provider_tty": tty,
             },
             working_on="Live Claude terminal",
         )
@@ -10981,7 +12153,14 @@ class ClaudeSessionsPgBackend:
         except Exception:
             pass  # GC is best-effort
 
-    def collect_rows(self, since_min: int, live_only: bool, limit: int) -> list[dict]:
+    def collect_rows(
+        self,
+        since_min: int,
+        live_only: bool,
+        limit: int,
+        *,
+        strict: bool = False,
+    ) -> list[dict]:
         where = [
             f"last_heartbeat > NOW() - INTERVAL '{since_min} minutes'",
             "claude_uuid IS NOT NULL",
@@ -11000,8 +12179,14 @@ class ClaudeSessionsPgBackend:
         try:
             proc = self._psql(sql, timeout=5, tabbed=True)
         except Exception:
+            if strict:
+                raise
             return []
         if proc.returncode != 0:
+            if strict:
+                raise RuntimeError(
+                    f"psql failed: {proc.stderr.strip()[:200]}"
+                )
             return []
         rows: list[dict] = []
         for line in proc.stdout.strip().split("\n"):
@@ -11009,6 +12194,8 @@ class ClaudeSessionsPgBackend:
                 continue
             parts = line.split("\t")
             if len(parts) < 8:
+                if strict:
+                    raise RuntimeError("psql returned a malformed session row")
                 continue
             rows.append({
                 "id": parts[0],
@@ -11219,9 +12406,21 @@ class ClaudeSessionsSqliteBackend:
             if _safe_session_id(sid):
                 _agent_registry_mark_closed("claude", sid)
 
-    def collect_rows(self, since_min: int, live_only: bool, limit: int) -> list[dict]:
+    def collect_rows(
+        self,
+        since_min: int,
+        live_only: bool,
+        limit: int,
+        *,
+        strict: bool = False,
+    ) -> list[dict]:
         rows: list[dict] = []
-        for row in _agent_registry_recent("claude", since_min=since_min, limit=1000):
+        for row in _agent_registry_recent(
+            "claude",
+            since_min=since_min,
+            limit=1000,
+            strict=strict,
+        ):
             if not row.get("claude_uuid") and not _registry_row_has_live_terminal(row, "claude"):
                 continue
             if live_only and row.get("closed_at") is not None:
@@ -13109,6 +14308,7 @@ def _control_receipt_bootstrap_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS session_live_receipts (
             receipt_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            receipt_revision INTEGER NOT NULL CHECK (receipt_revision >= 1),
             observed_at REAL NOT NULL,
             device_id TEXT NOT NULL,
             session_id TEXT NOT NULL,
@@ -13116,10 +14316,75 @@ def _control_receipt_bootstrap_schema(conn: sqlite3.Connection) -> None:
             action_kind TEXT NOT NULL,
             action_json TEXT,
             receipt_json TEXT NOT NULL,
-            UNIQUE (device_id, session_id, client_action_id, action_kind)
+            UNIQUE (
+                device_id,
+                session_id,
+                client_action_id,
+                action_kind,
+                receipt_revision
+            )
         )
         """
     )
+    receipt_columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(session_live_receipts)").fetchall()
+    }
+    if "receipt_revision" not in receipt_columns:
+        conn.execute("DROP TABLE IF EXISTS session_live_receipts_migrating")
+        conn.execute(
+            """
+            CREATE TABLE session_live_receipts_migrating (
+                receipt_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                receipt_revision INTEGER NOT NULL CHECK (receipt_revision >= 1),
+                observed_at REAL NOT NULL,
+                device_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                client_action_id TEXT NOT NULL,
+                action_kind TEXT NOT NULL,
+                action_json TEXT,
+                receipt_json TEXT NOT NULL,
+                UNIQUE (
+                    device_id,
+                    session_id,
+                    client_action_id,
+                    action_kind,
+                    receipt_revision
+                )
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO session_live_receipts_migrating (
+                receipt_seq,
+                receipt_revision,
+                observed_at,
+                device_id,
+                session_id,
+                client_action_id,
+                action_kind,
+                action_json,
+                receipt_json
+            )
+            SELECT
+                receipt_seq,
+                1,
+                observed_at,
+                device_id,
+                session_id,
+                client_action_id,
+                action_kind,
+                action_json,
+                receipt_json
+            FROM session_live_receipts
+            ORDER BY receipt_seq ASC
+            """
+        )
+        conn.execute("DROP TABLE session_live_receipts")
+        conn.execute(
+            "ALTER TABLE session_live_receipts_migrating RENAME TO session_live_receipts"
+        )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS session_live_receipts_session_seq "
         "ON session_live_receipts (session_id, receipt_seq)"
@@ -13190,6 +14455,7 @@ def _session_live_receipt_event_from_row(row: sqlite3.Row) -> dict:
         audit_action = None
     return {
         "receipt_seq": int(row["receipt_seq"]),
+        "receipt_revision": int(row["receipt_revision"]),
         "observed_at": float(row["observed_at"]),
         "device_id": str(row["device_id"] or "") or None,
         "session_id": str(row["session_id"]),
@@ -13223,11 +14489,45 @@ def _insert_session_live_receipt(
         else None
     )
     receipt_json = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
-    inserted = conn.execute(
-        "INSERT OR IGNORE INTO session_live_receipts "
-        "(observed_at, device_id, session_id, client_action_id, action_kind, action_json, receipt_json) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+    latest = conn.execute(
+        "SELECT * FROM session_live_receipts "
+        "WHERE device_id=? AND session_id=? AND client_action_id=? AND action_kind=? "
+        "ORDER BY receipt_revision DESC, receipt_seq DESC LIMIT 1",
         (
+            normalized_device_id,
+            canonical_session_id,
+            normalized_action_id,
+            action_kind,
+        ),
+    ).fetchone()
+    next_revision = 1
+    if latest is not None:
+        try:
+            latest_receipt = json.loads(latest["receipt_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            latest_receipt = {}
+        latest_state = str(
+            latest_receipt.get("state") if isinstance(latest_receipt, dict) else ""
+        ).strip().lower()
+        next_state = str(receipt.get("state") or "").strip().lower()
+        if latest_state == next_state:
+            return _session_live_receipt_event_from_row(latest), False
+        valid_transition = (
+            action_kind == "first_prompt_delivery"
+            and latest_state == "indeterminate"
+            and next_state in {"applied", "failed"}
+        )
+        if not valid_transition:
+            return _session_live_receipt_event_from_row(latest), False
+        next_revision = int(latest["receipt_revision"]) + 1
+
+    inserted = conn.execute(
+        "INSERT INTO session_live_receipts "
+        "(receipt_revision, observed_at, device_id, session_id, client_action_id, "
+        "action_kind, action_json, receipt_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            next_revision,
             observed_at,
             normalized_device_id,
             canonical_session_id,
@@ -13238,18 +14538,12 @@ def _insert_session_live_receipt(
         ),
     )
     row = conn.execute(
-        "SELECT * FROM session_live_receipts "
-        "WHERE device_id=? AND session_id=? AND client_action_id=? AND action_kind=?",
-        (
-            normalized_device_id,
-            canonical_session_id,
-            normalized_action_id,
-            action_kind,
-        ),
+        "SELECT * FROM session_live_receipts WHERE receipt_seq=?",
+        (int(inserted.lastrowid),),
     ).fetchone()
     if row is None:
         raise sqlite3.DatabaseError("session live receipt insert was not readable")
-    return _session_live_receipt_event_from_row(row), inserted.rowcount == 1
+    return _session_live_receipt_event_from_row(row), True
 
 
 def _publish_session_live_receipt_event(event: dict) -> None:
@@ -15419,14 +16713,19 @@ def _list_codex_sessions(live_only: bool, active_within_min: int) -> list[dict]:
     )
 
 
-def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> list[dict]:
+def _list_codex_sessions_uncached(
+    live_only: bool,
+    active_within_min: int,
+    live_terminal_rows: list[dict] | None = None,
+) -> list[dict]:
     """Codex provider backed by transcripts plus live terminal discovery."""
     index = _codex_index_map()
     history = _codex_history_map()
     cutoff = _time.time() - max(1, active_within_min) * 60
     rows: list[dict] = []
     seen: set[str] = set()
-    live_terminal_rows = _codex_live_terminal_rows()
+    if live_terminal_rows is None:
+        live_terminal_rows = _codex_live_terminal_rows()
     live_registry_rows = _agent_registry_live("codex", limit=1000)
     exact_live_native_counts: dict[str, int] = {}
     for terminal in live_terminal_rows:
@@ -15715,7 +17014,7 @@ def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> li
                     "reason": "Live identity is being rechecked; this session is temporarily read-only.",
                 }
         rows.append(row)
-    _codex_register_terminal_only_rows(seen)
+    _codex_register_terminal_only_rows(seen, live_terminal_rows)
     rows.extend(_codex_pending_registry_rows(
         seen,
         live_only,
@@ -19597,17 +20896,48 @@ class Handler(BaseHTTPRequestHandler):
         payload["count"] = len(payload.get("items") or [])
         self._send_json(payload)
 
-    def _collect_visible_session_rows(self, provider_filter: str, active_within_min: int,
-                                      limit: int = 200, *, live_only: bool = False) -> list[dict]:
+    def _collect_visible_session_rows(
+        self,
+        provider_filter: str,
+        active_within_min: int,
+        limit: int = 200,
+        *,
+        live_only: bool = False,
+        authoritative_inventory: bool = False,
+        provider_inventory: dict[str, list[dict]] | None = None,
+        collection_metadata: dict | None = None,
+    ) -> list[dict]:
         rows: list[dict] = []
         visible = _visible_agent_provider_ids()
+        claude_live_terminal_rows = (
+            provider_inventory.get("claude", [])
+            if provider_inventory is not None
+            else None
+        )
+        codex_inventory_rows = (
+            provider_inventory.get("codex", [])
+            if provider_inventory is not None
+            else None
+        )
         if provider_filter in ("all", "claude") and "claude" in visible:
-            for raw in self._collect_session_rows(
-                since_min=active_within_min,
-                live_only=live_only,
-                limit=max(limit, 50),
-                include_first_prompt=True,
-            ):
+            claude_rows = (
+                self._collect_session_rows_uncached(
+                    since_min=active_within_min,
+                    live_only=live_only,
+                    limit=max(limit + 1, 50),
+                    include_first_prompt=True,
+                    live_terminal_rows=claude_live_terminal_rows,
+                    require_complete=True,
+                )
+                if authoritative_inventory
+                else self._collect_session_rows(
+                    since_min=active_within_min,
+                    live_only=live_only,
+                    limit=max(limit, 50),
+                    include_first_prompt=True,
+                )
+            )
+            for raw in claude_rows:
                 native_id = raw.get("id") or ""
                 claude_pid = int(raw.get("claude_pid") or 0)
                 terminal_tty = raw.get("terminal_tty") or ""
@@ -19619,20 +20949,35 @@ class Handler(BaseHTTPRequestHandler):
                 rows.append(row)
 
         if provider_filter in ("all", "codex") and "codex" in visible:
-            for row in _list_codex_sessions(live_only=live_only, active_within_min=active_within_min):
+            codex_rows = (
+                _list_codex_sessions_uncached(
+                    live_only=live_only,
+                    active_within_min=active_within_min,
+                    live_terminal_rows=codex_inventory_rows,
+                )
+                if authoritative_inventory
+                else _list_codex_sessions(
+                    live_only=live_only,
+                    active_within_min=active_within_min,
+                )
+            )
+            for row in codex_rows:
                 rows.append(row)
 
         rows = _filter_tombstoned_session_rows(rows)
         rows = _collapse_live_session_rows_by_terminal(rows)
-        codex_live_terminal_rows = (
-            _codex_live_terminal_rows()
-            if any(
-                row.get("provider") == "codex"
-                and row.get("closed_at") is None
-                for row in rows
+        if codex_inventory_rows is not None:
+            codex_live_terminal_rows = codex_inventory_rows
+        else:
+            codex_live_terminal_rows = (
+                _codex_live_terminal_rows()
+                if any(
+                    row.get("provider") == "codex"
+                    and row.get("closed_at") is None
+                    for row in rows
+                )
+                else []
             )
-            else []
-        )
         if not live_only:
             rows.sort(key=_session_meaningful_sort_key)
             rows = self._limit_visible_session_rows(
@@ -19654,21 +20999,47 @@ class Handler(BaseHTTPRequestHandler):
                 row["recent_anomaly"] = signal.get("anomaly")
                 row["latest_command"] = signal.get("latest_command")
                 row["latest_edit"] = signal.get("latest_edit")
-            enriched_rows.append(self._decorate_session_lifecycle_row(row))
+            if provider_inventory is None:
+                enriched_rows.append(self._decorate_session_lifecycle_row(row))
+            else:
+                enriched_rows.append(
+                    self._decorate_session_lifecycle_row(
+                        row,
+                        provider_inventory=provider_inventory,
+                    )
+                )
         rows = enriched_rows
 
         if live_only:
-            projected_rows = [
-                self._strict_live_projection(row, codex_live_terminal_rows)
-                for row in rows
-            ]
+            if provider_inventory is None:
+                projected_rows = [
+                    self._strict_live_projection(
+                        row,
+                        codex_live_terminal_rows,
+                    )
+                    for row in rows
+                ]
+            else:
+                projected_rows = [
+                    self._strict_live_projection(
+                        row,
+                        codex_live_terminal_rows,
+                        claude_live_terminal_rows,
+                    )
+                    for row in rows
+                ]
             rows = [row for row in projected_rows if row is not None]
         rows.sort(key=_session_meaningful_sort_key)
+        pre_limit_count = len(rows)
         rows = self._limit_visible_session_rows(
             rows,
             limit=limit,
             codex_live_terminal_rows=codex_live_terminal_rows,
+            claude_live_terminal_rows=claude_live_terminal_rows,
         )
+        if collection_metadata is not None:
+            collection_metadata["pre_limit_count"] = pre_limit_count
+            collection_metadata["truncated"] = len(rows) < pre_limit_count
         for row in rows:
             row["runtime_truth_summary"] = self._runtime_truth_summary_for_row(row)
         _record_sessions_scan(rows)
@@ -19680,18 +21051,29 @@ class Handler(BaseHTTPRequestHandler):
         rows: list[dict],
         limit: int,
         codex_live_terminal_rows: list[dict] | None = None,
+        claude_live_terminal_rows: list[dict] | None = None,
     ) -> list[dict]:
         """Keep verified live terminals inside an archive-heavy response cap."""
         cap = max(1, min(int(limit or 200), 500))
         if len(rows) <= cap:
             return rows
 
+        def is_strictly_live(row: dict) -> bool:
+            if claude_live_terminal_rows is None:
+                return cls._session_row_is_strictly_live(
+                    row,
+                    codex_live_terminal_rows,
+                )
+            return cls._session_row_is_strictly_live(
+                row,
+                codex_live_terminal_rows,
+                claude_live_terminal_rows,
+            )
+
         live_rows = [
             row
             for row in rows
-            if cls._session_row_is_strictly_live(
-                row, codex_live_terminal_rows
-            )
+            if is_strictly_live(row)
         ]
         if len(live_rows) >= cap:
             return live_rows[:cap]
@@ -19736,7 +21118,11 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def _sessions_backend_degradation(
-        self, provider_filter: str = "all"
+        self,
+        provider_filter: str = "all",
+        *,
+        require_fresh: bool = False,
+        provider_inventories: dict[str, dict] | None = None,
     ) -> dict | None:
         """Cheap cached probe distinguishing "PG answered: zero sessions"
         from "PG unreachable" (Docker down). Without it the sessions stream
@@ -19752,16 +21138,60 @@ class Handler(BaseHTTPRequestHandler):
                 "reason": "session_tombstone_store_unavailable",
                 "detail": str(error),
             }
-        codex_relevant = (
-            provider_filter in {"all", "codex"}
-            and "codex" in _visible_agent_provider_ids()
+        if require_fresh:
+            try:
+                with _agent_registry_conn() as conn:
+                    conn.execute("SELECT 1").fetchone()
+            except Exception as error:
+                return {
+                    "reason": "agent_session_store_unavailable",
+                    "detail": (
+                        "Pairling could not verify the Mac session registry. "
+                        f"{type(error).__name__}: {str(error)[:160]}"
+                    ),
+                }
+        visible = _visible_agent_provider_ids()
+        requested = (
+            set(visible)
+            if provider_filter == "all"
+            else ({provider_filter} if provider_filter in visible else set())
         )
-        if codex_relevant:
-            with _codex_terminal_scan_lock:
-                codex_probe_state = _codex_terminal_scan_cache.get("probe_state")
-                codex_membership_complete = bool(
-                    _codex_terminal_scan_cache.get("membership_complete")
+        unsupported = sorted(requested - _SESSION_MEMBERSHIP_PROVIDERS)
+        if unsupported:
+            return {
+                "reason": "session_provider_inventory_unsupported",
+                "detail": (
+                    "Pairling cannot prove live session membership for: "
+                    + ", ".join(unsupported)
+                    + ". The last trusted session list is being kept."
+                ),
+                "providers": unsupported,
+            }
+
+        def inventory_state(provider: str) -> tuple[str, bool]:
+            if provider_inventories is not None:
+                inventory = provider_inventories.get(provider) or {}
+                return (
+                    str(inventory.get("probe_state") or "unknown"),
+                    bool(inventory.get("membership_complete")),
                 )
+            if provider == "codex":
+                lock = _codex_terminal_scan_lock
+                cache = _codex_terminal_scan_cache
+            else:
+                lock = _claude_terminal_scan_lock
+                cache = _claude_terminal_scan_cache
+            with lock:
+                return (
+                    str(cache.get("probe_state") or "unknown"),
+                    bool(cache.get("membership_complete")),
+                )
+
+        codex_relevant = "codex" in requested
+        if codex_relevant:
+            codex_probe_state, codex_membership_complete = inventory_state(
+                "codex"
+            )
             if codex_probe_state == "failed" and not codex_membership_complete:
                 return {
                     "reason": "codex_process_scan_unavailable",
@@ -19770,18 +21200,11 @@ class Handler(BaseHTTPRequestHandler):
                         "the Mac. The last trusted session list is being kept."
                     ),
                 }
-        claude_relevant = (
-            provider_filter in {"all", "claude"}
-            and "claude" in _visible_agent_provider_ids()
-        )
+        claude_relevant = "claude" in requested
         if claude_relevant:
-            with _claude_terminal_scan_lock:
-                claude_probe_state = _claude_terminal_scan_cache.get(
-                    "probe_state"
-                )
-                claude_membership_complete = bool(
-                    _claude_terminal_scan_cache.get("membership_complete")
-                )
+            claude_probe_state, claude_membership_complete = inventory_state(
+                "claude"
+            )
             if (
                 claude_probe_state == "failed"
                 and not claude_membership_complete
@@ -19805,7 +21228,11 @@ class Handler(BaseHTTPRequestHandler):
             )
             return {"ok": bool(ok)}
 
-        result = _cached_probe("sessions_backend_pg", 10.0, probe)
+        result = (
+            probe()
+            if require_fresh
+            else _cached_probe("sessions_backend_pg", 10.0, probe)
+        )
         if result.get("ok"):
             return None
         return {
@@ -19813,25 +21240,222 @@ class Handler(BaseHTTPRequestHandler):
             "detail": "Session database is unreachable on the Mac (is Docker running?).",
         }
 
-    def _collect_sessions_stream_rows(self, provider_filter: str) -> list[dict]:
-        payload = _cached_runtime_snapshot(
-            ("sessions-stream-rows", provider_filter),
-            RUNTIME_SNAPSHOT_CACHE_SECONDS,
-            lambda: {
-                "items": self._collect_visible_session_rows(
-                    provider_filter,
-                    active_within_min=60,
-                    limit=200,
-                    live_only=True,
-                )
-            },
+    def _sessions_membership_proof(
+        self,
+        provider_filter: str,
+        degraded: dict | None,
+        provider_inventories: dict[str, dict],
+        rows: list[dict],
+        *,
+        truncated: bool = False,
+    ) -> tuple[bool, float, dict | None]:
+        """Prove that one exact scan generation is fully represented on wire."""
+        visible = _visible_agent_provider_ids()
+        requested = (
+            set(visible)
+            if provider_filter == "all"
+            else ({provider_filter} if provider_filter in visible else set())
         )
-        return list(payload.get("items") or [])
+        checked_at = [
+            float((provider_inventories.get(provider) or {}).get("checked_at") or 0)
+            for provider in sorted(requested & _SESSION_MEMBERSHIP_PROVIDERS)
+        ]
+        proof_times = [value for value in checked_at if value > 0]
+        proof_at = min(proof_times) if proof_times else _time.time()
+
+        if degraded is not None:
+            return False, proof_at, None
+        unsupported = sorted(requested - _SESSION_MEMBERSHIP_PROVIDERS)
+        if unsupported:
+            return False, proof_at, {
+                "reason": "session_provider_inventory_unsupported",
+                "detail": (
+                    "Pairling cannot prove live session membership for: "
+                    + ", ".join(unsupported)
+                    + "."
+                ),
+                "providers": unsupported,
+            }
+        if truncated:
+            return False, proof_at, {
+                "reason": "session_snapshot_truncated",
+                "detail": (
+                    "The Mac found more live sessions than this snapshot can "
+                    "carry. The last trusted session list is being kept."
+                ),
+            }
+
+        missing: list[dict] = []
+        unexpected: list[dict] = []
+        for provider in sorted(requested):
+            inventory = provider_inventories.get(provider) or {}
+            if (
+                inventory.get("probe_state") != "exact"
+                or not bool(inventory.get("membership_complete"))
+                or float(inventory.get("checked_at") or 0) <= 0
+            ):
+                return False, proof_at, None
+            for terminal in inventory.get("rows") or []:
+                matching_rows = [
+                    row
+                    for row in rows
+                    if _session_inventory_terminal_matches_row(
+                        provider,
+                        terminal,
+                        row,
+                    )
+                ]
+                if len(matching_rows) != 1:
+                    missing.append({
+                        "provider": provider,
+                        "pid": int(terminal.get("pid") or 0),
+                        "terminal_tty": str(
+                            terminal.get("terminal_tty")
+                            or terminal.get("provider_tty")
+                            or terminal.get("tty")
+                            or ""
+                        ),
+                        "native_id": str(terminal.get("native_id") or "") or None,
+                        "match_count": len(matching_rows),
+                    })
+        for row in rows:
+            provider = str(row.get("provider") or "")
+            inventory_rows = list(
+                (provider_inventories.get(provider) or {}).get("rows") or []
+            )
+            matching_terminals = [
+                terminal
+                for terminal in inventory_rows
+                if _session_inventory_terminal_matches_row(
+                    provider,
+                    terminal,
+                    row,
+                )
+            ]
+            if provider not in requested or len(matching_terminals) != 1:
+                unexpected.append({
+                    "provider": provider,
+                    "id": str(row.get("id") or ""),
+                    "native_id": str(row.get("native_id") or "") or None,
+                    "pid": int(row.get("pid") or row.get("claude_pid") or 0),
+                    "terminal_tty": str(row.get("terminal_tty") or ""),
+                    "match_count": len(matching_terminals),
+                })
+        if missing or unexpected:
+            return False, proof_at, {
+                "reason": "session_inventory_materialization_incomplete",
+                "detail": (
+                    "The Mac could not map live provider terminals and session "
+                    "rows one to one. The last trusted session list is being "
+                    "kept."
+                ),
+                "missing": missing[:20],
+                "unexpected": unexpected[:20],
+            }
+        if len(proof_times) != len(checked_at):
+            return False, proof_at, None
+        return True, proof_at, None
+
+    def _collect_sessions_stream_snapshot(
+        self,
+        provider_filter: str,
+        *,
+        force_refresh: bool = False,
+    ) -> dict:
+        def load_snapshot() -> dict:
+            # Serialize authoritative provider scans so the rows and their
+            # completeness proof cannot be taken from different generations.
+            with _sessions_membership_snapshot_lock:
+                visible = _visible_agent_provider_ids()
+                requested = (
+                    set(visible)
+                    if provider_filter == "all"
+                    else (
+                        {provider_filter}
+                        if provider_filter in visible
+                        else set()
+                    )
+                )
+                provider_inventories = {
+                    provider: _capture_sessions_provider_inventory(provider)
+                    for provider in sorted(
+                        requested & _SESSION_MEMBERSHIP_PROVIDERS
+                    )
+                }
+                provider_inventory = {
+                    provider: list(inventory.get("rows") or [])
+                    for provider, inventory in provider_inventories.items()
+                }
+                metadata: dict[str, object] = {}
+                rows: list[dict] = []
+                degraded: dict | None = None
+                try:
+                    rows = self._collect_visible_session_rows(
+                        provider_filter,
+                        active_within_min=60,
+                        limit=200,
+                        live_only=True,
+                        authoritative_inventory=True,
+                        provider_inventory=provider_inventory,
+                        collection_metadata=metadata,
+                    )
+                except Exception as error:
+                    degraded = {
+                        "reason": "agent_session_store_unavailable",
+                        "detail": (
+                            "Pairling could not build the Mac session list. "
+                            f"{type(error).__name__}: {str(error)[:160]}"
+                        ),
+                    }
+                if degraded is None:
+                    degraded = self._sessions_backend_degradation(
+                        provider_filter,
+                        require_fresh=True,
+                        provider_inventories=provider_inventories,
+                    )
+                (
+                    membership_complete,
+                    membership_checked_at,
+                    proof_degradation,
+                ) = self._sessions_membership_proof(
+                    provider_filter,
+                    degraded,
+                    provider_inventories,
+                    rows,
+                    truncated=bool(metadata.get("truncated")),
+                )
+                if degraded is None and proof_degradation is not None:
+                    degraded = proof_degradation
+                snapshot = {
+                    "items": rows,
+                    "ts": _time.time(),
+                    "membership_complete": membership_complete,
+                    "membership_checked_at": membership_checked_at,
+                }
+                if degraded is not None:
+                    snapshot["degraded"] = degraded
+                return snapshot
+
+        return _cached_runtime_snapshot(
+            ("sessions-stream-snapshot", provider_filter),
+            RUNTIME_SNAPSHOT_CACHE_SECONDS,
+            load_snapshot,
+            force_refresh=force_refresh,
+            # Authoritative discovery can register a terminal while building
+            # this exact snapshot. That registry write invalidates older
+            # snapshots, but this completed value already includes the write.
+            store_after_loader_invalidation=True,
+        )
+
+    def _collect_sessions_stream_rows(self, provider_filter: str) -> list[dict]:
+        snapshot = self._collect_sessions_stream_snapshot(provider_filter)
+        return list(snapshot.get("items") or [])
 
     @staticmethod
     def _session_row_is_strictly_live(
         row: dict,
         codex_live_terminal_rows: list[dict] | None = None,
+        claude_live_terminal_rows: list[dict] | None = None,
     ) -> bool:
         if row.get("closed_at") is not None:
             return False
@@ -19866,11 +21490,20 @@ class Handler(BaseHTTPRequestHandler):
                 return _codex_inventory_registry_process_matches(
                     verification_row, codex_live_terminal_rows
                 )
-            return _session_has_verified_provider_process(verification_row)
+            native_id = str(row.get("native_id") or "").strip()
+            verification_row = _agent_registry_get("claude", native_id)
+            return _claude_inventory_registry_process_matches(
+                verification_row,
+                claude_live_terminal_rows,
+            )
         # Older Claude hook rows may not have a pid yet. A fresh hook-backed
         # UUID is still stronger evidence than transcript mtime alone, but it
         # is membership proof only. Without a pid or TTY the row is read-only.
-        if row.get("provider") == "claude" and row.get("claude_uuid"):
+        if (
+            row.get("provider") == "claude"
+            and claude_live_terminal_rows is None
+            and row.get("claude_uuid")
+        ):
             age = max(0, int(_time.time()) - int(row.get("last_heartbeat") or 0))
             return age <= 120
         return False
@@ -19880,10 +21513,21 @@ class Handler(BaseHTTPRequestHandler):
         cls,
         row: dict,
         codex_live_terminal_rows: list[dict] | None = None,
+        claude_live_terminal_rows: list[dict] | None = None,
     ) -> dict | None:
-        if not cls._session_row_is_strictly_live(
-            row, codex_live_terminal_rows
-        ):
+        is_live = (
+            cls._session_row_is_strictly_live(
+                row,
+                codex_live_terminal_rows,
+            )
+            if claude_live_terminal_rows is None
+            else cls._session_row_is_strictly_live(
+                row,
+                codex_live_terminal_rows,
+                claude_live_terminal_rows,
+            )
+        )
+        if not is_live:
             return None
         projected = dict(row)
         projected["readable_state"] = "live"
@@ -19941,7 +21585,12 @@ class Handler(BaseHTTPRequestHandler):
         ]
         return projected
 
-    def _decorate_session_lifecycle_row(self, row: dict) -> dict:
+    def _decorate_session_lifecycle_row(
+        self,
+        row: dict,
+        *,
+        provider_inventory: dict[str, list[dict]] | None = None,
+    ) -> dict:
         row.setdefault("closed_at", None)
         provider = row.get("provider") or "claude"
         native_id = row.get("native_id") or row.get("id") or ""
@@ -19964,14 +21613,22 @@ class Handler(BaseHTTPRequestHandler):
         row["branch"] = identity.get("branch")
         row["worktree"] = identity.get("worktree")
         row["terminal_title"] = _session_terminal_title(row)
-        decorated = self._decorate_visible_session_row(row)
+        decorated = self._decorate_visible_session_row(
+            row,
+            provider_inventory=provider_inventory,
+        )
         decorated.setdefault("closed_at", None)
         decorated.setdefault("turn_count", None)
         if decorated.get("readable_state") == "closed":
             decorated["state"] = decorated.get("state") or "terminated"
         return decorated
 
-    def _decorate_visible_session_row(self, row: dict) -> dict:
+    def _decorate_visible_session_row(
+        self,
+        row: dict,
+        *,
+        provider_inventory: dict[str, list[dict]] | None = None,
+    ) -> dict:
         now = int(_time.time())
         last = int(row.get("last_heartbeat") or 0)
         closed_at = row.get("closed_at")
@@ -19996,13 +21653,23 @@ class Handler(BaseHTTPRequestHandler):
                     has_verified_process = bool(
                         registry_row
                         and _codex_inventory_registry_process_matches(
-                            registry_row
+                            registry_row,
+                            (
+                                provider_inventory.get("codex", [])
+                                if provider_inventory is not None
+                                else None
+                            ),
                         )
                     )
                 else:
                     has_verified_process = _session_has_verified_provider_process(
                         row,
                         str(row.get("provider") or "claude"),
+                        (
+                            provider_inventory.get("claude", [])
+                            if provider_inventory is not None
+                            else None
+                        ),
                     )
             except Exception:
                 has_verified_process = False
@@ -20058,6 +21725,35 @@ class Handler(BaseHTTPRequestHandler):
             within_min = int(q.get("active_within_min", ["60"])[0])
         except ValueError:
             within_min = 60
+
+        if live_only:
+            if (
+                provider_filter != "all"
+                and provider_filter not in _SESSION_MEMBERSHIP_PROVIDERS
+            ):
+                _send_unsupported_provider(
+                    self,
+                    provider_filter,
+                    "live session inventory",
+                )
+                return
+            if (
+                provider_filter != "all"
+                and provider_filter not in _visible_agent_provider_ids()
+            ):
+                _send_provider_hidden(self, provider_filter)
+                return
+            snapshot = self._collect_sessions_stream_snapshot(
+                provider_filter,
+                force_refresh=True,
+            )
+            snapshot["source"] = _sessions_stream_source()
+            snapshot["count"] = len(snapshot.get("items") or [])
+            self._send_json(
+                snapshot,
+                status=503 if snapshot.get("degraded") is not None else 200,
+            )
+            return
 
         if provider_filter != "all" and provider_filter not in _agent_provider_ids():
             self._send_json({"count": 0, "items": []})
@@ -20347,78 +22043,113 @@ class Handler(BaseHTTPRequestHandler):
         if not _valid_provider_filter(provider_filter):
             _send_unknown_provider(self, provider_filter)
             return
+        if (
+            provider_filter != "all"
+            and provider_filter not in _SESSION_MEMBERSHIP_PROVIDERS
+        ):
+            _send_unsupported_provider(
+                self,
+                provider_filter,
+                "live session inventory",
+            )
+            return
+        if (
+            provider_filter != "all"
+            and provider_filter not in _visible_agent_provider_ids()
+        ):
+            _send_provider_hidden(self, provider_filter)
+            return
 
-        def collect_live() -> list[dict]:
+        def collect_live() -> dict:
             _agent_registry_close_stale()
-            return self._collect_sessions_stream_rows(provider_filter)
+            return self._collect_sessions_stream_snapshot(provider_filter)
 
-        # Hash JUST the rows list, NOT the timestamp — otherwise the
-        # diff detector triggers every tick because `ts` always changes.
-        def hash_rows(rows: list[dict]) -> str:
-            return hashlib.sha256(
-                json.dumps(rows, sort_keys=True).encode()
-            ).hexdigest()
-
-        def snapshot_payload(rows: list[dict]) -> tuple[bytes, str]:
-            degraded = self._sessions_backend_degradation(provider_filter)
+        def snapshot_payload(snapshot: dict) -> tuple[bytes, str]:
             source = _sessions_stream_source()
-            body: dict = {"source": source, "items": rows, "ts": _time.time()}
+            rows = list(snapshot.get("items") or [])
+            degraded = snapshot.get("degraded")
+            membership_complete = bool(
+                snapshot.get("membership_complete", False)
+            )
+            body: dict = {
+                "source": source,
+                "items": rows,
+                "ts": float(snapshot.get("ts") or _time.time()),
+                "membership_complete": membership_complete,
+                "membership_checked_at": float(
+                    snapshot.get("membership_checked_at") or 0
+                ),
+            }
             if degraded is not None:
                 body["degraded"] = degraded
             stable_rows = _stable_sessions_stream_rows(rows)
             digest = hashlib.sha256(
                 json.dumps(
-                    {"rows": stable_rows, "degraded": degraded}, sort_keys=True
+                    {
+                        "rows": stable_rows,
+                        "degraded": degraded,
+                        "membership_complete": membership_complete,
+                    },
+                    sort_keys=True,
                 ).encode()
             ).hexdigest()
             return json.dumps(body).encode(), digest
 
-        # Build the first authoritative snapshot before committing the SSE
-        # response headers. If session truth cannot be computed, return a
-        # typed retryable failure instead of opening a silent stream that can
-        # leave the phone showing an unproven empty dashboard for ten minutes.
+        sessions_wakes = (
+            SESSION_EVENT_HUB.subscribe(SESSION_SUMMARIES_TOPIC)
+            if SESSION_EVENT_HUB is not None
+            else None
+        )
         try:
-            initial = collect_live()
-            payload, last_hash = snapshot_payload(initial)
-        except Exception:
-            self._send_json({
-                "ok": False,
-                "error": {
-                    "code": "sessions_initial_snapshot_unavailable",
-                    "message": "The Mac could not confirm the current session list. Pairling will retry.",
-                },
-            }, status=503)
-            return
+            # Subscribe before collecting the first authoritative snapshot.
+            # Any mutation during that scan stays queued and triggers an
+            # immediate follow-up scan after the initial snapshot is sent.
+            try:
+                initial = collect_live()
+                payload, last_hash = snapshot_payload(initial)
+            except Exception:
+                self._send_json({
+                    "ok": False,
+                    "error": {
+                        "code": "sessions_initial_snapshot_unavailable",
+                        "message": "The Mac could not confirm the current session list. Pairling will retry.",
+                    },
+                }, status=503)
+                return
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
 
-        last_keepalive = _time.time()
-        deadline = _time.time() + 600  # 10 min
+            last_keepalive = _time.time()
+            deadline = _time.time() + 600  # 10 min
 
-        try:
             # Emit initial snapshot immediately so the iPhone never paints
             # an empty Dashboard while waiting for the first poll.
             # Initial snapshot body contract: {"items": initial}.
             self.wfile.write(b"event: snapshot\ndata: " + payload + b"\n\n")
             self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            return
 
-        sessions_wakes = SESSION_EVENT_HUB.subscribe(SESSION_SUMMARIES_TOPIC) if SESSION_EVENT_HUB is not None else None
-        last_scan = _time.time()
-        try:
+            pending_wake = False
+            if sessions_wakes is not None:
+                wake = sessions_wakes.get(timeout=0)
+                while wake is not None:
+                    pending_wake = True
+                    wake = sessions_wakes.get(timeout=0)
+
+            last_scan = _time.time()
             while _time.time() < deadline:
-                woke = False
+                woke = pending_wake
+                pending_wake = False
                 if sessions_wakes is not None:
-                    wake = sessions_wakes.get(timeout=1.5)
-                    while wake is not None:
-                        woke = True
-                        wake = sessions_wakes.get(timeout=0)
+                    if not woke:
+                        wake = sessions_wakes.get(timeout=1.5)
+                        while wake is not None:
+                            woke = True
+                            wake = sessions_wakes.get(timeout=0)
                 else:
                     _time.sleep(1.5)
                     woke = True
@@ -20435,8 +22166,8 @@ class Handler(BaseHTTPRequestHandler):
                         last_keepalive = _time.time()
                     continue
                 last_scan = _time.time()
-                rows = collect_live()
-                payload, h = snapshot_payload(rows)
+                snapshot = collect_live()
+                payload, h = snapshot_payload(snapshot)
                 if h != last_hash:
                     try:
                         self.wfile.write(b"event: snapshot\ndata: " + payload + b"\n\n")
@@ -24900,8 +26631,9 @@ class Handler(BaseHTTPRequestHandler):
              in the encoded project dir. This is essential when N sessions
              share a project (e.g. 4 terminals all in /Users/example) — without
              it, all N collide on the most-recent-JSONL fallback.
-          3. Last-ditch: PG project lookup → most recent JSONL in dir. Only
-             fires when claude_uuid is unknown (pre-migration zombie sessions).
+
+        Pairling never substitutes the newest transcript in a project. A
+        missing exact identity is not enough evidence to choose a file.
         """
         native_id = _claude_native_session_id(session_id)
         if not native_id:
@@ -24914,8 +26646,7 @@ class Handler(BaseHTTPRequestHandler):
             project = self._lookup_pg_project(session_id)
             if claude_uuid and project:
                 candidate = projects_root / _encode_project_dir(project) / f"{claude_uuid}.jsonl"
-                if candidate.exists():
-                    return candidate
+                return candidate if candidate.exists() else None
 
         # Strategy 1: direct filename match.
         for project_dir in projects_root.iterdir():
@@ -24934,22 +26665,9 @@ class Handler(BaseHTTPRequestHandler):
         if claude_uuid and project:
             encoded = _encode_project_dir(project)
             candidate = projects_root / encoded / f"{claude_uuid}.jsonl"
-            if candidate.exists():
-                return candidate
+            return candidate if candidate.exists() else None
 
-        # Strategy 3: most-recent in project dir. Last-ditch for sessions
-        # whose claude_uuid was never captured (pre-migration). Will collide
-        # for multi-session projects, but the caller should already be
-        # filtering those out via /sessions?live=true requiring claude_uuid.
-        if not project:
-            return None
-        encoded = _encode_project_dir(project)
-        target_dir = projects_root / encoded
-        if not target_dir.is_dir():
-            return None
-        jsonls = sorted(target_dir.glob("*.jsonl"),
-                        key=lambda p: p.stat().st_mtime, reverse=True)
-        return jsonls[0] if jsonls else None
+        return None
 
     def _lookup_pg_project(self, session_id: str):
         """Query the continuous-claude PG for a session's project."""
@@ -25610,56 +27328,78 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError) as exc:
             raise ClientDisconnected() from exc
 
+    def _collect_session_rows_uncached(
+        self,
+        since_min: int = 360,
+        live_only: bool = False,
+        limit: int = 100,
+        include_first_prompt: bool = True,
+        live_terminal_rows: list[dict] | None = None,
+        require_complete: bool = False,
+    ) -> list[dict]:
+        since_min = max(1, min(int(since_min), 60 * 24 * 14))
+        limit = max(1, min(int(limit), 500))
+        _claude_register_terminal_only_rows(set(), live_terminal_rows)
+        backend = _claude_sessions_backend()
+        if require_complete:
+            backend_rows = backend.collect_rows(
+                since_min,
+                live_only,
+                limit,
+                strict=True,
+            )
+        else:
+            backend_rows = backend.collect_rows(since_min, live_only, limit)
+        rows: list[dict] = []
+        try:
+            _session_tombstone_keys()
+        except SessionTombstoneStoreError:
+            return []
+        for raw in backend_rows:
+            session_id, project = raw["id"], raw["project"]
+            if _is_excluded_project(project):
+                continue
+            claude_uuid = raw.get("claude_uuid") or ""
+            row = dict(raw)
+            row["first_prompt"] = None
+            row.update(self._turn_state_summary(claude_uuid))
+            _refresh_claude_observed_activity(row, project, claude_uuid)
+            if include_first_prompt and project and claude_uuid:
+                transcript = (
+                    HOME / ".claude" / "projects" / _encode_project_dir(project)
+                    / f"{claude_uuid}.jsonl"
+                )
+                if transcript.is_file():
+                    row["first_prompt"] = _peek_first_prompt(transcript)
+            if project and claude_uuid:
+                transcript = (
+                    HOME / ".claude" / "projects" / _encode_project_dir(project)
+                    / f"{claude_uuid}.jsonl"
+                )
+                stats = _session_transcript_stats(
+                    transcript, "claude", session_id
+                )
+                row["turn_count"] = stats.get("turn_count")
+                row["last_meaningful_turn_at"] = stats.get(
+                    "last_meaningful_turn_at"
+                )
+            rows.append(row)
+        return _filter_tombstoned_session_rows(rows)
+
     def _collect_session_rows(self, since_min: int = 360, live_only: bool = False, limit: int = 100, include_first_prompt: bool = True) -> list[dict]:
         since_min = max(1, min(int(since_min), 60 * 24 * 14))
         limit = max(1, min(int(limit), 500))
         cache_key = ("collect-session-rows", since_min, bool(live_only), limit, bool(include_first_prompt))
 
-        def load_rows() -> list[dict]:
-            _claude_register_terminal_only_rows(set())
-            backend_rows = _claude_sessions_backend().collect_rows(
-                since_min, live_only, limit
-            )
-            rows: list[dict] = []
-            try:
-                _session_tombstone_keys()
-            except SessionTombstoneStoreError:
-                return []
-            for raw in backend_rows:
-                session_id, project = raw["id"], raw["project"]
-                if _is_excluded_project(project):
-                    continue
-                claude_uuid = raw.get("claude_uuid") or ""
-                row = dict(raw)
-                row["first_prompt"] = None
-                row.update(self._turn_state_summary(claude_uuid))
-                _refresh_claude_observed_activity(row, project, claude_uuid)
-                if include_first_prompt and project and claude_uuid:
-                    transcript = (
-                        HOME / ".claude" / "projects" / _encode_project_dir(project)
-                        / f"{claude_uuid}.jsonl"
-                    )
-                    if transcript.is_file():
-                        row["first_prompt"] = _peek_first_prompt(transcript)
-                if project and claude_uuid:
-                    transcript = (
-                        HOME / ".claude" / "projects" / _encode_project_dir(project)
-                        / f"{claude_uuid}.jsonl"
-                    )
-                    stats = _session_transcript_stats(
-                        transcript, "claude", session_id
-                    )
-                    row["turn_count"] = stats.get("turn_count")
-                    row["last_meaningful_turn_at"] = stats.get(
-                        "last_meaningful_turn_at"
-                    )
-                rows.append(row)
-            return _filter_tombstoned_session_rows(rows)
-
         return _cached_runtime_snapshot(
             cache_key,
             RUNTIME_SNAPSHOT_CACHE_SECONDS,
-            load_rows,
+            lambda: self._collect_session_rows_uncached(
+                since_min=since_min,
+                live_only=live_only,
+                limit=limit,
+                include_first_prompt=include_first_prompt,
+            ),
         )
 
     def _recent_session_signal(self, session_id: str, project: str | None = None, claude_uuid: str | None = None) -> dict:
@@ -36880,6 +38620,16 @@ Worker instructions:
 class _PairlingThreadingHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = max(16, RUNTIME_MAX_ACTIVE_CONNECTIONS)
+
+    def service_actions(self):
+        super().service_actions()
+        try:
+            with _FIRST_PROMPT_DELIVERY_LOCK:
+                _ensure_first_prompt_delivery_receipt_retry_worker_locked()
+        except Exception:  # noqa: BLE001 - queued truth survives for the next tick
+            # The enqueue or worker exit path already logged the start failure.
+            # Do not let a temporary thread-start failure stop serve_forever.
+            return
 
     def process_request(self, request, client_address):
         if not _CONNECTION_ADMISSION_SEMAPHORE.acquire(blocking=False):

@@ -53,6 +53,7 @@ _ANSI_COLOR_NAMES = ("black", "red", "green", "yellow", "blue", "magenta", "cyan
 # the local-socket contract bounded, but large enough for the maximum grid the
 # broker itself permits.
 _RPC_MAX_FRAME_BYTES = 16 * 1024 * 1024
+_PASTE_RENDER_TIMEOUT_SECONDS = 2.0
 
 # Capture retention (Wave A): recordings are the replay corpus and the
 # forensic record, but they must not grow without bound or keep old
@@ -1476,6 +1477,10 @@ class PTYBrokerSession:
         self.process_group_id = 0
         self._closed = False
         self._lock = threading.RLock()
+        # A submitted paste is a two-step transaction: render the paste, then
+        # send Enter. Keep other input out of that boundary while still letting
+        # the reader thread update the virtual terminal between the two writes.
+        self._input_transaction_lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         # Guards the master_fd check-close-null so the two close sites (the
         # read loop's finally and the terminate/signal path) cannot both close
@@ -1919,8 +1924,9 @@ class PTYBrokerSession:
         # Serialize every PTY input with proofed controls. A local attached
         # terminal must not slip a key between a permission screen check and
         # Pairling's Enter/Escape write.
-        with self._lock:
-            self._write_locked(data)
+        with self._input_transaction_lock:
+            with self._lock:
+                self._write_locked(data)
 
     def _write_control_bytes(self, data: bytes, action: dict) -> dict:
         if action.get("require_screen_proof") is not True:
@@ -1947,38 +1953,39 @@ class PTYBrokerSession:
             }
         expected_generation = raw_generation
 
-        with self._lock:
-            current = self._snapshot_locked(self.session_id)
-            if (
-                str(current.get("screen_hash") or "") != expected_hash
-                or str(current.get("nonce") or "") != expected_nonce
-                or int(current.get("generation") or 0) != expected_generation
-            ):
+        with self._input_transaction_lock:
+            with self._lock:
+                current = self._snapshot_locked(self.session_id)
+                if (
+                    str(current.get("screen_hash") or "") != expected_hash
+                    or str(current.get("nonce") or "") != expected_nonce
+                    or int(current.get("generation") or 0) != expected_generation
+                ):
+                    return {
+                        "ok": False,
+                        "reason": "stale_screen",
+                        "error_code": "stale_screen",
+                        "status": 409,
+                        "pty_written": False,
+                        "screen_hash": current.get("screen_hash"),
+                        "nonce": current.get("nonce"),
+                        "generation": current.get("generation"),
+                    }
+                try:
+                    bytes_written = self._write_locked(data)
+                except PTYWriteError as exc:
+                    return _pty_write_failure_result(exc)
                 return {
-                    "ok": False,
-                    "reason": "stale_screen",
-                    "error_code": "stale_screen",
-                    "status": 409,
-                    "pty_written": False,
+                    "ok": True,
+                    "pty_written": True,
+                    "bytes_written": bytes_written,
+                    "bytes_expected": len(data),
+                    "write_outcome": "complete",
+                    "screen_proof_verified": True,
                     "screen_hash": current.get("screen_hash"),
                     "nonce": current.get("nonce"),
                     "generation": current.get("generation"),
                 }
-            try:
-                bytes_written = self._write_locked(data)
-            except PTYWriteError as exc:
-                return _pty_write_failure_result(exc)
-            return {
-                "ok": True,
-                "pty_written": True,
-                "bytes_written": bytes_written,
-                "bytes_expected": len(data),
-                "write_outcome": "complete",
-                "screen_proof_verified": True,
-                "screen_hash": current.get("screen_hash"),
-                "nonce": current.get("nonce"),
-                "generation": current.get("generation"),
-            }
 
     def interrupt(self) -> dict:
         """Interrupt an owned session after the daemon's identity gate.
@@ -1986,18 +1993,19 @@ class PTYBrokerSession:
         Interrupt intent is not tied to a rendered prompt. The authenticated
         session-signal path calls this only after it verifies broker ownership.
         """
-        with self._lock:
-            try:
-                bytes_written = self._write_locked(b"\x03")
-            except PTYWriteError as exc:
-                return _pty_write_failure_result(exc)
-            return {
-                "ok": True,
-                "pty_written": True,
-                "bytes_written": bytes_written,
-                "bytes_expected": 1,
-                "write_outcome": "complete",
-            }
+        with self._input_transaction_lock:
+            with self._lock:
+                try:
+                    bytes_written = self._write_locked(b"\x03")
+                except PTYWriteError as exc:
+                    return _pty_write_failure_result(exc)
+                return {
+                    "ok": True,
+                    "pty_written": True,
+                    "bytes_written": bytes_written,
+                    "bytes_expected": 1,
+                    "write_outcome": "complete",
+                }
 
     def control(self, action: dict) -> dict:
         kind = action.get("type")
@@ -2108,91 +2116,135 @@ class PTYBrokerSession:
             # Decode first, then keep the generation decision and write inside
             # one lock. Output cannot replace the frame after validation but
             # before these bytes reach the PTY.
-            with self._lock:
-                current = int(self.generation)
-                if (
-                    input_epoch != self._type_mode_epoch
-                    or not device_id
-                    or device_id != self._type_mode_device_id
-                ):
-                    return {
-                        "ok": False,
-                        "reason": "input_epoch_changed",
-                        "generation": current,
-                        "next_sequence": self._type_mode_last_sequence + 1,
-                    }
-                cached = self._type_mode_receipts.get(input_sequence)
-                if cached is not None:
-                    cached_hash, cached_result = cached
-                    if cached_hash != input_hash:
+            with self._input_transaction_lock:
+                with self._lock:
+                    current = int(self.generation)
+                    if (
+                        input_epoch != self._type_mode_epoch
+                        or not device_id
+                        or device_id != self._type_mode_device_id
+                    ):
                         return {
                             "ok": False,
-                            "reason": "input_sequence_conflict",
+                            "reason": "input_epoch_changed",
                             "generation": current,
                             "next_sequence": self._type_mode_last_sequence + 1,
                         }
-                    replay = dict(cached_result)
-                    replay["deduped"] = True
-                    return replay
-                if input_sequence <= self._type_mode_last_sequence:
-                    return {
-                        "ok": False,
-                        "reason": "input_sequence_already_finished",
-                        "generation": current,
-                        "next_sequence": self._type_mode_last_sequence + 1,
-                    }
-                if input_sequence != self._type_mode_last_sequence + 1:
-                    return {
-                        "ok": False,
-                        "reason": "input_sequence_gap",
-                        "generation": current,
-                        "next_sequence": self._type_mode_last_sequence + 1,
-                    }
-                if expected > current or (current - expected) > 1000:
+                    cached = self._type_mode_receipts.get(input_sequence)
+                    if cached is not None:
+                        cached_hash, cached_result = cached
+                        if cached_hash != input_hash:
+                            return {
+                                "ok": False,
+                                "reason": "input_sequence_conflict",
+                                "generation": current,
+                                "next_sequence": self._type_mode_last_sequence + 1,
+                            }
+                        replay = dict(cached_result)
+                        replay["deduped"] = True
+                        return replay
+                    if input_sequence <= self._type_mode_last_sequence:
+                        return {
+                            "ok": False,
+                            "reason": "input_sequence_already_finished",
+                            "generation": current,
+                            "next_sequence": self._type_mode_last_sequence + 1,
+                        }
+                    if input_sequence != self._type_mode_last_sequence + 1:
+                        return {
+                            "ok": False,
+                            "reason": "input_sequence_gap",
+                            "generation": current,
+                            "next_sequence": self._type_mode_last_sequence + 1,
+                        }
+                    if expected > current or (current - expected) > 1000:
+                        result = {
+                            "ok": False,
+                            "reason": "stale_generation",
+                            "generation": current,
+                            "input_epoch": input_epoch,
+                            "input_sequence": input_sequence,
+                            "next_sequence": input_sequence + 1,
+                        }
+                        self._type_mode_last_sequence = input_sequence
+                        self._type_mode_receipts[input_sequence] = (input_hash, result)
+                        return result
+                    try:
+                        bytes_written = self._write_locked(data)
+                    except PTYWriteError as exc:
+                        result = _pty_write_failure_result(exc)
+                        result["generation"] = int(self.generation)
+                        result["input_epoch"] = input_epoch
+                        result["input_sequence"] = input_sequence
+                        result["next_sequence"] = input_sequence + 1
+                        self._type_mode_last_sequence = input_sequence
+                        self._type_mode_receipts[input_sequence] = (input_hash, result)
+                        return result
                     result = {
-                        "ok": False,
-                        "reason": "stale_generation",
-                        "generation": current,
+                        "ok": True,
+                        "generation": int(self.generation),
+                        "pty_written": True,
+                        "bytes_written": bytes_written,
+                        "bytes_expected": len(data),
+                        "write_outcome": "complete",
                         "input_epoch": input_epoch,
                         "input_sequence": input_sequence,
                         "next_sequence": input_sequence + 1,
                     }
                     self._type_mode_last_sequence = input_sequence
                     self._type_mode_receipts[input_sequence] = (input_hash, result)
+                    if len(self._type_mode_receipts) > 256:
+                        cutoff = self._type_mode_last_sequence - 256
+                        self._type_mode_receipts = {
+                            sequence: receipt
+                            for sequence, receipt in self._type_mode_receipts.items()
+                            if sequence > cutoff
+                        }
                     return result
-                try:
-                    bytes_written = self._write_locked(data)
-                except PTYWriteError as exc:
-                    result = _pty_write_failure_result(exc)
-                    result["generation"] = int(self.generation)
-                    result["input_epoch"] = input_epoch
-                    result["input_sequence"] = input_sequence
-                    result["next_sequence"] = input_sequence + 1
-                    self._type_mode_last_sequence = input_sequence
-                    self._type_mode_receipts[input_sequence] = (input_hash, result)
-                    return result
-                result = {
-                    "ok": True,
-                    "generation": int(self.generation),
-                    "pty_written": True,
-                    "bytes_written": bytes_written,
-                    "bytes_expected": len(data),
-                    "write_outcome": "complete",
-                    "input_epoch": input_epoch,
-                    "input_sequence": input_sequence,
-                    "next_sequence": input_sequence + 1,
-                }
-                self._type_mode_last_sequence = input_sequence
-                self._type_mode_receipts[input_sequence] = (input_hash, result)
-                if len(self._type_mode_receipts) > 256:
-                    cutoff = self._type_mode_last_sequence - 256
-                    self._type_mode_receipts = {
-                        sequence: receipt
-                        for sequence, receipt in self._type_mode_receipts.items()
-                        if sequence > cutoff
-                    }
-                return result
         return {"ok": False, "reason": "unsupported action"}
+
+    @staticmethod
+    def _compact_render_text(value: str) -> str:
+        return re.sub(r"\s+", "", value)
+
+    def _pasted_text_is_rendered_locked(
+        self,
+        text: str,
+        *,
+        after_generation: int,
+        before_rendered: str,
+    ) -> bool:
+        compact = self._compact_render_text(text)
+        if not compact:
+            return False
+        needle = compact[-64:]
+        rows = self.screen.text_rows()
+        rendered = self._compact_render_text("\n".join(rows))
+        composer = self._compact_render_text("\n".join(rows[-8:]))
+        return (
+            int(self.generation) > after_generation
+            and needle in composer
+            and rendered.count(needle) > before_rendered.count(needle)
+        )
+
+    def _wait_for_pasted_text(
+        self,
+        text: str,
+        *,
+        after_generation: int,
+        before_rendered: str,
+    ) -> bool:
+        deadline = time.monotonic() + _PASTE_RENDER_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._pasted_text_is_rendered_locked(
+                    text,
+                    after_generation=after_generation,
+                    before_rendered=before_rendered,
+                ):
+                    return True
+            time.sleep(0.02)
+        return False
 
     def send_text(self, text: str) -> dict:
         text, err = sanitize_terminal_text_input(
@@ -2205,20 +2257,94 @@ class PTYBrokerSession:
         is_slash = _is_direct_slash_invocation_text(text)
         if is_slash:
             data = text.encode() + b"\r"
-        else:
-            data = b"\x1b[200~" + text.encode() + b"\x1b[201~\r"
-        with self._lock:
-            try:
-                bytes_written = self._write_locked(data)
-            except PTYWriteError as exc:
-                return _pty_write_failure_result(exc)
+            with self._input_transaction_lock:
+                with self._lock:
+                    try:
+                        bytes_written = self._write_locked(data)
+                    except PTYWriteError as exc:
+                        return _pty_write_failure_result(exc)
+            return {
+                "ok": True,
+                "pty_written": True,
+                "bytes_written": bytes_written,
+                "bytes_expected": len(data),
+                "write_outcome": "complete",
+                "outcome_indeterminate": False,
+            }
+
+        paste = b"\x1b[200~" + text.encode() + b"\x1b[201~"
+        expected = len(paste) + 1
+        with self._input_transaction_lock:
+            with self._lock:
+                before_generation = int(self.generation)
+                before_rendered = self._compact_render_text(
+                    "\n".join(self.screen.text_rows())
+                )
+                try:
+                    paste_written = self._write_locked(paste)
+                except PTYWriteError as exc:
+                    result = _pty_write_failure_result(exc)
+                    result["bytes_expected"] = expected
+                    return result
+            if not self._wait_for_pasted_text(
+                text,
+                after_generation=before_generation,
+                before_rendered=before_rendered,
+            ):
+                return {
+                    "ok": False,
+                    "reason": "paste_render_unconfirmed",
+                    "error_code": "paste_render_unconfirmed",
+                    "status": 409,
+                    "pty_written": True,
+                    "bytes_written": paste_written,
+                    "bytes_expected": expected,
+                    "write_outcome": "partial",
+                    "outcome_indeterminate": False,
+                    "paste_render_confirmed": False,
+                    "submit_key_written": False,
+                }
+            with self._lock:
+                if not self._pasted_text_is_rendered_locked(
+                    text,
+                    after_generation=before_generation,
+                    before_rendered=before_rendered,
+                ):
+                    return {
+                        "ok": False,
+                        "reason": "paste_render_changed_before_submit",
+                        "error_code": "paste_render_changed_before_submit",
+                        "status": 409,
+                        "pty_written": True,
+                        "bytes_written": paste_written,
+                        "bytes_expected": expected,
+                        "write_outcome": "partial",
+                        "outcome_indeterminate": False,
+                        "paste_render_confirmed": False,
+                        "submit_key_written": False,
+                    }
+                try:
+                    submit_written = self._write_locked(b"\r")
+                except PTYWriteError as exc:
+                    combined = PTYWriteError(
+                        str(exc),
+                        bytes_written=paste_written + exc.bytes_written,
+                        total_bytes=expected,
+                    )
+                    result = _pty_write_failure_result(combined)
+                    result["paste_render_confirmed"] = True
+                    result["submit_key_written"] = exc.bytes_written == 1
+                    return result
+        bytes_written = paste_written + submit_written
         return {
             "ok": True,
             "pty_written": True,
             "bytes_written": bytes_written,
-            "bytes_expected": len(data),
+            "bytes_expected": expected,
             "write_outcome": "complete",
             "outcome_indeterminate": False,
+            "paste_render_confirmed": True,
+            "submit_key_written": True,
         }
 
     def attach(self, conn: socket.socket) -> None:
