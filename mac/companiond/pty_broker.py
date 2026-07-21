@@ -2220,10 +2220,35 @@ class PTYBrokerSession:
         needle = compact[-64:]
         rows = self.screen.text_rows()
         rendered = self._compact_render_text("\n".join(rows))
-        composer = self._compact_render_text("\n".join(rows[-8:]))
+        cursor_row = getattr(self.screen, "cursor_row", None)
+        cursor_col = getattr(self.screen, "cursor_col", None)
+        columns = getattr(self.screen, "columns", None)
+        if (
+            not isinstance(cursor_row, int)
+            or isinstance(cursor_row, bool)
+            or not isinstance(cursor_col, int)
+            or isinstance(cursor_col, bool)
+            or not isinstance(columns, int)
+            or isinstance(columns, bool)
+            or not rows
+            or cursor_row < 0
+            or cursor_row >= len(rows)
+            or cursor_col < 0
+            or cursor_col > columns
+            or columns <= 0
+        ):
+            return False
+        needle_rows = max(1, (len(needle) + columns - 1) // columns)
+        composer_rows = max(8, needle_rows + 2)
+        composer_start = max(0, cursor_row - composer_rows + 1)
+        composer_lines = rows[composer_start:cursor_row]
+        composer_lines.append(rows[cursor_row][:cursor_col])
+        composer = self._compact_render_text(
+            "\n".join(composer_lines)
+        )
         return (
             int(self.generation) > after_generation
-            and needle in composer
+            and composer.endswith(needle)
             and rendered.count(needle) > before_rendered.count(needle)
         )
 
