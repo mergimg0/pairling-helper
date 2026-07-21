@@ -1410,10 +1410,22 @@ def _session_transcript_delete_is_pending_or_done(provider: str, native_id: str)
 
 
 def _stable_sessions_stream_rows(rows: list[dict]) -> list[dict]:
-    return [
-        {key: value for key, value in row.items() if key != "stale_seconds"}
-        for row in rows
-    ]
+    stable_rows: list[dict] = []
+    for row in rows:
+        stable_row = {
+            key: value for key, value in row.items() if key != "stale_seconds"
+        }
+        native_id = str(row.get("native_id") or "")
+        if row.get("provider") == "codex" and native_id.startswith("terminal-"):
+            # The terminal scanner renews this placeholder's registry lease on
+            # every safety pass. That proves the same process is still alive;
+            # it is not a provider turn and must not reorder the dashboard or
+            # wake every sessions stream. Canonical Codex rows retain their
+            # heartbeat in the digest, and every other placeholder field still
+            # participates in change detection.
+            stable_row.pop("last_heartbeat", None)
+        stable_rows.append(stable_row)
+    return stable_rows
 
 
 def _invalidate_session_list_caches() -> None:
@@ -4944,7 +4956,14 @@ def _agent_registry_upsert(provider: str, native_id: str, project: str, *,
     now = _time.time()
     stored_metadata = dict(metadata or {})
     if provider in {"claude", "codex"} and int(pid or 0) > 0:
-        process_started_at = _process_start_epoch(int(pid))
+        try:
+            process_started_at = float(
+                stored_metadata.get("process_started_at") or 0
+            )
+        except (TypeError, ValueError):
+            process_started_at = 0.0
+        if process_started_at <= 0:
+            process_started_at = _process_start_epoch(int(pid))
         if process_started_at > 0:
             stored_metadata.setdefault("process_started_at", process_started_at)
     try:
@@ -5872,15 +5891,45 @@ def _bind_codex_registry_to_terminal(
     by a partial failure.
     """
     native_id = str(native_id or "").strip()
-    provider_tty = str(discovered.get("tty") or "")
-    pid = int(discovered.get("pid") or 0)
+    provider_tty = str(
+        discovered.get("provider_tty") or discovered.get("tty") or ""
+    )
+    observed_terminal_tty = str(
+        discovered.get("terminal_tty") or provider_tty
+    )
+    try:
+        pid = int(discovered.get("pid") or 0)
+        observed_terminal_owner_pid = int(
+            discovered.get("terminal_owner_pid") or 0
+        )
+        observed_terminal_owner_started_at = float(
+            discovered.get("terminal_owner_process_started_at") or 0
+        )
+        observed_process_started_at = float(
+            discovered.get("started_at") or 0
+        )
+    except (TypeError, ValueError):
+        return _agent_registry_get("codex", native_id)
     canonical_project = str(discovered.get("project") or project or "")
     output_path = str(discovered.get("output_path") or "")
+    has_inventory_topology = bool(
+        str(discovered.get("identity_probe_state") or "") == "exact"
+        and discovered.get("terminal_tty")
+        and observed_process_started_at > 0
+    )
     if (
         not _safe_agent_native_id(native_id)
         or not canonical_project
         or pid <= 0
-        or not provider_tty
+        or re.fullmatch(r"/dev/ttys[0-9]{3,}", provider_tty) is None
+        or re.fullmatch(r"/dev/ttys[0-9]{3,}", observed_terminal_tty) is None
+        or (
+            observed_terminal_tty != provider_tty
+            and (
+                observed_terminal_owner_pid <= 0
+                or observed_terminal_owner_started_at <= 0
+            )
+        )
     ):
         return _agent_registry_get("codex", native_id)
     approved_output_path = (
@@ -5891,6 +5940,18 @@ def _bind_codex_registry_to_terminal(
     if approved_output_path is None:
         return _agent_registry_get("codex", native_id)
     output_path = str(approved_output_path)
+
+    def terminal_topology_matches(registry_row: dict) -> bool:
+        if has_inventory_topology:
+            return _codex_inventory_registry_process_matches(
+                registry_row, [discovered]
+            )
+        return _direct_terminal_binding_is_verified(
+            registry_row,
+            "codex",
+            pid,
+            provider_tty=provider_tty,
+        )
 
     now = _time.time()
     linked_send_scope_id = ""
@@ -5929,12 +5990,7 @@ def _bind_codex_registry_to_terminal(
                     exact_script_binding = bool(
                         exact.get("closed_at") is None
                         and exact_provider_tty == provider_tty
-                        and _direct_terminal_binding_is_verified(
-                            exact,
-                            "codex",
-                            pid,
-                            provider_tty=provider_tty,
-                        )
+                        and terminal_topology_matches(exact)
                     )
                     identity_conflict = (
                         bool(exact_project and exact_project != canonical_project)
@@ -6001,12 +6057,7 @@ def _bind_codex_registry_to_terminal(
                             capture_backend == "script"
                             and str(candidate_metadata.get("provider_tty") or "")
                             == provider_tty
-                            and _direct_terminal_binding_is_verified(
-                                candidate,
-                                "codex",
-                                pid,
-                                provider_tty=provider_tty,
-                            )
+                            and terminal_topology_matches(candidate)
                         )
                     )
                     if (
@@ -6086,8 +6137,15 @@ def _bind_codex_registry_to_terminal(
                         discovered.get("command") or metadata.get("command") or ""
                     )[:500],
                 })
+                if observed_terminal_tty != provider_tty:
+                    metadata.update({
+                        "terminal_owner_pid": observed_terminal_owner_pid,
+                        "terminal_owner_process_started_at": (
+                            observed_terminal_owner_started_at
+                        ),
+                    })
                 process_started_at = float(
-                    discovered.get("started_at") or _process_start_epoch(pid) or 0
+                    observed_process_started_at or _process_start_epoch(pid) or 0
                 )
                 if process_started_at > 0:
                     metadata["process_started_at"] = process_started_at
@@ -6099,7 +6157,7 @@ def _bind_codex_registry_to_terminal(
                 if process_project and process_project != canonical_project:
                     metadata["process_project"] = process_project
 
-                canonical_tty = provider_tty
+                canonical_tty = observed_terminal_tty
                 if pending_owner is not None:
                     canonical_tty = str(
                         pending_owner.get("terminal_tty") or provider_tty
@@ -6109,9 +6167,17 @@ def _bind_codex_registry_to_terminal(
                         exact_metadata.get("provider_tty") or ""
                     )
                     if exact_provider_tty == provider_tty:
-                        canonical_tty = str(
+                        exact_terminal_tty = str(
                             exact.get("terminal_tty") or provider_tty
                         )
+                        if exact_terminal_tty != provider_tty:
+                            canonical_tty = exact_terminal_tty
+
+                if canonical_tty == provider_tty:
+                    metadata.pop("terminal_owner_pid", None)
+                    metadata.pop(
+                        "terminal_owner_process_started_at", None
+                    )
 
                 started_at = float(
                     (exact or {}).get("started_at")
@@ -7745,28 +7811,122 @@ def _pid_for_tty_command(tty: str, command_name: str) -> int:
     return matches[0] if matches else 0
 
 
-def _scan_provider_process_rows(provider: str) -> tuple[bool, list[dict]]:
-    """Read provider processes once, including their own inner tty."""
-    if provider not in {"claude", "codex"}:
-        return False, []
+def _scan_process_snapshot() -> tuple[bool, dict[int, dict]]:
+    """Read the process table once for one inventory scan."""
     try:
         proc = subprocess.run(
-            ["/bin/ps", "-axo", "pid=,tty=,lstart=,command="],
+            ["/bin/ps", "-axo", "pid=,ppid=,tty=,lstart=,command="],
             capture_output=True,
             text=True,
             timeout=2,
         )
     except Exception:
-        return False, []
+        return False, {}
     if proc.returncode != 0:
-        return False, []
-    raw_candidates: list[dict] = []
+        return False, {}
+
+    snapshot: dict[int, dict] = {}
     for line in proc.stdout.splitlines():
-        parts = line.strip().split(None, 7)
-        if len(parts) < 8 or not parts[0].isdigit():
+        parts = line.strip().split(None, 8)
+        if not parts or not parts[0].isdigit():
             continue
-        tty_name = parts[1]
-        command = parts[7]
+        if len(parts) < 9 or not parts[1].isdigit():
+            # Without PPID the snapshot cannot prove process ancestry.
+            return False, {}
+        ppid = int(parts[1])
+        tty_name = parts[2]
+        started_text = " ".join(parts[3:8])
+        command = parts[8]
+        try:
+            started_at = datetime.strptime(
+                started_text, "%a %b %d %H:%M:%S %Y"
+            ).timestamp()
+        except (TypeError, ValueError):
+            # An incomplete snapshot cannot prove ancestry or process birth.
+            return False, {}
+
+        pid = int(parts[0])
+        tty = "" if tty_name == "??" else (
+            tty_name if tty_name.startswith("/dev/") else f"/dev/{tty_name}"
+        )
+        snapshot[pid] = {
+            "pid": pid,
+            "ppid": ppid,
+            "tty": tty,
+            "started_at": started_at,
+            "command": command,
+            "ppid_observed": True,
+        }
+    return True, snapshot
+
+
+def _snapshot_process_is_descendant_of(
+    snapshot: dict[int, dict], pid: int, ancestor_pid: int
+) -> bool:
+    current = int(pid or 0)
+    ancestor_pid = int(ancestor_pid or 0)
+    if current <= 0 or ancestor_pid <= 0:
+        return False
+    seen: set[int] = set()
+    for _ in range(8):
+        if current == ancestor_pid:
+            return True
+        if current in seen:
+            return False
+        seen.add(current)
+        row = snapshot.get(current)
+        if row is None or not bool(row.get("ppid_observed")):
+            return False
+        current = int(row.get("ppid") or 0)
+        if current <= 0:
+            return False
+    return False
+
+
+def _snapshot_terminal_script_owner(
+    snapshot: dict[int, dict], provider_pid: int, terminal_tty: str = ""
+) -> dict | None:
+    current_row = snapshot.get(int(provider_pid or 0))
+    if current_row is None or not bool(current_row.get("ppid_observed")):
+        return None
+    current = int(current_row.get("ppid") or 0)
+    seen: set[int] = set()
+    for _ in range(8):
+        if current <= 0 or current in seen:
+            return None
+        seen.add(current)
+        row = snapshot.get(current)
+        if row is None:
+            return None
+        row_tty = str(row.get("tty") or "")
+        if (
+            "/usr/bin/script" in str(row.get("command") or "")
+            and re.fullmatch(r"/dev/ttys[0-9]{3,}", row_tty) is not None
+            and (not terminal_tty or row_tty == terminal_tty)
+        ):
+            return row
+        if not bool(row.get("ppid_observed")):
+            return None
+        current = int(row.get("ppid") or 0)
+    return None
+
+
+def _scan_provider_process_rows(
+    provider: str,
+    *,
+    include_snapshot: bool = False,
+):
+    """Read provider processes from one all-process inventory snapshot."""
+    empty = (False, [], {}) if include_snapshot else (False, [])
+    if provider not in {"claude", "codex"}:
+        return empty
+    snapshot_ok, snapshot = _scan_process_snapshot()
+    if not snapshot_ok:
+        return empty
+
+    raw_candidates: list[dict] = []
+    for process in snapshot.values():
+        command = str(process.get("command") or "")
         command_matches = (
             _is_codex_cli_command(command)
             if provider == "codex"
@@ -7775,28 +7935,30 @@ def _scan_provider_process_rows(provider: str) -> tuple[bool, list[dict]]:
         if not command_matches:
             continue
         raw_candidates.append({
-            "pid": int(parts[0]),
-            "tty_name": tty_name,
-            "started_text": " ".join(parts[2:7]),
+            "pid": int(process["pid"]),
+            "ppid": int(process.get("ppid") or 0),
+            "tty": str(process.get("tty") or ""),
+            "started_at": float(process.get("started_at") or 0),
             "command": command,
+            "ppid_observed": bool(process.get("ppid_observed")),
         })
 
     missing_tty_pids = [
         int(candidate["pid"])
         for candidate in raw_candidates
-        if candidate["tty_name"] == "??"
+        if not candidate["tty"]
     ]
     stdio_probe_ok, stdio_evidence_by_pid = _process_stdio_tty_evidence(
         missing_tty_pids
     )
     if not stdio_probe_ok:
-        return False, []
+        return empty
 
     candidates: list[dict] = []
     for raw_candidate in raw_candidates:
         pid = int(raw_candidate["pid"])
-        tty_name = str(raw_candidate["tty_name"])
-        if tty_name == "??":
+        tty = str(raw_candidate["tty"])
+        if not tty:
             stdio_evidence = stdio_evidence_by_pid.get(pid)
             if stdio_evidence is None:
                 # A provider command without one trustworthy PTY binding is
@@ -7805,22 +7967,15 @@ def _scan_provider_process_rows(provider: str) -> tuple[bool, list[dict]]:
             tty = str(stdio_evidence["tty"])
             control_eligible = bool(stdio_evidence["control_eligible"])
         else:
-            tty = f"/dev/{tty_name}"
             control_eligible = True
-        try:
-            started = datetime.strptime(
-                str(raw_candidate["started_text"]), "%a %b %d %H:%M:%S %Y"
-            ).timestamp()
-        except Exception:
-            # A process without a trustworthy birth time cannot take part in
-            # an identity decision. Treat the whole snapshot as incomplete.
-            return False, []
         candidates.append({
             "pid": pid,
+            "ppid": int(raw_candidate.get("ppid") or 0),
             "tty": tty,
-            "started_at": started,
+            "started_at": float(raw_candidate["started_at"]),
             "command": str(raw_candidate["command"]),
             "control_eligible": control_eligible,
+            "ppid_observed": bool(raw_candidate.get("ppid_observed")),
         })
     cwd_probe_ok, cwd_by_pid = _process_cwds([
         int(candidate["pid"]) for candidate in candidates
@@ -7829,11 +7984,14 @@ def _scan_provider_process_rows(provider: str) -> tuple[bool, list[dict]]:
         # A partial process scan is not exact identity evidence. Returning a
         # successful partial list would make a real session disappear or let
         # the registry act on a subset while lsof is temporarily unavailable.
-        return False, []
-    return True, [
+        return empty
+    rows = [
         {**candidate, "project": cwd_by_pid[int(candidate["pid"])]}
         for candidate in candidates
     ]
+    if include_snapshot:
+        return True, rows, snapshot
+    return True, rows
 
 
 def _provider_terminal_identity_for_tab(
@@ -7842,7 +8000,9 @@ def _provider_terminal_identity_for_tab(
     """Resolve one provider process below one exact visible Terminal tab."""
     if re.fullmatch(r"/dev/ttys[0-9]{3,}", terminal_tty or "") is None:
         return None
-    probe_ok, processes = _scan_provider_process_rows(provider)
+    probe_ok, processes, process_snapshot = _scan_provider_process_rows(
+        provider, include_snapshot=True
+    )
     if not probe_ok:
         return None
     groups: dict[tuple[str, int], list[dict]] = {}
@@ -7851,7 +8011,11 @@ def _provider_terminal_identity_for_tab(
         provider_tty = str(process.get("tty") or "")
         owner_pid = 0
         if provider_tty != terminal_tty:
-            owner_pid = _terminal_script_owner_pid(pid, terminal_tty)
+            owner = _snapshot_terminal_script_owner(
+                process_snapshot, pid, terminal_tty
+            )
+            if owner is not None:
+                owner_pid = int(owner.get("pid") or 0)
             if owner_pid <= 0:
                 continue
         groups.setdefault((provider_tty, owner_pid), []).append(process)
@@ -7872,11 +8036,17 @@ def _provider_terminal_identity_for_tab(
     family_pids = [
         int(item.get("pid") or 0)
         for item in candidates
-        if _process_is_descendant_of(int(item.get("pid") or 0), control_pid)
+        if _snapshot_process_is_descendant_of(
+            process_snapshot,
+            int(item.get("pid") or 0),
+            control_pid,
+        )
     ]
     if not family_pids:
         return None
-    owner_started_at = _process_start_epoch(owner_pid) if owner_pid else 0.0
+    owner_started_at = float(
+        (process_snapshot.get(owner_pid) or {}).get("started_at") or 0
+    )
     return {
         **control,
         "pid": control_pid,
@@ -7928,7 +8098,14 @@ _codex_terminal_scan_cache: dict[str, object] = {
     "membership_complete": False,
 }
 _codex_terminal_scan_lock = threading.Lock()
-_claude_terminal_scan_cache: dict[str, object] = {"ts": 0.0, "rows": []}
+_claude_terminal_scan_cache: dict[str, object] = {
+    "ts": 0.0,
+    "rows": [],
+    "probe_state": "unknown",
+    "probe_reason": None,
+    "membership_complete": False,
+}
+_claude_terminal_scan_lock = threading.Lock()
 _codex_task_boundary_cache: dict[str, dict[str, object]] = {}
 
 
@@ -8192,7 +8369,9 @@ def _codex_live_terminal_rows_locked() -> list[dict]:
         )
         return rows
 
-    ps_ok, process_rows = _scan_provider_process_rows("codex")
+    ps_ok, process_rows, process_snapshot = _scan_provider_process_rows(
+        "codex", include_snapshot=True
+    )
     if not ps_ok:
         return degraded_rows("process_scan_failed")
 
@@ -8217,9 +8396,19 @@ def _codex_live_terminal_rows_locked() -> list[dict]:
             key=lambda item: int(item.get("pid") or 0),
         )
         control_pid = int(control.get("pid") or 0)
+        owner = _snapshot_terminal_script_owner(
+            process_snapshot, control_pid
+        )
+        terminal_tty = str((owner or {}).get("tty") or tty)
         by_tty[tty] = {
             "pid": control_pid,
             "tty": tty,
+            "provider_tty": tty,
+            "terminal_tty": terminal_tty,
+            "terminal_owner_pid": int((owner or {}).get("pid") or 0),
+            "terminal_owner_process_started_at": float(
+                (owner or {}).get("started_at") or 0
+            ),
             "project": control.get("project"),
             "started_at": control.get("started_at"),
             "command": control.get("command"),
@@ -8228,7 +8417,7 @@ def _codex_live_terminal_rows_locked() -> list[dict]:
             ),
         }
 
-    rollout_probe = _codex_open_rollouts_by_pid(
+    rollout_probe_ok, rollout_map = _codex_open_rollouts_by_pid(
         [
             pid
             for row in by_tty.values()
@@ -8236,12 +8425,6 @@ def _codex_live_terminal_rows_locked() -> list[dict]:
         ],
         include_probe_status=True,
     )
-    if isinstance(rollout_probe, tuple):
-        rollout_probe_ok, rollout_map = rollout_probe
-    else:
-        # Test doubles written against the older helper contract return only
-        # the exact map. Production calls always use the status tuple.
-        rollout_probe_ok, rollout_map = True, rollout_probe
     if not rollout_probe_ok:
         return degraded_rows("rollout_identity_probe_failed")
     for row in by_tty.values():
@@ -8250,7 +8433,9 @@ def _codex_live_terminal_rows_locked() -> list[dict]:
         verified_provider_pids = [
             pid
             for pid in (row.get("provider_pids") or [])
-            if _process_is_descendant_of(int(pid), control_pid)
+            if _snapshot_process_is_descendant_of(
+                process_snapshot, int(pid), control_pid
+            )
         ]
         for pid in verified_provider_pids:
             for candidate in rollout_map.get(int(pid), []):
@@ -8282,12 +8467,22 @@ def _codex_live_terminal_rows_locked() -> list[dict]:
 
 
 def _claude_live_terminal_rows() -> list[dict]:
+    with _claude_terminal_scan_lock:
+        return _claude_live_terminal_rows_locked()
+
+
+def _claude_live_terminal_rows_locked() -> list[dict]:
     now = _time.time()
     cached_ts = float(_claude_terminal_scan_cache.get("ts") or 0)
     if now - cached_ts < 2:
-        return list(_claude_terminal_scan_cache.get("rows") or [])
+        return copy.deepcopy(_claude_terminal_scan_cache.get("rows") or [])
     ps_ok, process_rows = _scan_provider_process_rows("claude")
     if not ps_ok:
+        _claude_terminal_scan_cache["ts"] = now
+        _claude_terminal_scan_cache["rows"] = []
+        _claude_terminal_scan_cache["probe_state"] = "failed"
+        _claude_terminal_scan_cache["probe_reason"] = "process_scan_failed"
+        _claude_terminal_scan_cache["membership_complete"] = False
         return []
 
     by_tty: dict[str, dict] = {}
@@ -8308,8 +8503,11 @@ def _claude_live_terminal_rows() -> list[dict]:
             }
     rows = list(by_tty.values())
     _claude_terminal_scan_cache["ts"] = now
-    _claude_terminal_scan_cache["rows"] = rows
-    return rows
+    _claude_terminal_scan_cache["rows"] = copy.deepcopy(rows)
+    _claude_terminal_scan_cache["probe_state"] = "exact"
+    _claude_terminal_scan_cache["probe_reason"] = None
+    _claude_terminal_scan_cache["membership_complete"] = True
+    return copy.deepcopy(rows)
 
 
 def _codex_discover_terminal_control_for_session(native_id: str) -> dict | None:
@@ -8343,16 +8541,50 @@ def _codex_register_terminal_only_rows(seen: set[str]) -> None:
     for terminal in _codex_live_terminal_rows():
         if str(terminal.get("identity_probe_state") or "exact") != "exact":
             continue
-        tty = str(terminal.get("tty") or "")
+        provider_tty = str(
+            terminal.get("provider_tty") or terminal.get("tty") or ""
+        )
+        terminal_tty = str(terminal.get("terminal_tty") or provider_tty)
         project = str(terminal.get("project") or "")
         pid = int(terminal.get("pid") or 0)
-        if not project or not pid or not re.match(r"^/dev/ttys[0-9]{3,}$", tty):
+        try:
+            terminal_owner_pid = int(terminal.get("terminal_owner_pid") or 0)
+            terminal_owner_started_at = float(
+                terminal.get("terminal_owner_process_started_at") or 0
+            )
+            process_started_at = float(terminal.get("started_at") or 0)
+        except (TypeError, ValueError):
             continue
+        if (
+            not project
+            or pid <= 0
+            or process_started_at <= 0
+            or re.fullmatch(r"/dev/ttys[0-9]{3,}", provider_tty) is None
+            or re.fullmatch(r"/dev/ttys[0-9]{3,}", terminal_tty) is None
+        ):
+            continue
+        if (
+            provider_tty != terminal_tty
+            and (terminal_owner_pid <= 0 or terminal_owner_started_at <= 0)
+        ):
+            continue
+        discovery_metadata = {
+            "discovered_by": "terminal_scan",
+            "terminal_only": True,
+            "command": str(terminal.get("command") or "")[:500],
+            "process_started_at": process_started_at,
+            "provider_tty": provider_tty,
+        }
+        if terminal_owner_pid > 0 and terminal_owner_started_at > 0:
+            discovery_metadata.update({
+                "terminal_owner_pid": terminal_owner_pid,
+                "terminal_owner_process_started_at": terminal_owner_started_at,
+            })
         exact_native_id = str(terminal.get("native_id") or "")
         if exact_native_id:
             _agent_registry_promote_codex(exact_native_id, project, 0)
             continue
-        existing = _agent_registry_get_by_tty("codex", tty)
+        existing = _agent_registry_get_by_tty("codex", terminal_tty)
         if existing and not existing.get("closed_at"):
             native_id = str(existing.get("native_id") or "")
             existing_pid = int(existing.get("pid") or 0)
@@ -8361,23 +8593,45 @@ def _codex_register_terminal_only_rows(seen: set[str]) -> None:
                 native_id == expected_terminal_native_id
                 and str(existing.get("project") or "") == project
             ):
-                existing_metadata = _registry_metadata_from_row(existing)
-                _agent_registry_upsert(
-                    "codex",
-                    native_id,
-                    project,
-                    pid=pid,
-                    terminal_tty=tty,
-                    state="running",
-                    metadata=existing_metadata,
-                    working_on=str(existing.get("working_on") or "Live Codex terminal"),
-                )
+                if (
+                    existing_pid == pid
+                    and str(existing.get("terminal_tty") or "") == terminal_tty
+                    and _codex_inventory_registry_process_matches(
+                        existing, [terminal]
+                    )
+                ):
+                    # A safety scan is observation, not new session activity.
+                    # Refresh the stale-sweep lease without publishing a
+                    # summary event that would wake every sessions stream and
+                    # immediately trigger another scan.
+                    _agent_registry_update_control(
+                        "codex",
+                        native_id,
+                        pid=pid,
+                        terminal_tty=terminal_tty,
+                        state="running",
+                    )
+                else:
+                    existing_metadata = _registry_metadata_from_row(existing)
+                    existing_metadata.update(discovery_metadata)
+                    _agent_registry_upsert(
+                        "codex",
+                        native_id,
+                        project,
+                        pid=pid,
+                        terminal_tty=terminal_tty,
+                        state="running",
+                        metadata=existing_metadata,
+                        working_on=str(existing.get("working_on") or "Live Codex terminal"),
+                    )
                 continue
             if (
                 native_id.startswith("pending-")
                 and existing_pid == pid
                 and str(existing.get("project") or "") == project
-                and _codex_registry_process_birth_matches(existing, pid)
+                and _codex_inventory_registry_process_matches(
+                    existing, [terminal]
+                )
             ):
                 continue
             if native_id.startswith("terminal-") or existing_pid <= 0 or not _process_alive(existing_pid):
@@ -8390,13 +8644,9 @@ def _codex_register_terminal_only_rows(seen: set[str]) -> None:
             native_id,
             project,
             pid=pid,
-            terminal_tty=tty,
+            terminal_tty=terminal_tty,
             state="running",
-            metadata={
-                "discovered_by": "terminal_scan",
-                "terminal_only": True,
-                "command": str(terminal.get("command") or "")[:500],
-            },
+            metadata=discovery_metadata,
             working_on="Live Codex terminal",
         )
 
@@ -8459,6 +8709,153 @@ def _session_has_verified_provider_process(row: dict, provider: str | None = Non
             continue
         return True
     return False
+
+
+def _codex_inventory_registry_process_matches(
+    reg: dict | None,
+    live_terminal_rows: list[dict] | None = None,
+) -> bool:
+    """Verify read-only inventory membership against one exact scan.
+
+    This deliberately does not replace the mutation verifier below. Inventory
+    may use the scan's process birth and terminal topology. A signal or stale
+    close must still re-read the target process immediately before mutation.
+    """
+    if not isinstance(reg, dict) or reg.get("closed_at") is not None:
+        return False
+    if str(reg.get("provider") or "codex").strip().lower() != "codex":
+        return False
+    pid = int(reg.get("pid") or 0)
+    native_id = str(reg.get("native_id") or "")
+    project = str(reg.get("project") or "")
+    terminal_tty = str(reg.get("terminal_tty") or "")
+    metadata = _registry_metadata_from_row(reg)
+    try:
+        expected_started_at = float(metadata.get("process_started_at") or 0)
+        stored_owner_pid = int(metadata.get("terminal_owner_pid") or 0)
+        stored_owner_started_at = float(
+            metadata.get("terminal_owner_process_started_at") or 0
+        )
+    except (TypeError, ValueError):
+        return False
+    expected_provider_tty = str(metadata.get("provider_tty") or terminal_tty)
+    if (
+        pid <= 0
+        or expected_started_at <= 0
+        or re.fullmatch(r"/dev/ttys[0-9]{3,}", terminal_tty) is None
+        or re.fullmatch(r"/dev/ttys[0-9]{3,}", expected_provider_tty) is None
+    ):
+        return False
+
+    candidates = (
+        live_terminal_rows
+        if live_terminal_rows is not None
+        else _codex_live_terminal_rows()
+    )
+    for candidate in candidates:
+        if str(candidate.get("identity_probe_state") or "exact") != "exact":
+            continue
+        if int(candidate.get("pid") or 0) != pid:
+            continue
+        try:
+            actual_started_at = float(candidate.get("started_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if (
+            actual_started_at <= 0
+            or abs(actual_started_at - expected_started_at) > 2
+        ):
+            continue
+        candidate_native_id = str(candidate.get("native_id") or "")
+        if (
+            native_id
+            and not native_id.startswith(("pending-", "terminal-"))
+            and candidate_native_id != native_id
+        ):
+            continue
+        candidate_project = str(candidate.get("project") or "")
+        if project:
+            if not candidate_project:
+                continue
+            try:
+                projects_match = os.path.realpath(candidate_project) == os.path.realpath(project)
+            except OSError:
+                projects_match = candidate_project == project
+            if not projects_match:
+                continue
+
+        candidate_provider_tty = str(
+            candidate.get("provider_tty") or candidate.get("tty") or ""
+        )
+        candidate_terminal_tty = str(
+            candidate.get("terminal_tty") or candidate_provider_tty
+        )
+        if (
+            candidate_provider_tty != expected_provider_tty
+            or candidate_terminal_tty != terminal_tty
+        ):
+            continue
+        if terminal_tty != expected_provider_tty:
+            try:
+                candidate_owner_pid = int(
+                    candidate.get("terminal_owner_pid") or 0
+                )
+                candidate_owner_started_at = float(
+                    candidate.get("terminal_owner_process_started_at") or 0
+                )
+            except (TypeError, ValueError):
+                continue
+            if (
+                stored_owner_pid <= 0
+                or stored_owner_started_at <= 0
+                or candidate_owner_pid != stored_owner_pid
+                or candidate_owner_started_at <= 0
+                or abs(
+                    candidate_owner_started_at - stored_owner_started_at
+                ) > 2
+            ):
+                continue
+        return True
+    return False
+
+
+def _codex_registry_row_for_strict_live_display(row: dict) -> dict | None:
+    """Resolve private process proof for one public Codex session row.
+
+    API rows deliberately omit registry metadata such as process birth time.
+    Strict membership must therefore verify the owning registry row instead of
+    re-running the birth check against the redacted response object.
+    """
+    native_id = str(row.get("native_id") or "").strip()
+    if not native_id:
+        return None
+    canonical_id = _agent_registry_resolve_native_alias("codex", native_id)
+    reg = _agent_registry_get("codex", canonical_id)
+    if not reg or reg.get("closed_at") is not None:
+        return None
+
+    display_pid = int(row.get("pid") or row.get("claude_pid") or 0)
+    registry_pid = int(reg.get("pid") or 0)
+    if display_pid <= 0 or registry_pid != display_pid:
+        return None
+
+    display_tty = str(row.get("terminal_tty") or "")
+    registry_tty = str(reg.get("terminal_tty") or "")
+    if display_tty and registry_tty != display_tty:
+        return None
+
+    display_project = str(row.get("project") or "")
+    registry_project = str(reg.get("project") or "")
+    if display_project:
+        if not registry_project:
+            return None
+        try:
+            projects_match = os.path.realpath(display_project) == os.path.realpath(registry_project)
+        except OSError:
+            projects_match = display_project == registry_project
+        if not projects_match:
+            return None
+    return reg
 
 
 def _session_signal_target_is_verified(row: dict, provider: str, pid: int) -> bool:
@@ -11555,6 +11952,7 @@ def _direct_terminal_action_profile(
     tty: str,
     *,
     allowed: bool = True,
+    inventory_live_terminal_rows: list[dict] | None = None,
 ) -> dict:
     """Expose only the direct Terminal actions whose identity is still proven."""
     read_only = {
@@ -11571,7 +11969,21 @@ def _direct_terminal_action_profile(
     if not re.match(r"^/dev/ttys[0-9]{3,}$", tty or ""):
         return read_only
     pid = int(registry_row.get("pid") or registry_row.get("claude_pid") or 0)
-    if pid <= 0 or not _process_alive(pid):
+    if pid <= 0:
+        return read_only
+    if inventory_live_terminal_rows is not None and provider == "codex":
+        if not _codex_inventory_registry_process_matches(
+            registry_row, inventory_live_terminal_rows
+        ):
+            return read_only
+        return {
+            "can_control": False,
+            "can_send_text": True,
+            "can_interrupt": True,
+            "can_terminate": True,
+            "control_profile": "direct_terminal_receipted",
+        }
+    if not _process_alive(pid):
         return read_only
     # Bind the recorded provider process to the exact Terminal tab before
     # advertising any action. A script-backed launch has separate provider and
@@ -11592,7 +12004,11 @@ def _direct_terminal_action_profile(
     }
 
 
-def _terminal_surface_source(raw_session: str) -> dict:
+def _terminal_surface_source(
+    raw_session: str,
+    *,
+    inventory_live_terminal_rows: list[dict] | None = None,
+) -> dict:
     provider, native_id = _parse_agent_session_ref(raw_session)
     qualified = _qualified_session_id(provider, native_id) if native_id else ""
     if not native_id:
@@ -11662,7 +12078,11 @@ def _terminal_surface_source(raw_session: str) -> dict:
                 candidates = _codex_terminal_tty_candidates(reg)
                 tty = candidates[0] if candidates else ""
             direct_actions = _direct_terminal_action_profile(
-                "codex", reg, tty, allowed=not broker_id
+                "codex",
+                reg,
+                tty,
+                allowed=not broker_id,
+                inventory_live_terminal_rows=inventory_live_terminal_rows,
             )
             return {
                 "available": True,
@@ -11682,7 +12102,11 @@ def _terminal_surface_source(raw_session: str) -> dict:
         if not re.match(r"^/dev/ttys[0-9]{3,}$", tty):
             return {"available": False, "source": "unavailable", "reason": "invalid_tty", "tty": tty}
         direct_actions = _direct_terminal_action_profile(
-            "codex", reg, tty, allowed=not broker_id
+            "codex",
+            reg,
+            tty,
+            allowed=not broker_id,
+            inventory_live_terminal_rows=inventory_live_terminal_rows,
         )
         if direct_actions.get("control_profile") == "read_only":
             return {
@@ -11796,8 +12220,15 @@ def _terminal_surface_source(raw_session: str) -> dict:
     return {"available": False, "source": "unavailable", "reason": broker_error or "no_terminal_tty"}
 
 
-def _terminal_surface_capabilities(raw_session: str) -> dict:
-    source = _terminal_surface_source(raw_session)
+def _terminal_surface_capabilities(
+    raw_session: str,
+    *,
+    inventory_live_terminal_rows: list[dict] | None = None,
+) -> dict:
+    source = _terminal_surface_source(
+        raw_session,
+        inventory_live_terminal_rows=inventory_live_terminal_rows,
+    )
     capabilities = []
     if source.get("available"):
         capabilities.extend(["terminal_output", "terminal_surface"])
@@ -11886,9 +12317,19 @@ def _session_terminal_title(row: dict) -> str | None:
         return None
     if not session_id or PTY_BROKER is None:
         return None
-    source = _terminal_surface_capabilities(session_id)
-    broker_id = str(source.get("broker_id") or "").strip()
-    if source.get("source") != "broker_vt" or not broker_id:
+    registry_metadata = _registry_metadata_from_row(registry_row)
+    broker_id = str(
+        row.get("broker_id") or registry_metadata.get("broker_id") or ""
+    ).strip()
+    if not broker_id:
+        return None
+    try:
+        broker_session = PTY_BROKER.get(broker_id)
+    except Exception:
+        return None
+    if broker_session is None or not _broker_session_owns_identity(
+        broker_session, provider, native_id
+    ):
         return None
     snapshot = _broker_snapshot_or_none(broker_id)
     return cleaned((snapshot or {}).get("title"))
@@ -14637,6 +15078,7 @@ def _codex_control_overlay(
     *,
     verify_process: bool = True,
     observed_output_path: str = "",
+    inventory_live_terminal_rows: list[dict] | None = None,
 ) -> dict:
     if verify_process:
         reg = _agent_registry_promote_codex(
@@ -14684,7 +15126,8 @@ def _codex_control_overlay(
         return row
     state_payload = _codex_turn_state_payload(row.get("native_id") or "", apply_boundary=False)
     surface_caps = _terminal_surface_capabilities(
-        _qualified_session_id("codex", row.get("native_id") or "")
+        _qualified_session_id("codex", row.get("native_id") or ""),
+        inventory_live_terminal_rows=inventory_live_terminal_rows,
     )
     broker_id = str(
         _durable_broker_id_from_registry_row(
@@ -14748,7 +15191,12 @@ def _codex_control_overlay(
     return row
 
 
-def _codex_pending_registry_rows(seen: set[str], live_only: bool, active_within_min: int) -> list[dict]:
+def _codex_pending_registry_rows(
+    seen: set[str],
+    live_only: bool,
+    active_within_min: int,
+    live_terminal_rows: list[dict] | None = None,
+) -> list[dict]:
     cutoff = _time.time() - max(1, active_within_min) * 60
     rows: list[dict] = []
     for reg in _agent_registry_live("codex"):
@@ -14764,13 +15212,17 @@ def _codex_pending_registry_rows(seen: set[str], live_only: bool, active_within_
         process_alive = bool(pid and _process_alive(pid))
         stale_seconds = max(0, int(_time.time() - heartbeat)) if heartbeat else 0
         surface_caps = _terminal_surface_capabilities(
-            _qualified_session_id("codex", native_id)
+            _qualified_session_id("codex", native_id),
+            inventory_live_terminal_rows=live_terminal_rows,
         )
         can_send = bool(surface_caps.get("can_send_text"))
         can_interrupt = bool(surface_caps.get("can_interrupt"))
         can_terminate = bool(surface_caps.get("can_terminate"))
         process_verified = bool(
-            process_alive and _session_has_verified_provider_process(reg, "codex")
+            process_alive
+            and _codex_inventory_registry_process_matches(
+                reg, live_terminal_rows
+            )
         )
         broker_verified = bool(
             surface_caps.get("source") == "broker_vt"
@@ -15207,6 +15659,7 @@ def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> li
             st.st_mtime,
             verify_process=verify_process,
             observed_output_path=str(path),
+            inventory_live_terminal_rows=live_terminal_rows,
         )
         if sid in ambiguous_live_native_ids:
             reason = (
@@ -15240,7 +15693,9 @@ def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> li
             control_reg = _agent_registry_get("codex", sid)
             has_verified_process = bool(
                 control_reg
-                and _session_has_verified_provider_process(control_reg, "codex")
+                and _codex_inventory_registry_process_matches(
+                    control_reg, live_terminal_rows
+                )
             )
             if row.get("closed_at") is not None or not (
                 has_verified_action
@@ -15261,7 +15716,12 @@ def _list_codex_sessions_uncached(live_only: bool, active_within_min: int) -> li
                 }
         rows.append(row)
     _codex_register_terminal_only_rows(seen)
-    rows.extend(_codex_pending_registry_rows(seen, live_only, active_within_min))
+    rows.extend(_codex_pending_registry_rows(
+        seen,
+        live_only,
+        active_within_min,
+        live_terminal_rows,
+    ))
     if not live_only:
         rows.extend(_codex_recent_closed_registry_rows(
             seen,
@@ -19164,9 +19624,22 @@ class Handler(BaseHTTPRequestHandler):
 
         rows = _filter_tombstoned_session_rows(rows)
         rows = _collapse_live_session_rows_by_terminal(rows)
+        codex_live_terminal_rows = (
+            _codex_live_terminal_rows()
+            if any(
+                row.get("provider") == "codex"
+                and row.get("closed_at") is None
+                for row in rows
+            )
+            else []
+        )
         if not live_only:
             rows.sort(key=_session_meaningful_sort_key)
-            rows = self._limit_visible_session_rows(rows, limit=limit)
+            rows = self._limit_visible_session_rows(
+                rows,
+                limit=limit,
+                codex_live_terminal_rows=codex_live_terminal_rows,
+            )
 
         enriched_rows: list[dict] = []
         for row in rows:
@@ -19185,23 +19658,41 @@ class Handler(BaseHTTPRequestHandler):
         rows = enriched_rows
 
         if live_only:
-            projected_rows = [self._strict_live_projection(row) for row in rows]
+            projected_rows = [
+                self._strict_live_projection(row, codex_live_terminal_rows)
+                for row in rows
+            ]
             rows = [row for row in projected_rows if row is not None]
         rows.sort(key=_session_meaningful_sort_key)
-        rows = self._limit_visible_session_rows(rows, limit=limit)
+        rows = self._limit_visible_session_rows(
+            rows,
+            limit=limit,
+            codex_live_terminal_rows=codex_live_terminal_rows,
+        )
         for row in rows:
             row["runtime_truth_summary"] = self._runtime_truth_summary_for_row(row)
         _record_sessions_scan(rows)
         return rows
 
     @classmethod
-    def _limit_visible_session_rows(cls, rows: list[dict], limit: int) -> list[dict]:
+    def _limit_visible_session_rows(
+        cls,
+        rows: list[dict],
+        limit: int,
+        codex_live_terminal_rows: list[dict] | None = None,
+    ) -> list[dict]:
         """Keep verified live terminals inside an archive-heavy response cap."""
         cap = max(1, min(int(limit or 200), 500))
         if len(rows) <= cap:
             return rows
 
-        live_rows = [row for row in rows if cls._session_row_is_strictly_live(row)]
+        live_rows = [
+            row
+            for row in rows
+            if cls._session_row_is_strictly_live(
+                row, codex_live_terminal_rows
+            )
+        ]
         if len(live_rows) >= cap:
             return live_rows[:cap]
 
@@ -19252,8 +19743,8 @@ class Handler(BaseHTTPRequestHandler):
         emitted an empty snapshot during outages and the phone wiped its
         list — sessions looked deleted instead of unreadable.
 
-        In sqlite mode the registry is in-process and cannot be "down", so
-        there is no degradation axis — return None unconditionally."""
+        Process inventory remains a separate truth axis in every storage mode.
+        The database probe only applies when Claude uses Postgres."""
         try:
             _read_session_tombstones()
         except SessionTombstoneStoreError as error:
@@ -19279,7 +19770,30 @@ class Handler(BaseHTTPRequestHandler):
                         "the Mac. The last trusted session list is being kept."
                     ),
                 }
-        if _session_backend() == "sqlite":
+        claude_relevant = (
+            provider_filter in {"all", "claude"}
+            and "claude" in _visible_agent_provider_ids()
+        )
+        if claude_relevant:
+            with _claude_terminal_scan_lock:
+                claude_probe_state = _claude_terminal_scan_cache.get(
+                    "probe_state"
+                )
+                claude_membership_complete = bool(
+                    _claude_terminal_scan_cache.get("membership_complete")
+                )
+            if (
+                claude_probe_state == "failed"
+                and not claude_membership_complete
+            ):
+                return {
+                    "reason": "claude_process_scan_unavailable",
+                    "detail": (
+                        "Pairling could not verify the full Claude process list "
+                        "on the Mac. The last trusted session list is being kept."
+                    ),
+                }
+        if not claude_relevant or _session_backend() == "sqlite":
             return None
 
         def probe() -> dict:
@@ -19315,7 +19829,10 @@ class Handler(BaseHTTPRequestHandler):
         return list(payload.get("items") or [])
 
     @staticmethod
-    def _session_row_is_strictly_live(row: dict) -> bool:
+    def _session_row_is_strictly_live(
+        row: dict,
+        codex_live_terminal_rows: list[dict] | None = None,
+    ) -> bool:
         if row.get("closed_at") is not None:
             return False
         if (
@@ -19341,7 +19858,15 @@ class Handler(BaseHTTPRequestHandler):
             # while removing every mutation capability until the probe heals.
             return True
         if pid > 0 or has_real_tty:
-            return _session_has_verified_provider_process(row)
+            verification_row = row
+            if row.get("provider") == "codex":
+                verification_row = _codex_registry_row_for_strict_live_display(row)
+                if verification_row is None:
+                    return False
+                return _codex_inventory_registry_process_matches(
+                    verification_row, codex_live_terminal_rows
+                )
+            return _session_has_verified_provider_process(verification_row)
         # Older Claude hook rows may not have a pid yet. A fresh hook-backed
         # UUID is still stronger evidence than transcript mtime alone, but it
         # is membership proof only. Without a pid or TTY the row is read-only.
@@ -19351,8 +19876,14 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     @classmethod
-    def _strict_live_projection(cls, row: dict) -> dict | None:
-        if not cls._session_row_is_strictly_live(row):
+    def _strict_live_projection(
+        cls,
+        row: dict,
+        codex_live_terminal_rows: list[dict] | None = None,
+    ) -> dict | None:
+        if not cls._session_row_is_strictly_live(
+            row, codex_live_terminal_rows
+        ):
             return None
         projected = dict(row)
         projected["readable_state"] = "live"
@@ -19458,10 +19989,21 @@ class Handler(BaseHTTPRequestHandler):
         has_verified_process = can_control
         if not closed_at and not has_verified_process:
             try:
-                has_verified_process = _session_has_verified_provider_process(
-                    row,
-                    str(row.get("provider") or "claude"),
-                )
+                if str(row.get("provider") or "claude") == "codex":
+                    registry_row = _codex_registry_row_for_strict_live_display(
+                        row
+                    )
+                    has_verified_process = bool(
+                        registry_row
+                        and _codex_inventory_registry_process_matches(
+                            registry_row
+                        )
+                    )
+                else:
+                    has_verified_process = _session_has_verified_provider_process(
+                        row,
+                        str(row.get("provider") or "claude"),
+                    )
             except Exception:
                 has_verified_process = False
 
@@ -19540,9 +20082,22 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 }, status=503)
                 return
+            codex_rows = _list_codex_sessions(
+                live_only=live_only,
+                active_within_min=within_min,
+            )
+            if live_only:
+                degraded = self._sessions_backend_degradation(provider_filter)
+                if degraded is not None:
+                    self._send_json({
+                        "count": 0,
+                        "items": [],
+                        "degraded": degraded,
+                    }, status=503)
+                    return
             rows = [
                 self._decorate_session_lifecycle_row(row)
-                for row in _list_codex_sessions(live_only=live_only, active_within_min=within_min)
+                for row in codex_rows
             ]
             rows = _filter_tombstoned_session_rows(rows)
             rows = _collapse_live_session_rows_by_terminal(rows)
@@ -19567,7 +20122,14 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 backend_rows = backend.sessions_rows(live_only, within_min)
             except RuntimeError as exc:
-                self.send_error(502, str(exc)[:220])
+                self._send_json({
+                    "count": 0,
+                    "items": [],
+                    "degraded": {
+                        "reason": "sessions_backend_unreachable",
+                        "detail": str(exc)[:220],
+                    },
+                }, status=503)
                 return
 
         rows = []
@@ -19644,6 +20206,16 @@ class Handler(BaseHTTPRequestHandler):
         else:
             rows = _filter_tombstoned_session_rows(rows)
             rows = _collapse_live_session_rows_by_terminal(rows)
+
+        if live_only:
+            degraded = self._sessions_backend_degradation(provider_filter)
+            if degraded is not None:
+                self._send_json({
+                    "count": 0,
+                    "items": [],
+                    "degraded": degraded,
+                }, status=503)
+                return
 
         _record_sessions_scan(rows)
         body = json.dumps({"count": len(rows), "items": rows}).encode()
@@ -19776,17 +20348,6 @@ class Handler(BaseHTTPRequestHandler):
             _send_unknown_provider(self, provider_filter)
             return
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
-
-        last_hash: str | None = None
-        last_keepalive = _time.time()
-        deadline = _time.time() + 600  # 10 min
-
         def collect_live() -> list[dict]:
             _agent_registry_close_stale()
             return self._collect_sessions_stream_rows(provider_filter)
@@ -19812,18 +20373,41 @@ class Handler(BaseHTTPRequestHandler):
             ).hexdigest()
             return json.dumps(body).encode(), digest
 
+        # Build the first authoritative snapshot before committing the SSE
+        # response headers. If session truth cannot be computed, return a
+        # typed retryable failure instead of opening a silent stream that can
+        # leave the phone showing an unproven empty dashboard for ten minutes.
+        try:
+            initial = collect_live()
+            payload, last_hash = snapshot_payload(initial)
+        except Exception:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "sessions_initial_snapshot_unavailable",
+                    "message": "The Mac could not confirm the current session list. Pairling will retry.",
+                },
+            }, status=503)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        last_keepalive = _time.time()
+        deadline = _time.time() + 600  # 10 min
+
         try:
             # Emit initial snapshot immediately so the iPhone never paints
             # an empty Dashboard while waiting for the first poll.
             # Initial snapshot body contract: {"items": initial}.
-            initial = collect_live()
-            payload, last_hash = snapshot_payload(initial)
             self.wfile.write(b"event: snapshot\ndata: " + payload + b"\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             return
-        except Exception:
-            pass
 
         sessions_wakes = SESSION_EVENT_HUB.subscribe(SESSION_SUMMARIES_TOPIC) if SESSION_EVENT_HUB is not None else None
         last_scan = _time.time()
