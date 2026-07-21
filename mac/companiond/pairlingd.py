@@ -72,6 +72,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import MappingProxyType
 from urllib.parse import urlparse, parse_qs, quote, unquote
 
 _DAEMON_SCRIPT_PATH = Path(__file__).resolve()
@@ -5574,6 +5575,9 @@ def _agent_registry_close_stale(now: float | None = None) -> int:
 
 
 def _agent_registry_get(provider: str, native_id: str) -> dict | None:
+    snapshot = _current_agent_registry_read_snapshot(provider)
+    if snapshot is not None:
+        return snapshot.get(native_id)
     try:
         with _agent_registry_conn() as conn:
             row = conn.execute(
@@ -5757,12 +5761,18 @@ def _agent_registry_row_for_broker_id(provider: str, broker_id: str) -> dict | N
         provider, _parse_agent_session_ref(broker_id)[1]
     ):
         return None
+    snapshot = _current_agent_registry_read_snapshot(provider)
+    if snapshot is not None:
+        return snapshot.row_for_broker_id(broker_id)
     try:
         with _agent_registry_conn() as conn:
             rows = conn.execute(
                 "SELECT * FROM agent_sessions WHERE provider = ? "
-                "AND metadata_json LIKE ? ORDER BY last_heartbeat DESC LIMIT 3",
-                (provider, f"%{broker_id}%"),
+                "AND CASE WHEN json_valid(metadata_json) "
+                "THEN json_extract(metadata_json, '$.broker_id') END = ? "
+                "ORDER BY CASE WHEN closed_at IS NULL THEN 0 ELSE 1 END, "
+                "last_heartbeat DESC LIMIT 2",
+                (provider, broker_id),
             ).fetchall()
     except Exception:
         return None
@@ -5821,6 +5831,9 @@ def _agent_registry_row_for_send_scope_id(
     send_scope_id = _normalized_send_scope_id(provider, send_scope_id)
     if not send_scope_id:
         return None
+    snapshot = _current_agent_registry_read_snapshot(provider)
+    if snapshot is not None:
+        return snapshot.row_for_send_scope_id(send_scope_id)
     try:
         with _agent_registry_conn() as conn:
             rows = conn.execute(
@@ -5860,6 +5873,385 @@ def _durable_broker_id_from_registry_row(
     if metadata.get("capture_backend") != "pty_broker" and not broker_id:
         return None
     return broker_id or _qualified_session_id(provider, native_id)
+
+
+class _AgentRegistryReadSnapshot:
+    """One immutable provider view used by a session-list request.
+
+    Session collection resolves the same native ids many times while shaping
+    transcript, state, and terminal rows. Reading those identities from one
+    SQLite snapshot keeps the result internally consistent and avoids opening
+    a new connection for every lookup. Callers always receive mutable copies;
+    the captured rows and indexes cannot be changed in place.
+    """
+
+    __slots__ = (
+        "provider",
+        "_rows",
+        "_by_native_id",
+        "_by_send_scope_id",
+        "_by_broker_id",
+        "_send_scope_counts",
+        "_broker_live_counts",
+        "_broker_total_counts",
+    )
+
+    def __init__(
+        self,
+        provider: str,
+        rows: list[dict],
+        *,
+        send_scope_counts: dict[str, int] | None = None,
+        broker_live_counts: dict[str, int] | None = None,
+        broker_total_counts: dict[str, int] | None = None,
+    ):
+        self.provider = str(provider or "").strip().lower()
+        ordered_rows = sorted(
+            (dict(row) for row in rows if row.get("provider") == self.provider),
+            key=lambda row: float(row.get("last_heartbeat") or 0),
+            reverse=True,
+        )
+        frozen_rows = tuple(MappingProxyType(row) for row in ordered_rows)
+        by_native_id = {}
+        by_send_scope_id: dict[str, list[MappingProxyType]] = {}
+        by_broker_id: dict[str, list[MappingProxyType]] = {}
+        for row in frozen_rows:
+            native_id = str(row.get("native_id") or "")
+            if native_id:
+                by_native_id.setdefault(native_id, row)
+            if row.get("closed_at") is None:
+                send_scope_id = _durable_send_scope_id_from_registry_row(
+                    row,
+                    provider=self.provider,
+                    native_id=native_id,
+                )
+                if send_scope_id:
+                    by_send_scope_id.setdefault(send_scope_id, []).append(row)
+            raw_broker_id = str(
+                _registry_metadata_from_row(row).get("broker_id") or ""
+            )
+            broker_id = _normalized_send_scope_id(
+                self.provider,
+                raw_broker_id,
+            )
+            if broker_id and raw_broker_id == broker_id:
+                by_broker_id.setdefault(broker_id, []).append(row)
+
+        self._rows = frozen_rows
+        self._by_native_id = MappingProxyType(by_native_id)
+        self._by_send_scope_id = MappingProxyType({
+            key: tuple(matches) for key, matches in by_send_scope_id.items()
+        })
+        self._by_broker_id = MappingProxyType({
+            key: tuple(matches) for key, matches in by_broker_id.items()
+        })
+        self._send_scope_counts = MappingProxyType(
+            dict(send_scope_counts)
+            if send_scope_counts is not None
+            else {key: len(matches) for key, matches in by_send_scope_id.items()}
+        )
+        self._broker_live_counts = MappingProxyType(
+            dict(broker_live_counts)
+            if broker_live_counts is not None
+            else {
+                key: sum(row.get("closed_at") is None for row in matches)
+                for key, matches in by_broker_id.items()
+            }
+        )
+        self._broker_total_counts = MappingProxyType(
+            dict(broker_total_counts)
+            if broker_total_counts is not None
+            else {key: len(matches) for key, matches in by_broker_id.items()}
+        )
+
+    @staticmethod
+    def _copy(row) -> dict | None:
+        return dict(row) if row is not None else None
+
+    def get(self, native_id: str) -> dict | None:
+        return self._copy(self._by_native_id.get(str(native_id or "")))
+
+    def live(self, limit: int) -> list[dict]:
+        cap = max(1, min(int(limit or 100), 1000))
+        return [dict(row) for row in self._rows if row.get("closed_at") is None][:cap]
+
+    def recent(self, since_min: int, limit: int) -> list[dict]:
+        cutoff = _time.time() - max(1, int(since_min or 1)) * 60
+        cap = max(1, min(int(limit or 300), 1000))
+        return [
+            dict(row)
+            for row in self._rows
+            if float(row.get("last_heartbeat") or 0) >= cutoff
+        ][:cap]
+
+    def row_for_send_scope_id(self, send_scope_id: str) -> dict | None:
+        identity = str(send_scope_id or "")
+        matches = self._by_send_scope_id.get(identity, ())
+        if int(self._send_scope_counts.get(identity, 0)) != 1:
+            return None
+        return self._copy(matches[0]) if len(matches) == 1 else None
+
+    def row_for_broker_id(self, broker_id: str) -> dict | None:
+        identity = str(broker_id or "")
+        matches = self._by_broker_id.get(identity, ())
+        live_matches = [row for row in matches if row.get("closed_at") is None]
+        if int(self._broker_live_counts.get(identity, 0)) == 1:
+            if len(live_matches) != 1:
+                return None
+            return self._copy(live_matches[0])
+        if int(self._broker_total_counts.get(identity, 0)) != 1:
+            return None
+        return self._copy(matches[0]) if len(matches) == 1 else None
+
+    def _identity_counts_after_removing(
+        self,
+        rows: list[dict],
+    ) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+        send_scope_counts = dict(self._send_scope_counts)
+        broker_live_counts = dict(self._broker_live_counts)
+        broker_total_counts = dict(self._broker_total_counts)
+
+        def decrement(counts: dict[str, int], identity: str) -> None:
+            if not identity or identity not in counts:
+                return
+            remaining = int(counts[identity]) - 1
+            if remaining > 0:
+                counts[identity] = remaining
+            else:
+                counts.pop(identity, None)
+
+        for existing in rows:
+            native_id = str(existing.get("native_id") or "")
+            metadata = _registry_metadata_from_row(existing)
+            if existing.get("closed_at") is None:
+                decrement(
+                    send_scope_counts,
+                    _durable_send_scope_id_from_registry_row(
+                        existing,
+                        provider=self.provider,
+                        native_id=native_id,
+                    ),
+                )
+            raw_broker_id = str(metadata.get("broker_id") or "")
+            broker_id = _normalized_send_scope_id(self.provider, raw_broker_id)
+            if broker_id and raw_broker_id == broker_id:
+                decrement(broker_total_counts, broker_id)
+                if existing.get("closed_at") is None:
+                    decrement(broker_live_counts, broker_id)
+        return send_scope_counts, broker_live_counts, broker_total_counts
+
+    def _identity_counts_after_adding(
+        self,
+        row: dict,
+        send_scope_counts: dict[str, int],
+        broker_live_counts: dict[str, int],
+        broker_total_counts: dict[str, int],
+    ) -> None:
+        native_id = str(row.get("native_id") or "")
+        metadata = _registry_metadata_from_row(row)
+        if row.get("closed_at") is None:
+            send_scope_id = _durable_send_scope_id_from_registry_row(
+                row,
+                provider=self.provider,
+                native_id=native_id,
+            )
+            if send_scope_id:
+                send_scope_counts[send_scope_id] = (
+                    int(send_scope_counts.get(send_scope_id, 0)) + 1
+                )
+        raw_broker_id = str(metadata.get("broker_id") or "")
+        broker_id = _normalized_send_scope_id(self.provider, raw_broker_id)
+        if broker_id and raw_broker_id == broker_id:
+            broker_total_counts[broker_id] = (
+                int(broker_total_counts.get(broker_id, 0)) + 1
+            )
+            if row.get("closed_at") is None:
+                broker_live_counts[broker_id] = (
+                    int(broker_live_counts.get(broker_id, 0)) + 1
+                )
+
+    def replacing_after_write(self, row: dict) -> "_AgentRegistryReadSnapshot":
+        """Return a new request view containing one freshly committed row.
+
+        Codex promotion replaces a temporary pending identity with its canonical
+        identity in one transaction. The request that performed that write must
+        use the committed identity for the rest of its response instead of
+        falling back to the snapshot captured before the transaction.
+        """
+        fresh = dict(row or {})
+        if str(fresh.get("provider") or "").strip().lower() != self.provider:
+            return self
+        native_id = str(fresh.get("native_id") or "")
+        if not native_id:
+            return self
+        replaced_native_ids = {native_id}
+        pending_native_id = str(
+            _registry_metadata_from_row(fresh).get("pending_native_id") or ""
+        )
+        if pending_native_id:
+            replaced_native_ids.add(pending_native_id)
+        replaced_rows = [
+            dict(existing)
+            for existing in self._rows
+            if str(existing.get("native_id") or "") in replaced_native_ids
+        ]
+        rows = [
+            dict(existing)
+            for existing in self._rows
+            if str(existing.get("native_id") or "") not in replaced_native_ids
+        ]
+        (
+            send_scope_counts,
+            broker_live_counts,
+            broker_total_counts,
+        ) = self._identity_counts_after_removing(replaced_rows)
+        self._identity_counts_after_adding(
+            fresh,
+            send_scope_counts,
+            broker_live_counts,
+            broker_total_counts,
+        )
+        rows.append(fresh)
+        return _AgentRegistryReadSnapshot(
+            self.provider,
+            rows,
+            send_scope_counts=send_scope_counts,
+            broker_live_counts=broker_live_counts,
+            broker_total_counts=broker_total_counts,
+        )
+
+
+_agent_registry_read_snapshot_state = threading.local()
+
+
+def _current_agent_registry_read_snapshot(
+    provider: str,
+) -> _AgentRegistryReadSnapshot | None:
+    snapshot = getattr(_agent_registry_read_snapshot_state, "snapshot", None)
+    if (
+        isinstance(snapshot, _AgentRegistryReadSnapshot)
+        and snapshot.provider == str(provider or "").strip().lower()
+    ):
+        return snapshot
+    return None
+
+
+_AGENT_REGISTRY_READ_SNAPSHOT_LIVE_LIMIT = 1000
+_AGENT_REGISTRY_READ_SNAPSHOT_CLOSED_LIMIT = 1000
+
+
+@contextmanager
+def _agent_registry_read_snapshot(
+    provider: str,
+    active_within_min: int = 60 * 24,
+):
+    provider = str(provider or "").strip().lower()
+    cutoff = _time.time() - max(1, int(active_within_min or 1)) * 60
+    previous = getattr(_agent_registry_read_snapshot_state, "snapshot", None)
+    if isinstance(previous, _AgentRegistryReadSnapshot) and previous.provider == provider:
+        yield previous
+        return
+    snapshot = None
+    try:
+        with _agent_registry_conn() as conn:
+            # Live rows have their own high cap, well above the supported 24
+            # live lanes, so closed history can never crowd them out. Closed
+            # history is limited to the request window and the same maximum
+            # used by the public registry helpers.
+            if not conn.in_transaction:
+                conn.execute("BEGIN")
+            live_rows = conn.execute(
+                "SELECT * FROM agent_sessions WHERE provider = ? "
+                "AND closed_at IS NULL ORDER BY last_heartbeat DESC LIMIT ?",
+                (provider, _AGENT_REGISTRY_READ_SNAPSHOT_LIVE_LIMIT),
+            ).fetchall()
+            closed_rows = conn.execute(
+                "SELECT * FROM agent_sessions WHERE provider = ? "
+                "AND closed_at IS NOT NULL AND last_heartbeat >= ? "
+                "ORDER BY last_heartbeat DESC LIMIT ?",
+                (
+                    provider,
+                    cutoff,
+                    _AGENT_REGISTRY_READ_SNAPSHOT_CLOSED_LIMIT,
+                ),
+            ).fetchall()
+            identity_rows = conn.execute(
+                "SELECT "
+                "CASE WHEN json_valid(metadata_json) "
+                "THEN json_extract(metadata_json, '$.send_scope_id') END "
+                "AS send_scope_id, "
+                "CASE WHEN json_valid(metadata_json) "
+                "THEN json_extract(metadata_json, '$.broker_id') END "
+                "AS broker_id, "
+                "CASE WHEN closed_at IS NULL THEN 1 ELSE 0 END AS is_live, "
+                "COUNT(*) AS row_count "
+                "FROM agent_sessions WHERE provider = ? "
+                "GROUP BY send_scope_id, broker_id, is_live",
+                (provider,),
+            ).fetchall()
+        send_scope_counts: dict[str, int] = {}
+        broker_live_counts: dict[str, int] = {}
+        broker_total_counts: dict[str, int] = {}
+        for identity_row in identity_rows:
+            row_count = int(identity_row["row_count"] or 0)
+            if row_count <= 0:
+                continue
+            raw_broker_id = str(identity_row["broker_id"] or "")
+            broker_id = _normalized_send_scope_id(provider, raw_broker_id)
+            is_live = bool(identity_row["is_live"])
+            if broker_id and raw_broker_id == broker_id:
+                broker_total_counts[broker_id] = (
+                    broker_total_counts.get(broker_id, 0) + row_count
+                )
+                if is_live:
+                    broker_live_counts[broker_id] = (
+                        broker_live_counts.get(broker_id, 0) + row_count
+                    )
+            if is_live:
+                send_scope_id = _normalized_send_scope_id(
+                    provider,
+                    identity_row["send_scope_id"],
+                ) or broker_id
+                if send_scope_id:
+                    send_scope_counts[send_scope_id] = (
+                        send_scope_counts.get(send_scope_id, 0) + row_count
+                    )
+        snapshot = _AgentRegistryReadSnapshot(
+            provider,
+            [dict(row) for row in [*live_rows, *closed_rows]],
+            send_scope_counts=send_scope_counts,
+            broker_live_counts=broker_live_counts,
+            broker_total_counts=broker_total_counts,
+        )
+    except Exception:
+        # Preserve the existing per-lookup fallback if the bounded snapshot
+        # cannot be captured. Session truth must degrade, not disappear.
+        snapshot = None
+    _agent_registry_read_snapshot_state.snapshot = snapshot
+    try:
+        yield snapshot
+    finally:
+        _agent_registry_read_snapshot_state.snapshot = previous
+
+
+@contextmanager
+def _agent_registry_read_snapshot_disabled():
+    previous = getattr(_agent_registry_read_snapshot_state, "snapshot", None)
+    _agent_registry_read_snapshot_state.snapshot = None
+    try:
+        yield
+    finally:
+        _agent_registry_read_snapshot_state.snapshot = previous
+
+
+def _agent_registry_read_snapshot_replace_after_write(
+    provider: str,
+    row: dict | None,
+) -> None:
+    snapshot = _current_agent_registry_read_snapshot(provider)
+    if snapshot is None or not isinstance(row, dict):
+        return
+    _agent_registry_read_snapshot_state.snapshot = snapshot.replacing_after_write(row)
 
 
 def _agent_registry_resolve_native_alias(provider: str, native_id: str) -> str:
@@ -6254,6 +6646,9 @@ def _apply_launch_context_to_session_row(row: dict, metadata: dict | None) -> di
 
 def _agent_registry_live(provider: str, *, limit: int = 100) -> list[dict]:
     limit = max(1, min(int(limit or 100), 1000))
+    snapshot = _current_agent_registry_read_snapshot(provider)
+    if snapshot is not None:
+        return snapshot.live(limit)
     try:
         with _agent_registry_conn() as conn:
             rows = conn.execute(
@@ -6276,6 +6671,9 @@ def _agent_registry_recent(
 ) -> list[dict]:
     cutoff = _time.time() - max(1, int(since_min or 1)) * 60
     limit = max(1, min(int(limit or 300), 1000))
+    snapshot = _current_agent_registry_read_snapshot(provider)
+    if snapshot is not None:
+        return snapshot.recent(since_min, limit)
     try:
         with _agent_registry_conn() as conn:
             rows = conn.execute(
@@ -16366,6 +16764,38 @@ def _codex_first_prompt(path: Path, session_id: str, history: dict[str, dict]) -
     return None
 
 
+_codex_preverified_registry_state = threading.local()
+_CODEX_PREVERIFIED_REGISTRY_UNSET = object()
+
+
+@contextmanager
+def _codex_preverified_registry_row(row: dict | None):
+    previous_active = getattr(_codex_preverified_registry_state, "active", False)
+    previous = getattr(_codex_preverified_registry_state, "row", None)
+    _codex_preverified_registry_state.active = True
+    _codex_preverified_registry_state.row = dict(row) if row else None
+    try:
+        yield
+    finally:
+        _codex_preverified_registry_state.active = previous_active
+        _codex_preverified_registry_state.row = previous
+
+
+def _current_codex_preverified_registry_row(native_id: str):
+    if not getattr(_codex_preverified_registry_state, "active", False):
+        return _CODEX_PREVERIFIED_REGISTRY_UNSET
+    row = getattr(_codex_preverified_registry_state, "row", None)
+    if row is None:
+        return None
+    if (
+        isinstance(row, dict)
+        and str(row.get("provider") or "codex").strip().lower() == "codex"
+        and str(row.get("native_id") or "") == str(native_id or "")
+    ):
+        return dict(row)
+    return _CODEX_PREVERIFIED_REGISTRY_UNSET
+
+
 def _codex_control_overlay(
     row: dict,
     observed_mtime: float | None = None,
@@ -16375,12 +16805,15 @@ def _codex_control_overlay(
     inventory_live_terminal_rows: list[dict] | None = None,
 ) -> dict:
     if verify_process:
-        reg = _agent_registry_promote_codex(
-            row.get("native_id") or "",
-            row.get("project") or "",
-            float(row.get("started_at") or 0),
-            observed_output_path,
-        )
+        native_id = row.get("native_id") or ""
+        reg = _current_codex_preverified_registry_row(native_id)
+        if reg is _CODEX_PREVERIFIED_REGISTRY_UNSET:
+            reg = _agent_registry_promote_codex(
+                native_id,
+                row.get("project") or "",
+                float(row.get("started_at") or 0),
+                observed_output_path,
+            )
     else:
         reg = _agent_registry_get("codex", row.get("native_id") or "")
     if not reg:
@@ -16630,7 +17063,7 @@ def _codex_recent_closed_registry_rows(
     )
     for reg in recent:
         native_id = reg.get("native_id") or ""
-        if not native_id:
+        if not native_id or native_id in seen:
             continue
         try:
             metadata = json.loads(reg.get("metadata_json") or "{}")
@@ -16714,6 +17147,22 @@ def _list_codex_sessions(live_only: bool, active_within_min: int) -> list[dict]:
 
 
 def _list_codex_sessions_uncached(
+    live_only: bool,
+    active_within_min: int,
+    live_terminal_rows: list[dict] | None = None,
+) -> list[dict]:
+    with _agent_registry_read_snapshot(
+        "codex",
+        active_within_min=active_within_min,
+    ):
+        return _list_codex_sessions_from_read_snapshot(
+            live_only,
+            active_within_min,
+            live_terminal_rows,
+        )
+
+
+def _list_codex_sessions_from_read_snapshot(
     live_only: bool,
     active_within_min: int,
     live_terminal_rows: list[dict] | None = None,
@@ -16953,13 +17402,46 @@ def _list_codex_sessions_uncached(
             or matches_unidentified_terminal
             or matches_single_pending_registry
         )
-        row = _codex_control_overlay(
-            row,
-            st.st_mtime,
-            verify_process=verify_process,
-            observed_output_path=str(path),
-            inventory_live_terminal_rows=live_terminal_rows,
-        )
+        if verify_process:
+            # Promotion writes through a fresh connection, then folds the
+            # committed row into a replacement immutable view for the rest of
+            # this response. Without this step the live-only check below could
+            # consult the pre-promotion snapshot and drop the canonical row.
+            refreshed_registry_row = None
+            with _agent_registry_read_snapshot_disabled():
+                refreshed_registry_row = _agent_registry_promote_codex(
+                    row.get("native_id") or "",
+                    row.get("project") or "",
+                    float(row.get("started_at") or 0),
+                    str(path),
+                )
+                refreshed_pid = int(
+                    (refreshed_registry_row or {}).get("pid") or 0
+                )
+                if refreshed_pid and not _process_alive(refreshed_pid):
+                    _agent_registry_mark_closed("codex", sid)
+                    refreshed_registry_row = _agent_registry_get("codex", sid)
+            if refreshed_registry_row:
+                _agent_registry_read_snapshot_replace_after_write(
+                    "codex",
+                    refreshed_registry_row,
+                )
+            with _codex_preverified_registry_row(refreshed_registry_row):
+                row = _codex_control_overlay(
+                    row,
+                    st.st_mtime,
+                    verify_process=True,
+                    observed_output_path=str(path),
+                    inventory_live_terminal_rows=live_terminal_rows,
+                )
+        else:
+            row = _codex_control_overlay(
+                row,
+                st.st_mtime,
+                verify_process=False,
+                observed_output_path=str(path),
+                inventory_live_terminal_rows=live_terminal_rows,
+            )
         if sid in ambiguous_live_native_ids:
             reason = (
                 "More than one live terminal claims this Codex session; "
@@ -17014,19 +17496,26 @@ def _list_codex_sessions_uncached(
                     "reason": "Live identity is being rechecked; this session is temporarily read-only.",
                 }
         rows.append(row)
-    _codex_register_terminal_only_rows(seen, live_terminal_rows)
-    rows.extend(_codex_pending_registry_rows(
-        seen,
-        live_only,
-        active_within_min,
-        live_terminal_rows,
-    ))
-    if not live_only:
-        rows.extend(_codex_recent_closed_registry_rows(
-            seen,
-            active_within_min,
-            transcript_paths_by_id,
-        ))
+    # Terminal discovery can write or promote registry rows. Leave the
+    # immutable read view before that work, then read the committed state.
+    with _agent_registry_read_snapshot_disabled():
+        _codex_register_terminal_only_rows(seen, live_terminal_rows)
+        with _agent_registry_read_snapshot(
+            "codex",
+            active_within_min=active_within_min,
+        ):
+            rows.extend(_codex_pending_registry_rows(
+                seen,
+                live_only,
+                active_within_min,
+                live_terminal_rows,
+            ))
+            if not live_only:
+                rows.extend(_codex_recent_closed_registry_rows(
+                    seen,
+                    active_within_min,
+                    transcript_paths_by_id,
+                ))
     rows = _filter_tombstoned_session_rows(rows)
     rows = _collapse_live_session_rows_by_terminal(rows)
     rows.sort(key=_session_meaningful_sort_key)
