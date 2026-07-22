@@ -2052,6 +2052,7 @@ TRANSCRIPT_INITIAL_STREAM_BYTES = 900_000
 # admit multi-megabyte tool-result lines without opening an unbounded read.
 TRANSCRIPT_RANGE_FETCH_MAX_BYTES = 8 * 1024 * 1024
 TRANSCRIPT_TAIL_SCAN_BYTES = 512 * 1024
+CODEX_ROLLOUT_META_SCAN_BYTES = 2 * 1024 * 1024
 TRANSCRIPT_STATS_MAX_SCAN_BYTES = 512 * 1024
 RUNTIME_SNAPSHOT_CACHE_SECONDS = 2.0
 PROVIDER_STATUS_CACHE_SECONDS = 8.0
@@ -2096,9 +2097,11 @@ BOUND_HOST = ""
 DAEMON_VERSION = "2026-05-07"
 
 _sessions_health_lock = threading.Lock()
-_sessions_health: dict[str, float | int] = {
+_sessions_health: dict[str, object] = {
     "last_scan_at": 0.0,
     "last_snapshot_count": 0,
+    "inventory_state": "cold",
+    "inventory_checked_at": 0.0,
 }
 
 
@@ -5469,12 +5472,18 @@ def _agent_registry_upsert(provider: str, native_id: str, project: str, *,
             process_started_at = _process_start_epoch(int(pid))
         if process_started_at > 0:
             stored_metadata.setdefault("process_started_at", process_started_at)
+    membership_changed = False
     try:
         # Serialize reopen with durable removal. If a registration arrives
         # during removal, it runs afterwards and clears the old receipt.
         with _session_tombstone_reopen_guard() as track_reopen:
             track_reopen(provider, native_id)
             with _agent_registry_conn() as conn:
+                previous = conn.execute(
+                    "SELECT project, pid, terminal_tty, closed_at "
+                    "FROM agent_sessions WHERE provider = ? AND native_id = ?",
+                    (provider, native_id),
+                ).fetchone()
                 conn.execute(
                     """
                     INSERT INTO agent_sessions
@@ -5508,6 +5517,21 @@ def _agent_registry_upsert(provider: str, native_id: str, project: str, *,
                     ),
                 )
                 _clear_session_tombstone_for_reopen(provider, native_id)
+                membership_changed = bool(
+                    previous is None
+                    or previous["closed_at"] is not None
+                    or str(previous["project"] or "") != project
+                    or (
+                        int(pid or 0) > 0
+                        and int(previous["pid"] or 0) != int(pid)
+                    )
+                    or (
+                        bool(terminal_tty)
+                        and str(previous["terminal_tty"] or "") != terminal_tty
+                    )
+                )
+        if membership_changed:
+            _invalidate_sessions_provider_inventory(provider)
         _publish_session_event(SESSION_SUMMARIES_TOPIC, {
             "type": "session_registered",
             "provider": provider,
@@ -5549,6 +5573,7 @@ def _agent_registry_close_stale(now: float | None = None) -> int:
             if not _session_has_verified_provider_process(row)
         ]
         closed = 0
+        closed_providers: set[str] = set()
         with _agent_registry_conn() as conn:
             for row in stale:
                 cursor = conn.execute(
@@ -5562,8 +5587,14 @@ def _agent_registry_close_stale(now: float | None = None) -> int:
                         row.get("last_heartbeat"),
                     ),
                 )
-                closed += cursor.rowcount or 0
+                changed = cursor.rowcount or 0
+                closed += changed
+                if changed:
+                    closed_providers.add(str(row.get("provider") or ""))
         if closed:
+            for provider in closed_providers:
+                _invalidate_sessions_provider_inventory(provider)
+            _invalidate_session_list_caches()
             _publish_session_event(SESSION_SUMMARIES_TOPIC, {
                 "type": "registry_swept",
                 "closed": int(closed),
@@ -5630,6 +5661,7 @@ def _agent_registry_heartbeat_by_claude_uuid(provider: str, claude_uuid: str, *,
     Returns False when no row matched, preserving UPDATE-no-op semantics."""
     if not claude_uuid:
         return False
+    membership_changed = False
     try:
         matched_native_ids: list[str] = []
         with _session_tombstone_reopen_guard() as track_reopen:
@@ -5640,6 +5672,18 @@ def _agent_registry_heartbeat_by_claude_uuid(provider: str, claude_uuid: str, *,
                 ).fetchall()]
                 if not matched:
                     return False
+                membership_changed = any(
+                    row.get("closed_at") is not None
+                    or (
+                        bool(terminal_tty)
+                        and not str(row.get("terminal_tty") or "")
+                    )
+                    or (
+                        int(pid or 0) > 0
+                        and int(row.get("pid") or 0) == 0
+                    )
+                    for row in matched
+                )
                 for row in matched:
                     native_id = str(row.get("native_id") or "")
                     if native_id:
@@ -5660,22 +5704,28 @@ def _agent_registry_heartbeat_by_claude_uuid(provider: str, claude_uuid: str, *,
                     effective_tty = str(row.get("terminal_tty") or terminal_tty or "")
                     effective_pid = int(row.get("pid") or pid or 0)
                     if effective_tty:
-                        conn.execute(
+                        alias_close = conn.execute(
                             "UPDATE agent_sessions SET closed_at = ?, state = 'superseded' "
                             "WHERE provider = ? AND native_id LIKE 'terminal-%' "
                             "AND native_id != ? AND terminal_tty = ? AND closed_at IS NULL",
                             (now, provider, native_id, effective_tty),
                         )
+                        membership_changed = bool(alias_close.rowcount) or membership_changed
                     elif effective_pid:
-                        conn.execute(
+                        alias_close = conn.execute(
                             "UPDATE agent_sessions SET closed_at = ?, state = 'superseded' "
                             "WHERE provider = ? AND native_id LIKE 'terminal-%' "
                             "AND native_id != ? AND pid = ? AND closed_at IS NULL",
                             (now, provider, native_id, effective_pid),
                         )
+                        membership_changed = bool(alias_close.rowcount) or membership_changed
                 for native_id in matched_native_ids:
                     _clear_session_tombstone_for_reopen(provider, native_id)
-        return cur.rowcount > 0
+        changed = cur.rowcount > 0
+        if membership_changed:
+            _invalidate_sessions_provider_inventory(provider)
+            _invalidate_session_list_caches()
+        return changed
     except Exception:
         return False
 
@@ -5684,10 +5734,16 @@ def _agent_registry_heartbeat_by_native_id(provider: str, native_id: str, *,
                                            terminal_tty: str = "", pid: int = 0) -> bool:
     if not provider or not native_id:
         return False
+    membership_changed = False
     try:
         with _session_tombstone_reopen_guard() as track_reopen:
             track_reopen(provider, native_id)
             with _agent_registry_conn() as conn:
+                previous = conn.execute(
+                    "SELECT pid, terminal_tty, closed_at FROM agent_sessions "
+                    "WHERE provider = ? AND native_id = ?",
+                    (provider, native_id),
+                ).fetchone()
                 cur = conn.execute(
                     "UPDATE agent_sessions SET last_heartbeat = ?, state = 'running', closed_at = NULL, "
                     "terminal_tty = COALESCE(NULLIF(?, ''), terminal_tty), "
@@ -5698,6 +5754,23 @@ def _agent_registry_heartbeat_by_native_id(provider: str, native_id: str, *,
                 changed = cur.rowcount > 0
                 if changed:
                     _clear_session_tombstone_for_reopen(provider, native_id)
+                    membership_changed = bool(
+                        previous is not None
+                        and (
+                            previous["closed_at"] is not None
+                            or (
+                                int(pid or 0) > 0
+                                and int(previous["pid"] or 0) != int(pid)
+                            )
+                            or (
+                                bool(terminal_tty)
+                                and str(previous["terminal_tty"] or "")
+                                != terminal_tty
+                            )
+                        )
+                    )
+            if membership_changed:
+                _invalidate_sessions_provider_inventory(provider)
             return changed
     except Exception:
         return False
@@ -5716,7 +5789,10 @@ def _agent_registry_mark_closed_by_claude_uuid(provider: str, claude_uuid: str) 
                 "WHERE provider = ? AND claude_uuid = ? AND closed_at IS NULL",
                 (_time.time(), provider, claude_uuid),
             )
-            return cur.rowcount > 0
+            changed = cur.rowcount > 0
+        if changed:
+            _invalidate_sessions_provider_inventory(provider)
+        return changed
     except Exception:
         return False
 
@@ -5731,7 +5807,10 @@ def _agent_registry_mark_closed_by_native_id(provider: str, native_id: str) -> b
                 "WHERE provider = ? AND native_id = ? AND closed_at IS NULL",
                 (_time.time(), provider, native_id),
             )
-            return cur.rowcount > 0
+            changed = cur.rowcount > 0
+        if changed:
+            _invalidate_sessions_provider_inventory(provider)
+        return changed
     except Exception:
         return False
 
@@ -6540,6 +6619,7 @@ def _agent_registry_link_claude_launch_registration(
     except Exception as exc:
         return {"state": "error", "reason": type(exc).__name__}
 
+    _invalidate_sessions_provider_inventory("claude")
     _invalidate_session_list_caches()
     identity_event = {
         "type": "session_identity_linked",
@@ -6724,6 +6804,7 @@ def _agent_registry_mark_closed(provider: str, native_id: str) -> None:
     except Exception:
         pass
     if changed:
+        _invalidate_sessions_provider_inventory(provider)
         _invalidate_session_list_caches()
 
 
@@ -6754,11 +6835,17 @@ def _agent_registry_update_control(provider: str, native_id: str, *,
     if reopen:
         assignments.append("closed_at = NULL")
     params.extend([provider, native_id])
+    membership_changed = False
     try:
         with _session_tombstone_reopen_guard() as track_reopen:
             if reopen:
                 track_reopen(provider, native_id)
             with _agent_registry_conn() as conn:
+                previous = conn.execute(
+                    "SELECT pid, terminal_tty, closed_at FROM agent_sessions "
+                    "WHERE provider = ? AND native_id = ?",
+                    (provider, native_id),
+                ).fetchone()
                 cursor = conn.execute(
                     f"UPDATE agent_sessions SET {', '.join(assignments)} "
                     "WHERE provider = ? AND native_id = ?",
@@ -6767,8 +6854,27 @@ def _agent_registry_update_control(provider: str, native_id: str, *,
                 changed = cursor.rowcount > 0
                 if reopen and changed:
                     _clear_session_tombstone_for_reopen(provider, native_id)
+                membership_changed = bool(
+                    changed
+                    and previous is not None
+                    and (
+                        (reopen and previous["closed_at"] is not None)
+                        or (
+                            pid is not None
+                            and int(previous["pid"] or 0) != int(pid or 0)
+                        )
+                        or (
+                            terminal_tty is not None
+                            and str(previous["terminal_tty"] or "")
+                            != terminal_tty
+                        )
+                    )
+                )
     except Exception:
-        pass
+        return
+    if membership_changed:
+        _invalidate_sessions_provider_inventory(provider)
+        _invalidate_session_list_caches()
 
 
 def _close_codex_terminal_placeholders(tty: str, canonical_native_id: str) -> None:
@@ -7168,6 +7274,7 @@ def _bind_codex_registry_to_terminal(
     if not registry_changed and not tombstone_cleared:
         return promoted
     _close_codex_terminal_placeholders(canonical_tty, native_id)
+    _invalidate_sessions_provider_inventory("codex")
     _invalidate_session_list_caches()
     if linked_send_scope_id:
         identity_event = {
@@ -9316,7 +9423,60 @@ _claude_terminal_scan_cache: dict[str, object] = {
 _claude_terminal_scan_lock = threading.Lock()
 _sessions_membership_snapshot_lock = threading.Lock()
 _SESSION_MEMBERSHIP_PROVIDERS = frozenset({"claude", "codex"})
+_SESSION_INVENTORY_FRESH_SECONDS = 5.0
+_sessions_inventory_bundle_lock = threading.Lock()
+_sessions_inventory_bundle: dict[str, object] = {
+    "generation": 0,
+    "membership_generation": 0,
+    "inventories": {},
+    "completed_at": 0.0,
+    "refreshing": False,
+    "error": None,
+}
+_sessions_inventory_scan_context = threading.local()
 _codex_task_boundary_cache: dict[str, dict[str, object]] = {}
+
+
+def _sessions_inventory_scan_active() -> bool:
+    return bool(getattr(_sessions_inventory_scan_context, "active", False))
+
+
+def _sessions_inventory_membership_generation() -> int:
+    with _sessions_inventory_bundle_lock:
+        return int(
+            _sessions_inventory_bundle.get("membership_generation") or 0
+        )
+
+
+def _invalidate_sessions_provider_inventory(provider: str | None = None) -> None:
+    """Expire exact membership before publishing a real registry mutation."""
+    if _sessions_inventory_scan_active():
+        return
+    provider = str(provider or "").strip().lower()
+    with _sessions_inventory_bundle_lock:
+        stored = _sessions_inventory_bundle.get("inventories") or {}
+        targets = (
+            {provider}
+            if provider in _SESSION_MEMBERSHIP_PROVIDERS
+            else set(_SESSION_MEMBERSHIP_PROVIDERS)
+        )
+        for target in targets:
+            inventory = stored.get(target)
+            if isinstance(inventory, dict):
+                inventory["checked_at"] = 0.0
+                inventory["membership_complete"] = False
+        _sessions_inventory_bundle["generation"] = int(
+            _sessions_inventory_bundle.get("generation") or 0
+        ) + 1
+        _sessions_inventory_bundle["membership_generation"] = int(
+            _sessions_inventory_bundle.get("membership_generation") or 0
+        ) + 1
+        refreshing = bool(_sessions_inventory_bundle.get("refreshing"))
+    with _sessions_health_lock:
+        _sessions_health["inventory_state"] = (
+            "refreshing" if refreshing else "cold"
+        )
+        _sessions_health["inventory_checked_at"] = 0.0
 
 
 def _process_cwds(pids: list[int]) -> tuple[bool, dict[int, str]]:
@@ -9932,6 +10092,238 @@ def _capture_sessions_provider_inventory(provider: str) -> dict:
             # probes. This timestamp is taken after all probes and row capture.
             "checked_at": _time.time(),
         }
+
+
+def _sessions_inventory_placeholder(
+    provider: str,
+    state: str,
+    error: str | None = None,
+) -> dict:
+    payload = {
+        "provider": provider,
+        "rows": [],
+        "probe_state": state,
+        "membership_complete": False,
+        "checked_at": 0.0,
+    }
+    if error:
+        payload["probe_reason"] = error
+    return payload
+
+
+def _sessions_inventory_degradation(state: str) -> dict | None:
+    if state == "ready":
+        return None
+    return {
+        "reason": f"session_inventory_{state}",
+        "detail": (
+            "Pairling is refreshing the Mac session inventory. "
+            "The last trusted session list is being kept until it is exact."
+        ),
+    }
+
+
+def _refresh_sessions_inventory_bundle(
+    providers: tuple[str, ...],
+    expected_generation: int | None = None,
+    expected_membership_generation: int | None = None,
+) -> None:
+    try:
+        if expected_generation is None or expected_membership_generation is None:
+            with _sessions_inventory_bundle_lock:
+                if expected_generation is None:
+                    expected_generation = int(
+                        _sessions_inventory_bundle.get("generation") or 0
+                    )
+                expected_membership_generation = int(
+                    _sessions_inventory_bundle.get("membership_generation")
+                    or 0
+                )
+        previous_scan_state = _sessions_inventory_scan_active()
+        _sessions_inventory_scan_context.active = True
+        try:
+            with _sessions_membership_snapshot_lock:
+                inventories = {
+                    provider: _capture_sessions_provider_inventory(provider)
+                    for provider in providers
+                }
+        finally:
+            _sessions_inventory_scan_context.active = previous_scan_state
+        completed_at = _time.time()
+        with _sessions_inventory_bundle_lock:
+            if (
+                int(_sessions_inventory_bundle.get("generation") or 0)
+                != int(expected_generation)
+                or int(
+                    _sessions_inventory_bundle.get("membership_generation")
+                    or 0
+                )
+                != int(expected_membership_generation)
+            ):
+                _sessions_inventory_bundle["refreshing"] = False
+                discarded = True
+                stored = copy.deepcopy(
+                    _sessions_inventory_bundle.get("inventories") or {}
+                )
+            else:
+                discarded = False
+                stored = copy.deepcopy(
+                    _sessions_inventory_bundle.get("inventories") or {}
+                )
+                stored.update(copy.deepcopy(inventories))
+                _sessions_inventory_bundle["inventories"] = stored
+                _sessions_inventory_bundle["completed_at"] = completed_at
+                _sessions_inventory_bundle["refreshing"] = False
+                _sessions_inventory_bundle["error"] = None
+                _sessions_inventory_bundle["generation"] = int(
+                    _sessions_inventory_bundle.get("generation") or 0
+                ) + 1
+        if discarded:
+            with _sessions_health_lock:
+                _sessions_health["inventory_state"] = "cold"
+                _sessions_health["inventory_checked_at"] = 0.0
+            _publish_session_event(
+                SESSION_SUMMARIES_TOPIC,
+                {"type": "session_inventory_invalidated"},
+            )
+            return
+        now = _time.time()
+        state = "ready" if all(
+            isinstance(inventory, dict)
+            and inventory.get("probe_state") == "exact"
+            and bool(inventory.get("membership_complete"))
+            and float(inventory.get("checked_at") or 0) > 0
+            and now - float(inventory.get("checked_at") or 0)
+            < _SESSION_INVENTORY_FRESH_SECONDS
+            for inventory in stored.values()
+        ) else "incomplete"
+        with _sessions_health_lock:
+            _sessions_health["inventory_state"] = state
+            _sessions_health["inventory_checked_at"] = completed_at
+        _publish_session_event(
+            SESSION_SUMMARIES_TOPIC,
+            {"type": "session_inventory_refreshed", "checked_at": completed_at},
+        )
+    except Exception as error:
+        detail = f"{type(error).__name__}: {str(error)[:160]}"
+        with _sessions_inventory_bundle_lock:
+            _sessions_inventory_bundle["refreshing"] = False
+            _sessions_inventory_bundle["error"] = detail
+            _sessions_inventory_bundle["generation"] = int(
+                _sessions_inventory_bundle.get("generation") or 0
+            ) + 1
+        with _sessions_health_lock:
+            _sessions_health["inventory_state"] = "failed"
+        _publish_session_event(
+            SESSION_SUMMARIES_TOPIC,
+            {"type": "session_inventory_failed"},
+        )
+
+
+def _sessions_provider_inventory_bundle(
+    requested: set[str],
+) -> tuple[dict[str, dict], str, int, int]:
+    requested = set(requested) & set(_SESSION_MEMBERSHIP_PROVIDERS)
+    if not requested:
+        with _sessions_inventory_bundle_lock:
+            generation = int(_sessions_inventory_bundle.get("generation") or 0)
+            membership_generation = int(
+                _sessions_inventory_bundle.get("membership_generation") or 0
+            )
+        return {}, "ready", generation, membership_generation
+    now = _time.time()
+    start_refresh = False
+    refresh_generation = 0
+    membership_generation = 0
+    refresh_providers: set[str] = set()
+    with _sessions_inventory_bundle_lock:
+        refreshing = bool(_sessions_inventory_bundle.get("refreshing"))
+        stored = copy.deepcopy(_sessions_inventory_bundle.get("inventories") or {})
+        provider_fresh = {
+            provider: (
+                isinstance(stored.get(provider), dict)
+                and float(stored[provider].get("checked_at") or 0) > 0
+                and now - float(stored[provider].get("checked_at") or 0)
+                < _SESSION_INVENTORY_FRESH_SECONDS
+            )
+            for provider in requested
+        }
+        refresh_providers = {
+            provider for provider, fresh in provider_fresh.items() if not fresh
+        }
+        stale = bool(refresh_providers)
+        if stale and not refreshing:
+            _sessions_inventory_bundle["refreshing"] = True
+            _sessions_inventory_bundle["generation"] = int(
+                _sessions_inventory_bundle.get("generation") or 0
+            ) + 1
+            refresh_generation = int(
+                _sessions_inventory_bundle["generation"]
+            )
+            refreshing = True
+            start_refresh = True
+        error = str(_sessions_inventory_bundle.get("error") or "") or None
+        generation = int(_sessions_inventory_bundle.get("generation") or 0)
+        membership_generation = int(
+            _sessions_inventory_bundle.get("membership_generation") or 0
+        )
+
+    if start_refresh:
+        try:
+            threading.Thread(
+                target=_refresh_sessions_inventory_bundle,
+                args=(
+                    tuple(sorted(refresh_providers)),
+                    refresh_generation,
+                    membership_generation,
+                ),
+                name="pairling-session-inventory",
+                daemon=True,
+            ).start()
+        except Exception as thread_error:
+            error = f"{type(thread_error).__name__}: {str(thread_error)[:160]}"
+            with _sessions_inventory_bundle_lock:
+                _sessions_inventory_bundle["refreshing"] = False
+                _sessions_inventory_bundle["error"] = error
+                _sessions_inventory_bundle["generation"] = int(
+                    _sessions_inventory_bundle.get("generation") or 0
+                ) + 1
+                generation = int(_sessions_inventory_bundle["generation"])
+            refreshing = False
+
+    fresh = not stale
+    exact = fresh and all(
+        isinstance(stored.get(provider), dict)
+        and stored[provider].get("probe_state") == "exact"
+        and bool(stored[provider].get("membership_complete"))
+        for provider in requested
+    )
+    if fresh:
+        state = "ready" if exact else "incomplete"
+    elif refreshing:
+        state = "refreshing" if any(provider_fresh.values()) else "warming"
+    else:
+        state = "failed" if error else "cold"
+
+    inventories: dict[str, dict] = {}
+    for provider in sorted(requested):
+        inventory = copy.deepcopy(stored.get(provider))
+        if not isinstance(inventory, dict):
+            inventories[provider] = _sessions_inventory_placeholder(
+                provider,
+                "failed" if error and not refreshing else state,
+                error,
+            )
+            continue
+        if not provider_fresh.get(provider, False):
+            inventory["probe_state"] = state
+            inventory["membership_complete"] = False
+        inventories[provider] = inventory
+
+    if state != "ready":
+        with _sessions_health_lock:
+            _sessions_health["inventory_state"] = state
+    return inventories, state, generation, membership_generation
 
 
 def _session_inventory_terminal_matches_row(
@@ -12438,12 +12830,21 @@ class ClaudeSessionsPgBackend:
             return False
         try:
             proc = self._psql(
-                "UPDATE sessions SET closed_at = COALESCE(closed_at, NOW()) "
-                f"WHERE id = '{session_id}';",
+                "WITH changed AS ("
+                "UPDATE sessions SET closed_at = NOW() "
+                f"WHERE id = '{session_id}' AND closed_at IS NULL RETURNING 1"
+                ") SELECT COUNT(*) FROM changed;",
                 timeout=5,
             )
         except Exception:
             return False
+        changed = any(
+            line.strip().isdigit() and int(line.strip()) > 0
+            for line in (proc.stdout or "").splitlines()
+        )
+        if proc.returncode == 0 and changed:
+            _invalidate_sessions_provider_inventory("claude")
+            _invalidate_session_list_caches()
         return proc.returncode == 0
 
     def worker_stats_rows(self, since_min: int) -> list[tuple[str, str, int]]:
@@ -12540,16 +12941,22 @@ class ClaudeSessionsPgBackend:
         ids_sql = ",".join(f"'{i}'" for i in session_ids if _safe_session_id(i))
         if not ids_sql:
             return
-        gc_sql = f"UPDATE sessions SET closed_at = NOW() WHERE id IN ({ids_sql}) AND closed_at IS NULL"
+        gc_sql = (
+            "WITH changed AS (UPDATE sessions SET closed_at = NOW() "
+            f"WHERE id IN ({ids_sql}) AND closed_at IS NULL RETURNING 1) "
+            "SELECT COUNT(*) FROM changed;"
+        )
         try:
-            subprocess.run(
-                ["docker", "exec", "continuous-claude-postgres",
-                 "psql", "-U", "claude", "-d", "continuous_claude",
-                 "-c", gc_sql],
-                capture_output=True, text=True, timeout=3,
-            )
+            proc = self._psql(gc_sql, timeout=3)
         except Exception:
-            pass  # GC is best-effort
+            return  # GC is best-effort
+        changed = any(
+            line.strip().isdigit() and int(line.strip()) > 0
+            for line in (proc.stdout or "").splitlines()
+        )
+        if proc.returncode == 0 and changed:
+            _invalidate_sessions_provider_inventory("claude")
+            _invalidate_session_list_caches()
 
     def collect_rows(
         self,
@@ -16278,7 +16685,12 @@ def _iso_to_epoch(value: str | None) -> float:
         return 0.0
 
 
-def _read_jsonl_map(path: Path, id_key: str = "id") -> dict[str, dict]:
+def _read_jsonl_map(
+    path: Path,
+    id_key: str = "id",
+    *,
+    keep_first: bool = False,
+) -> dict[str, dict]:
     out: dict[str, dict] = {}
     if not path.is_file():
         return out
@@ -16291,8 +16703,12 @@ def _read_jsonl_map(path: Path, id_key: str = "id") -> dict[str, dict]:
                     obj = json.loads(line)
                 except (ValueError, json.JSONDecodeError):
                     continue
+                if not isinstance(obj, dict):
+                    continue
                 sid = obj.get(id_key)
                 if isinstance(sid, str) and sid:
+                    if keep_first and sid in out:
+                        continue
                     out[sid] = obj
     except OSError:
         pass
@@ -16300,17 +16716,61 @@ def _read_jsonl_map(path: Path, id_key: str = "id") -> dict[str, dict]:
 
 
 def _codex_history_map() -> dict[str, dict]:
-    return _read_jsonl_map(CODEX_HISTORY, id_key="session_id")
+    return _read_jsonl_map(
+        CODEX_HISTORY,
+        id_key="session_id",
+        keep_first=True,
+    )
 
 
 def _codex_index_map() -> dict[str, dict]:
     return _read_jsonl_map(CODEX_SESSION_INDEX, id_key="id")
 
 
+def _iter_jsonl_prefix_lines(
+    path: Path,
+    *,
+    max_lines: int,
+    max_bytes: int = TRANSCRIPT_TAIL_SCAN_BYTES,
+    scan_status: dict[str, str] | None = None,
+):
+    def stop(reason: str) -> None:
+        if scan_status is not None:
+            scan_status["stop_reason"] = reason
+
+    stop("unknown")
+    remaining = max(1, int(max_bytes))
+    try:
+        with path.open("rb") as handle:
+            for _ in range(max(1, int(max_lines))):
+                raw = handle.readline(remaining + 1)
+                if not raw:
+                    stop("eof")
+                    return
+                if len(raw) > remaining:
+                    stop("byte_limit")
+                    return
+                remaining -= len(raw)
+                yield raw.decode("utf-8", errors="replace")
+                if remaining <= 0:
+                    stop("eof" if not handle.read(1) else "byte_limit")
+                    return
+            stop("eof" if not handle.read(1) else "line_limit")
+    except OSError:
+        stop("io_error")
+        return
+
+
 def _codex_rollout_meta(path: Path) -> dict | None:
     try:
-        with path.open(encoding="utf-8", errors="replace") as f:
-            first = f.readline()
+        first = next(
+            _iter_jsonl_prefix_lines(
+                path,
+                max_lines=1,
+                max_bytes=CODEX_ROLLOUT_META_SCAN_BYTES,
+            ),
+            "",
+        )
         if not first:
             return None
         obj = json.loads(first)
@@ -16723,43 +17183,56 @@ def _codex_turn_state_payload(native_id: str, *, apply_boundary: bool = True) ->
 def _codex_first_prompt(path: Path, session_id: str, history: dict[str, dict]) -> str | None:
     hist = history.get(session_id) or {}
     history_text = hist.get("text")
-    first_transcript_user: str | None = None
+    scan_status: dict[str, str] = {}
+    malformed_before_prompt = False
     try:
-        with path.open(encoding="utf-8", errors="replace") as f:
-            for _, line in zip(range(200), f):
-                try:
-                    obj = json.loads(line)
-                except (ValueError, json.JSONDecodeError):
-                    obj = {}
-                payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
-                if obj.get("type") == "event_msg" and payload.get("type") == "user_message":
-                    text = _text_from_codex_value(
-                        payload.get("message") or payload.get("text") or payload.get("content")
-                    ).strip()
-                    if text:
-                        return text[:500]
-                rows = _normalize_codex_line(line, session_id)
-                for row in rows:
-                    msg = row.get("message") or {}
-                    if msg.get("role") == "user":
-                        content = msg.get("content") or []
-                        if content and isinstance(content, list):
-                            first = content[0]
-                            if isinstance(first, dict):
-                                t = first.get("text")
-                                if isinstance(t, str) and t.strip():
-                                    candidate = t.strip()
-                                    is_injected_context = (
-                                        candidate.startswith("# AGENTS.md instructions for ")
-                                        and "\n\n<INSTRUCTIONS>\n" in candidate
-                                    )
-                                    if not is_injected_context and first_transcript_user is None:
-                                        first_transcript_user = candidate
+        for line in _iter_jsonl_prefix_lines(
+            path,
+            max_lines=200,
+            scan_status=scan_status,
+        ):
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except (ValueError, json.JSONDecodeError):
+                malformed_before_prompt = True
+                break
+            if not isinstance(obj, dict):
+                malformed_before_prompt = True
+                break
+            payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+            if obj.get("type") == "event_msg" and payload.get("type") == "user_message":
+                text = _text_from_codex_value(
+                    payload.get("message") or payload.get("text") or payload.get("content")
+                ).strip()
+                if text:
+                    return text[:500]
+            rows = _normalize_codex_line(line, session_id)
+            for row in rows:
+                msg = row.get("message") or {}
+                if msg.get("role") == "user":
+                    content = msg.get("content") or []
+                    if content and isinstance(content, list):
+                        first = content[0]
+                        if isinstance(first, dict):
+                            t = first.get("text")
+                            if isinstance(t, str) and t.strip():
+                                candidate = t.strip()
+                                is_injected_context = (
+                                    candidate.startswith("# AGENTS.md instructions for ")
+                                    and "\n\n<INSTRUCTIONS>\n" in candidate
+                                )
+                                if not is_injected_context:
+                                    return candidate[:500]
     except OSError:
         pass
-    if first_transcript_user:
-        return first_transcript_user[:500]
-    if isinstance(history_text, str) and history_text.strip():
+    if (
+        not malformed_before_prompt
+        and scan_status.get("stop_reason") == "eof"
+        and isinstance(history_text, str)
+        and history_text.strip()
+    ):
         return history_text.strip()[:500]
     return None
 
@@ -17207,6 +17680,7 @@ def _list_codex_sessions_from_read_snapshot(
     live_transcript_path_set: set[str] = set()
     priority_transcript_paths: list[str] = []
     priority_transcript_path_set: set[str] = set()
+    recent_closed_registry_ids: set[str] = set()
 
     def add_priority_transcript_path(path: Path) -> None:
         path_text = str(path)
@@ -17253,6 +17727,7 @@ def _list_codex_sessions_from_read_snapshot(
             )
             if not resolved_native_id:
                 continue
+            recent_closed_registry_ids.add(resolved_native_id)
             closed_rows_by_canonical.setdefault(resolved_native_id, []).append(reg)
         for resolved_native_id, grouped_rows in closed_rows_by_canonical.items():
             canonical_rows = [
@@ -17277,11 +17752,28 @@ def _list_codex_sessions_from_read_snapshot(
                     break
     discovered_rollout_paths = _codex_rollout_paths()
     rollout_paths = [Path(path) for path in priority_transcript_paths]
-    rollout_paths.extend(
-        path
-        for path in discovered_rollout_paths
-        if str(path) not in priority_transcript_path_set
+    retained_registry_suffixes = tuple(
+        f"{native_id}.jsonl"
+        for native_id in sorted(
+            live_registry_ids | recent_closed_registry_ids
+        )
+        if native_id
     )
+    for path in discovered_rollout_paths:
+        if str(path) in priority_transcript_path_set:
+            continue
+        try:
+            if (
+                path.stat().st_mtime < cutoff
+                and not (
+                    retained_registry_suffixes
+                    and path.name.endswith(retained_registry_suffixes)
+                )
+            ):
+                continue
+        except OSError:
+            continue
+        rollout_paths.append(path)
     indexed_rollouts, transcript_paths_by_id = _codex_rollout_index(rollout_paths)
     rollout_entries: list[tuple[Path, os.stat_result, dict]] = []
     for path, meta in indexed_rollouts:
@@ -18805,17 +19297,14 @@ def _run_osascript(
 def _peek_cwd_from_transcript(path: Path) -> str:
     """Return the `cwd` from the first transcript line that has one, else empty string."""
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for i, line in enumerate(f):
-                if i > 30:
-                    break
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                cwd = obj.get("cwd")
-                if isinstance(cwd, str) and cwd:
-                    return cwd
+        for line in _iter_jsonl_prefix_lines(path, max_lines=31):
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            cwd = obj.get("cwd")
+            if isinstance(cwd, str) and cwd:
+                return cwd
     except Exception:
         pass
     return ""
@@ -18824,54 +19313,51 @@ def _peek_cwd_from_transcript(path: Path) -> str:
 def _peek_first_prompt(path: Path, max_chars: int = 200) -> str | None:
     """Return the first real (non-slash-command, non-system) user prompt as a snippet."""
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for i, line in enumerate(f):
-                if i > 200:
-                    break
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                if obj.get("type") != "user":
-                    continue
-                msg = obj.get("message") or {}
-                content = msg.get("content")
-                text = content if isinstance(content, str) else None
-                if isinstance(content, list):
-                    pieces = []
-                    for block in content:
-                        if not isinstance(block, dict):
-                            continue
-                        if str(block.get("type") or "text") not in {
-                            "text", "input_text", "output_text"
-                        }:
-                            continue
-                        value = block.get("text") or block.get("content")
-                        if isinstance(value, str):
-                            pieces.append(value)
-                    text = "\n".join(pieces) if pieces else None
-                if not text:
-                    continue
-                stripped = text.strip()
-                if not stripped:
-                    continue
-                # Skip slash-command boilerplate / hook injections — anything
-                # that's purely tag-wrapped meta is not a real user prompt.
-                lower = stripped.lower()
-                if any(tag in lower for tag in (
-                    "<local-command-caveat>", "<local-command-stdout>",
-                    "<local-command-stderr>", "<system-reminder>",
-                    "<command-name>", "<command-message>", "<command-args>",
-                    "<task-notification>", "<persisted-output>",
-                )):
-                    continue
-                # Strip wrapping tag noise then re-check non-empty
-                cleaned = re.sub(r"<[^>]+>", "", stripped).strip()
-                if not cleaned or len(cleaned) < 4:
-                    continue
-                # Take first non-empty line of cleaned text
-                first_line = cleaned.split("\n", 1)[0].strip()
-                return first_line[:max_chars] if first_line else None
+        for line in _iter_jsonl_prefix_lines(path, max_lines=201):
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if obj.get("type") != "user":
+                continue
+            msg = obj.get("message") or {}
+            content = msg.get("content")
+            text = content if isinstance(content, str) else None
+            if isinstance(content, list):
+                pieces = []
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if str(block.get("type") or "text") not in {
+                        "text", "input_text", "output_text"
+                    }:
+                        continue
+                    value = block.get("text") or block.get("content")
+                    if isinstance(value, str):
+                        pieces.append(value)
+                text = "\n".join(pieces) if pieces else None
+            if not text:
+                continue
+            stripped = text.strip()
+            if not stripped:
+                continue
+            # Skip slash-command boilerplate / hook injections — anything
+            # that's purely tag-wrapped meta is not a real user prompt.
+            lower = stripped.lower()
+            if any(tag in lower for tag in (
+                "<local-command-caveat>", "<local-command-stdout>",
+                "<local-command-stderr>", "<system-reminder>",
+                "<command-name>", "<command-message>", "<command-args>",
+                "<task-notification>", "<persisted-output>",
+            )):
+                continue
+            # Strip wrapping tag noise then re-check non-empty
+            cleaned = re.sub(r"<[^>]+>", "", stripped).strip()
+            if not cleaned or len(cleaned) < 4:
+                continue
+            # Take first non-empty line of cleaned text
+            first_line = cleaned.split("\n", 1)[0].strip()
+            return first_line[:max_chars] if first_line else None
     except Exception:
         pass
     return None
@@ -21373,14 +21859,108 @@ class Handler(BaseHTTPRequestHandler):
             within_min = 60 * 24 * 7
         within_min = max(1, min(within_min, 60 * 24 * 14))
 
-        payload = _cached_runtime_snapshot(
-            ("sessions-visible", provider_filter, within_min, 200),
-            RUNTIME_SNAPSHOT_CACHE_SECONDS,
-            lambda: {
+        visible = _visible_agent_provider_ids()
+        requested = (
+            set(visible)
+            if provider_filter == "all"
+            else ({provider_filter} if provider_filter in visible else set())
+        )
+        (
+            provider_inventories,
+            inventory_state,
+            inventory_generation,
+            membership_generation,
+        ) = (
+            _sessions_provider_inventory_bundle(requested)
+        )
+        provider_inventory = {
+            provider: list(inventory.get("rows") or [])
+            for provider, inventory in provider_inventories.items()
+        }
+
+        def load_visible_snapshot() -> dict:
+            metadata: dict[str, object] = {}
+            degraded: dict | None = None
+            try:
+                items = self._collect_visible_session_rows_from_inventory(
+                    provider_filter,
+                    active_within_min=within_min,
+                    limit=200,
+                    authoritative_inventory=True,
+                    provider_inventory=provider_inventory,
+                    collection_metadata=metadata,
+                )
+            except Exception as error:
+                items = []
+                degraded = {
+                    "reason": "agent_session_store_unavailable",
+                    "detail": (
+                        "Pairling could not build the Mac session list. "
+                        f"{type(error).__name__}: {str(error)[:160]}"
+                    ),
+                }
+            if degraded is None:
+                degraded = self._sessions_backend_degradation(
+                    provider_filter,
+                    require_fresh=True,
+                    provider_inventories=provider_inventories,
+                )
+            if degraded is None:
+                degraded = _sessions_inventory_degradation(inventory_state)
+            (
+                membership_complete,
+                membership_checked_at,
+                proof_degradation,
+            ) = self._sessions_membership_proof(
+                provider_filter,
+                degraded,
+                provider_inventories,
+                items,
+                truncated=bool(metadata.get("truncated")),
+                allow_readable_history=True,
+            )
+            if degraded is None and proof_degradation is not None:
+                degraded = proof_degradation
+            with _sessions_inventory_bundle_lock:
+                generation_changed = bool(requested) and (
+                    int(_sessions_inventory_bundle.get("generation") or 0)
+                    != inventory_generation
+                    or int(
+                        _sessions_inventory_bundle.get(
+                            "membership_generation"
+                        ) or 0
+                    )
+                    != membership_generation
+                )
+            state = "refreshing" if generation_changed else inventory_state
+            if generation_changed:
+                membership_complete = False
+                membership_checked_at = 0.0
+                degraded = _sessions_inventory_degradation(state)
+            payload = {
                 "source": _sessions_stream_source(),
-                "items": self._collect_visible_session_rows(provider_filter, active_within_min=within_min, limit=200),
+                "items": items,
+                "inventory_state": state,
+                "membership_complete": membership_complete,
+                "membership_checked_at": membership_checked_at,
                 "ts": _time.time(),
-            },
+            }
+            if degraded is not None:
+                payload["degraded"] = degraded
+            return payload
+
+        payload = _cached_runtime_snapshot(
+            (
+                "sessions-visible",
+                provider_filter,
+                within_min,
+                200,
+                inventory_state,
+                inventory_generation,
+            ),
+            RUNTIME_SNAPSHOT_CACHE_SECONDS,
+            load_visible_snapshot,
+            store_after_loader_invalidation=True,
         )
         payload["count"] = len(payload.get("items") or [])
         self._send_json(payload, headers={"Cache-Control": "no-store"})
@@ -21533,6 +22113,25 @@ class Handler(BaseHTTPRequestHandler):
             row["runtime_truth_summary"] = self._runtime_truth_summary_for_row(row)
         _record_sessions_scan(rows)
         return rows
+
+    def _collect_visible_session_rows_from_inventory(
+        self,
+        provider_filter: str,
+        active_within_min: int,
+        limit: int = 200,
+        **kwargs,
+    ) -> list[dict]:
+        previous_scan_state = _sessions_inventory_scan_active()
+        _sessions_inventory_scan_context.active = True
+        try:
+            return self._collect_visible_session_rows(
+                provider_filter,
+                active_within_min,
+                limit,
+                **kwargs,
+            )
+        finally:
+            _sessions_inventory_scan_context.active = previous_scan_state
 
     @classmethod
     def _limit_visible_session_rows(
@@ -21737,6 +22336,7 @@ class Handler(BaseHTTPRequestHandler):
         rows: list[dict],
         *,
         truncated: bool = False,
+        allow_readable_history: bool = False,
     ) -> tuple[bool, float, dict | None]:
         """Prove that one exact scan generation is fully represented on wire."""
         visible = _visible_agent_provider_ids()
@@ -21821,6 +22421,8 @@ class Handler(BaseHTTPRequestHandler):
                     row,
                 )
             ]
+            if allow_readable_history and row.get("readable_state") != "live":
+                continue
             if provider not in requested or len(matching_terminals) != 1:
                 unexpected.append({
                     "provider": provider,
@@ -21849,87 +22451,111 @@ class Handler(BaseHTTPRequestHandler):
         self,
         provider_filter: str,
         *,
-        force_refresh: bool = False,
+        bypass_snapshot_cache: bool = False,
     ) -> dict:
+        visible = _visible_agent_provider_ids()
+        requested = (
+            set(visible)
+            if provider_filter == "all"
+            else ({provider_filter} if provider_filter in visible else set())
+        )
+        (
+            provider_inventories,
+            inventory_state,
+            inventory_generation,
+            membership_generation,
+        ) = (
+            _sessions_provider_inventory_bundle(requested)
+        )
+
         def load_snapshot() -> dict:
-            # Serialize authoritative provider scans so the rows and their
-            # completeness proof cannot be taken from different generations.
-            with _sessions_membership_snapshot_lock:
-                visible = _visible_agent_provider_ids()
-                requested = (
-                    set(visible)
-                    if provider_filter == "all"
-                    else (
-                        {provider_filter}
-                        if provider_filter in visible
-                        else set()
-                    )
-                )
-                provider_inventories = {
-                    provider: _capture_sessions_provider_inventory(provider)
-                    for provider in sorted(
-                        requested & _SESSION_MEMBERSHIP_PROVIDERS
-                    )
-                }
-                provider_inventory = {
-                    provider: list(inventory.get("rows") or [])
-                    for provider, inventory in provider_inventories.items()
-                }
-                metadata: dict[str, object] = {}
-                rows: list[dict] = []
-                degraded: dict | None = None
-                try:
-                    rows = self._collect_visible_session_rows(
-                        provider_filter,
-                        active_within_min=60,
-                        limit=200,
-                        live_only=True,
-                        authoritative_inventory=True,
-                        provider_inventory=provider_inventory,
-                        collection_metadata=metadata,
-                    )
-                except Exception as error:
-                    degraded = {
-                        "reason": "agent_session_store_unavailable",
-                        "detail": (
-                            "Pairling could not build the Mac session list. "
-                            f"{type(error).__name__}: {str(error)[:160]}"
-                        ),
-                    }
-                if degraded is None:
-                    degraded = self._sessions_backend_degradation(
-                        provider_filter,
-                        require_fresh=True,
-                        provider_inventories=provider_inventories,
-                    )
-                (
-                    membership_complete,
-                    membership_checked_at,
-                    proof_degradation,
-                ) = self._sessions_membership_proof(
+            provider_inventory = {
+                provider: list(inventory.get("rows") or [])
+                for provider, inventory in provider_inventories.items()
+            }
+            metadata: dict[str, object] = {}
+            rows: list[dict] = []
+            degraded: dict | None = None
+            try:
+                rows = self._collect_visible_session_rows_from_inventory(
                     provider_filter,
-                    degraded,
-                    provider_inventories,
-                    rows,
-                    truncated=bool(metadata.get("truncated")),
+                    active_within_min=60,
+                    limit=200,
+                    live_only=True,
+                    authoritative_inventory=True,
+                    provider_inventory=provider_inventory,
+                    collection_metadata=metadata,
                 )
-                if degraded is None and proof_degradation is not None:
-                    degraded = proof_degradation
-                snapshot = {
-                    "items": rows,
-                    "ts": _time.time(),
-                    "membership_complete": membership_complete,
-                    "membership_checked_at": membership_checked_at,
+            except Exception as error:
+                degraded = {
+                    "reason": "agent_session_store_unavailable",
+                    "detail": (
+                        "Pairling could not build the Mac session list. "
+                        f"{type(error).__name__}: {str(error)[:160]}"
+                    ),
                 }
-                if degraded is not None:
-                    snapshot["degraded"] = degraded
-                return snapshot
+            if degraded is None:
+                degraded = self._sessions_backend_degradation(
+                    provider_filter,
+                    require_fresh=True,
+                    provider_inventories=provider_inventories,
+                )
+            if degraded is None:
+                degraded = _sessions_inventory_degradation(inventory_state)
+            (
+                membership_complete,
+                membership_checked_at,
+                proof_degradation,
+            ) = self._sessions_membership_proof(
+                provider_filter,
+                degraded,
+                provider_inventories,
+                rows,
+                truncated=bool(metadata.get("truncated")),
+            )
+            if degraded is None and proof_degradation is not None:
+                degraded = proof_degradation
+            with _sessions_inventory_bundle_lock:
+                generation_changed = bool(requested) and (
+                    int(_sessions_inventory_bundle.get("generation") or 0)
+                    != inventory_generation
+                    or int(
+                        _sessions_inventory_bundle.get(
+                            "membership_generation"
+                        ) or 0
+                    )
+                    != membership_generation
+                )
+            final_inventory_state = (
+                "refreshing" if generation_changed else inventory_state
+            )
+            if generation_changed:
+                membership_complete = False
+                membership_checked_at = 0.0
+                degraded = _sessions_inventory_degradation(
+                    final_inventory_state
+                )
+            snapshot = {
+                "items": rows,
+                "ts": _time.time(),
+                "membership_complete": membership_complete,
+                "membership_checked_at": membership_checked_at,
+                "inventory_state": final_inventory_state,
+            }
+            if degraded is not None:
+                snapshot["degraded"] = degraded
+            return snapshot
 
         return _cached_runtime_snapshot(
-            ("sessions-stream-snapshot", provider_filter),
+            (
+                "sessions-stream-snapshot",
+                provider_filter,
+                inventory_state,
+                inventory_generation,
+            ),
             RUNTIME_SNAPSHOT_CACHE_SECONDS,
             load_snapshot,
-            force_refresh=force_refresh,
+            force_refresh=bypass_snapshot_cache,
             # Authoritative discovery can register a terminal while building
             # this exact snapshot. That registry write invalidates older
             # snapshots, but this completed value already includes the write.
@@ -22234,7 +22860,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             snapshot = self._collect_sessions_stream_snapshot(
                 provider_filter,
-                force_refresh=True,
+                bypass_snapshot_cache=True,
             )
             snapshot["source"] = _sessions_stream_source()
             snapshot["count"] = len(snapshot.get("items") or [])
@@ -39320,6 +39946,9 @@ if __name__ == "__main__":
     _start_keep_awake()
     server = _PairlingThreadingHTTPServer((host, PORT), Handler)
     server.daemon_threads = True
+    _sessions_provider_inventory_bundle(
+        set(_visible_agent_provider_ids()) & set(_SESSION_MEMBERSHIP_PROVIDERS)
+    )
     # Name the inputs that produced this bind. On 2026-07-08 a daemon boot
     # served 0.0.0.0 while the plist said loopback and nothing on disk could
     # say why; a non-loopback bind is a security posture change, so the boot
