@@ -22393,6 +22393,7 @@ class Handler(BaseHTTPRequestHandler):
                         terminal,
                         row,
                     )
+                    and row.get("readable_state") == "live"
                 ]
                 if len(matching_rows) != 1:
                     missing.append({
@@ -22777,21 +22778,33 @@ class Handler(BaseHTTPRequestHandler):
                         )
                     )
                 else:
-                    has_verified_process = _session_has_verified_provider_process(
-                        row,
-                        str(row.get("provider") or "claude"),
-                        (
-                            provider_inventory.get("claude", [])
-                            if provider_inventory is not None
-                            else None
-                        ),
+                    claude_inventory = (
+                        provider_inventory.get("claude", [])
+                        if provider_inventory is not None
+                        else None
                     )
+                    if claude_inventory is not None:
+                        has_verified_process = any(
+                            _session_inventory_terminal_matches_row(
+                                "claude",
+                                terminal,
+                                row,
+                            )
+                            for terminal in claude_inventory
+                        )
+                    else:
+                        has_verified_process = _session_has_verified_provider_process(
+                            row,
+                            "claude",
+                        )
             except Exception:
                 has_verified_process = False
 
         if closed_at:
             readable_state = "closed"
-        elif has_verified_process or age <= 60 * 60:
+        elif has_verified_process or (
+            provider_inventory is None and age <= 60 * 60
+        ):
             readable_state = "live"
         elif age <= 60 * 24 * 60:
             readable_state = "stale"
