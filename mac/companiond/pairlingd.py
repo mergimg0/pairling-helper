@@ -21383,7 +21383,7 @@ class Handler(BaseHTTPRequestHandler):
             },
         )
         payload["count"] = len(payload.get("items") or [])
-        self._send_json(payload)
+        self._send_json(payload, headers={"Cache-Control": "no-store"})
 
     def _collect_visible_session_rows(
         self,
@@ -22241,6 +22241,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(
                 snapshot,
                 status=503 if snapshot.get("degraded") is not None else 200,
+                headers={"Cache-Control": "no-store"},
             )
             return
 
