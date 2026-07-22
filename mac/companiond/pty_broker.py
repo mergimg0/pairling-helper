@@ -2246,11 +2246,27 @@ class PTYBrokerSession:
         composer = self._compact_render_text(
             "\n".join(composer_lines)
         )
-        return (
-            int(self.generation) > after_generation
-            and composer.endswith(needle)
+        if int(self.generation) <= after_generation:
+            return False
+        if (
+            composer.endswith(needle)
             and rendered.count(needle) > before_rendered.count(needle)
-        )
+        ):
+            return True
+        extra_lines = text.count("\n")
+        if extra_lines < 1:
+            return False
+        for match in re.finditer(
+            r"\[Pastedtext#\d+\+(\d+)lines?\]",
+            composer,
+        ):
+            chip = match.group(0)
+            if (
+                int(match.group(1)) == extra_lines
+                and composer.count(chip) > before_rendered.count(chip)
+            ):
+                return True
+        return False
 
     def _wait_for_pasted_text(
         self,
