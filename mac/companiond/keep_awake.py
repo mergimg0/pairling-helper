@@ -82,13 +82,14 @@ class KeepAwakeManager:
             return
         self._record("spawned", count)
 
-    def _terminate(self, count: int, event: str) -> None:
+    def _take_child_for_termination_locked(self):
         child = self._child
         self._child = None
         self._since = None
         self._since_wall = None
-        if child is None:
-            return
+        return child
+
+    def _terminate_child(self, child) -> None:
         try:
             child.terminate()
             child.wait(timeout=5)
@@ -97,10 +98,12 @@ class KeepAwakeManager:
                 child.kill()
             except Exception:
                 pass
-        self._record(event, count)
 
     def evaluate(self, reasons: dict[str, int], now: float | None = None) -> dict:
         """Apply the current activity reasons; spawn, hold, linger, or release."""
+        child_to_terminate = None
+        terminate_event = ""
+        terminate_count = 0
         with self._lock:
             self._reasons = {k: int(v) for k, v in (reasons or {}).items()}
             if not self.enabled:
@@ -120,11 +123,19 @@ class KeepAwakeManager:
                         self._zero_since = tick
                         self._record("linger_started", count)
                     elif tick - self._zero_since >= self.linger_seconds:
-                        self._terminate(count, "released")
+                        child_to_terminate = self._take_child_for_termination_locked()
+                        terminate_event = "released"
+                        terminate_count = count
                         self._zero_since = None
                 else:
                     self._zero_since = None
-            return self._status_locked()
+            status = self._status_locked()
+        if child_to_terminate is not None:
+            self._terminate_child(child_to_terminate)
+            with self._lock:
+                self._record(terminate_event, terminate_count)
+                status = self._status_locked()
+        return status
 
     def status(self) -> dict:
         with self._lock:
@@ -143,7 +154,12 @@ class KeepAwakeManager:
         }
 
     def shutdown(self) -> None:
+        child_to_terminate = None
         with self._lock:
             if self._child is not None:
-                self._terminate(0, "shutdown")
+                child_to_terminate = self._take_child_for_termination_locked()
             self._zero_since = None
+        if child_to_terminate is not None:
+            self._terminate_child(child_to_terminate)
+            with self._lock:
+                self._record("shutdown", 0)

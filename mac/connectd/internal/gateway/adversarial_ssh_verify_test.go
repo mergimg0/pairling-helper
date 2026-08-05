@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAdversarialSSHGatewayBypass(t *testing.T) {
@@ -101,5 +102,68 @@ func TestAdversarialSSHGatewayBypass(t *testing.T) {
 		if prov != "" && prov != "ssh_gateway" {
 			t.Fatalf("forged provenance reached upstream: %q", prov)
 		}
+	}
+}
+
+func TestAdversarialSSHGatewayCapsBodyBeforeForwarding(t *testing.T) {
+	var forwarded int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	upstreamURL, _ := url.Parse(upstream.URL)
+	handler, err := NewHandler(Options{
+		Upstream:     upstreamURL,
+		MaxBodyBytes: 32,
+		Mode:         ExposureModeSSH,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "http://ssh.local/send-text", strings.NewReader(strings.Repeat("x", 33)))
+	req.Header.Set("Authorization", "Bearer device-token")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", rec.Code)
+	}
+	if forwarded != 0 {
+		t.Fatalf("oversized SSH request reached upstream")
+	}
+}
+
+func TestAdversarialSSHGatewayRateLimitsAllowedRequests(t *testing.T) {
+	var forwarded int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	upstreamURL, _ := url.Parse(upstream.URL)
+	handler, err := NewHandler(Options{
+		Upstream:     upstreamURL,
+		MaxBodyBytes: 4096,
+		Mode:         ExposureModeSSH,
+		RateLimiter:  NewMemoryRateLimiter(1, time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, want := range []int{http.StatusOK, http.StatusTooManyRequests} {
+		req := httptest.NewRequest(http.MethodGet, "http://ssh.local/sessions", nil)
+		req.RemoteAddr = "203.0.113.10:12345"
+		req.Header.Set("Authorization", "Bearer device-token")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Fatalf("request %d status = %d, want %d", i+1, rec.Code, want)
+		}
+	}
+	if forwarded != 1 {
+		t.Fatalf("forwarded = %d, want 1", forwarded)
 	}
 }

@@ -47,6 +47,14 @@ class ClaudeProviderAdapter(ProviderAdapter):
             Path("/usr/local/bin/claude"),
         ]
 
+    def create_control_driver(self, binding):
+        # Import lazily so provider detection stays available when Node or the
+        # pinned Agent SDK dependency is absent. Launch performs the live SDK
+        # handshake and fails closed with a typed unavailable error.
+        from .claude_agent_sdk import ClaudeAgentSDKDriver
+
+        return ClaudeAgentSDKDriver(binding)
+
     def supports(self, capability: str) -> bool:
         return capability in {
             "detect",

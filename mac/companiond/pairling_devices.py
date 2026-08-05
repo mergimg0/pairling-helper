@@ -19,7 +19,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from runtime_contract import DEFAULT_DEVICE_SCOPES
+from runtime_contract import (
+    DEFAULT_DEVICE_SCOPES,
+    DEVICE_ROLE_CUSTOM,
+    DEVICE_ROLE_INTERNAL,
+    DEVICE_ROLE_OPERATOR,
+    DEVICE_ROLE_READER,
+    LOCAL_MCP_DISPATCH_SCOPE,
+    MIGRATABLE_OPERATOR_DEVICE_SCOPES,
+    OPERATOR_DEVICE_SCOPES,
+    READER_DEVICE_SCOPES,
+    device_scopes_for_role,
+)
 from runtime_paths import app_support_root, audit_log_path, devices_db_path
 
 
@@ -39,6 +50,37 @@ INSTALL_ID_MAX_LENGTH = 256
 PHONE_TOOL_ACTIVITY_EVENT = "pairling_tools.run"
 PHONE_TOOL_ACTIVITY_MAX_ITEMS = 100
 PHONE_TOOL_ACTIVITY_READ_BYTES = 2 * 1024 * 1024
+
+def _device_role_for_scopes(
+    *,
+    role: str | None,
+    scopes: Iterable[str],
+    purpose: str | None,
+) -> str:
+    normalized_role = str(role or "").strip().lower()
+    normalized_scopes = frozenset(scopes)
+    if normalized_role:
+        if normalized_role not in {
+            DEVICE_ROLE_READER,
+            DEVICE_ROLE_OPERATOR,
+            DEVICE_ROLE_INTERNAL,
+            DEVICE_ROLE_CUSTOM,
+        }:
+            raise ValueError(f"unsupported device role: {normalized_role}")
+        expected = {
+            DEVICE_ROLE_READER: READER_DEVICE_SCOPES,
+            DEVICE_ROLE_OPERATOR: OPERATOR_DEVICE_SCOPES,
+        }.get(normalized_role)
+        if expected is not None and normalized_scopes != expected:
+            raise ValueError(f"{normalized_role} device scopes do not match its role profile")
+        return normalized_role
+    if str(purpose or "").strip() in INTERNAL_DEVICE_PURPOSES:
+        return DEVICE_ROLE_INTERNAL
+    if normalized_scopes == READER_DEVICE_SCOPES:
+        return DEVICE_ROLE_READER
+    if normalized_scopes in MIGRATABLE_OPERATOR_DEVICE_SCOPES:
+        return DEVICE_ROLE_OPERATOR
+    return DEVICE_ROLE_CUSTOM
 
 
 def utc_epoch() -> float:
@@ -565,8 +607,10 @@ class DeviceAuthResult:
     device_id: str | None = None
     install_id: str | None = None
     proof_secret: str | None = None
+    token_hash: str | None = None
     scopes: frozenset[str] = frozenset()
     activation_state: str = "active"
+    role: str | None = None
     credential_expires_at: float | None = None
 
     def has_scope(self, scope: str) -> bool:
@@ -582,6 +626,7 @@ class CreatedDevice:
     install_id: str
     relay_device_id: str | None = None
     attestation_status: str = "none"
+    role: str | None = None
 
 
 @dataclass(frozen=True)
@@ -753,6 +798,7 @@ class DeviceRegistry:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
             self._ensure_schema(conn)
+            conn.commit()
             if immediate:
                 conn.execute("BEGIN IMMEDIATE")
             yield conn
@@ -775,6 +821,7 @@ class DeviceRegistry:
                 device_name TEXT NOT NULL,
                 token_hash TEXT NOT NULL UNIQUE,
                 scopes_json TEXT NOT NULL,
+                role TEXT,
                 install_id TEXT NOT NULL,
                 created_at REAL NOT NULL,
                 last_seen_at REAL,
@@ -787,6 +834,7 @@ class DeviceRegistry:
             for row in conn.execute("PRAGMA table_info(devices)").fetchall()
         }
         additive_columns = {
+            "role": "ALTER TABLE devices ADD COLUMN role TEXT",
             "relay_device_id": "ALTER TABLE devices ADD COLUMN relay_device_id TEXT",
             "attestation_status": "ALTER TABLE devices ADD COLUMN attestation_status TEXT DEFAULT 'none'",
             "apns_registered_at": "ALTER TABLE devices ADD COLUMN apns_registered_at REAL",
@@ -807,9 +855,46 @@ class DeviceRegistry:
             "purpose": "ALTER TABLE devices ADD COLUMN purpose TEXT",
             "lease_expires_at": "ALTER TABLE devices ADD COLUMN lease_expires_at REAL",
         }
+        role_was_added = "role" not in existing
         for column, statement in additive_columns.items():
             if column not in existing:
                 conn.execute(statement)
+        rows = conn.execute(
+            "SELECT device_id, scopes_json, purpose, role FROM devices"
+        ).fetchall()
+        for row in rows:
+            try:
+                saved_scopes = frozenset(json.loads(row["scopes_json"] or "[]"))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                saved_scopes = frozenset()
+            purpose = str(row["purpose"] or "").strip()
+            saved_role = str(row["role"] or "").strip().lower()
+            is_internal = (
+                purpose in INTERNAL_DEVICE_PURPOSES
+                or LOCAL_MCP_DISPATCH_SCOPE in saved_scopes
+            )
+            if is_internal:
+                migrated_role = DEVICE_ROLE_INTERNAL
+            elif not purpose and (
+                saved_role == DEVICE_ROLE_OPERATOR
+                or saved_scopes in MIGRATABLE_OPERATOR_DEVICE_SCOPES
+            ):
+                # Preserve the exact authority that the local Mac previously
+                # granted. A role migration may classify historical human
+                # pairings, but it must never add scopes as new controls ship.
+                # Fresh Operator scopes require a new explicit local pairing.
+                migrated_role = DEVICE_ROLE_OPERATOR
+            elif saved_role:
+                migrated_role = saved_role
+            elif saved_scopes == READER_DEVICE_SCOPES:
+                migrated_role = DEVICE_ROLE_READER
+            else:
+                migrated_role = DEVICE_ROLE_CUSTOM
+            if role_was_added or migrated_role != saved_role:
+                conn.execute(
+                    "UPDATE devices SET role = ? WHERE device_id = ?",
+                    (migrated_role, row["device_id"]),
+                )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_devices_token_hash ON devices(token_hash)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_devices_relay_device_id ON devices(relay_device_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_devices_pending_pair_id ON devices(pending_pair_id)")
@@ -854,6 +939,7 @@ class DeviceRegistry:
         device_name: str,
         install_id: str,
         scopes: Iterable[str] | None = None,
+        role: str | None = None,
         token: str | None = None,
         proof_secret: str | None = None,
         device_id: str | None = None,
@@ -865,7 +951,20 @@ class DeviceRegistry:
         purpose: str | None = None,
         lease_expires_at: float | None = None,
     ) -> CreatedDevice:
-        normalized_scopes = tuple(sorted(set(scopes or DEFAULT_DEVICE_SCOPES)))
+        requested_role = str(role or "").strip().lower()
+        if scopes is None and requested_role in {
+            DEVICE_ROLE_READER,
+            DEVICE_ROLE_OPERATOR,
+        }:
+            selected_scopes = device_scopes_for_role(requested_role)
+        else:
+            selected_scopes = DEFAULT_DEVICE_SCOPES if scopes is None else scopes
+        normalized_scopes = tuple(sorted(set(selected_scopes)))
+        normalized_role = _device_role_for_scopes(
+            role=requested_role or None,
+            scopes=normalized_scopes,
+            purpose=purpose,
+        )
         token_value = token or generate_token()
         proof_secret_value = proof_secret or generate_proof_secret()
         device_id_value = device_id or generate_device_id()
@@ -915,12 +1014,12 @@ class DeviceRegistry:
             conn.execute(
                 """
                 INSERT INTO devices
-                    (device_id, device_name, token_hash, scopes_json, install_id,
+                    (device_id, device_name, token_hash, scopes_json, role, install_id,
                      created_at, last_seen_at, revoked_at, relay_device_id,
                      attestation_status, apns_registered_at, relay_pair_secret_ref,
                      device_display_name, proof_secret, se_public_key_der,
                      activation_state, activated_at, purpose, lease_expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?, ?, ?, ?,
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?, ?, ?, ?,
                         'active', ?, ?, ?)
                 """,
                 (
@@ -928,6 +1027,7 @@ class DeviceRegistry:
                     device_name,
                     hash_token(token_value),
                     json.dumps(normalized_scopes),
+                    normalized_role,
                     install_id_value,
                     now,
                     relay_device_id,
@@ -947,6 +1047,7 @@ class DeviceRegistry:
                 outcome="ok",
                 detail={
                     "scopes": list(normalized_scopes),
+                    "role": normalized_role,
                     "attestation_status": attestation_value,
                     "relay_device_id": relay_device_id,
                     "purpose": purpose or None,
@@ -968,6 +1069,7 @@ class DeviceRegistry:
             install_id_value,
             relay_device_id,
             attestation_value,
+            normalized_role,
         )
 
     def create_pending_device(
@@ -984,6 +1086,7 @@ class DeviceRegistry:
         device_id: str,
         scopes: Iterable[str],
         install_id: str,
+        role: str | None = None,
         relay_device_id: str | None = None,
         attestation_status: str = "none",
         device_display_name: str | None = None,
@@ -999,6 +1102,11 @@ class DeviceRegistry:
         normalized_scopes = tuple(sorted(set(scopes)))
         if not normalized_scopes:
             raise DeviceRegistryError("invalid_scopes", 400, "pending device scopes are empty")
+        normalized_role = _device_role_for_scopes(
+            role=role,
+            scopes=normalized_scopes,
+            purpose=purpose,
+        )
         try:
             decoded_response = json.loads(response_json)
         except (TypeError, ValueError, RecursionError) as exc:
@@ -1038,13 +1146,13 @@ class DeviceRegistry:
             conn.execute(
                 """
                 INSERT INTO devices
-                    (device_id, device_name, token_hash, scopes_json, install_id,
+                    (device_id, device_name, token_hash, scopes_json, role, install_id,
                      created_at, last_seen_at, revoked_at, relay_device_id,
                      attestation_status, apns_registered_at, relay_pair_secret_ref,
                      device_display_name, proof_secret, se_public_key_der,
                      activation_state, pending_pair_id, pending_expires_at,
                      activation_nonce, activated_at, purpose, lease_expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?, ?, ?, ?,
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?, ?, ?, ?,
                         'pending', ?, ?, ?, NULL, ?, ?)
                 """,
                 (
@@ -1052,6 +1160,7 @@ class DeviceRegistry:
                     device_name,
                     hash_token(token),
                     json.dumps(normalized_scopes),
+                    normalized_role,
                     install_id_value,
                     now,
                     relay_device_id,
@@ -1091,6 +1200,7 @@ class DeviceRegistry:
                 detail={
                     "pair_id": pair_id,
                     "scopes": list(normalized_scopes),
+                    "role": normalized_role,
                     "relay_device_id": relay_device_id,
                     "purpose": purpose or None,
                     "pending_expires_at": float(pending_expires_at),
@@ -1106,6 +1216,7 @@ class DeviceRegistry:
             install_id_value,
             relay_device_id,
             attestation_value,
+            normalized_role,
         )
 
     def resumable_pair_claim(
@@ -1661,6 +1772,46 @@ class DeviceRegistry:
             )
             return True
 
+    def authorization_for_device(self, device_id: str) -> dict[str, Any] | None:
+        """Return current non-secret authorization for one active push target."""
+        normalized_device_id = str(device_id or "").strip()
+        if not normalized_device_id:
+            return None
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT device_id, install_id, scopes_json, role, purpose, "
+                "activation_state, revoked_at, lease_expires_at "
+                "FROM devices WHERE device_id = ?",
+                (normalized_device_id,),
+            ).fetchone()
+        if (
+            row is None
+            or row["revoked_at"] is not None
+            or str(row["activation_state"] or "active") != "active"
+        ):
+            return None
+        lease_expires_at = row["lease_expires_at"]
+        if lease_expires_at is not None and utc_epoch() >= float(lease_expires_at):
+            return None
+        try:
+            scopes = frozenset(json.loads(row["scopes_json"] or "[]"))
+            role = _device_role_for_scopes(
+                role=row["role"],
+                scopes=scopes,
+                purpose=row["purpose"],
+            )
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        return {
+            "device_id": str(row["device_id"]),
+            "install_id": str(row["install_id"]),
+            "role": role,
+            "scopes": tuple(sorted(scopes)),
+            "credential_expires_at": (
+                float(lease_expires_at) if lease_expires_at is not None else None
+            ),
+        }
+
     def authenticate(
         self,
         token: str | None,
@@ -1752,6 +1903,7 @@ class DeviceRegistry:
                     proof_secret=row["proof_secret"],
                     scopes=scopes,
                     activation_state=activation_state,
+                    role=str(row["role"] or "") or None,
                     credential_expires_at=(
                         min(
                             value
@@ -1782,8 +1934,10 @@ class DeviceRegistry:
                 device_id=row["device_id"],
                 install_id=row["install_id"],
                 proof_secret=row["proof_secret"],
+                token_hash=token_hash,
                 scopes=scopes,
                 activation_state=activation_state,
+                role=str(row["role"] or "") or None,
                 credential_expires_at=(
                     min(
                         value
@@ -2238,32 +2392,107 @@ class DeviceRegistry:
                 )
             return len(rows)
 
-    def rotate_token(self, device_id: str) -> str | None:
-        token = generate_token()
+    def rotation_token_hash(self, device_id: str) -> str | None:
+        """Return the credential generation for one currently rotatable device."""
         with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT token_hash FROM devices
+                WHERE device_id = ?
+                  AND revoked_at IS NULL
+                  AND superseded_by_device_id IS NULL
+                  AND COALESCE(activation_state, 'active') = 'active'
+                  AND (lease_expires_at IS NULL OR lease_expires_at > ?)
+                """,
+                (device_id, utc_epoch()),
+            ).fetchone()
+        return None if row is None else str(row["token_hash"])
+
+    def rotate_token(
+        self,
+        device_id: str,
+        *,
+        expected_token_hash: str | None = None,
+    ) -> str | None:
+        if expected_token_hash is not None and not re.fullmatch(
+            r"[0-9a-f]{64}",
+            expected_token_hash,
+        ):
+            raise DeviceRegistryError(
+                "device_token_rotation_forbidden",
+                403,
+                "device token rotation authorization is invalid",
+                device_id=device_id,
+            )
+
+        conflict: DeviceRegistryError | None = None
+        token: str | None = None
+        with self.connect(immediate=True) as conn:
+            authorized_token_hash = expected_token_hash
+            if authorized_token_hash is None:
+                row = conn.execute(
+                    """
+                    SELECT token_hash FROM devices
+                    WHERE device_id = ?
+                      AND revoked_at IS NULL
+                      AND superseded_by_device_id IS NULL
+                      AND COALESCE(activation_state, 'active') = 'active'
+                      AND (lease_expires_at IS NULL OR lease_expires_at > ?)
+                    """,
+                    (device_id, utc_epoch()),
+                ).fetchone()
+                if row is None:
+                    self.record_audit(
+                        "device.rotate_token",
+                        device_id=device_id,
+                        outcome="not_found",
+                        conn=conn,
+                    )
+                    return None
+                authorized_token_hash = str(row["token_hash"])
+
+            token = generate_token()
             cur = conn.execute(
                 """
                 UPDATE devices
-                SET token_hash = ?, revoked_at = NULL
+                SET token_hash = ?
                 WHERE device_id = ?
+                  AND token_hash = ?
+                  AND revoked_at IS NULL
+                  AND superseded_by_device_id IS NULL
+                  AND COALESCE(activation_state, 'active') = 'active'
+                  AND (lease_expires_at IS NULL OR lease_expires_at > ?)
                 """,
-                (hash_token(token), device_id),
+                (
+                    hash_token(token),
+                    device_id,
+                    authorized_token_hash,
+                    utc_epoch(),
+                ),
             )
             if cur.rowcount <= 0:
                 self.record_audit(
                     "device.rotate_token",
                     device_id=device_id,
-                    outcome="not_found",
+                    outcome="conflict",
                     conn=conn,
                 )
-                return None
-            self.record_audit(
-                "device.rotate_token",
-                device_id=device_id,
-                outcome="ok",
-                conn=conn,
-            )
-            return token
+                conflict = DeviceRegistryError(
+                    "device_token_rotation_conflict",
+                    409,
+                    "device token rotation authorization is stale",
+                    device_id=device_id,
+                )
+            else:
+                self.record_audit(
+                    "device.rotate_token",
+                    device_id=device_id,
+                    outcome="ok",
+                    conn=conn,
+                )
+        if conflict is not None:
+            raise conflict
+        return token
 
     def register_se_pubkey(self, device_id: str, se_public_key_der: str) -> bool:
         """WS4: store the device's Secure-Enclave public key (base64 X9.63)."""

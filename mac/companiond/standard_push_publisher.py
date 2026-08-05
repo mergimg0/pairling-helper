@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 import threading
 import time
 from pathlib import Path
@@ -23,6 +24,8 @@ class TurnStateAlertPublisher:
         turn_state_dir: Path,
         push_dispatcher,
         claude_session_resolver: Callable[[str], str] | None = None,
+        device_authorization_fn: Callable[[str], dict[str, Any] | None] | None = None,
+        notification_nonce_fn: Callable[[], str] | None = None,
         now_fn=time.time,
         sleep_fn=time.sleep,
         poll_interval: float = 2.0,
@@ -36,6 +39,8 @@ class TurnStateAlertPublisher:
         self.turn_state_dir = turn_state_dir
         self.push_dispatcher = push_dispatcher
         self.claude_session_resolver = claude_session_resolver or (lambda _uuid: "")
+        self.device_authorization_fn = device_authorization_fn
+        self.notification_nonce_fn = notification_nonce_fn or (lambda: secrets.token_urlsafe(24))
         self.now_fn = now_fn
         self.sleep_fn = sleep_fn
         self.poll_interval = poll_interval
@@ -100,7 +105,10 @@ class TurnStateAlertPublisher:
                 for device in devices:
                     if not self._device_wants_event(device, event["kind"]):
                         continue
-                    result = self._publish(device["device_id"], event)
+                    authorized_event = self._event_for_device(device, event)
+                    if authorized_event is None:
+                        continue
+                    result = self._publish(device["device_id"], authorized_event)
                     if result is not None:
                         results.append(result)
         return results
@@ -217,8 +225,8 @@ class TurnStateAlertPublisher:
         })
         if kind == "action_required" and visible.get("request_nonce"):
             payload["request_nonce"] = visible.get("request_nonce")
-        if visible.get("mac_install_id"):
-            payload["mac_install_id"] = visible.get("mac_install_id")
+        if self.mac_install_id:
+            payload["mac_install_id"] = self.mac_install_id
         return payload
 
     def _route_session_id_for_event(self, session_id: str) -> str:
@@ -250,6 +258,75 @@ class TurnStateAlertPublisher:
         if kind == "turn_result":
             return bool(device.get("turn_done_enabled"))
         return True
+
+    def _event_for_device(
+        self,
+        device: dict[str, Any],
+        event: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        requires_decision = event.get("kind") == "action_required" and bool(event.get("request_nonce"))
+        supports_interrupt_action = event.get("kind") in {"action_required", "turn_failed"}
+        if not requires_decision and not supports_interrupt_action:
+            return event
+        if self.device_authorization_fn is None:
+            return None if requires_decision else event
+
+        device_id = str(device.get("device_id") or "")
+        try:
+            authorization = self.device_authorization_fn(device_id)
+        except Exception:
+            return None if requires_decision else event
+        if not isinstance(authorization, dict):
+            return None if requires_decision else event
+        scopes = frozenset(authorization.get("scopes") or ())
+        install_id = str(authorization.get("install_id") or "")
+        event_install_id = str(event.get("mac_install_id") or "")
+        if not device_id or not install_id or event_install_id != install_id:
+            return None if requires_decision else event
+
+        issued_at = float(self.now_fn())
+        expires_at = issued_at + 120.0
+        credential_expires_at = authorization.get("credential_expires_at")
+        if credential_expires_at is not None:
+            try:
+                expires_at = min(expires_at, float(credential_expires_at))
+            except (TypeError, ValueError, OverflowError):
+                return None if requires_decision else event
+        if expires_at <= issued_at:
+            return None if requires_decision else event
+
+        personalized = dict(event)
+        if requires_decision:
+            if "approval:decide" not in scopes:
+                return None
+            personalized.update({
+                "category": "PAIRLING_APPROVAL_DECISION",
+                "authorization_contract": "pairling.authorization.v1",
+                "authorization_control": "approval.decide",
+                "authorization_device_id": device_id,
+                "authorization_install_id": install_id,
+                "authorization_issued_at": issued_at,
+                "authorization_expires_at": expires_at,
+            })
+
+        if supports_interrupt_action and "session:signal" in scopes:
+            provider = str(event.get("provider") or "").strip()
+            native_id = str(event.get("session_id") or "").strip()
+            session_id = f"{provider}:{native_id}" if provider and native_id else ""
+            nonce = _bounded_optional(self.notification_nonce_fn(), 256)
+            if session_id and nonce:
+                personalized.update({
+                    "notification_action_nonce": nonce,
+                    "notification_action_contract": "pairling.authorization.v1",
+                    "notification_action_control": "session.interrupt",
+                    "notification_action_device_id": device_id,
+                    "notification_action_install_id": install_id,
+                    "notification_action_session_id": session_id,
+                    "notification_action_action": "interrupt",
+                    "notification_action_issued_at": issued_at,
+                    "notification_action_expires_at": expires_at,
+                })
+        return personalized
 
     def _publish(self, device_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         key = (device_id, payload["kind"], payload["event_id"])

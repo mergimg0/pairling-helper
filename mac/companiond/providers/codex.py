@@ -4,6 +4,13 @@ import time
 from pathlib import Path
 
 from . import registry_data
+from .codex_app_server import (
+    CodexAppServerDriver,
+    is_compatible_codex_app_server_version,
+    normalized_codex_app_server_version,
+)
+from .controls import ProviderControlBinding
+from .operations import provider_has_release_membership
 from .base import (
     ProviderAdapter,
     ProviderAvailability,
@@ -45,6 +52,38 @@ class CodexProviderAdapter(ProviderAdapter):
             Path("/opt/homebrew/bin/codex"),
             Path("/usr/local/bin/codex"),
         ]
+
+    def create_control_driver(
+        self,
+        binding: ProviderControlBinding,
+    ) -> CodexAppServerDriver | None:
+        if (
+            binding.provider_id != self.descriptor.provider_id
+            or not provider_has_release_membership(binding.provider_id)
+        ):
+            return None
+        expected = normalized_codex_app_server_version(binding.provider_version)
+        if expected is None or not is_compatible_codex_app_server_version(
+            binding.provider_version
+        ):
+            return None
+        env_var = _ENTRY.env_override if _ENTRY is not None else "PAIRLING_CODEX_BIN"
+        resolved = resolve_executable("codex", self.candidates, env_var=env_var)
+        if resolved is None:
+            return None
+        observed_version = cli_version(resolved.path)
+        if normalized_codex_app_server_version(observed_version) != expected:
+            return None
+        return CodexAppServerDriver(
+            binding=binding,
+            argv=(
+                str(resolved.path),
+                "app-server",
+                "--listen",
+                "stdio://",
+            ),
+            client_version="2026.08.03",
+        )
 
     def supports(self, capability: str) -> bool:
         return capability in {

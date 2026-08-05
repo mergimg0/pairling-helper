@@ -2,11 +2,7 @@
 set -euo pipefail
 
 export PYTHONDONTWRITEBYTECODE=1
-if [[ -z "${PYTHONPYCACHEPREFIX:-}" ]]; then
-  PYTHONPYCACHEPREFIX="${TMPDIR:-/tmp}/pairling-pycache-$(id -u)"
-  mkdir -p "$PYTHONPYCACHEPREFIX" 2>/dev/null || true
-  export PYTHONPYCACHEPREFIX
-fi
+unset PYTHONPYCACHEPREFIX
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DOCTOR_APP_SUPPORT="${PAIRLING_APP_SUPPORT_ROOT:-${COMPANION_APP_SUPPORT_ROOT:-$HOME/Library/Application Support/Pairling}}"
@@ -159,9 +155,9 @@ def connect_query_only_database(path: Path) -> sqlite3.Connection:
     raise AssertionError("query-only database retry loop exhausted")
 
 
-def run(args, timeout=5):
+def run(args, timeout=5, env=None):
     try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
         return proc.returncode, proc.stdout or "", proc.stderr or ""
     except Exception as exc:
         return 127, "", f"{type(exc).__name__}: {exc}"
@@ -721,10 +717,18 @@ compile_targets = [
     repo_root / "mac" / "install" / "render-launchd.py",
 ]
 compile_errors = []
-for target in compile_targets:
-    code, out, err = run([sys.executable, "-m", "py_compile", str(target)])
-    if code != 0:
-        compile_errors.append(f"{target}: {err or out}")
+compile_env = os.environ.copy()
+compile_env.pop("PYTHONDONTWRITEBYTECODE", None)
+with tempfile.TemporaryDirectory(prefix="pairling-doctor-pycache.") as pycache_root:
+    os.chmod(pycache_root, 0o700)
+    compile_env["PYTHONPYCACHEPREFIX"] = pycache_root
+    for target in compile_targets:
+        code, out, err = run(
+            [sys.executable, "-m", "py_compile", str(target)],
+            env=compile_env,
+        )
+        if code != 0:
+            compile_errors.append(f"{target}: {err or out}")
 add("lifecycle_sources_compile", not compile_errors, "error", "Lifecycle sources compile." if not compile_errors else "Lifecycle compile failed.", compile_errors)
 
 ok, evidence = writable_dir(APP_SUPPORT)

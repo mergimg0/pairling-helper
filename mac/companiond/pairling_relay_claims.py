@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from pairling_assurance_policy import relay_claims_required
 
 try:
     from cryptography.exceptions import InvalidSignature
@@ -226,15 +227,6 @@ class RelayClaimVerifier:
                 raise RelayClaimError("attested_claim_invalid", f"invalid relay public key {path}: {exc}")
             keys.append((path.stem, public_key))
         return keys
-
-
-def relay_claims_required() -> bool:
-    return os.environ.get("PAIRLING_RELAY_CLAIMS_REQUIRED", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "required",
-    }
 
 
 def configured_public_key_paths() -> list[Path]:

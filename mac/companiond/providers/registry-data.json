@@ -18,7 +18,16 @@
         "~/.claude/settings.json"
       ],
       "version_command": ["--version"],
-      "docs_url": "https://docs.anthropic.com/en/docs/claude-code"
+      "docs_url": "https://docs.anthropic.com/en/docs/claude-code",
+      "managed_launch": {
+        "control_channel": "agent-sdk",
+        "ready_auth_states": ["ready"],
+        "ready_config_states": ["ready", "missing"]
+      },
+      "terminal_launch": {
+        "profile": "claude_phone",
+        "backends": ["terminal_app", "broker"]
+      }
     },
     {
       "id": "codex",
@@ -37,7 +46,65 @@
         "~/.codex/config.toml"
       ],
       "version_command": ["--version"],
-      "docs_url": "https://developers.openai.com/codex"
+      "docs_url": "https://developers.openai.com/codex",
+      "managed_launch": {
+        "control_channel": "app-server-stdio",
+        "ready_auth_states": ["ready"],
+        "ready_config_states": ["ready", "missing"]
+      },
+      "terminal_launch": {
+        "profile": "codex_workspace",
+        "backends": ["terminal_app", "broker"]
+      }
+    },
+    {
+      "id": "copilot",
+      "display_name": "GitHub Copilot CLI",
+      "kind": "terminal_cli",
+      "adapter_depth": "standard",
+      "builtin": true,
+      "binary_name": "copilot",
+      "binary_candidates": [
+        "~/.local/bin/copilot",
+        "/opt/homebrew/bin/copilot",
+        "/usr/local/bin/copilot"
+      ],
+      "env_override": "PAIRLING_COPILOT_BIN",
+      "config_paths": [
+        "~/.copilot"
+      ],
+      "version_command": ["--version"],
+      "docs_url": "https://docs.github.com/en/copilot/how-tos/copilot-sdk",
+      "managed_launch": {
+        "control_channel": "stable",
+        "ready_auth_states": ["unknown"],
+        "ready_config_states": ["sdk_resolved"],
+        "auth_verification": "runtime"
+      }
+    },
+    {
+      "id": "droid",
+      "display_name": "Factory Droid",
+      "kind": "terminal_cli",
+      "adapter_depth": "deep",
+      "builtin": true,
+      "binary_name": "droid",
+      "binary_candidates": [
+        "~/.local/bin/droid",
+        "/opt/homebrew/bin/droid",
+        "/usr/local/bin/droid"
+      ],
+      "env_override": "PAIRLING_DROID_BIN",
+      "config_paths": [
+        "~/.factory"
+      ],
+      "version_command": ["--version"],
+      "docs_url": "https://docs.factory.ai/droid-cli/cli-reference",
+      "managed_launch": {
+        "control_channel": "stable",
+        "ready_auth_states": ["configured"],
+        "ready_config_states": ["compatible"]
+      }
     },
     {
       "id": "aider",
@@ -61,9 +128,10 @@
       "id": "opencode",
       "display_name": "OpenCode",
       "kind": "terminal_cli",
-      "adapter_depth": "recognized",
+      "adapter_depth": "deep",
       "binary_name": "opencode",
       "binary_candidates": [
+        "~/.opencode/bin/opencode",
         "~/.local/bin/opencode",
         "/opt/homebrew/bin/opencode",
         "/usr/local/bin/opencode"
@@ -73,13 +141,20 @@
         "~/.config/opencode/opencode.json"
       ],
       "version_command": ["--version"],
-      "docs_url": "https://opencode.ai/docs"
+      "docs_url": "https://opencode.ai/docs",
+      "managed_launch": {
+        "control_channel": "stable",
+        "ready_auth_states": ["owned_child_required"],
+        "ready_config_states": ["ready", "default"],
+        "auth_verification": "runtime",
+        "require_post_launch_verification": true
+      }
     },
     {
       "id": "hermes_agent",
       "display_name": "Hermes Agent",
       "kind": "terminal_cli",
-      "adapter_depth": "recognized",
+      "adapter_depth": "standard",
       "binary_name": "hermes",
       "binary_candidates": [
         "~/.local/bin/hermes",
@@ -89,13 +164,19 @@
       "env_override": "PAIRLING_HERMES_AGENT_BIN",
       "config_paths": [],
       "version_command": ["--version"],
-      "docs_url": "https://hermes-agent.nousresearch.com/docs/user-guide/cli"
+      "docs_url": "https://hermes-agent.nousresearch.com/docs/user-guide/cli",
+      "managed_launch": {
+        "control_channel": "upstream-937222f4",
+        "ready_auth_states": ["owned_server_required"],
+        "ready_config_states": ["manual_approval_required"],
+        "auth_verification": "runtime"
+      }
     },
     {
       "id": "grok_build",
       "display_name": "Grok Build",
       "kind": "terminal_cli",
-      "adapter_depth": "recognized",
+      "adapter_depth": "standard",
       "binary_name": "grok",
       "binary_candidates": [
         "~/.local/bin/grok",
@@ -105,29 +186,37 @@
       "env_override": "PAIRLING_GROK_BUILD_BIN",
       "config_paths": [],
       "version_command": ["--version"],
-      "docs_url": "https://x.ai/cli"
+      "docs_url": "https://x.ai/cli",
+      "managed_launch": {
+        "control_channel": "stable",
+        "ready_auth_states": ["unknown"],
+        "ready_config_states": ["pairling_managed", "ready"],
+        "auth_verification": "runtime",
+        "require_post_launch_verification": true
+      }
     },
     {
       "id": "antigravity",
       "display_name": "Antigravity",
       "kind": "agent_platform",
       "adapter_depth": "recognized",
-      "binary_name": "antigravity",
+      "binary_name": "agy",
       "binary_candidates": [
-        "~/.local/bin/antigravity",
-        "/opt/homebrew/bin/antigravity",
-        "/usr/local/bin/antigravity"
+        "~/.local/bin/agy",
+        "/opt/homebrew/bin/agy",
+        "/usr/local/bin/agy"
       ],
       "env_override": "PAIRLING_ANTIGRAVITY_BIN",
       "config_paths": [],
       "version_command": ["--version"],
-      "docs_url": "https://developers.googleblog.com/en/build-with-google-antigravity-our-new-agentic-development-platform/"
+      "version_identity_pattern": "(?i)(?:\\bagy\\b|\\bAntigravity(?:\\s+CLI)?\\b)",
+      "docs_url": "https://antigravity.google/docs/cli/headless"
     },
     {
-      "id": "gemini",
+      "id": "gemini_cli",
       "display_name": "Gemini CLI",
       "kind": "terminal_cli",
-      "adapter_depth": "recognized",
+      "adapter_depth": "standard",
       "binary_name": "gemini",
       "binary_candidates": [
         "~/.local/bin/gemini",
@@ -139,7 +228,200 @@
         "~/.gemini/settings.json"
       ],
       "version_command": ["--version"],
-      "docs_url": "https://github.com/google-gemini/gemini-cli"
+      "docs_url": "https://github.com/google-gemini/gemini-cli",
+      "managed_launch": {
+        "control_channel": "stable",
+        "ready_auth_states": ["unknown"],
+        "ready_config_states": ["pairling_managed", "ready"],
+        "auth_verification": "runtime",
+        "require_post_launch_verification": true
+      }
+    },
+    {
+      "id": "omp",
+      "display_name": "Oh My Pi",
+      "kind": "terminal_cli",
+      "adapter_depth": "standard",
+      "binary_name": "omp",
+      "binary_candidates": [
+        "~/.local/bin/omp",
+        "/opt/homebrew/bin/omp",
+        "/usr/local/bin/omp"
+      ],
+      "env_override": "PAIRLING_OMP_BIN",
+      "config_paths": [],
+      "version_command": ["--version"],
+      "docs_url": "https://github.com/can1357/oh-my-pi",
+      "managed_launch": {
+        "control_channel": "stable",
+        "ready_auth_states": ["unknown"],
+        "ready_config_states": ["pairling_managed", "ready"],
+        "auth_verification": "runtime",
+        "require_post_launch_verification": true
+      }
+    },
+    {
+      "id": "kimi_code",
+      "display_name": "Kimi Code",
+      "kind": "terminal_cli",
+      "adapter_depth": "standard",
+      "binary_name": "kimi",
+      "binary_candidates": [
+        "~/.local/bin/kimi",
+        "/opt/homebrew/bin/kimi",
+        "/usr/local/bin/kimi"
+      ],
+      "env_override": "PAIRLING_KIMI_CODE_BIN",
+      "config_paths": [
+        "~/.kimi/config.toml"
+      ],
+      "version_command": ["--version"],
+      "docs_url": "https://moonshotai.github.io/kimi-code/",
+      "managed_launch": {
+        "control_channel": "stable",
+        "ready_auth_states": ["unknown"],
+        "ready_config_states": ["pairling_managed", "ready"],
+        "auth_verification": "runtime",
+        "require_post_launch_verification": true
+      }
+    },
+    {
+      "id": "cline_cli",
+      "display_name": "Cline CLI",
+      "kind": "terminal_cli",
+      "adapter_depth": "standard",
+      "binary_name": "cline",
+      "binary_candidates": [
+        "~/.local/bin/cline",
+        "/opt/homebrew/bin/cline",
+        "/usr/local/bin/cline"
+      ],
+      "env_override": "PAIRLING_CLINE_CLI_BIN",
+      "config_paths": [],
+      "version_command": ["--version"],
+      "docs_url": "https://docs.cline.bot/cli/cli-reference",
+      "managed_launch": {
+        "control_channel": "stable",
+        "ready_auth_states": ["unknown"],
+        "ready_config_states": ["pairling_managed", "ready"],
+        "auth_verification": "runtime",
+        "require_post_launch_verification": true
+      }
+    },
+    {
+      "id": "cursor_agent",
+      "display_name": "Cursor Agent",
+      "kind": "terminal_cli",
+      "adapter_depth": "recognized",
+      "binary_name": "agent",
+      "binary_candidates": [
+        "~/.local/bin/agent",
+        "/opt/homebrew/bin/agent",
+        "/usr/local/bin/agent"
+      ],
+      "env_override": "PAIRLING_CURSOR_AGENT_BIN",
+      "config_paths": [],
+      "version_command": ["--version"],
+      "version_identity_pattern": "(?i)cursor",
+      "docs_url": "https://cursor.com/docs/cli/acp"
+    },
+    {
+      "id": "pi_coding_agent",
+      "display_name": "Pi Coding Agent",
+      "kind": "terminal_cli",
+      "adapter_depth": "recognized",
+      "binary_name": "pi",
+      "binary_candidates": [
+        "~/.local/bin/pi",
+        "/opt/homebrew/bin/pi",
+        "/usr/local/bin/pi"
+      ],
+      "env_override": "PAIRLING_PI_CODING_AGENT_BIN",
+      "config_paths": [],
+      "version_command": ["--version"],
+      "docs_url": "https://github.com/badlogic/pi-mono"
+    },
+    {
+      "id": "kiro_cli",
+      "display_name": "Kiro CLI",
+      "kind": "terminal_cli",
+      "adapter_depth": "recognized",
+      "binary_name": "kiro-cli",
+      "binary_candidates": [
+        "~/.local/bin/kiro-cli",
+        "/opt/homebrew/bin/kiro-cli",
+        "/usr/local/bin/kiro-cli"
+      ],
+      "env_override": "PAIRLING_KIRO_CLI_BIN",
+      "config_paths": [],
+      "version_command": ["--version"],
+      "docs_url": "https://kiro.dev/docs/cli/"
+    },
+    {
+      "id": "goose",
+      "display_name": "Goose",
+      "kind": "terminal_cli",
+      "adapter_depth": "recognized",
+      "binary_name": "goose",
+      "binary_candidates": [
+        "~/.local/bin/goose",
+        "/opt/homebrew/bin/goose",
+        "/usr/local/bin/goose"
+      ],
+      "env_override": "PAIRLING_GOOSE_BIN",
+      "config_paths": [
+        "~/.config/goose/config.yaml"
+      ],
+      "version_command": ["--version"],
+      "docs_url": "https://goose-docs.ai/"
+    },
+    {
+      "id": "openhands",
+      "display_name": "OpenHands Agent Server",
+      "kind": "agent_server",
+      "adapter_depth": "deep",
+      "builtin": true,
+      "binary_name": "agent-server",
+      "binary_candidates": [
+        "~/.local/bin/agent-server",
+        "/opt/homebrew/bin/agent-server",
+        "/usr/local/bin/agent-server"
+      ],
+      "env_override": "PAIRLING_OPENHANDS_AGENT_SERVER_BIN",
+      "config_paths": [],
+      "version_command": ["--help"],
+      "docs_url": "https://docs.openhands.dev/sdk/arch/agent-server",
+      "managed_launch": {
+        "control_channel": "stable",
+        "ready_auth_states": ["owned_session_key"],
+        "ready_config_states": ["pinned"],
+        "auth_verification": "runtime"
+      }
+    },
+    {
+      "id": "qwen_code",
+      "display_name": "Qwen Code",
+      "kind": "terminal_cli",
+      "adapter_depth": "standard",
+      "builtin": true,
+      "binary_name": "qwen",
+      "binary_candidates": [
+        "~/.local/bin/qwen",
+        "/opt/homebrew/bin/qwen",
+        "/usr/local/bin/qwen"
+      ],
+      "env_override": "PAIRLING_QWEN_BIN",
+      "config_paths": [
+        "~/.qwen/settings.json"
+      ],
+      "version_command": ["--version"],
+      "docs_url": "https://qwenlm.github.io/qwen-code-docs/",
+      "managed_launch": {
+        "control_channel": "stable",
+        "ready_auth_states": ["unknown"],
+        "ready_config_states": ["present", "unknown"],
+        "auth_verification": "runtime"
+      }
     }
   ]
 }

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "sidecar": "claude_agent_sidecar.mjs",
+  "protocol_version": 2,
+  "runtime": {
+    "node": ">=18.0.0"
+  },
+  "dependency": {
+    "package": "@anthropic-ai/claude-agent-sdk",
+    "version": "0.3.220",
+    "claude_code_version": "2.1.220"
+  }
+}

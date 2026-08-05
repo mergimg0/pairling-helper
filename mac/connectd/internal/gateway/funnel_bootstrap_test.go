@@ -2,11 +2,13 @@ package gateway
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestFunnelBootstrapAllowlist verifies the public Funnel surface forwards only
@@ -95,6 +97,96 @@ func TestFunnelBootstrapAllowlist(t *testing.T) {
 		if forwarded[c.method+" "+c.path] {
 			t.Errorf("denied %s %s (bearer=%v): reached upstream, must be blocked at the gateway", c.method, c.path, c.bearer)
 		}
+	}
+}
+
+func TestFunnelBootstrapRejectsUnboundedBodiesBeforeUpstream(t *testing.T) {
+	upstreamHits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	upstreamURL, _ := url.Parse(upstream.URL)
+	handler, err := NewHandler(Options{
+		Upstream: upstreamURL,
+		Mode:     ExposureModeFunnelBootstrap,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name          string
+		body          string
+		contentLength int64
+		transfer      []string
+		wantStatus    int
+	}{
+		{name: "missing content length", body: "{}", contentLength: 0, wantStatus: http.StatusLengthRequired},
+		{name: "chunked body", body: "{}", contentLength: -1, transfer: []string{"chunked"}, wantStatus: http.StatusLengthRequired},
+		{name: "declared oversized", body: "{}", contentLength: prePairMaxBodyBytes + 1, wantStatus: http.StatusRequestEntityTooLarge},
+		{
+			name:          "actual body exceeds declared length",
+			body:          strings.Repeat("x", int(prePairMaxBodyBytes)+1),
+			contentLength: 2,
+			wantStatus:    http.StatusRequestEntityTooLarge,
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			upstreamHits = 0
+			req := httptest.NewRequest(
+				http.MethodPost,
+				"/pair/psk-claim-v2",
+				strings.NewReader(test.body),
+			)
+			req.ContentLength = test.contentLength
+			req.TransferEncoding = test.transfer
+			rec := httptest.NewRecorder()
+
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != test.wantStatus {
+				t.Fatalf("got %d, want %d", rec.Code, test.wantStatus)
+			}
+			if upstreamHits != 0 {
+				t.Fatalf("upstream received %d request(s), want 0", upstreamHits)
+			}
+		})
+	}
+}
+
+func TestFunnelBootstrapRejectsBodiesOnPublicGetRoutes(t *testing.T) {
+	upstreamHits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	upstreamURL, _ := url.Parse(upstream.URL)
+	handler, err := NewHandler(Options{
+		Upstream: upstreamURL,
+		Mode:     ExposureModeFunnelBootstrap,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{"/health", "/manifest", "/readyz"} {
+		for _, contentLength := range []int64{-1, 1} {
+			req := httptest.NewRequest(http.MethodGet, path, strings.NewReader("x"))
+			req.ContentLength = contentLength
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("%s with content length %d got %d, want 413", path, contentLength, rec.Code)
+			}
+		}
+	}
+	if upstreamHits != 0 {
+		t.Fatalf("upstream received %d request(s), want 0", upstreamHits)
 	}
 }
 
@@ -376,5 +468,211 @@ func TestFunnelMarkerInjectedAndStripped(t *testing.T) {
 	tailnet.ServeHTTP(httptest.NewRecorder(), req2)
 	if gotMarker != "" {
 		t.Errorf("tailnet handler upstream marker = %q, want empty (must be stripped)", gotMarker)
+	}
+}
+
+type funnelAdmissionTestBody struct {
+	data    []byte
+	reads   int
+	entered chan struct{}
+	proceed chan struct{}
+	readErr error
+}
+
+func (b *funnelAdmissionTestBody) Read(dst []byte) (int, error) {
+	b.reads++
+	if b.entered != nil {
+		close(b.entered)
+		b.entered = nil
+		<-b.proceed
+	}
+	if b.readErr != nil {
+		return 0, b.readErr
+	}
+	if len(b.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(dst, b.data)
+	b.data = b.data[n:]
+	return n, nil
+}
+
+func (b *funnelAdmissionTestBody) Close() error {
+	return nil
+}
+
+func newFunnelAdmissionTestHandler(t *testing.T, mode ExposureMode, limiter *FunnelLimiter) *Handler {
+	t.Helper()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewHandler(Options{
+		Upstream:      upstreamURL,
+		Mode:          mode,
+		FunnelLimiter: limiter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.funnelAdmission = make(chan struct{}, 1)
+	return handler
+}
+
+func TestFunnelBodyAdmissionBudgetIsSharedAcrossHandlers(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := NewHandler(Options{Upstream: upstreamURL, Mode: ExposureModeFunnelBootstrap})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewHandler(Options{Upstream: upstreamURL, Mode: ExposureModeFunnelBootstrap})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.funnelAdmission != second.funnelAdmission {
+		t.Fatal("Funnel handlers have independent pre-body budgets, want one process-global budget")
+	}
+}
+
+func TestFunnelBodyAdmissionRejectsBeforeReadingWhenSaturated(t *testing.T) {
+	handler := newFunnelAdmissionTestHandler(t, ExposureModeFunnelBootstrap, nil)
+	entered := make(chan struct{})
+	proceed := make(chan struct{})
+	firstBody := &funnelAdmissionTestBody{
+		data:    []byte(`{"pair_id":"first"}`),
+		entered: entered,
+		proceed: proceed,
+	}
+	firstRequest := httptest.NewRequest(http.MethodPost, "/pair/psk-claim-v2", firstBody)
+	firstRequest.ContentLength = int64(len(firstBody.data))
+	firstResponse := httptest.NewRecorder()
+	firstDone := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(firstResponse, firstRequest)
+		close(firstDone)
+	}()
+
+	<-entered
+	secondBody := &funnelAdmissionTestBody{data: []byte(`{"pair_id":"second"}`)}
+	secondRequest := httptest.NewRequest(http.MethodPost, "/pair/psk-claim-v2", secondBody)
+	secondRequest.ContentLength = int64(len(secondBody.data))
+	secondResponse := httptest.NewRecorder()
+	secondDone := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(secondResponse, secondRequest)
+		close(secondDone)
+	}()
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		close(proceed)
+		<-firstDone
+		<-secondDone
+		t.Fatal("saturated admission blocked instead of rejecting immediately")
+	}
+
+	close(proceed)
+	<-firstDone
+	if secondResponse.Code != http.StatusTooManyRequests {
+		t.Fatalf("saturated admission status = %d, want 429", secondResponse.Code)
+	}
+	if secondBody.reads != 0 {
+		t.Fatalf("saturated request body reads = %d, want 0", secondBody.reads)
+	}
+	if firstResponse.Code != http.StatusOK {
+		t.Fatalf("admitted request status = %d, want 200", firstResponse.Code)
+	}
+}
+
+func TestFunnelBodyAdmissionRecoversAfterMalformedAndSuccessfulRequests(t *testing.T) {
+	handler := newFunnelAdmissionTestHandler(t, ExposureModeFunnelBootstrap, nil)
+	malformedBody := &funnelAdmissionTestBody{readErr: io.ErrUnexpectedEOF}
+	malformedRequest := httptest.NewRequest(http.MethodPost, "/pair/psk-claim-v2", malformedBody)
+	malformedRequest.ContentLength = 1
+	malformedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(malformedResponse, malformedRequest)
+	if malformedResponse.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("malformed request status = %d, want 413", malformedResponse.Code)
+	}
+
+	for i := range 2 {
+		body := &funnelAdmissionTestBody{data: []byte(fmt.Sprintf(`{"pair_id":"success-%d"}`, i))}
+		request := httptest.NewRequest(http.MethodPost, "/pair/psk-claim-v2", body)
+		request.ContentLength = int64(len(body.data))
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("successful request %d status = %d, want 200", i+1, response.Code)
+		}
+	}
+}
+
+func TestFunnelBodyAdmissionIsDistinctFromParsedRequestLimits(t *testing.T) {
+	limiter := NewFunnelLimiter(1, 1, 1)
+	handler := newFunnelAdmissionTestHandler(t, ExposureModeFunnelBootstrap, limiter)
+	handler.funnelAdmission <- struct{}{}
+
+	deniedBody := &funnelAdmissionTestBody{data: []byte(`{"pair_id":"denied"}`)}
+	deniedRequest := httptest.NewRequest(http.MethodPost, "/pair/psk-claim-v2", deniedBody)
+	deniedRequest.ContentLength = int64(len(deniedBody.data))
+	deniedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(deniedResponse, deniedRequest)
+	if deniedResponse.Code != http.StatusTooManyRequests {
+		t.Fatalf("pre-body denial status = %d, want 429", deniedResponse.Code)
+	}
+	if deniedBody.reads != 0 {
+		t.Fatalf("pre-body denied request reads = %d, want 0", deniedBody.reads)
+	}
+	<-handler.funnelAdmission
+
+	acceptedBody := &funnelAdmissionTestBody{data: []byte(`{"pair_id":"accepted"}`)}
+	acceptedRequest := httptest.NewRequest(http.MethodPost, "/pair/psk-claim-v2", acceptedBody)
+	acceptedRequest.ContentLength = int64(len(acceptedBody.data))
+	acceptedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(acceptedResponse, acceptedRequest)
+	if acceptedResponse.Code != http.StatusOK {
+		t.Fatalf("first parsed request status = %d, want 200", acceptedResponse.Code)
+	}
+
+	postParseDeniedBody := &funnelAdmissionTestBody{data: []byte(`{"pair_id":"other"}`)}
+	postParseDeniedRequest := httptest.NewRequest(http.MethodPost, "/pair/psk-claim-v2", postParseDeniedBody)
+	postParseDeniedRequest.ContentLength = int64(len(postParseDeniedBody.data))
+	postParseDeniedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(postParseDeniedResponse, postParseDeniedRequest)
+	if postParseDeniedResponse.Code != http.StatusTooManyRequests {
+		t.Fatalf("post-parse limiter status = %d, want 429", postParseDeniedResponse.Code)
+	}
+	if postParseDeniedBody.reads == 0 {
+		t.Fatal("post-parse limiter rejected before body parsing; admission and parsed-request limits are not distinct")
+	}
+}
+
+func TestFunnelBodyAdmissionDoesNotGatePrivateHandlers(t *testing.T) {
+	handler := newFunnelAdmissionTestHandler(t, ExposureModePrePair, nil)
+	handler.funnelAdmission <- struct{}{}
+	defer func() { <-handler.funnelAdmission }()
+
+	body := &funnelAdmissionTestBody{data: []byte(`{"pair_id":"private"}`)}
+	request := httptest.NewRequest(http.MethodPost, "/pair/psk-claim-v2", body)
+	request.ContentLength = int64(len(body.data))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("private handler status = %d, want 200", response.Code)
+	}
+	if body.reads == 0 {
+		t.Fatal("private handler did not read the body")
 	}
 }

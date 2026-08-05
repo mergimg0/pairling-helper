@@ -18,7 +18,7 @@
         {"name": "/config",    "description": "Edit Claude Code config", "args": null},
         {"name": "/login",     "description": "Authenticate with Anthropic", "args": null},
         {"name": "/logout",    "description": "Sign out", "args": null},
-        {"name": "/mcp",       "description": "Manage MCP servers", "args": null},
+        {"name": "/mcp",       "description": "Inspect MCP server diagnostics", "args": null},
         {"name": "/agents",    "description": "List or run agents", "args": null},
         {"name": "/tools",     "description": "List available tools", "args": null},
         {"name": "/skills",    "description": "List available skills", "args": null},
@@ -35,7 +35,7 @@
         {"name": "/status", "description": "Show Codex session status when available", "args": null},
         {"name": "/model", "description": "Change model if supported by the current Codex build", "args": "<model>"},
         {"name": "/resume", "description": "Resume a previous Codex session in this project", "args": "<session_id>"},
-        {"name": "/mcp", "description": "Inspect or manage Codex MCP servers", "args": null},
+        {"name": "/mcp", "description": "Inspect Codex MCP server diagnostics", "args": null},
         {"name": "/quit", "description": "Exit the Codex session", "args": null},
         {"name": "/exit", "description": "Exit the Codex session", "args": null}
       ]

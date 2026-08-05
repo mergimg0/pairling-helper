@@ -27,7 +27,13 @@ from pathlib import Path
 from typing import Any, BinaryIO, Iterable
 
 from terminal_text_sanitizer import TERMINAL_TEXT_MAX_CHARS, sanitize_terminal_text_input
-from terminal_screen_backend import create_terminal_screen_backend, detect_terminal_pending_input
+from terminal_screen_backend import (
+    TERMINAL_LINK_ID_MAX_CHARS,
+    TERMINAL_LINK_URI_MAX_CHARS,
+    TERMINAL_TITLE_MAX_CHARS,
+    create_terminal_screen_backend,
+    detect_terminal_pending_input,
+)
 from runtime_manifest import ptybroker_payload_sha256
 
 
@@ -54,6 +60,7 @@ _ANSI_COLOR_NAMES = ("black", "red", "green", "yellow", "blue", "magenta", "cyan
 # broker itself permits.
 _RPC_MAX_FRAME_BYTES = 16 * 1024 * 1024
 _PASTE_RENDER_TIMEOUT_SECONDS = 2.0
+TERMINAL_SURFACE_MAX_LINKS = 128
 
 # Capture retention (Wave A): recordings are the replay corpus and the
 # forensic record, but they must not grow without bound or keep old
@@ -405,9 +412,58 @@ def _terminal_surface_v2_cell_payload(cell) -> dict:
         payload["underline"] = True
     if inverse:
         payload["inverse"] = True
-    if link_id is not None:
-        payload["link_id"] = link_id
+    if link_id is not None and len(str(link_id)) <= TERMINAL_LINK_ID_MAX_CHARS:
+        payload["link_id"] = str(link_id)
     return payload
+
+def _bounded_terminal_surface_title(value: Any) -> str | None:
+    if value is None:
+        return None
+    title = str(value)
+    return title if len(title) <= TERMINAL_TITLE_MAX_CHARS else None
+
+
+def _terminal_surface_link_payload(
+    row_payloads: list[dict],
+    raw_links: Any,
+) -> dict[str, dict]:
+    if not isinstance(raw_links, dict):
+        return {}
+    links_payload: dict[str, dict] = {}
+    for row in row_payloads:
+        for cell in row.get("cells", ()):
+            raw_link_id = cell.get("link_id") if isinstance(cell, dict) else None
+            if raw_link_id is None:
+                continue
+            link_id = str(raw_link_id)
+            if (
+                not link_id
+                or len(link_id) > TERMINAL_LINK_ID_MAX_CHARS
+                or link_id in links_payload
+            ):
+                continue
+            link_value = raw_links.get(link_id)
+            if link_value is None:
+                continue
+            if isinstance(link_value, dict):
+                url = link_value.get("url")
+                label = link_value.get("label")
+            else:
+                url = link_value
+                label = None
+            url_text = str(url) if url is not None else None
+            label_text = str(label) if label is not None else None
+            if (
+                (url_text is not None and len(url_text) > TERMINAL_LINK_URI_MAX_CHARS)
+                or (label_text is not None and len(label_text) > TERMINAL_TITLE_MAX_CHARS)
+            ):
+                continue
+            links_payload[link_id] = {"url": url_text, "label": label_text}
+            if len(links_payload) >= TERMINAL_SURFACE_MAX_LINKS:
+                return links_payload
+    return links_payload
+
+
 
 
 def terminal_surface_v2_payload_from_state(
@@ -421,18 +477,7 @@ def terminal_surface_v2_payload_from_state(
 ) -> dict:
     provider, native_id = _parse_session_ref(session_id)
     row_payloads: list[dict] = []
-    links_payload: dict[str, dict] = {}
-    for link_id, link_value in (getattr(state, "links", None) or {}).items():
-        if isinstance(link_value, dict):
-            url = link_value.get("url")
-            label = link_value.get("label")
-        else:
-            url = str(link_value)
-            label = None
-        links_payload[str(link_id)] = {
-            "url": str(url) if url is not None else None,
-            "label": str(label) if label is not None else None,
-        }
+    links_payload: dict[str, dict]
     if scrollback_rows is not None and window_start is not None:
         # History window (SPEC-p4 §2.3): serve the requested slice with
         # ABSOLUTE indexes so the phone can stitch pages above the live view.
@@ -466,6 +511,10 @@ def terminal_surface_v2_payload_from_state(
                 "cells_hash": _sha256_prefixed(row_material),
                 "cells": cells,
             })
+    links_payload = _terminal_surface_link_payload(
+        row_payloads,
+        getattr(state, "links", None),
+    )
     cursor = getattr(state, "cursor", None)
     cursor_payload = {
         "row": getattr(cursor, "row", None),
@@ -526,7 +575,7 @@ def terminal_surface_v2_payload_from_state(
         "generation": int(getattr(state, "generation", 0) or 0),
         "raw_offset": int(getattr(state, "raw_offset", 0) or 0),
         "dimensions": dimensions,
-        "title": getattr(state, "title", None),
+        "title": _bounded_terminal_surface_title(getattr(state, "title", None)),
         "alternate_screen": bool(getattr(state, "alternate_screen", False)),
         "cursor": cursor_payload,
         "scrollback": scrollback,
@@ -634,6 +683,11 @@ def _pending_input(rows: list[str]) -> dict | None:
 
 class VTScreen:
     SCROLLBACK_MEMORY_ROWS = 5000
+    MAX_CSI_CHARS = 256
+    MAX_OSC_CHARS = 8192
+    MAX_TITLE_CHARS = TERMINAL_TITLE_MAX_CHARS
+    MAX_LINK_URI_CHARS = TERMINAL_LINK_URI_MAX_CHARS
+    MAX_LINK_MAPPINGS = 512
 
     def __init__(
         self,
@@ -652,8 +706,8 @@ class VTScreen:
         self.cursor_col = 0
         self.cursor_visible = True
         self._state = "normal"
-        self._csi = ""
-        self._osc = ""
+        self._csi: list[str] = []
+        self._osc: list[str] = []
         self._utf8_decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.title: str | None = None
         self.alternate_screen = False
@@ -799,20 +853,40 @@ class VTScreen:
     def _feed_char(self, ch: str) -> None:
         if self._state == "osc":
             if ch == "\x07":
-                self._handle_osc(self._osc)
+                self._handle_osc("".join(self._osc))
+                self._osc.clear()
                 self._state = "normal"
             elif ch == "\x1b":
                 self._state = "osc_esc"
+            elif len(self._osc) >= self.MAX_OSC_CHARS:
+                self._osc.clear()
+                self._state = "osc_discard"
             else:
-                self._osc += ch
+                self._osc.append(ch)
             return
         if self._state == "osc_esc":
             if ch == "\\":
-                self._handle_osc(self._osc)
+                self._handle_osc("".join(self._osc))
+                self._osc.clear()
                 self._state = "normal"
+            elif len(self._osc) + 2 > self.MAX_OSC_CHARS:
+                self._osc.clear()
+                self._state = "osc_discard"
             else:
-                self._osc += "\x1b" + ch
+                self._osc.extend(("\x1b", ch))
                 self._state = "osc"
+            return
+        if self._state == "osc_discard":
+            if ch == "\x07":
+                self._state = "normal"
+            elif ch == "\x1b":
+                self._state = "osc_discard_esc"
+            return
+        if self._state == "osc_discard_esc":
+            if ch in {"\\", "\x07"}:
+                self._state = "normal"
+            elif ch != "\x1b":
+                self._state = "osc_discard"
             return
         if self._state == "esc_intermediate":
             self._state = "normal"
@@ -820,10 +894,10 @@ class VTScreen:
         if self._state == "esc":
             if ch == "[":
                 self._state = "csi"
-                self._csi = ""
+                self._csi.clear()
             elif ch == "]":
                 self._state = "osc"
-                self._osc = ""
+                self._osc.clear()
             elif ch == "c":
                 self._reset()
                 self._state = "normal"
@@ -850,11 +924,18 @@ class VTScreen:
             return
         if self._state == "csi":
             if "@" <= ch <= "~":
-                self._handle_csi(self._csi, ch)
+                self._handle_csi("".join(self._csi), ch)
+                self._csi.clear()
                 self._state = "normal"
-                self._csi = ""
+            elif len(self._csi) >= self.MAX_CSI_CHARS:
+                self._csi.clear()
+                self._state = "csi_discard"
             else:
-                self._csi += ch
+                self._csi.append(ch)
+            return
+        if self._state == "csi_discard":
+            if "@" <= ch <= "~":
+                self._state = "normal"
             return
 
         if ch == "\x1b":
@@ -1373,12 +1454,16 @@ class VTScreen:
 
     def _handle_osc(self, payload: str) -> None:
         if payload.startswith(("0;", "2;")):
-            self.title = payload.split(";", 1)[1]
+            title = payload.split(";", 1)[1]
+            if len(title) <= self.MAX_TITLE_CHARS:
+                self.title = title
         elif payload.startswith("8;"):
             parts = payload.split(";", 2)
             uri = parts[2] if len(parts) >= 3 else ""
-            if uri:
+            if uri and len(uri) <= self.MAX_LINK_URI_CHARS:
                 link_id = "link-" + hashlib.sha256(uri.encode("utf-8")).hexdigest()[:12]
+                if link_id not in self.links and len(self.links) >= self.MAX_LINK_MAPPINGS:
+                    self.links.pop(next(iter(self.links)))
                 self.links[link_id] = uri
                 self.current_link_id = link_id
             else:
@@ -2012,24 +2097,51 @@ class PTYBrokerSession:
         if kind == "input_mode_enter":
             epoch = str(action.get("input_epoch") or "").strip()
             device_id = str(action.get("device_id") or "").strip()
+            proof = action.get("control_proof")
             if not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", epoch):
                 return {"ok": False, "reason": "bad_input_epoch"}
             if not device_id:
                 return {"ok": False, "reason": "device_id_required"}
-            with self._lock:
-                if epoch == self._type_mode_epoch and device_id != self._type_mode_device_id:
-                    return {"ok": False, "reason": "type_mode_identity_changed"}
-                if epoch != self._type_mode_epoch:
-                    self._type_mode_epoch = epoch
-                    self._type_mode_device_id = device_id
-                    self._type_mode_last_sequence = 0
-                    self._type_mode_receipts.clear()
-                return {
-                    "ok": True,
-                    "input_epoch": self._type_mode_epoch,
-                    "next_sequence": self._type_mode_last_sequence + 1,
-                    "generation": int(self.generation),
-                }
+            if not isinstance(proof, dict):
+                return {"ok": False, "reason": "screen_proof_missing"}
+            proof_generation = proof.get("generation")
+            if (
+                str(proof.get("session_id") or "") != self.session_id
+                or not str(proof.get("screen_hash") or "")
+                or not str(proof.get("nonce") or "")
+                or type(proof_generation) is not int
+            ):
+                return {"ok": False, "reason": "screen_proof_missing"}
+            with self._input_transaction_lock:
+                with self._lock:
+                    current = self._snapshot_locked(self.session_id)
+                    if (
+                        str(current.get("screen_hash") or "") != proof["screen_hash"]
+                        or str(current.get("nonce") or "") != proof["nonce"]
+                        or int(current.get("generation") or 0) != proof_generation
+                    ):
+                        return {
+                            "ok": False,
+                            "reason": "stale_screen",
+                            "status": 409,
+                            "screen_hash": current.get("screen_hash"),
+                            "nonce": current.get("nonce"),
+                            "generation": current.get("generation"),
+                        }
+                    if epoch == self._type_mode_epoch and device_id != self._type_mode_device_id:
+                        return {"ok": False, "reason": "type_mode_identity_changed"}
+                    if epoch != self._type_mode_epoch:
+                        self._type_mode_epoch = epoch
+                        self._type_mode_device_id = device_id
+                        self._type_mode_last_sequence = 0
+                        self._type_mode_receipts.clear()
+                    return {
+                        "ok": True,
+                        "input_epoch": self._type_mode_epoch,
+                        "next_sequence": self._type_mode_last_sequence + 1,
+                        "generation": int(self.generation),
+                        "screen_proof_verified": True,
+                    }
         if kind == "input_mode_status":
             device_id = str(action.get("device_id") or "").strip()
             with self._lock:
@@ -2085,25 +2197,26 @@ class PTYBrokerSession:
                 return {"ok": False, "reason": "unsupported text mode"}
             return self._write_control_bytes(text.encode() + b"\r", action)
         if kind == "input":
-            # Type mode (SPEC-p4 §2.2): small raw byte chunks straight to the
-            # PTY, no per-keystroke confirm. The generation guard lives HERE
-            # because this session owns the per-frame generation counter. The
-            # check is epoch-shaped: a client ahead of us saw a screen that
-            # has since been reset/replaced (reject), and a client more than
-            # 1000 frames behind is typing blind (reject). Both surface as
-            # stale_generation for the daemon's receipt.
+            # The exact displayed-screen proof is consumed once when the
+            # broker creates the type-mode lease. Streamed bytes are then
+            # authorized only by that device-bound lease plus the exact epoch
+            # and monotonic idempotency sequence; frame generations are not
+            # an independent or stale-window authority.
             try:
                 data = base64.b64decode(str(action.get("b64") or ""), validate=True)
             except Exception:
                 return {"ok": False, "reason": "bad_input_encoding"}
             if not data or len(data) > 1024:
                 return {"ok": False, "reason": "input_size", "generation": int(self.generation)}
-            expected = action.get("expected_generation")
-            if not isinstance(expected, int) or isinstance(expected, bool):
-                return {"ok": False, "reason": "bad_generation"}
             input_epoch = str(action.get("input_epoch") or "").strip()
             device_id = str(action.get("device_id") or "").strip()
             input_sequence = action.get("input_sequence")
+            expected_generation = action.get("expected_generation")
+            if (
+                not isinstance(expected_generation, int)
+                or isinstance(expected_generation, bool)
+            ):
+                return {"ok": False, "reason": "bad_generation"}
             if not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", input_epoch):
                 return {"ok": False, "reason": "bad_input_epoch"}
             if (
@@ -2157,18 +2270,18 @@ class PTYBrokerSession:
                             "generation": current,
                             "next_sequence": self._type_mode_last_sequence + 1,
                         }
-                    if expected > current or (current - expected) > 1000:
-                        result = {
+                    if (
+                        expected_generation > current
+                        or current - expected_generation > 1000
+                    ):
+                        return {
                             "ok": False,
                             "reason": "stale_generation",
                             "generation": current,
                             "input_epoch": input_epoch,
                             "input_sequence": input_sequence,
-                            "next_sequence": input_sequence + 1,
+                            "next_sequence": self._type_mode_last_sequence + 1,
                         }
-                        self._type_mode_last_sequence = input_sequence
-                        self._type_mode_receipts[input_sequence] = (input_hash, result)
-                        return result
                     try:
                         bytes_written = self._write_locked(data)
                     except PTYWriteError as exc:

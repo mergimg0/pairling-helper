@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
+import socket
 import subprocess
 import time
 import urllib.error
@@ -79,6 +81,107 @@ def _canonical_endpoint_url(raw: str) -> tuple[str, str | None, str | None, bool
     path = parsed.path.rstrip("/")
     canonical = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
     return canonical, parsed.netloc, parsed.hostname, canonical != value
+
+
+def _normalized_host(host: str) -> str:
+    value = host.rstrip(".")
+    try:
+        return ipaddress.ip_address(value).compressed.lower()
+    except ValueError:
+        return value.encode("idna").decode("ascii").lower()
+
+
+def _url_origin(url: str, *, redirect: bool = False) -> tuple[str, str, int]:
+    label = "redirect" if redirect else "endpoint"
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+        host = _normalized_host(parsed.hostname or "")
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError(f"Aperture {label} URL is invalid.") from exc
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(f"Aperture {label} credentials are not allowed.")
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not host:
+        raise ValueError(f"Aperture {label} must use HTTP or HTTPS with a host.")
+    effective_port = port if port is not None else (443 if scheme == "https" else 80)
+    return scheme, host, effective_port
+
+
+def _resolve_destination_addresses(
+    host: str,
+    port: int,
+) -> frozenset[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    addresses: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
+    for family, _, _, _, sockaddr in socket.getaddrinfo(
+        host,
+        port,
+        type=socket.SOCK_STREAM,
+    ):
+        if family not in {socket.AF_INET, socket.AF_INET6}:
+            continue
+        address = str(sockaddr[0]).split("%", 1)[0]
+        addresses.add(ipaddress.ip_address(address))
+    if not addresses:
+        raise OSError(f"no IP addresses resolved for {host}")
+    return frozenset(addresses)
+
+
+def _is_private_destination(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    return address.is_private or address.is_loopback or address.is_link_local
+
+
+class _ApertureRedirectError(urllib.error.URLError):
+    pass
+
+
+class _ValidatedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(
+        self,
+        original_url: str,
+        original_addresses: frozenset[
+            ipaddress.IPv4Address | ipaddress.IPv6Address
+        ],
+    ) -> None:
+        self._original_origin = _url_origin(original_url)
+        self._explicit_private_addresses = frozenset(
+            address
+            for address in original_addresses
+            if _is_private_destination(address)
+        )
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirect_url = urllib.parse.urljoin(req.full_url, newurl)
+        try:
+            redirect_origin = _url_origin(redirect_url, redirect=True)
+        except ValueError as exc:
+            raise _ApertureRedirectError(str(exc)) from exc
+        if redirect_origin != self._original_origin:
+            raise _ApertureRedirectError(
+                "Aperture redirect origin must match the configured endpoint."
+            )
+        try:
+            redirect_addresses = _resolve_destination_addresses(
+                redirect_origin[1],
+                redirect_origin[2],
+            )
+        except OSError as exc:
+            raise _ApertureRedirectError(
+                "Aperture redirect destination address resolution failed."
+            ) from exc
+        private_addresses = frozenset(
+            address
+            for address in redirect_addresses
+            if _is_private_destination(address)
+        )
+        if not private_addresses.issubset(self._explicit_private_addresses):
+            raise _ApertureRedirectError(
+                "Aperture private redirect destination was not the explicit "
+                "original endpoint."
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def _normalize_endpoint(obj: Any) -> dict[str, Any] | None:
@@ -294,8 +397,16 @@ class ApertureCLIProbe:
                 "last_error": "Bridge endpoints require an active Aperture CLI tsnet proxy; Pairling native bridge probing is not enabled yet.",
             }
         try:
-            # _canonical_endpoint_url has just restricted this URL to HTTP or HTTPS with a host.
-            with urllib.request.urlopen(url, timeout=PROVIDER_TIMEOUT_SECONDS) as response:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+            original_origin = _url_origin(url)
+            original_addresses = _resolve_destination_addresses(
+                original_origin[1],
+                original_origin[2],
+            )
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                _ValidatedRedirectHandler(url, original_addresses),
+            )
+            with opener.open(url, timeout=PROVIDER_TIMEOUT_SECONDS) as response:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
                 status = getattr(response, "status", 200)
                 body = response.read(1024 * 1024)
         except (urllib.error.URLError, TimeoutError, OSError) as exc:

@@ -17,6 +17,7 @@ to the wizard that calls it.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -46,6 +47,9 @@ def _detect(home: Path, entries):
             missing.append(entry.provider_id)
             continue
         version = cli_version(resolved.path, list(entry.version_command)) or "version unknown"
+        if entry.version_identity_pattern and re.search(entry.version_identity_pattern, version) is None:
+            missing.append(entry.provider_id)
+            continue
         detected.append((entry, version))
     return detected, missing
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 
@@ -29,6 +30,10 @@ class RecognizedProviderAdapter(ProviderAdapter):
 
     def supports(self, capability: str) -> bool:
         return capability == "detect"
+    def create_control_driver(self, binding):
+        # Detection-only adapters never become actionable from registry data.
+        return None
+
 
     def probe(self) -> ProviderProbeResult:
         resolved = resolve_executable(
@@ -36,12 +41,24 @@ class RecognizedProviderAdapter(ProviderAdapter):
             registry_data.candidate_paths(self.entry, home=self.home),
             env_var=self.entry.env_override,
         )
-        installed = resolved is not None
         version = cli_version(resolved.path, list(self.entry.version_command)) if resolved else None
+        identity_pattern = self.entry.version_identity_pattern
+        identity_matches = (
+            resolved is not None
+            and (
+                identity_pattern is None
+                or (version is not None and re.search(identity_pattern, version) is not None)
+            )
+        )
+        installed = identity_matches
         config_candidates = registry_data.config_file_paths(self.entry, home=self.home)
         primary_config = config_candidates[0] if config_candidates else None
         if installed:
             notes = ("Recognized, not yet controllable.",)
+        elif resolved is not None:
+            notes = (
+                f"Executable at {resolved.path} did not identify as {self.entry.display_name}.",
+            )
         else:
             notes = (
                 f"{self.entry.display_name} CLI not found in configured, known, or daemon PATH locations",

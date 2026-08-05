@@ -28,11 +28,7 @@ if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
 fi
 
 export PYTHONDONTWRITEBYTECODE=1
-if [[ -z "${PYTHONPYCACHEPREFIX:-}" ]]; then
-  PYTHONPYCACHEPREFIX="${TMPDIR:-/tmp}/pairling-pycache-$(id -u)"
-  mkdir -p "$PYTHONPYCACHEPREFIX" 2>/dev/null || true
-  export PYTHONPYCACHEPREFIX
-fi
+unset PYTHONPYCACHEPREFIX
 
 resolve_pairling_python() {
   local candidate marker
@@ -49,6 +45,7 @@ resolve_pairling_python() {
   done
   return 1
 }
+
 
 if [[ "${1:-}" == "attach" ]]; then
   shift
@@ -91,25 +88,23 @@ if [[ "${1:-}" == "connect-auth-open" ]]; then
         ;;
     esac
   done
-  if output="$(/usr/bin/curl -sS --max-time 5 -X POST http://127.0.0.1:7774/auth/open 2>/dev/null)"; then
-    if "$pairling_python" -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("ok") else 1)' <<<"$output"; then
-      response_status=0
-    else
-      response_status=1
-    fi
-    if [[ "$json_mode" == "true" ]]; then
-      printf '%s\n' "$output"
-    else
-      "$pairling_python" -c 'import json,sys; data=json.load(sys.stdin); print("Pairling Connect browser approval opened." if data.get("opened") else data.get("error", "Pairling Connect browser approval is not available."))' <<<"$output"
-    fi
-    exit "$response_status"
+  helper_status=0
+  response_status=1
+  output="$("$pairling_python" "$REPO_ROOT/mac/companiond/local_control_client.py" \
+    POST /connect/auth/open 2>/dev/null)" || helper_status=$?
+  if [[ "$helper_status" == "0" ]] && \
+    "$pairling_python" -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("ok") else 1)' <<<"$output"; then
+    response_status=0
+  fi
+  if [[ -z "$output" ]]; then
+    output='{"ok":false,"opened":false,"auth_url_present":false,"error":{"code":"control_transport_error","message":"Pairling local control socket is unavailable."}}'
   fi
   if [[ "$json_mode" == "true" ]]; then
-    printf '{"ok":false,"opened":false,"auth_url_present":false,"error":"Pairling Connect auth endpoint unavailable."}\n'
+    printf '%s\n' "$output"
   else
-    printf 'Pairling Connect auth endpoint unavailable.\n' >&2
+    "$pairling_python" -c 'import json,sys; data=json.load(sys.stdin); error=data.get("error"); message=error.get("message") if isinstance(error,dict) else error; print("Pairling Connect browser approval opened." if data.get("opened") else (message or "Pairling Connect browser approval is not available."))' <<<"$output" >&2
   fi
-  exit 1
+  exit "$response_status"
 fi
 
 exec "$REPO_ROOT/mac/install/install-runtime.sh" "$@"

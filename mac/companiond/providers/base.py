@@ -5,13 +5,232 @@ import os
 import re
 import subprocess
 import time
+import threading
 from dataclasses import asdict, dataclass, replace
+from enum import Enum
 from pathlib import Path
-from typing import Iterable, Protocol
+from typing import Iterable, Mapping, Protocol
 
 
 ProviderCapability = str
+_BASE_CHILD_ENVIRONMENT_KEYS = (
+    "HOME",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_COLLATE",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "PATH",
+    "SHELL",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "TZ",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+    "XDG_STATE_HOME",
+)
+_ENVIRONMENT_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_SECRET_ENVIRONMENT_MARKERS = (
+    "CREDENTIAL",
+    "KEY",
+    "PASSWORD",
+    "PASSWD",
+    "PSK",
+    "SECRET",
+    "TOKEN",
+)
 
+_CLI_VERSION_CACHE_TTL_SECONDS = 300.0
+_CLI_VERSION_CACHE_MAX_ENTRIES = 128
+_CLI_VERSION_CACHE: dict[
+    tuple[str, tuple[str, ...], int],
+    tuple[tuple[int, int, int, int], float, str | None],
+] = {}
+_CLI_VERSION_CACHE_LOCK = threading.Lock()
+
+
+def managed_child_environment(
+    source: Mapping[str, str] | None = None,
+    *,
+    home: Path | str | None = None,
+    provider_settings: Mapping[str, str] | None = None,
+    private_runtime_settings: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Build the complete environment for one Pairling-managed provider child.
+
+    Ambient input is limited to basic process, locale, and state paths. Provider
+    settings must be named with exact, non-secret values by the driver. The
+    private runtime channel is only for newly generated, child-scoped values
+    such as a loopback server credential; it must never receive ambient values.
+    """
+
+    ambient = os.environ if source is None else source
+    environment = {
+        key: value
+        for key in _BASE_CHILD_ENVIRONMENT_KEYS
+        if isinstance((value := ambient.get(key)), str) and "\x00" not in value
+    }
+    if home is not None:
+        environment["HOME"] = _required_environment_value("HOME", str(home))
+    for key, value in (provider_settings or {}).items():
+        normalized = _required_environment_name(key)
+        if any(marker in normalized.upper() for marker in _SECRET_ENVIRONMENT_MARKERS):
+            raise ValueError(f"provider environment setting {normalized!r} may contain a credential")
+        environment[normalized] = _required_environment_value(normalized, value)
+    for key, value in (private_runtime_settings or {}).items():
+        normalized = _required_environment_name(key)
+        environment[normalized] = _required_environment_value(normalized, value)
+    return environment
+
+
+def _required_environment_name(value: str) -> str:
+    if not isinstance(value, str) or _ENVIRONMENT_NAME_RE.fullmatch(value) is None:
+        raise ValueError("invalid child environment setting name")
+    return value
+
+
+def _required_environment_value(name: str, value: str) -> str:
+    if not isinstance(value, str) or "\x00" in value:
+        raise ValueError(f"invalid child environment setting {name!r}")
+    return value
+
+
+
+class ManagedAuthVerification(str, Enum):
+    PROBE = "probe"
+    RUNTIME = "runtime"
+
+
+class TerminalLaunchProfile(str, Enum):
+    CLAUDE_PHONE = "claude_phone"
+    CODEX_WORKSPACE = "codex_workspace"
+
+
+@dataclass(frozen=True)
+class ManagedLaunchSetupDiagnostic:
+    code: str
+    category: str
+    message: str
+    setup_actions: tuple[str, ...] = ()
+
+    def to_payload(self) -> dict:
+        return {
+            "code": self.code,
+            "category": self.category,
+            "message": self.message,
+            "setup_actions": list(self.setup_actions),
+        }
+
+
+@dataclass(frozen=True)
+class ManagedLaunchContract:
+    control_channel: str
+    ready_auth_states: tuple[str, ...]
+    ready_config_states: tuple[str, ...]
+    auth_verification: ManagedAuthVerification = ManagedAuthVerification.PROBE
+    require_post_launch_verification: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.control_channel, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", self.control_channel)
+            is None
+        ):
+            raise ValueError("managed launch control channel is invalid")
+        for states, label in (
+            (self.ready_auth_states, "auth"),
+            (self.ready_config_states, "config"),
+        ):
+            if (
+                not isinstance(states, tuple)
+                or not states
+                or len(states) != len(set(states))
+                or any(
+                    not isinstance(value, str)
+                    or re.fullmatch(r"[a-z0-9_]{1,64}", value) is None
+                    for value in states
+                )
+            ):
+                raise ValueError(f"managed launch {label} states are invalid")
+        if (
+            "unknown" in self.ready_auth_states
+            and self.auth_verification is not ManagedAuthVerification.RUNTIME
+        ):
+            raise ValueError(
+                "unknown authentication requires explicit runtime verification"
+            )
+
+    def setup_diagnostic(
+        self,
+        availability,
+        *,
+        version: str | None,
+    ) -> ManagedLaunchSetupDiagnostic | None:
+        actions = tuple(getattr(availability, "setup_actions", ()) or ())
+        if not bool(getattr(availability, "installed", False)):
+            return ManagedLaunchSetupDiagnostic(
+                "managed_provider_not_installed",
+                "installation",
+                "The reviewed provider executable is not installed.",
+                actions,
+            )
+        if not isinstance(version, str) or not version.strip():
+            return ManagedLaunchSetupDiagnostic(
+                "managed_provider_version_unverified",
+                "version",
+                "The installed provider version could not be verified.",
+                actions,
+            )
+        config_state = str(getattr(availability, "config_state", "") or "")
+        if config_state not in self.ready_config_states:
+            return ManagedLaunchSetupDiagnostic(
+                "managed_provider_config_unavailable",
+                "configuration",
+                "The provider does not satisfy its reviewed managed-launch configuration.",
+                actions,
+            )
+        auth_state = str(getattr(availability, "auth_state", "") or "")
+        if auth_state not in self.ready_auth_states:
+            return ManagedLaunchSetupDiagnostic(
+                "managed_provider_auth_unavailable",
+                "authentication",
+                "The provider does not satisfy its reviewed authentication posture.",
+                actions,
+            )
+        if not bool(getattr(availability, "usable", False)) or not bool(
+            getattr(availability, "launchable", False)
+        ):
+            return ManagedLaunchSetupDiagnostic(
+                "managed_provider_not_launchable",
+                "availability",
+                "The provider is not ready for a managed launch.",
+                actions,
+            )
+        return None
+
+
+@dataclass(frozen=True)
+class TerminalLaunchContract:
+    profile: TerminalLaunchProfile
+    backends: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.profile, TerminalLaunchProfile):
+            raise ValueError("terminal launch profile is invalid")
+        if (
+            not isinstance(self.backends, tuple)
+            or not self.backends
+            or len(self.backends) != len(set(self.backends))
+            or any(value not in {"terminal_app", "broker"} for value in self.backends)
+        ):
+            raise ValueError("terminal launch backends are invalid")
 
 @dataclass(frozen=True)
 class ProviderDescriptor:
@@ -23,6 +242,8 @@ class ProviderDescriptor:
     # Internal, automatic integration tier (deep | standard | recognized).
     # Never a permission, never a gate on the raw-PTY floor (SPEC-p1 §2.2).
     adapter_depth: str = "deep"
+    managed_launch: ManagedLaunchContract | None = None
+    terminal_launch: TerminalLaunchContract | None = None
 
 
 @dataclass(frozen=True)
@@ -123,16 +344,63 @@ def resolve_executable(name: str, known: Iterable[Path | str], env_var: str | No
     return None
 
 
-def cli_version(bin_path: Path | str | None, args: list[str] | None = None, timeout: int = 3) -> str | None:
+def cli_version(
+    bin_path: Path | str | None,
+    args: list[str] | None = None,
+    timeout: int = 3,
+) -> str | None:
     if not bin_path:
         return None
+    path = Path(bin_path)
+    command_args = tuple(args or ["--version"])
     try:
-        proc = subprocess.run([str(bin_path), *(args or ["--version"])], capture_output=True, text=True, timeout=timeout)
+        metadata = path.stat()
+    except OSError:
+        return None
+    signature = (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+    )
+    cache_key = (str(path), command_args, timeout)
+    now = time.monotonic()
+    with _CLI_VERSION_CACHE_LOCK:
+        cached = _CLI_VERSION_CACHE.get(cache_key)
+        if cached is not None:
+            cached_signature, expires_at, value = cached
+            if cached_signature == signature and expires_at > now:
+                return value
+            _CLI_VERSION_CACHE.pop(cache_key, None)
+    try:
+        proc = subprocess.run(
+            [str(path), *command_args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
     except Exception:
-        return None
-    if proc.returncode != 0:
-        return None
-    return (proc.stdout or proc.stderr or "").strip()[:160] or None
+        value = None
+    else:
+        value = (
+            (proc.stdout or proc.stderr or "").strip()[:160] or None
+            if proc.returncode == 0
+            else None
+        )
+    with _CLI_VERSION_CACHE_LOCK:
+        if len(_CLI_VERSION_CACHE) >= _CLI_VERSION_CACHE_MAX_ENTRIES:
+            _CLI_VERSION_CACHE.pop(next(iter(_CLI_VERSION_CACHE)), None)
+        _CLI_VERSION_CACHE[cache_key] = (
+            signature,
+            now + _CLI_VERSION_CACHE_TTL_SECONDS,
+            value,
+        )
+    return value
+
+
+def _clear_cli_version_cache_for_tests() -> None:
+    with _CLI_VERSION_CACHE_LOCK:
+        _CLI_VERSION_CACHE.clear()
 
 
 def count_dirs(root: Path, excluded: set[str] | None = None) -> int:

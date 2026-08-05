@@ -204,45 +204,55 @@ def _destination_file(directory: Path, filename: str) -> Path:
 
 def _export(args: argparse.Namespace) -> int:
     store = PairDropStore(_vault_root())
-    descriptor = store.download_descriptor(args.file_id)
-    item = descriptor["item"]
-    source = Path(descriptor["path"])
-    destination = _destination_file(Path(args.to), str(item["display_name"]))
-    temporary_fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.pairdrop-",
-        dir=destination.parent,
-    )
-    temporary = Path(temporary_name)
-    digest = hashlib.sha256()
-    byte_count = 0
-    try:
-        with os.fdopen(temporary_fd, "wb") as output_handle, _open_regular_file(source) as input_handle:
-            identity = _snapshot(input_handle)
-            while True:
-                chunk = input_handle.read(CHUNK_BYTES)
-                if not chunk:
-                    break
-                output_handle.write(chunk)
-                digest.update(chunk)
-                byte_count += len(chunk)
-            output_handle.flush()
-            os.fsync(output_handle.fileno())
-            if _snapshot(input_handle) != identity:
-                raise PairDropCLIError("The PairDrop object changed while it was exported.")
-        if byte_count != int(item["byte_size"]) or digest.hexdigest() != str(item["sha256"]):
-            raise PairDropCLIError("PairDrop export verification failed.")
+    with store.open_download(args.file_id) as descriptor:
+        item = descriptor["item"]
+        input_handle = descriptor["handle"]
+        destination = _destination_file(Path(args.to), str(item["display_name"]))
+        temporary_fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.pairdrop-",
+            dir=destination.parent,
+        )
+        temporary = Path(temporary_name)
+        digest = hashlib.sha256()
+        byte_count = 0
         try:
-            os.link(temporary, destination, follow_symlinks=False)
-        except FileExistsError as exc:
-            raise PairDropCLIError(f"Refusing to replace existing file: {destination}") from exc
-        temporary.unlink()
-        directory_fd = os.open(destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory_fd)
+            with os.fdopen(temporary_fd, "wb") as output_handle:
+                identity = _snapshot(input_handle)
+                while True:
+                    chunk = input_handle.read(CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    output_handle.write(chunk)
+                    digest.update(chunk)
+                    byte_count += len(chunk)
+                output_handle.flush()
+                os.fsync(output_handle.fileno())
+                if _snapshot(input_handle) != identity:
+                    raise PairDropCLIError(
+                        "The PairDrop object changed while it was exported."
+                    )
+            if (
+                byte_count != int(item["byte_size"])
+                or digest.hexdigest() != str(item["sha256"])
+            ):
+                raise PairDropCLIError("PairDrop export verification failed.")
+            try:
+                os.link(temporary, destination, follow_symlinks=False)
+            except FileExistsError as exc:
+                raise PairDropCLIError(
+                    f"Refusing to replace existing file: {destination}"
+                ) from exc
+            temporary.unlink()
+            directory_fd = os.open(
+                destination.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         finally:
-            os.close(directory_fd)
-    finally:
-        temporary.unlink(missing_ok=True)
+            temporary.unlink(missing_ok=True)
     _emit(
         {"ok": True, "file": _public_file(item), "path": str(destination)},
         json_mode=args.json,

@@ -2,11 +2,7 @@
 set -euo pipefail
 
 export PYTHONDONTWRITEBYTECODE=1
-if [[ -z "${PYTHONPYCACHEPREFIX:-}" ]]; then
-  PYTHONPYCACHEPREFIX="${TMPDIR:-/tmp}/pairling-pycache-$(id -u)"
-  mkdir -p "$PYTHONPYCACHEPREFIX" 2>/dev/null || true
-  export PYTHONPYCACHEPREFIX
-fi
+unset PYTHONPYCACHEPREFIX
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 MANIFEST_REPO_PATH="$REPO_ROOT"
@@ -1606,61 +1602,73 @@ with open(path, "a") as fh:
 PY
 }
 
-run_compile_checks() {
-  local pycache_root
-  pycache_root="$(mktemp -d)"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pairlingd.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/runtime_contract.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/runtime_manifest.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/runtime_paths.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pairdrop_store.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/compose_recording_store.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pairling_connectd_status.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pairling_devices.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/local_mcp_bridge.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/llm_route.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pairling_tools.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pairling_pairing.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pairling_psk.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pairling_relay_claims.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/request_proof.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/codex_approval.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pty_broker.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pty_broker_client.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/pty_broker_service.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/terminal_screen_backend.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/session_events.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/session_event_log.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/session_event_ingest.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/terminal_text_sanitizer.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/push_dispatcher.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/push_event_catalog.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/live_activity_publisher.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/standard_push_publisher.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/fleet_tier.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/fleet_activity_publisher.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/fd_watchdog.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/safety_monitor.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/sentinel_notifications.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/workstate_feed_contract.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/model_status_contract.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/substrate_status_contract.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/integrations/__init__.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/integrations/aperture_cli/__init__.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/integrations/aperture_cli/launch.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/integrations/aperture_cli/status.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/providers/__init__.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/providers/base.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/providers/claude.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/providers/codex.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/providers/external.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/companiond/providers/registry.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/mcp/phone_tools.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/install/render-launchd.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/install/psk_dependency_check.py"
-  PYTHONPYCACHEPREFIX="$pycache_root" "$PYTHON3_BIN" -m py_compile "$REPO_ROOT/mac/install/ssh_gateway_setup.py"
-  rm -rf "$pycache_root"
-}
+run_compile_checks() (
+  local pycache_root provider_source
+  local LC_ALL=C
+  umask 077
+  pycache_root="$(mktemp -d "${TMPDIR:-/tmp}/pairling-install-compile.XXXXXX")"
+  trap 'rm -rf -- "$pycache_root"' EXIT
+
+  compile_python_source() {
+    PYTHONDONTWRITEBYTECODE= PYTHONPYCACHEPREFIX="$pycache_root" \
+      "$PYTHON3_BIN" -m py_compile "$1"
+  }
+
+  compile_python_source "$REPO_ROOT/mac/companiond/pairlingd.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/safe_filesystem.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/runtime_contract.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/runtime_manifest.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/provider_runtime_assets.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/runtime_paths.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/pairdrop_store.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/compose_recording_store.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/pairling_connectd_status.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/local_control_client.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/pairling_devices.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/managed_provider_sessions.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/public_diagnostics.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/local_mcp_bridge.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/llm_route.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/pairling_tools.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/pairling_assurance_policy.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/pairling_pairing.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/pairling_psk.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/pairling_relay_claims.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/request_proof.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/codex_approval.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/pty_broker.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/pty_broker_client.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/pty_broker_service.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/terminal_screen_backend.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/session_events.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/session_event_log.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/session_event_ingest.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/terminal_text_sanitizer.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/push_dispatcher.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/push_event_catalog.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/live_activity_publisher.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/standard_push_publisher.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/fleet_tier.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/fleet_activity_publisher.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/fd_watchdog.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/safety_monitor.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/sentinel_notifications.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/workstate_feed_contract.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/model_status_contract.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/substrate_status_contract.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/integrations/__init__.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/integrations/aperture_cli/__init__.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/integrations/aperture_cli/launch.py"
+  compile_python_source "$REPO_ROOT/mac/companiond/integrations/aperture_cli/status.py"
+  for provider_source in "$REPO_ROOT/mac/companiond/providers/"*.py; do
+    [[ -f "$provider_source" ]] || continue
+    compile_python_source "$provider_source"
+  done
+  compile_python_source "$REPO_ROOT/mac/mcp/phone_tools.py"
+  compile_python_source "$REPO_ROOT/mac/install/render-launchd.py"
+  compile_python_source "$REPO_ROOT/mac/install/psk_dependency_check.py"
+  compile_python_source "$REPO_ROOT/mac/install/ssh_gateway_setup.py"
+)
 
 run_psk_dependency_import_check() {
   local python_bin="$1"
@@ -1907,7 +1915,7 @@ from pathlib import Path
 
 source_root, scan_value, install_value, version, revision, dirty = sys.argv[1:]
 sys.path.insert(0, source_root)
-from runtime_manifest import _verify_runtime_payload
+from runtime_manifest import PROVIDER_RUNTIME_ASSET_RELATIVE_PATHS, _verify_runtime_payload
 
 root = Path(scan_value)
 manifest_path = root / "manifest.json"
@@ -1916,6 +1924,8 @@ if root.is_symlink() or not root.is_dir() or manifest_path.is_symlink():
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 if manifest.get("schema_version") != 2:
     raise SystemExit("runtime manifest schema does not match the installer")
+if manifest.get("provider_runtime_assets") != list(PROVIDER_RUNTIME_ASSET_RELATIVE_PATHS):
+    raise SystemExit("runtime manifest provider asset inventory does not match the installer")
 install_path = Path(install_value)
 manifest_install_path = Path(str(manifest.get("install_root") or ""))
 if not install_path.is_absolute() or not manifest_install_path.is_absolute():
@@ -3694,6 +3704,55 @@ snapshot_packaged_sources() {
   fi
 }
 
+stage_provider_sdks() {
+  local dest="$1"
+  local runtime_root="${PAIRLING_RUNTIME_PACKAGE_ROOT:-}"
+  local source architecture
+  [[ -n "$runtime_root" ]] || return 0
+  source="$runtime_root/provider-sdks"
+  if [[ -L "$source" || ! -d "$source" || -e "$dest" || -L "$dest" ]]; then
+    log "ERROR: verified provider SDK source is missing/linked or its destination already exists." >&2
+    WIZARD_FATAL=1
+    return 1
+  fi
+  architecture="$("$PYTHON3_BIN" - "$runtime_root/manifest.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    architecture = json.load(handle).get("architecture")
+if architecture not in {"arm64", "x64"}:
+    raise SystemExit("runtime package architecture is invalid")
+print(architecture)
+PY
+  )" || {
+    log "ERROR: could not read the verified provider SDK architecture." >&2
+    WIZARD_FATAL=1
+    return 1
+  }
+  mkdir -p "$dest/node_modules"
+  /bin/cp -p "$source/package.json" "$dest/package.json"
+  /bin/cp -p "$source/npm-shrinkwrap.json" "$dest/npm-shrinkwrap.json"
+  /bin/cp -R "$source/packages/." "$dest/node_modules/"
+  if ! "$PYTHON3_BIN" "$REPO_ROOT/mac/install/verify-runtime-package-manifest.py" --installed-provider-sdks "$dest" "$architecture"; then
+    log "ERROR: staged provider SDK payload failed the reviewed dependency contract." >&2
+    WIZARD_FATAL=1
+    return 1
+  fi
+}
+
+stage_provider_runtime_assets() {
+  local source="$1" destination="$2"
+  local verifier="$REPO_ROOT/mac/install/verify-runtime-package-manifest.py"
+  if ! "$PYTHON3_BIN" "$verifier" \
+    --stage-provider-runtime-assets "$source" "$destination"; then
+    log "ERROR: reviewed provider runtime asset inventory could not be staged safely." >&2
+    WIZARD_FATAL=1
+    return 1
+  fi
+}
+
+
 adopt_snapshot_python() {
   local candidate="${PAIRLING_DAEMON_PYTHON:-}"
   case "$candidate" in
@@ -3708,6 +3767,49 @@ adopt_snapshot_python() {
   esac
 }
 
+activate_provider_sdk_environment() {
+  local release_root="$1"
+  local claude_sdk_root copilot_sdk_root copilot_bin copilot_arm64_bin copilot_x64_bin
+  unset PAIRLING_CLAUDE_AGENT_SDK_ROOT PAIRLING_COPILOT_SDK_ROOT PAIRLING_COPILOT_BIN
+  claude_sdk_root="$release_root/provider-sdks/node_modules/@anthropic-ai/claude-agent-sdk"
+  copilot_sdk_root="$release_root/provider-sdks/node_modules/@github/copilot-sdk"
+  copilot_arm64_bin="$release_root/provider-sdks/node_modules/@github/copilot-darwin-arm64/copilot"
+  copilot_x64_bin="$release_root/provider-sdks/node_modules/@github/copilot-darwin-x64/copilot"
+  [[ -e "$release_root/provider-sdks" || -L "$release_root/provider-sdks" ]] || return 0
+  if [[ -L "$release_root/provider-sdks" || ! -d "$release_root/provider-sdks" || \
+        -L "$claude_sdk_root" || ! -d "$claude_sdk_root" || \
+        -L "$claude_sdk_root/package.json" || ! -f "$claude_sdk_root/package.json" ]]; then
+    log "ERROR: installed provider SDK root is incomplete or linked: $claude_sdk_root" >&2
+    return 1
+  fi
+  if [[ -L "$copilot_sdk_root" || ! -d "$copilot_sdk_root" || \
+        -L "$copilot_sdk_root/package.json" || ! -f "$copilot_sdk_root/package.json" || \
+        -L "$copilot_sdk_root/dist/cjs/index.js" || ! -f "$copilot_sdk_root/dist/cjs/index.js" ]]; then
+    log "ERROR: installed Copilot SDK root is incomplete or linked: $copilot_sdk_root" >&2
+    return 1
+  fi
+  if [[ -e "$copilot_arm64_bin" || -L "$copilot_arm64_bin" ]]; then
+    if [[ -e "$copilot_x64_bin" || -L "$copilot_x64_bin" ]]; then
+      log "ERROR: installed Copilot CLI contains multiple platform binaries." >&2
+      return 1
+    fi
+    copilot_bin="$copilot_arm64_bin"
+  elif [[ -e "$copilot_x64_bin" || -L "$copilot_x64_bin" ]]; then
+    copilot_bin="$copilot_x64_bin"
+  else
+    log "ERROR: installed Copilot CLI platform binary is missing." >&2
+    return 1
+  fi
+  if [[ -L "$copilot_bin" || ! -f "$copilot_bin" || ! -x "$copilot_bin" ]]; then
+    log "ERROR: installed Copilot CLI platform binary is linked or not executable: $copilot_bin" >&2
+    return 1
+  fi
+  PAIRLING_CLAUDE_AGENT_SDK_ROOT="$claude_sdk_root"
+  PAIRLING_COPILOT_SDK_ROOT="$copilot_sdk_root"
+  PAIRLING_COPILOT_BIN="$copilot_bin"
+  export PAIRLING_CLAUDE_AGENT_SDK_ROOT PAIRLING_COPILOT_SDK_ROOT PAIRLING_COPILOT_BIN
+}
+
 adopt_current_release_sources() {
   if [[ -z "$RELEASE_ROOT" || -L "$RELEASE_ROOT" || ! -d "$RELEASE_ROOT" ]]; then
     log "ERROR: Pairling cannot adopt an unverified runtime source root: $RELEASE_ROOT" >&2
@@ -3719,6 +3821,7 @@ adopt_current_release_sources() {
     PAIRLING_DAEMON_PYTHON="$PYTHON3_BIN"
     export PAIRLING_DAEMON_PYTHON
   fi
+  activate_provider_sdk_environment "$RELEASE_ROOT" || return 1
   cleanup_source_snapshot
   unset PAIRLING_RUNTIME_PACKAGE_ROOT PAIRLING_CONNECTD_PREBUILT
 }
@@ -3784,18 +3887,25 @@ copy_release() {
   verify_platform_runtime_manifest
   adopt_snapshot_python
   mkdir -p "$tmp/bin" "$tmp/companiond" "$tmp/companiond/providers" "$tmp/companiond/integrations/aperture_cli" "$tmp/connectd" "$tmp/mac" "$tmp/mcp"
+  stage_provider_sdks "$tmp/provider-sdks"
   cp "$REPO_ROOT/mac/companiond/pairlingd.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/safe_filesystem.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/runtime_contract.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/runtime_manifest.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/provider_runtime_assets.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/runtime_paths.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairdrop_cli.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairdrop_store.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/compose_recording_store.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairling_connectd_status.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/local_control_client.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairling_devices.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/managed_provider_sessions.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/public_diagnostics.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/local_mcp_bridge.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/llm_route.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairling_tools.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/pairling_assurance_policy.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairling_pairing.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairling_psk.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairling_relay_claims.py" "$tmp/companiond/"
@@ -3833,6 +3943,7 @@ copy_release() {
   # registry-data.json is the provider source of truth (SPEC-p1); a release
   # without it silently degrades to the builtin fallbacks.
   cp "$REPO_ROOT/mac/companiond/providers/"*.json "$tmp/companiond/providers/"
+  stage_provider_runtime_assets "$REPO_ROOT/mac/companiond/providers" "$tmp/companiond/providers"
   cp "$REPO_ROOT/mac/mcp/phone_tools.py" "$tmp/mcp/"
   build_connectd_binary "$tmp/connectd/pairling-connectd"
   stage_vendored_python "$tmp/python"
@@ -3930,6 +4041,7 @@ copy_runtime_source_tree() {
   stage_app_attest_assets "$mac_root/companiond"
   cp "$REPO_ROOT/mac/companiond/providers/"*.py "$mac_root/companiond/providers/"
   cp "$REPO_ROOT/mac/companiond/providers/"*.json "$mac_root/companiond/providers/"
+  stage_provider_runtime_assets "$REPO_ROOT/mac/companiond/providers" "$mac_root/companiond/providers"
   cp "$REPO_ROOT/mac/companiond/integrations/__init__.py" "$mac_root/companiond/integrations/"
   cp "$REPO_ROOT/mac/companiond/integrations/aperture_cli/"*.py "$mac_root/companiond/integrations/aperture_cli/"
   cp "$REPO_ROOT/mac/connectd/go.mod" "$mac_root/connectd/"
@@ -4168,6 +4280,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 repo_root, scan_root, install_root, version, revision, branch, dirty, app_support, logs_root, devices_db, port, pairdrop_root = sys.argv[1:]
+sys.path.insert(0, str(Path(repo_root) / "mac" / "companiond"))
+from runtime_manifest import PROVIDER_RUNTIME_ASSET_RELATIVE_PATHS
 root = Path(scan_root)
 files = []
 directories = []
@@ -4249,6 +4363,7 @@ manifest = {
         "homebrew_tap": "pairling-app/tap",
         "homebrew_cask": "pairling-helper",
     },
+    "provider_runtime_assets": list(PROVIDER_RUNTIME_ASSET_RELATIVE_PATHS),
     "directories": directories,
     "files": files,
 }
@@ -4375,7 +4490,20 @@ SH
 render_plists() {
   # Prefer the staged vendored interpreter whenever it exists, so start/
   # rollback (which don't re-stage) also run the daemon under dev.pairling.python.
-  local daemon_python="$PYTHON3_BIN"
+  local daemon_python="$PYTHON3_BIN" installed_release_root=""
+  if [[ -n "${RELEASE_ROOT:-}" && ! -L "$RELEASE_ROOT" && -d "$RELEASE_ROOT" ]]; then
+    installed_release_root="$RELEASE_ROOT"
+  elif [[ -e "$CURRENT_LINK" || -L "$CURRENT_LINK" ]]; then
+    installed_release_root="$(cd "$CURRENT_LINK" 2>/dev/null && pwd -P)" || {
+      log "ERROR: Pairling current runtime link cannot be resolved for provider activation." >&2
+      return 1
+    }
+  fi
+  if [[ -n "$installed_release_root" ]]; then
+    activate_provider_sdk_environment "$installed_release_root" || return 1
+  else
+    unset PAIRLING_CLAUDE_AGENT_SDK_ROOT PAIRLING_COPILOT_SDK_ROOT PAIRLING_COPILOT_BIN
+  fi
   if [[ -x "$CURRENT_LINK/python/bin/python3" ]]; then
     daemon_python="$CURRENT_LINK/python/bin/python3"
   fi
@@ -5050,6 +5178,7 @@ from request_proof import (
     canonical_request,
     proof_hex,
 )
+from pairling_connectd_status import fetch_connectd_status
 
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 deadline = time.monotonic() + max(1, wait_seconds)
@@ -5153,7 +5282,7 @@ try:
                 credential=credential,
             )
             credential_was_accepted = True
-            connectd = fetch(f"http://127.0.0.1:{connectd_port}/status")
+            connectd = fetch_connectd_status(timeout_seconds=2, port=connectd_port)
             if ready.get("ok") is not True or ready.get("contract_version") != "pairling-runtime-v1":
                 raise RuntimeError("/readyz did not report the Pairling runtime contract as ready")
             if health.get("contract_version") != "pairling-runtime-v1" or int(health.get("schema_version") or 0) < 1:
@@ -5599,6 +5728,8 @@ pair_runtime() {
   local ttl="180"
   local show_qr="0"
   local json_requested="0"
+  local role="reader"
+  local role_explicit="0"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --json)
@@ -5611,24 +5742,59 @@ pair_runtime() {
         shift
         ttl="${1:-}"
         if [[ -z "$ttl" ]]; then
-          log "usage: pairling pair [--ttl seconds] [--json] [--qr]" >&2
+          log "usage: pairling pair [--ttl seconds] [--role reader|operator] [--json] [--qr]" >&2
+          exit 2
+        fi
+        ;;
+      --role)
+        shift
+        role="${1:-}"
+        role_explicit="1"
+        if [[ -z "$role" ]]; then
+          log "usage: pairling pair [--ttl seconds] [--role reader|operator] [--json] [--qr]" >&2
           exit 2
         fi
         ;;
       --help|-h)
-        log "usage: pairling pair [--ttl seconds] [--json] [--qr]"
+        log "usage: pairling pair [--ttl seconds] [--role reader|operator] [--json] [--qr]"
         return
         ;;
       *)
-        log "usage: pairling pair [--ttl seconds] [--json] [--qr]" >&2
+        log "usage: pairling pair [--ttl seconds] [--role reader|operator] [--json] [--qr]" >&2
         exit 2
         ;;
     esac
     shift
   done
+  if [[ "$role_explicit" == "1" ]]; then
+    case "$role" in
+      reader|operator) ;;
+      *)
+        log "Invalid pairing role. Choose reader or operator." >&2
+        exit 2
+        ;;
+    esac
+  fi
+  if [[ "$role_explicit" != "1" && "$json_requested" != "1" && "${GUIDED_TTY:-0}" == "1" && -t 0 ]]; then
+    printf '\n  Pairing role\n'
+    printf '  [r] Reader   Read sessions, transcripts, diagnostics, and files\n'
+    printf '  [o] Operator Reader access plus send, interrupt, approval, and control\n'
+    printf '  Choose r or o [r]: '
+    local role_choice=""
+    IFS= read -r role_choice </dev/tty || role_choice=""
+    role_choice="$(printf '%s' "$role_choice" | tr '[:upper:]' '[:lower:]')"
+    case "$role_choice" in
+      ""|r|reader) role="reader" ;;
+      o|operator) role="operator" ;;
+      *)
+        log "Pairing cancelled: choose reader or operator." >&2
+        exit 2
+        ;;
+    esac
+  fi
   local payload_file
   payload_file="$(mktemp)"
-  if "$PYTHON3_BIN" - "$PAIRLING_RUNTIME_PORT" "$ttl" "$REPO_ROOT" >"$payload_file" <<'PY'
+  if "$PYTHON3_BIN" - "$PAIRLING_RUNTIME_PORT" "$ttl" "$role" "$REPO_ROOT" >"$payload_file" <<'PY'
 import json
 import ipaddress
 import os
@@ -5636,12 +5802,11 @@ import socket
 import sys
 import time
 import urllib.parse
-import urllib.error
-import urllib.request
 
-port, ttl_raw, repo_root = sys.argv[1:]
+port, ttl_raw, role, repo_root = sys.argv[1:]
 sys.path.insert(0, os.path.join(repo_root, "mac", "companiond"))
 from pairling_connectd_status import advertised_pairling_connect_routes, fetch_connectd_status
+from local_control_client import LocalControlClientError, control_socket_path, request_json
 
 try:
     ttl = int(ttl_raw)
@@ -5652,36 +5817,27 @@ except ValueError:
     }, indent=2, sort_keys=True), file=sys.stderr)
     raise SystemExit(2)
 
-url = f"http://127.0.0.1:{int(port)}/pair/start"
-body = json.dumps({"ttl_seconds": ttl}).encode("utf-8")
-request = urllib.request.Request(
-    url,
-    data=body,
-    method="POST",
-    headers={"Content-Type": "application/json"},
-)
+body_payload = {"ttl_seconds": ttl, "role": role}
 try:
-    with urllib.request.urlopen(request, timeout=5) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-except urllib.error.HTTPError as exc:
-    try:
-        payload = json.loads(exc.read().decode("utf-8"))
-    except Exception:
-        payload = {
-            "ok": False,
-            "error": {"code": "http_error", "message": str(exc)},
-        }
-    print(json.dumps(payload, indent=2, sort_keys=True), file=sys.stderr)
-    raise SystemExit(1)
-except Exception as exc:
+    status, payload = request_json(
+        "/pair/start",
+        method="POST",
+        payload=body_payload,
+        socket_path=control_socket_path(),
+        timeout_seconds=5,
+    )
+except LocalControlClientError as exc:
     print(json.dumps({
         "ok": False,
         "error": {
-            "code": "runtime_unreachable",
-            "message": f"Pairling runtime is not reachable at {url}: {type(exc).__name__}: {exc}",
+            "code": exc.code,
+            "message": exc.message,
         },
         "repair": "Run `pairling start` or `pairling doctor --json`, then retry `pairling pair`.",
     }, indent=2, sort_keys=True), file=sys.stderr)
+    raise SystemExit(1)
+if not 200 <= status < 300:
+    print(json.dumps(payload, indent=2, sort_keys=True), file=sys.stderr)
     raise SystemExit(1)
 
 pair_id = str(payload.get("pair_id") or (payload.get("claim") or {}).get("pair_id") or "")
@@ -5691,6 +5847,9 @@ secret = str(
     or (payload.get("claim") or {}).get("secret")
     or ""
 )
+invited_role = str(payload.get("role") or (payload.get("claim") or {}).get("role") or "")
+if invited_role != role:
+    raise RuntimeError("Pairling runtime returned a different invitation role")
 install_id = str(payload.get("install_id") or "")
 mac_name = str(((payload.get("pair_service") or {}).get("txt") or {}).get("mac_name") or socket.gethostname())
 # The Mac ephemeral ECDH public key from /pair/start is required in the QR or
@@ -5835,6 +5994,7 @@ if pair_id and secret:
         "pair_id": pair_id,
         "secret": secret,
     }
+    pair_params["role"] = invited_role
     pair_params["mac_ake_pub"] = mac_ake_pub
     pair_params["pv"] = "2"
     if pair_route.get("source") == "pairling_connectd" and pair_route.get("status") == "ready":
@@ -5851,6 +6011,7 @@ if pair_id and secret:
         "base_url": base_url,
         "pair_id": pair_id,
         "secret": secret,
+        "role": invited_role,
     }
     if install_id:
         pair_params["install_id"] = install_id
@@ -5893,6 +6054,8 @@ import sys
 payload = json.load(open(sys.argv[1]))
 manual = payload.get("manual") or {}
 print("Pairling pairing invitation ready")
+if payload.get("role"):
+    print("Role:", str(payload["role"]).title())
 print("")
 print("Scan this QR in Pairling, or paste the pair URL below.")
 print("")
@@ -5936,9 +6099,10 @@ try:
             str(row[1])
             for row in db.execute("PRAGMA table_info(devices)").fetchall()
         }
+        role_column = "role" if "role" in columns else "NULL AS role"
         query = (
-            "SELECT device_id, device_name, scopes_json, created_at, last_seen_at, revoked_at "
-            "FROM devices"
+            "SELECT device_id, device_name, scopes_json, "
+            f"{role_column}, created_at, last_seen_at, revoked_at FROM devices"
         )
         params = ()
         if "purpose" in columns:
@@ -5955,9 +6119,10 @@ print(json.dumps({
             "device_id": row[0],
             "device_name": row[1],
             "scopes": json.loads(row[2]),
-            "created_at": row[3],
-            "last_seen_at": row[4],
-            "revoked_at": row[5],
+            "role": row[3],
+            "created_at": row[4],
+            "last_seen_at": row[5],
+            "revoked_at": row[6],
         }
         for row in rows
     ],
@@ -6021,6 +6186,7 @@ logs_runtime() {
   log "$LOGS_ROOT"
 }
 
+
 connect_auth_open() {
   local json_mode="false"
   while [[ $# -gt 0 ]]; do
@@ -6039,27 +6205,22 @@ connect_auth_open() {
     esac
     shift
   done
-  local output
-  if output="$(/usr/bin/curl -sS --max-time 5 -X POST http://127.0.0.1:7774/auth/open 2>/dev/null)"; then
-    local response_status
-    if "$PYTHON3_BIN" -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("ok") else 1)' <<<"$output"; then
-      response_status=0
-    else
-      response_status=1
-    fi
-    if [[ "$json_mode" == "true" ]]; then
-      printf '%s\n' "$output"
-    else
-      "$PYTHON3_BIN" -c 'import json,sys; data=json.load(sys.stdin); print("Pairling Connect browser approval opened." if data.get("opened") else data.get("error", "Pairling Connect browser approval is not available."))' <<<"$output"
-    fi
-    exit "$response_status"
+  local output helper_status=0 response_status=1
+  output="$("$PYTHON3_BIN" "$REPO_ROOT/mac/companiond/local_control_client.py" \
+    POST /connect/auth/open 2>/dev/null)" || helper_status=$?
+  if [[ "$helper_status" == "0" ]] && \
+    "$PYTHON3_BIN" -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("ok") else 1)' <<<"$output"; then
+    response_status=0
+  fi
+  if [[ -z "$output" ]]; then
+    output='{"ok":false,"opened":false,"auth_url_present":false,"error":{"code":"control_transport_error","message":"Pairling local control socket is unavailable."}}'
   fi
   if [[ "$json_mode" == "true" ]]; then
-    printf '{"ok":false,"opened":false,"auth_url_present":false,"error":"Pairling Connect auth endpoint unavailable."}\n'
+    printf '%s\n' "$output"
   else
-    printf 'Pairling Connect auth endpoint unavailable.\n' >&2
+    "$PYTHON3_BIN" -c 'import json,sys; data=json.load(sys.stdin); error=data.get("error"); message=error.get("message") if isinstance(error,dict) else error; print("Pairling Connect browser approval opened." if data.get("opened") else (message or "Pairling Connect browser approval is not available."))' <<<"$output" >&2
   fi
-  exit 1
+  exit "$response_status"
 }
 
 # Normal setup must have an authenticated embedded route before it creates a
@@ -6070,18 +6231,14 @@ require_pairling_connect_route() {
     return 0
   fi
   "$PYTHON3_BIN" - "$REPO_ROOT" <<'PY'
-import json
 import os
 import sys
 import time
-import urllib.error
-import urllib.request
 
 repo_root = sys.argv[1]
 sys.path.insert(0, os.path.join(repo_root, "mac", "companiond"))
 from pairling_connectd_status import advertised_pairling_connect_routes, fetch_connectd_status
-
-AUTH_OPEN_URL = "http://127.0.0.1:7774/auth/open"
+from local_control_client import LocalControlClientError, control_socket_path, request_json
 
 
 def readiness_wait_seconds() -> float:
@@ -6099,20 +6256,16 @@ def readiness_poll_seconds() -> float:
 
 
 def post_auth_open() -> bool:
-    request = urllib.request.Request(AUTH_OPEN_URL, data=b"", method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=5) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        # connectd answered but the auth URL is not ready (409) or similar.
-        try:
-            payload = json.loads(exc.read().decode("utf-8"))
-        except Exception:
-            payload = {}
-        return bool(payload.get("opened"))
-    except Exception:
+        _status, payload = request_json(
+            "/connect/auth/open",
+            method="POST",
+            socket_path=control_socket_path(),
+            timeout_seconds=5,
+        )
+    except LocalControlClientError:
         return False
-    return bool(payload.get("opened"))
+    return bool(payload.get("ok"))
 
 
 def main() -> None:

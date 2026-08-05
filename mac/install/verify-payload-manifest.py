@@ -4,12 +4,17 @@ from __future__ import annotations
 import ctypes
 import errno
 import hashlib
+import importlib.util
 import json
 import os
 import stat
 import sys
 import urllib.parse
 from pathlib import Path
+
+COMPANIOND_ROOT = Path(__file__).resolve().parents[1] / "companiond"
+sys.path.insert(0, str(COMPANIOND_ROOT))
+from provider_runtime_assets import PROVIDER_RUNTIME_ASSET_DIGESTS  # noqa: E402
 
 
 UNSAFE_MODE_BITS = 0o7022
@@ -21,6 +26,114 @@ FORBIDDEN_DEPENDENCY_KEYS = (
     "bundleDependencies",
 )
 ALLOWED_REPOSITORY_SHA256 = "33abebc9c629f9877e31b8c9f39670427ad5055d80ccdc8a51588101087a042a"
+SOURCE_ROOT = Path(__file__).resolve().parents[2]
+GENERATED_RELEASE_PAYLOAD_FILES = frozenset(
+    {
+        "payload/mac/VERSION",
+        "payload/mac/SOURCE_REVISION",
+        "payload/mac/SOURCE_BRANCH",
+        "payload/mac/SOURCE_DIRTY",
+        "payload/mac/companiond/providers/provider-control-capability-map.json",
+        "payload/mac/companiond/providers/reviewed-operation-manifest.json",
+    }
+)
+CANONICAL_DAEMON_SOURCE_PATHS = (
+    "mac/companiond/managed_provider_sessions.py",
+    "mac/companiond/pairlingd.py",
+    "mac/companiond/provider_runtime_assets.py",
+    "mac/companiond/route_registry.py",
+    "mac/companiond/runtime_contract.py",
+    "mac/companiond/runtime_manifest.py",
+    "mac/companiond/runtime_paths.py",
+    "mac/companiond/providers/__init__.py",
+    "mac/companiond/providers/acp.py",
+    "mac/companiond/providers/acp_profiles.py",
+    "mac/companiond/providers/base.py",
+    "mac/companiond/providers/codex.py",
+    "mac/companiond/providers/codex_app_server.py",
+    "mac/companiond/providers/controls.py",
+    "mac/companiond/providers/operations.py",
+    "mac/companiond/providers/registry.py",
+    "mac/companiond/providers/registry_data.py",
+    "mac/companiond/providers/visibility.py",
+)
+
+
+
+def required_release_source_files(source_root: Path) -> dict[str, Path]:
+    files: dict[str, Path] = {}
+
+    def add(source: Path, destination: str) -> None:
+        files[f"payload/{destination}"] = source
+
+    def add_glob(source_dir: Path, pattern: str, destination_dir: str) -> None:
+        for source in sorted(source_dir.glob(pattern), key=lambda path: path.name):
+            if source.is_file() or source.is_symlink():
+                add(source, f"{destination_dir}/{source.name}")
+
+    def add_tree(source_dir: Path, destination_dir: str) -> None:
+        if not source_dir.is_dir() or source_dir.is_symlink():
+            return
+        for source in sorted(
+            source_dir.rglob("*"),
+            key=lambda path: path.relative_to(source_dir).as_posix(),
+        ):
+            if source.is_file() or source.is_symlink():
+                relative = source.relative_to(source_dir).as_posix()
+                add(source, f"{destination_dir}/{relative}")
+
+    companiond = source_root / "mac" / "companiond"
+    providers = companiond / "providers"
+    add_glob(companiond, "*.py", "mac/companiond")
+    app_attest_validator = source_root / "relay" / "app_attest_validator.py"
+    if not app_attest_validator.is_file():
+        app_attest_validator = companiond / "app_attest_validator.py"
+    add(app_attest_validator, "mac/companiond/app_attest_validator.py")
+    add(
+        companiond / "apple-app-attest-root-ca.pem",
+        "mac/companiond/apple-app-attest-root-ca.pem",
+    )
+    add(
+        companiond / "relay-claim-2026-07-v1.pem",
+        "mac/companiond/relay-claim-2026-07-v1.pem",
+    )
+    add_glob(providers, "*.py", "mac/companiond/providers")
+    add_glob(providers, "*.json", "mac/companiond/providers")
+    for name in PROVIDER_RUNTIME_ASSET_DIGESTS:
+        add(providers / name, f"mac/companiond/providers/{name}")
+    add(
+        companiond / "integrations" / "__init__.py",
+        "mac/companiond/integrations/__init__.py",
+    )
+    add_glob(
+        companiond / "integrations" / "aperture_cli",
+        "*.py",
+        "mac/companiond/integrations/aperture_cli",
+    )
+    add_glob(source_root / "mac" / "mcp", "*.py", "mac/mcp")
+    add_glob(source_root / "mac" / "install", "*.sh", "mac/install")
+    add_glob(source_root / "mac" / "install", "*.py", "mac/install")
+    for relative in CANONICAL_DAEMON_SOURCE_PATHS:
+        add(source_root / relative, relative)
+    add(source_root / "mac" / "connectd" / "go.mod", "mac/connectd/go.mod")
+    add(source_root / "mac" / "connectd" / "go.sum", "mac/connectd/go.sum")
+    add_tree(source_root / "mac" / "connectd" / "cmd", "mac/connectd/cmd")
+    add_tree(source_root / "mac" / "connectd" / "internal", "mac/connectd/internal")
+    add(
+        source_root / "mac" / "packaging" / "bin" / "pairling",
+        "mac/packaging/bin/pairling",
+    )
+    add(
+        source_root / "mac" / "packaging" / "pairling_attach.py",
+        "mac/packaging/pairling_attach.py",
+    )
+    return files
+
+
+REQUIRED_RELEASE_SOURCE_FILES = required_release_source_files(SOURCE_ROOT)
+REQUIRED_RELEASE_PAYLOAD_FILES = frozenset(
+    {*REQUIRED_RELEASE_SOURCE_FILES, *GENERATED_RELEASE_PAYLOAD_FILES}
+)
 
 
 def valid_repository(value: object) -> bool:
@@ -255,6 +368,204 @@ def safe_archive_entry(path: Path, *, directory: bool, executable: bool = False)
     return None
 
 
+def verify_release_capability_membership(
+    payload_root: Path,
+    payload_manifest: dict[str, object],
+) -> str | None:
+    providers_root = payload_root / "mac" / "companiond" / "providers"
+    operations_path = providers_root / "operations.py"
+    manifest_path = providers_root / "reviewed-operation-manifest.json"
+    capability_map_path = providers_root / "provider-control-capability-map.json"
+    try:
+        release_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        capability_map = json.loads(capability_map_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return f"cannot load packaged provider release membership: {exc}"
+    if not isinstance(release_manifest, dict) or not isinstance(capability_map, dict):
+        return "packaged provider release membership and capability map must be objects"
+    if release_manifest.get("source_revision") != payload_manifest.get("source_revision"):
+        return "packaged provider release membership source_revision is not the payload revision"
+
+    module_name = "_pairling_packaged_provider_operations"
+    spec = importlib.util.spec_from_file_location(module_name, operations_path)
+    if spec is None or spec.loader is None:
+        return "cannot load packaged provider operation source"
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        membership_errors = module.validate_release_operation_manifest(
+            release_manifest,
+            source_root=payload_root,
+        )
+    except Exception as exc:
+        return f"cannot validate packaged provider release membership: {exc}"
+    finally:
+        sys.modules.pop(module_name, None)
+    if membership_errors:
+        return str(membership_errors[0])
+
+    capability_index: dict[tuple[str, str], dict[str, object]] = {}
+    agents = capability_map.get("agents")
+    if not isinstance(agents, list):
+        return "packaged capability map agents must be an array"
+    for agent in agents:
+        if not isinstance(agent, dict):
+            continue
+        provider_id = agent.get("provider_id")
+        capabilities = agent.get("capabilities")
+        if not isinstance(provider_id, str) or not isinstance(capabilities, list):
+            continue
+        for capability in capabilities:
+            if not isinstance(capability, dict):
+                continue
+            capability_key = capability.get("capability_key")
+            if isinstance(capability_key, str):
+                cell = (provider_id, capability_key)
+                if cell in capability_index:
+                    return f"duplicate packaged capability row: {provider_id}/{capability_key}"
+                capability_index[cell] = capability
+
+    catalog_ids = {
+        row.get("id")
+        for row in release_manifest.get("operations", [])
+        if isinstance(row, dict) and isinstance(row.get("id"), str)
+    }
+    seen_cells: set[tuple[str, str]] = set()
+    for membership in release_manifest.get("release_memberships", []):
+        if not isinstance(membership, dict):
+            return "packaged provider release membership row must be an object"
+        map_provider_id = membership.get("map_provider_id")
+        capabilities = membership.get("capabilities")
+        if not isinstance(map_provider_id, str) or not isinstance(capabilities, list):
+            return "packaged provider release membership identity is invalid"
+        for released in capabilities:
+            if not isinstance(released, dict):
+                return "packaged released capability membership must be an object"
+            capability_key = released.get("capability_key")
+            operation_ids = released.get("operation_ids")
+            cell = (map_provider_id, capability_key)
+            capability = capability_index.get(cell)
+            if capability is None:
+                return (
+                    "packaged release membership capability row is missing: "
+                    f"{map_provider_id}/{capability_key}"
+                )
+            if cell in seen_cells:
+                return (
+                    "duplicate packaged release membership capability row: "
+                    f"{map_provider_id}/{capability_key}"
+                )
+            seen_cells.add(cell)
+            support = capability.get("current_pairling_support")
+            if (
+                not isinstance(support, dict)
+                or support.get("status") not in {"supported", "partial"}
+            ):
+                return (
+                    "packaged release membership capability is not implemented: "
+                    f"{map_provider_id}/{capability_key}"
+                )
+            declared = capability.get("pairling_operation_ids")
+            if (
+                not isinstance(operation_ids, list)
+                or not operation_ids
+                or len(set(operation_ids)) != len(operation_ids)
+                or not isinstance(declared, list)
+                or not set(operation_ids).issubset(set(declared))
+                or not set(operation_ids).issubset(catalog_ids)
+            ):
+                return (
+                    "packaged release membership operation set is not exact: "
+                    f"{map_provider_id}/{capability_key}"
+                )
+    return None
+
+
+
+
+def verify_required_release_payload(
+    payload_root: Path,
+    manifest: dict[str, object],
+) -> str | None:
+    executable_paths = {
+        "payload/mac/install/install-runtime.sh",
+        "payload/mac/companiond/pairlingd.py",
+        "payload/mac/mcp/phone_tools.py",
+        "payload/mac/packaging/bin/pairling",
+    }
+    actual_files, _, scan_error = scan_payload(payload_root)
+    if scan_error:
+        return scan_error
+    unexpected = sorted(set(actual_files) - REQUIRED_RELEASE_PAYLOAD_FILES)
+    if unexpected:
+        return "release payload has files outside the reviewed source snapshot: " + ", ".join(
+            unexpected[:5]
+        )
+    for relative in sorted(REQUIRED_RELEASE_PAYLOAD_FILES):
+        resolved = payload_path(payload_root, relative)
+        if resolved is None:
+            return f"required release payload path is invalid: {relative}"
+        _, path = resolved
+        if path.is_symlink() or not path.is_file():
+            return f"required release payload file is missing or unsafe: {relative}"
+        entry_error = safe_archive_entry(
+            path,
+            directory=False,
+            executable=relative in executable_paths,
+        )
+        if entry_error:
+            return f"required release payload file is missing or unsafe: {relative}"
+        if relative not in executable_paths and stat.S_IMODE(path.lstat().st_mode) & 0o111:
+            return f"required release payload data file is executable: {relative}"
+    provider_root = payload_root / "mac" / "companiond" / "providers"
+    for name, expected_digest in PROVIDER_RUNTIME_ASSET_DIGESTS.items():
+        if sha256(provider_root / name) != expected_digest:
+            return f"required provider runtime asset digest is not canonical: {name}"
+    for relative, source in REQUIRED_RELEASE_SOURCE_FILES.items():
+        resolved = payload_path(payload_root, relative)
+        if resolved is None or source.is_symlink() or not source.is_file():
+            return f"canonical release payload source is unavailable: {relative}"
+        _, packaged = resolved
+        if sha256(packaged) != sha256(source):
+            return f"required release payload source snapshot mismatch: {relative}"
+    generated_values = {
+        "payload/mac/VERSION": f"{manifest.get('package_version')}\n".encode(),
+        "payload/mac/SOURCE_REVISION": f"{manifest.get('source_revision')}\n".encode(),
+        "payload/mac/SOURCE_DIRTY": b"false\n",
+    }
+    for relative, expected in generated_values.items():
+        resolved = payload_path(payload_root, relative)
+        if resolved is None:
+            return f"required release payload metadata path is invalid: {relative}"
+        _, packaged = resolved
+        try:
+            observed = packaged.read_bytes()
+        except OSError:
+            return f"required release payload metadata is unreadable: {relative}"
+        if observed != expected:
+            return f"required release payload metadata mismatch: {relative}"
+    source_branch = payload_root / "mac" / "SOURCE_BRANCH"
+    try:
+        branch_raw = source_branch.read_bytes()
+        branch = branch_raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return "required release payload metadata is unreadable: payload/mac/SOURCE_BRANCH"
+    if (
+        len(branch_raw) > 257
+        or not branch.endswith("\n")
+        or not branch[:-1]
+        or "\n" in branch[:-1]
+        or "\r" in branch
+        or "\0" in branch
+    ):
+        return "required release payload metadata mismatch: payload/mac/SOURCE_BRANCH"
+    membership_error = verify_release_capability_membership(payload_root, manifest)
+    if membership_error:
+        return membership_error
+    return None
+
+
 def verify_package_json(path: Path, manifest: dict[str, object]) -> str | None:
     try:
         package = json.loads(path.read_text(encoding="utf-8"))
@@ -330,9 +641,161 @@ def verify_archive_shape(
         acl_paths = extended_acl_paths(package_root)
     except OSError as exc:
         return f"could not inspect archive ACLs: {exc}"
+    canonical_root_files = {
+        package_root / "README.md": SOURCE_ROOT / "npm" / "pairling" / "README.md",
+        package_root / "bin" / "pairling.mjs": (
+            SOURCE_ROOT / "npm" / "pairling" / "bin" / "pairling.mjs"
+        ),
+    }
+    for packaged, source in canonical_root_files.items():
+        if source.is_symlink() or not source.is_file():
+            return f"canonical package source is unavailable: {packaged.name}"
+        if sha256(packaged) != sha256(source):
+            return f"package source snapshot mismatch: {packaged.name}"
     if acl_paths:
         return "archive contains extended ACLs: " + ", ".join(acl_paths[:5])
     return None
+
+
+def verify_payload_manifest(
+    payload_input: Path,
+    manifest_input: Path,
+    *,
+    archive_mode: bool = False,
+    expected_version: str | None = None,
+    expected_revision: str | None = None,
+    require_clean: bool = False,
+    require_release_files: bool = False,
+) -> tuple[int, int, str | None]:
+    if payload_input.is_symlink() or not payload_input.is_dir():
+        return 0, 0, "payload root must be a real directory"
+    if manifest_input.is_symlink() or not manifest_input.is_file():
+        return 0, 0, "payload manifest must be a regular file, not a symlink"
+    payload_root = payload_input.resolve()
+    manifest_path = manifest_input.resolve()
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return 0, 0, f"cannot read manifest: {exc}"
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != 2:
+        return 0, 0, "unsupported manifest schema"
+    if manifest.get("package") != "pairling" or not isinstance(
+        manifest.get("package_version"),
+        str,
+    ):
+        return 0, 0, "manifest package identity is invalid"
+    if expected_version is not None and manifest.get("package_version") != expected_version:
+        return 0, 0, "manifest package version does not match the expected release"
+    if not isinstance(manifest.get("source_revision"), str):
+        return 0, 0, "manifest source revision is invalid"
+    if expected_revision is not None and manifest.get("source_revision") != expected_revision:
+        return 0, 0, "manifest source revision does not match the expected release"
+    if not isinstance(manifest.get("source_dirty"), bool):
+        return 0, 0, "manifest source dirty flag is invalid"
+    if require_clean and manifest.get("source_dirty") is not False:
+        return 0, 0, "release payload manifest source_dirty must be false"
+    evidence_sha256 = manifest.get("release_evidence_sha256")
+    if evidence_sha256 is not None and (
+        not isinstance(evidence_sha256, str)
+        or len(evidence_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in evidence_sha256)
+    ):
+        return 0, 0, "manifest release evidence digest is invalid"
+    python_archives = manifest.get("python_archives")
+    if not isinstance(python_archives, dict) or set(python_archives) != {
+        "darwin-arm64",
+        "darwin-x64",
+    }:
+        return 0, 0, "manifest Python archive architecture map is invalid"
+    for architecture in ("arm64", "x64"):
+        digest = python_archives.get(f"darwin-{architecture}")
+        if digest is not None and (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            return 0, 0, f"manifest Python archive {architecture} digest is invalid"
+    runtime_manifests = manifest.get("runtime_manifests")
+    if not isinstance(runtime_manifests, dict) or set(runtime_manifests) != {
+        "darwin-arm64",
+        "darwin-x64",
+    }:
+        return 0, 0, "manifest runtime architecture map is invalid"
+    for architecture in ("arm64", "x64"):
+        digest = runtime_manifests.get(f"darwin-{architecture}")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            return 0, 0, f"manifest runtime {architecture} digest is invalid"
+    connectd = manifest.get("connectd")
+    if not isinstance(connectd, dict) or set(connectd) != {
+        "darwin-arm64",
+        "darwin-x64",
+    }:
+        return 0, 0, "manifest connectd architecture map is invalid"
+    for architecture in ("arm64", "x64"):
+        identity = connectd.get(f"darwin-{architecture}")
+        if not isinstance(identity, dict):
+            return 0, 0, f"manifest connectd {architecture} identity is invalid"
+        digest = identity.get("sha256")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or identity.get("identifier") != "dev.pairling.connectd"
+            or identity.get("architecture") != architecture
+            or (
+                identity.get("team_id") is not None
+                and not isinstance(identity.get("team_id"), str)
+            )
+        ):
+            return 0, 0, f"manifest connectd {architecture} identity is invalid"
+
+    file_count, directory_count, entry_error = verify_manifest_entries(
+        payload_root,
+        manifest,
+    )
+    if entry_error:
+        return 0, 0, entry_error
+    if require_release_files:
+        required_error = verify_required_release_payload(payload_root, manifest)
+        if required_error:
+            return 0, 0, required_error
+    try:
+        acl_paths = extended_acl_paths(payload_root)
+    except OSError as exc:
+        return 0, 0, f"could not inspect payload ACLs: {exc}"
+    if acl_paths:
+        return 0, 0, "payload contains extended ACLs: " + ", ".join(acl_paths[:5])
+    if archive_mode:
+        shape_error = verify_archive_shape(
+            manifest_path.parent,
+            payload_root,
+            manifest_path,
+            manifest,
+        )
+        if shape_error:
+            return 0, 0, shape_error
+    return file_count, directory_count, None
+
+
+def verify_payload_package_root(
+    package_root: Path,
+    *,
+    expected_version: str | None = None,
+    expected_revision: str | None = None,
+) -> tuple[int, int, str | None]:
+    return verify_payload_manifest(
+        package_root / "payload",
+        package_root / "payload-manifest.json",
+        archive_mode=True,
+        expected_version=expected_version,
+        expected_revision=expected_revision,
+        require_clean=True,
+        require_release_files=True,
+    )
 
 
 def main() -> int:
@@ -345,86 +808,13 @@ def main() -> int:
             "usage: verify-payload-manifest.py [--archive] "
             "<payload-root> <payload-manifest.json>"
         )
-    payload_input = Path(args[0])
-    manifest_input = Path(args[1])
-    if payload_input.is_symlink() or not payload_input.is_dir():
-        return fail("payload root must be a real directory")
-    if manifest_input.is_symlink() or not manifest_input.is_file():
-        return fail("payload manifest must be a regular file, not a symlink")
-    payload_root = payload_input.resolve()
-    manifest_path = manifest_input.resolve()
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return fail(f"cannot read manifest: {exc}")
-    if not isinstance(manifest, dict) or manifest.get("schema_version") != 2:
-        return fail("unsupported manifest schema")
-    if manifest.get("package") != "pairling" or not isinstance(manifest.get("package_version"), str):
-        return fail("manifest package identity is invalid")
-    if not isinstance(manifest.get("source_revision"), str):
-        return fail("manifest source revision is invalid")
-    if not isinstance(manifest.get("source_dirty"), bool):
-        return fail("manifest source dirty flag is invalid")
-    evidence_sha256 = manifest.get("release_evidence_sha256")
-    if evidence_sha256 is not None and (
-        not isinstance(evidence_sha256, str)
-        or len(evidence_sha256) != 64
-        or any(character not in "0123456789abcdef" for character in evidence_sha256)
-    ):
-        return fail("manifest release evidence digest is invalid")
-    python_archives = manifest.get("python_archives")
-    if not isinstance(python_archives, dict) or set(python_archives) != {"darwin-arm64", "darwin-x64"}:
-        return fail("manifest Python archive architecture map is invalid")
-    for architecture in ("arm64", "x64"):
-        digest = python_archives.get(f"darwin-{architecture}")
-        if digest is not None and (
-            not isinstance(digest, str)
-            or len(digest) != 64
-            or any(character not in "0123456789abcdef" for character in digest)
-        ):
-            return fail(f"manifest Python archive {architecture} digest is invalid")
-    runtime_manifests = manifest.get("runtime_manifests")
-    if not isinstance(runtime_manifests, dict) or set(runtime_manifests) != {"darwin-arm64", "darwin-x64"}:
-        return fail("manifest runtime architecture map is invalid")
-    for architecture in ("arm64", "x64"):
-        digest = runtime_manifests.get(f"darwin-{architecture}")
-        if (
-            not isinstance(digest, str)
-            or len(digest) != 64
-            or any(character not in "0123456789abcdef" for character in digest)
-        ):
-            return fail(f"manifest runtime {architecture} digest is invalid")
-    connectd = manifest.get("connectd")
-    if not isinstance(connectd, dict) or set(connectd) != {"darwin-arm64", "darwin-x64"}:
-        return fail("manifest connectd architecture map is invalid")
-    for architecture in ("arm64", "x64"):
-        identity = connectd.get(f"darwin-{architecture}")
-        if not isinstance(identity, dict):
-            return fail(f"manifest connectd {architecture} identity is invalid")
-        digest = identity.get("sha256")
-        if (
-            not isinstance(digest, str)
-            or len(digest) != 64
-            or any(character not in "0123456789abcdef" for character in digest)
-            or identity.get("identifier") != "dev.pairling.connectd"
-            or identity.get("architecture") != architecture
-            or (identity.get("team_id") is not None and not isinstance(identity.get("team_id"), str))
-        ):
-            return fail(f"manifest connectd {architecture} identity is invalid")
-
-    file_count, directory_count, entry_error = verify_manifest_entries(payload_root, manifest)
-    if entry_error:
-        return fail(entry_error)
-    try:
-        acl_paths = extended_acl_paths(payload_root)
-    except OSError as exc:
-        return fail(f"could not inspect payload ACLs: {exc}")
-    if acl_paths:
-        return fail("payload contains extended ACLs: " + ", ".join(acl_paths[:5]))
-    if archive_mode:
-        shape_error = verify_archive_shape(manifest_path.parent, payload_root, manifest_path, manifest)
-        if shape_error:
-            return fail(shape_error)
+    file_count, directory_count, verification_error = verify_payload_manifest(
+        Path(args[0]),
+        Path(args[1]),
+        archive_mode=archive_mode,
+    )
+    if verification_error:
+        return fail(verification_error)
     print(f"payload manifest verified: {file_count} files, {directory_count} directories")
     return 0
 

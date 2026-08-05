@@ -1,0 +1,6 @@
+{
+  "package": "@qwen-code/sdk",
+  "sdk_version": "0.1.8",
+  "cli_version": "0.21.4",
+  "node": ">=22"
+}

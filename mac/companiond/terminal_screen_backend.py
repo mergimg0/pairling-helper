@@ -11,6 +11,10 @@ from typing import Any, Protocol
 
 
 PENDING_INPUT_PARSER_VERSION = "terminal_pending_input_v3_2026_07_16"
+TERMINAL_TITLE_MAX_CHARS = 1024
+TERMINAL_LINK_URI_MAX_CHARS = 4096
+TERMINAL_LINK_ID_MAX_CHARS = 64
+TERMINAL_SCREEN_STATE_MAX_LINKS = 256
 
 
 @dataclass(frozen=True)
@@ -203,6 +207,51 @@ class TerminalScreenBackend(Protocol):
         ...
 
 
+def _bounded_terminal_text(value: Any, *, max_chars: int) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    if len(text) > max_chars:
+        return None
+    return text
+
+
+def _bounded_screen_links(
+    visible_rows: tuple[TerminalRow, ...],
+    raw_links: Any,
+) -> dict[str, str]:
+    if not isinstance(raw_links, dict):
+        return {}
+    bounded: dict[str, str] = {}
+
+    def remember(raw_link_id: Any) -> None:
+        if raw_link_id is None or len(bounded) >= TERMINAL_SCREEN_STATE_MAX_LINKS:
+            return
+        link_id = str(raw_link_id)
+        if not link_id or len(link_id) > TERMINAL_LINK_ID_MAX_CHARS or link_id in bounded:
+            return
+        raw_uri = raw_links.get(link_id)
+        if raw_uri is None:
+            return
+        uri = str(raw_uri)
+        if len(uri) > TERMINAL_LINK_URI_MAX_CHARS:
+            return
+        bounded[link_id] = uri
+
+    # Preserve every mapping referenced by the live grid first. Any remaining
+    # budget holds the newest mappings so recent scrollback links still work.
+    for row in visible_rows:
+        for cell in row.cells:
+            remember(cell.link_id)
+            if len(bounded) >= TERMINAL_SCREEN_STATE_MAX_LINKS:
+                return bounded
+    for link_id in reversed(raw_links):
+        remember(link_id)
+        if len(bounded) >= TERMINAL_SCREEN_STATE_MAX_LINKS:
+            break
+    return bounded
+
+
 class VTScreenBackend:
     # Generations of dirty-row history retained for delta requests; a client
     # further behind than this receives a full delta (all rows) instead.
@@ -266,10 +315,15 @@ class VTScreenBackend:
                 )
                 for index, row in enumerate(rows)
             )
+        title = _bounded_terminal_text(
+            getattr(self.screen, "title", None),
+            max_chars=TERMINAL_TITLE_MAX_CHARS,
+        )
+        links = _bounded_screen_links(visible_rows, getattr(self.screen, "links", None))
         capabilities = ["cells", "attributes", "cursor", "dirty_rows", "raw_offset", "control_receipts"]
-        if getattr(self.screen, "title", None):
+        if title:
             capabilities.append("title")
-        if getattr(self.screen, "links", None):
+        if links:
             capabilities.append("links")
         if getattr(self.screen, "alternate_screen", False):
             capabilities.append("alternate_screen")
@@ -293,7 +347,7 @@ class VTScreenBackend:
             raw_offset=self.raw_offset,
             source=self.source,
             backend=self.backend,
-            title=getattr(self.screen, "title", None),
+            title=title,
             alternate_screen=bool(getattr(self.screen, "alternate_screen", False)),
             cursor=cursor,
             visible_rows=visible_rows,
@@ -301,7 +355,7 @@ class VTScreenBackend:
             capabilities=tuple(dict.fromkeys(capabilities)),
             pending_input=pending_input,
             pending_input_detection=pending_detection,
-            links=dict(getattr(self.screen, "links", {}) or {}),
+            links=links,
         )
 
     def dirty_delta(self, *, since_generation: int) -> TerminalScreenState | None:

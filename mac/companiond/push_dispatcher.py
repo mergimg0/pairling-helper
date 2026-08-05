@@ -308,6 +308,7 @@ class LocalAPNSProvider:
         thread_id: str | None = None,
         pairling_extra: dict[str, Any] | None = None,
         interruption_level: str | None = None,
+        category: str | None = None,
     ) -> dict[str, Any]:
         config = self._config()
         if not config["local_apns_configured"]:
@@ -328,11 +329,16 @@ class LocalAPNSProvider:
                     continue
                 if isinstance(value, (str, int, float, bool)) or value is None:
                     pairling_payload[str(key)[:80]] = _bounded_optional(value, 180) if isinstance(value, str) else value
+        resolved_category = (
+            "PAIRLING_APPROVAL_DECISION"
+            if category == "PAIRLING_APPROVAL_DECISION"
+            else KIND_CATEGORY[kind]
+        )
         payload = {
             "aps": {
                 "alert": {"title": title, "body": body},
                 "sound": "default",
-                "category": KIND_CATEGORY[kind],
+                "category": resolved_category,
                 "thread-id": _bounded_optional(thread_id, 120) or _thread_id(kind, route),
             },
             "pairling": pairling_payload,
@@ -2213,6 +2219,7 @@ class PairlingPushDispatcher:
                     thread_id=context["thread_id"],
                     pairling_extra=context["pairling_extra"],
                     interruption_level=context["interruption_level"],
+                    category=context["category"],
                 )
                 sent = bool(result.get("sent"))
                 outcome = str(result.get("outcome") or ("sent" if sent else "failed"))
@@ -2242,6 +2249,7 @@ class PairlingPushDispatcher:
                         "thread_id": context["thread_id"],
                         "interruption_level": context["interruption_level"],
                         "pairling_extra": context["pairling_extra"],
+                        "category": context["category"],
                         **context["metadata"],
                     },
                 )
@@ -2309,6 +2317,11 @@ class PairlingPushDispatcher:
             "body": str(payload.get("body") or "")[:220] or None,
             "device": dict(device),
             "device_id": device_id,
+            "category": (
+                "PAIRLING_APPROVAL_DECISION"
+                if payload.get("category") == "PAIRLING_APPROVAL_DECISION"
+                else KIND_CATEGORY.get(kind, "PAIRLING_PUSH_DIAGNOSTIC")
+            ),
             "dispatch_mode": None,
             "event_id": event_id,
             "interruption_level": str(payload.get("interruption_level") or "").strip()[:40] or None,
@@ -4166,6 +4179,22 @@ def _alert_pairling_extra(payload: dict[str, Any]) -> dict[str, Any]:
         "health_severity",
         "health_summary",
         "mac_install_id",
+        "request_nonce",
+        "authorization_contract",
+        "authorization_control",
+        "authorization_device_id",
+        "authorization_install_id",
+        "authorization_issued_at",
+        "authorization_expires_at",
+        "notification_action_nonce",
+        "notification_action_contract",
+        "notification_action_control",
+        "notification_action_device_id",
+        "notification_action_install_id",
+        "notification_action_session_id",
+        "notification_action_action",
+        "notification_action_issued_at",
+        "notification_action_expires_at",
     }
     out: dict[str, Any] = {}
     for key in allowed:

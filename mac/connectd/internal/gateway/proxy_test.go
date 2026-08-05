@@ -218,6 +218,23 @@ func TestAllowedSessionSourceDiagnosticsIsGetOnly(t *testing.T) {
 	}
 }
 
+func TestAllowedMCPDiagnosticsAreReadOnlyAndRestartIsAbsent(t *testing.T) {
+	if !Allowed(http.MethodGet, "/pickers/mcp") {
+		t.Fatal("GET /pickers/mcp should remain available for read-only diagnostics")
+	}
+	if Allowed(http.MethodPost, "/pickers/mcp") {
+		t.Fatal("POST /pickers/mcp must not be allowed")
+	}
+	for _, path := range []string{
+		"/pickers/mcp/server/restart",
+		"/pickers/mcp/plugin:semgrep:semgrep/restart",
+	} {
+		if Allowed(http.MethodGet, path) || Allowed(http.MethodPost, path) {
+			t.Fatalf("MCP restart route must be absent: %s", path)
+		}
+	}
+}
+
 func TestAllowedPairDropContentRouteIsGetOnlyAndPathStrict(t *testing.T) {
 	if !Allowed(http.MethodGet, "/pairdrop/files/pd_0123456789abcdef0123456789abcdef/content") {
 		t.Fatal("GET PairDrop content route should be allowed")
@@ -505,63 +522,6 @@ func TestPairlingConnectStripsInternalTokenHeader(t *testing.T) {
 	}
 }
 
-func TestProbeRouteInjectsInternalTokenAndRequiresSemanticPayload(t *testing.T) {
-	const token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	var forwardedToken string
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		forwardedToken = r.Header.Get("X-Pairling-Internal-Token")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true,"schema_version":1,"contract_version":"pairling-runtime-v1","runtime":{"verified":true,"contract_version":"pairling-runtime-v1"}}`))
-	}))
-	defer upstream.Close()
-	logger := &recordingLogger{}
-	upstreamURL, err := url.Parse(upstream.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	handler, err := NewHandler(Options{
-		Upstream: upstreamURL,
-		Mode:     ExposureModePairlingConnect,
-		Logger:   logger,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if !handler.ProbeRoute(context.Background(), token) {
-		t.Fatal("semantic route probe failed")
-	}
-	if forwardedToken != token {
-		t.Fatalf("internal token = %q, want probe token", forwardedToken)
-	}
-	if event := logger.last(); event.Outcome != "route_verified" || event.Status != http.StatusOK {
-		t.Fatalf("last event = %+v, want route_verified 200", event)
-	}
-}
-
-func TestProbeRouteRejectsNonSemanticSuccess(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true}`))
-	}))
-	defer upstream.Close()
-	logger := &recordingLogger{}
-	upstreamURL, err := url.Parse(upstream.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	handler, err := NewHandler(Options{Upstream: upstreamURL, Mode: ExposureModePairlingConnect, Logger: logger})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if handler.ProbeRoute(context.Background(), "internal-token") {
-		t.Fatal("non-semantic HTTP success recovered the route")
-	}
-	if event := logger.last(); event.Outcome != "validation_failed" || event.Status != http.StatusOK {
-		t.Fatalf("last event = %+v, want validation_failed 200", event)
-	}
-}
 
 func TestPairlingConnectSetsPeerNodeHeaderFromResolver(t *testing.T) {
 	var forwardedHeader string

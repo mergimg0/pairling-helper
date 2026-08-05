@@ -18,7 +18,15 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from .base import ProviderDescriptor, is_valid_provider_id, normalize_provider_id
+from .base import (
+    ManagedAuthVerification,
+    ManagedLaunchContract,
+    ProviderDescriptor,
+    TerminalLaunchContract,
+    TerminalLaunchProfile,
+    is_valid_provider_id,
+    normalize_provider_id,
+)
 
 
 DEFAULT_PATH = Path(__file__).resolve().parent / "registry-data.json"
@@ -37,8 +45,11 @@ class RegistryEntry:
     env_override: str | None = None
     config_paths: tuple[str, ...] = ()
     version_command: tuple[str, ...] = ("--version",)
+    version_identity_pattern: str | None = None
     docs_url: str | None = None
     notes: tuple[str, ...] = ()
+    managed_launch: ManagedLaunchContract | None = None
+    terminal_launch: TerminalLaunchContract | None = None
 
 
 def registry_data_path() -> Path:
@@ -103,6 +114,61 @@ def _optional_string(item: dict, key: str) -> str | None:
     return value.strip() or None
 
 
+
+def _managed_launch_contract(item: dict) -> ManagedLaunchContract | None:
+    raw = item.get("managed_launch")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or not set(raw).issubset(
+        {
+            "control_channel",
+            "ready_auth_states",
+            "ready_config_states",
+            "auth_verification",
+            "require_post_launch_verification",
+        }
+    ):
+        raise ValueError("managed_launch must be a reviewed contract object")
+    channel = raw.get("control_channel")
+    auth_states = raw.get("ready_auth_states")
+    config_states = raw.get("ready_config_states")
+    verification = raw.get("auth_verification", "probe")
+    if (
+        not isinstance(channel, str)
+        or not isinstance(auth_states, list)
+        or not isinstance(config_states, list)
+        or not all(isinstance(value, str) for value in auth_states + config_states)
+        or not isinstance(verification, str)
+    ):
+        raise ValueError("managed_launch contract fields are invalid")
+    return ManagedLaunchContract(
+        control_channel=channel,
+        ready_auth_states=tuple(auth_states),
+        ready_config_states=tuple(config_states),
+        auth_verification=ManagedAuthVerification(verification),
+        require_post_launch_verification=bool(
+            raw.get("require_post_launch_verification", False)
+        ),
+    )
+
+
+def _terminal_launch_contract(item: dict) -> TerminalLaunchContract | None:
+    raw = item.get("terminal_launch")
+    if raw is None:
+        return None
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != {"profile", "backends"}
+        or not isinstance(raw.get("profile"), str)
+        or not isinstance(raw.get("backends"), list)
+        or not all(isinstance(value, str) for value in raw["backends"])
+    ):
+        raise ValueError("terminal_launch must be an exact reviewed contract object")
+    return TerminalLaunchContract(
+        profile=TerminalLaunchProfile(raw["profile"]),
+        backends=tuple(raw["backends"]),
+    )
+
 def _entry_from(item) -> RegistryEntry | None:
     if not isinstance(item, dict):
         return None
@@ -115,6 +181,11 @@ def _entry_from(item) -> RegistryEntry | None:
     if adapter_depth not in VALID_DEPTHS:
         return None
     version_command = _string_tuple(item, "version_command", ("--version",)) or ("--version",)
+    try:
+        managed_launch = _managed_launch_contract(item)
+        terminal_launch = _terminal_launch_contract(item)
+    except ValueError:
+        return None
     return RegistryEntry(
         provider_id=provider_id,
         display_name=display_name,
@@ -126,8 +197,11 @@ def _entry_from(item) -> RegistryEntry | None:
         env_override=_optional_string(item, "env_override"),
         config_paths=_string_tuple(item, "config_paths"),
         version_command=version_command,
+        version_identity_pattern=_optional_string(item, "version_identity_pattern"),
         docs_url=_optional_string(item, "docs_url"),
         notes=_string_tuple(item, "notes"),
+        managed_launch=managed_launch,
+        terminal_launch=terminal_launch,
     )
 
 
@@ -154,6 +228,8 @@ def descriptor_for(entry: RegistryEntry) -> ProviderDescriptor:
         builtin=entry.builtin,
         docs_url=entry.docs_url,
         adapter_depth=entry.adapter_depth,
+        managed_launch=entry.managed_launch,
+        terminal_launch=entry.terminal_launch,
     )
 
 

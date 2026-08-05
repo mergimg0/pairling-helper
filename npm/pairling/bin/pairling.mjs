@@ -92,6 +92,7 @@ function runtimePackageDir() {
   }
 }
 
+
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -417,15 +418,15 @@ function verifyPackageIntegrity(env) {
     throw new Error("runtime package identity does not match the Pairling payload");
   }
   const runtimeExpected = expectedEntries(runtimeManifest.files, {
-    allowedPrefixes: ["bin", "python"],
+    allowedPrefixes: ["bin", "python", "provider-sdks"],
     rejectBytecode: true,
     requireMode: true,
   });
   const runtimeDirectories = expectedDirectories(runtimeManifest.directories, {
-    allowedPrefixes: ["bin", "python"],
+    allowedPrefixes: ["bin", "python", "provider-sdks"],
   });
   const runtimeEntries = mergeExpected(runtimeExpected, runtimeDirectories);
-  const prefixes = ["bin"];
+  const prefixes = ["bin", "provider-sdks"];
   if (existsSync(join(env.runtimePackageDir, "python"))) {
     prefixes.push("python");
   }
@@ -812,6 +813,8 @@ function verifiedPackageEnvironment(pairlingRoot, runtimeRoot, integrity, snapsh
     PAIRLING_DAEMON_PYTHON: join(runtimeRoot, "python", "bin", "python3"),
     PAIRLING_RUNTIME_PACKAGE_DIR: runtimeRoot,
     PAIRLING_RUNTIME_PACKAGE_ROOT: runtimeRoot,
+    PAIRLING_CLAUDE_AGENT_SDK_ROOT: "",
+    PAIRLING_NODE_BIN: process.execPath,
     PAIRLING_SOURCE_REVISION: integrity.payloadManifest.source_revision,
     PAIRLING_SOURCE_DIRTY: integrity.payloadManifest.source_dirty ? "true" : "false",
     PAIRLING_CONNECTD_TEAM_ID: team,
@@ -917,7 +920,12 @@ function main() {
       const result = spawnDelegated(
         join(snapshot.pairling, "payload", "mac", "packaging", "bin", "pairling"),
         args,
-        verifiedPackageEnvironment(snapshot.pairling, snapshot.runtime, integrity, snapshot.mode),
+        verifiedPackageEnvironment(
+          snapshot.pairling,
+          snapshot.runtime,
+          integrity,
+          snapshot.mode,
+        ),
         { cwd: join(snapshot.pairling, "payload"), force: true },
       );
       rmSync(snapshot.root, { recursive: true, force: true });

@@ -4,24 +4,57 @@ from pathlib import Path
 
 from . import registry_data
 from .base import ProviderAdapter, ProviderDescriptor, failed_probe, normalize_provider_id
+from .controls import (
+    ProviderControlBinding,
+    ProviderControlDriver,
+    control_driver_for_adapter,
+)
+from .acp import AcpProviderAdapter
+from .acp_profiles import ACTIVE_ACP_PROVIDER_IDS
 from .claude import ClaudeProviderAdapter
 from .codex import CodexProviderAdapter
+from .copilot import CopilotProviderAdapter
+from .droid import FactoryDroidProviderAdapter
 from .external import RecognizedProviderAdapter
+from .hermes import HermesProviderAdapter
+from .opencode import OpenCodeProviderAdapter
+from .openhands import OpenHandsProviderAdapter
+from .qwen import QwenCodeProviderAdapter
+from .operations import provider_has_release_membership
 
 
-# Deep adapters keep bespoke Python (hooks, session feeds, probes); every
-# other registry-data entry is served by the detection-only recognized
-# adapter. There is no enable flag: detection is honest and free (SPEC-p1).
-_DEEP_ADAPTER_IDS = {"claude", "codex"}
+# Provider-specific adapters take precedence when a provider also exposes ACP.
+# Registry depth alone never promotes a detection adapter into a session or
+# control source.
+_DIRECT_ADAPTER_IDS = {
+    "claude",
+    "codex",
+    "copilot",
+    "droid",
+    "hermes_agent",
+    "opencode",
+    "openhands",
+    "qwen_code",
+}
+_SPECIALIZED_ADAPTER_IDS = _DIRECT_ADAPTER_IDS | set(ACTIVE_ACP_PROVIDER_IDS)
 
 
 def provider_adapters(home: Path | None = None) -> list[ProviderAdapter]:
     adapters: list[ProviderAdapter] = [
         ClaudeProviderAdapter(home=home),
         CodexProviderAdapter(home=home),
+        CopilotProviderAdapter(home=home),
+        FactoryDroidProviderAdapter(home=home),
+        HermesProviderAdapter(home=home),
+        OpenCodeProviderAdapter(home=home),
+        OpenHandsProviderAdapter(home=home),
+        QwenCodeProviderAdapter(home=home),
     ]
     for entry in registry_data.load_entries():
-        if entry.provider_id in _DEEP_ADAPTER_IDS:
+        if entry.provider_id in _DIRECT_ADAPTER_IDS:
+            continue
+        if entry.provider_id in ACTIVE_ACP_PROVIDER_IDS:
+            adapters.append(AcpProviderAdapter(entry, home=home))
             continue
         adapters.append(RecognizedProviderAdapter(entry, home=home))
     return adapters
@@ -36,21 +69,23 @@ def provider_descriptors() -> list[ProviderDescriptor]:
 
 
 def known_provider_ids() -> set[str]:
-    return _DEEP_ADAPTER_IDS | {entry.provider_id for entry in registry_data.load_entries()}
+    return _SPECIALIZED_ADAPTER_IDS | {entry.provider_id for entry in registry_data.load_entries()}
 
 
 def session_capable_provider_ids() -> set[str]:
-    """Providers whose sessions Pairling can enumerate and drive: registry
-    entries at depth deep or standard (SPEC-p2 §2.1). Recognized entries are
-    detect-only and never a session source. Falls back to the deep pair when
-    the data file is missing or empty so a corrupt file cannot lobotomize
-    the daemon."""
+    """Return only providers backed by a provider-specific adapter.
+
+    A registry row and its adapter-depth label are descriptive metadata, not a
+    grant of session access or control.
+    """
     ids = {
-        entry.provider_id
-        for entry in registry_data.load_entries()
-        if entry.adapter_depth in {"deep", "standard"}
+        adapter.descriptor.provider_id
+        for adapter in provider_adapters()
+        if not isinstance(adapter, RecognizedProviderAdapter)
+        and adapter.descriptor.adapter_depth in {"deep", "standard"}
+        and provider_has_release_membership(adapter.descriptor.provider_id)
     }
-    return ids or set(_DEEP_ADAPTER_IDS)
+    return ids
 
 
 def get_provider(provider_id: str, home: Path | None = None) -> ProviderAdapter | None:
@@ -59,6 +94,16 @@ def get_provider(provider_id: str, home: Path | None = None) -> ProviderAdapter 
         if adapter.descriptor.provider_id == wanted:
             return adapter
     return None
+
+def get_control_driver(
+    binding: ProviderControlBinding,
+    home: Path | None = None,
+) -> ProviderControlDriver | None:
+    adapter = get_provider(binding.provider_id, home=home)
+    if adapter is None:
+        return None
+    return control_driver_for_adapter(adapter, binding)
+
 
 
 def iter_providers(provider_filter: str = "all", home: Path | None = None) -> list[ProviderAdapter]:

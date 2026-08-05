@@ -19,12 +19,9 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from pairling_assurance_policy import direct_attest_required
 
 LAN_CANONICAL_PREFIX = "pair.lan.claim.v1"
-
-
-def direct_attest_required() -> bool:
-    return os.environ.get("PAIRLING_DIRECT_ATTEST_REQUIRED", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def canonical(pair_id: str, attest_challenge: str) -> str:
@@ -39,6 +36,10 @@ def _team_id() -> str:
 
 def _bundle_id() -> str:
     return os.environ.get("PAIRLING_APP_ATTEST_BUNDLE_ID", "dev.pairling.ios").strip()
+
+
+class DirectAttestVerifierUnavailable(RuntimeError):
+    """The configured App Attest validator could not be initialized."""
 
 
 _validator = None
@@ -70,12 +71,19 @@ def _load_validator():
         return None
 
 
+def require_verifier():
+    validator = _load_validator()
+    if validator is None:
+        raise DirectAttestVerifierUnavailable(
+            f"app attest validator unavailable: {_validator_error}"
+        )
+    return validator
+
+
 def verify_attestation(*, attestation: dict, pair_id: str, attest_challenge: str, key_id: str, environment: str) -> bool:
     """Raise on any failure; return True only on a fully-valid Apple attestation
     bound to this invitation. Fail-closed when the validator is unavailable."""
-    validator = _load_validator()
-    if validator is None:
-        raise RuntimeError(f"app attest validator unavailable: {_validator_error}")
+    validator = require_verifier()
     validator.validate_attestation(
         attestation=attestation,
         challenge=canonical(pair_id, attest_challenge),

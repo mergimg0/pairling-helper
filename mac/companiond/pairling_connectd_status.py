@@ -5,10 +5,15 @@ import json
 import os
 import re
 import urllib.parse
-import urllib.request
 from typing import Any
 
-CONNECTD_STATUS_URL = "http://127.0.0.1:7774/status"
+from local_control_client import (
+    LocalControlClientError,
+    connectd_control_socket_path,
+    request_json,
+)
+
+CONNECTD_STATUS_MAX_BYTES = 256 * 1024
 PAIRLING_CONNECT_ROUTE_SOURCE = "pairling_connectd"
 PAIRLING_CONNECT_ROUTE_KIND = "tailnet"
 PAIRLING_CONNECT_FUNNEL_KIND = "funnel"
@@ -16,20 +21,60 @@ PAIRLING_CONNECT_PORT = 7773
 PAIRLING_CONNECT_FUNNEL_PORT = 443
 
 
-def fetch_connectd_status(timeout_seconds: float = 1.5) -> dict[str, Any]:
+def fetch_connectd_status(
+    timeout_seconds: float = 1.5,
+    *,
+    port: int | None = None,
+) -> dict[str, Any]:
     fixture = os.environ.get("PAIRLING_TEST_CONNECTD_STATUS_JSON")
     if fixture:
         payload = json.loads(fixture)
         return payload if isinstance(payload, dict) else {}
 
-    req = urllib.request.Request(CONNECTD_STATUS_URL, method="GET")
+    # Keep validating the old caller-supplied status port, but never use it as
+    # a transport target. Local status moved to the same-UID Unix listener so
+    # the reusable internal hook token cannot cross a squattable TCP port.
+    if port is not None:
+        try:
+            status_port = int(port)
+        except (TypeError, ValueError):
+            return {}
+        if not 1 <= status_port <= 65535:
+            return {}
     try:
-        # CONNECTD_STATUS_URL is a fixed loopback HTTP endpoint, not caller input.
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
-            payload = json.loads(response.read().decode("utf-8"))
-    except Exception:
+        status, payload = request_json(
+            "/status",
+            method="GET",
+            socket_path=connectd_control_socket_path(),
+            timeout_seconds=timeout_seconds,
+            max_response_bytes=CONNECTD_STATUS_MAX_BYTES,
+        )
+    except LocalControlClientError:
         return {}
-    return payload if isinstance(payload, dict) else {}
+    return payload if status == 200 else {}
+
+
+def open_connectd_auth(
+    timeout_seconds: float = 5.0,
+) -> tuple[int, dict[str, Any]]:
+    try:
+        return request_json(
+            "/auth/open",
+            method="POST",
+            socket_path=connectd_control_socket_path(),
+            timeout_seconds=timeout_seconds,
+            max_response_bytes=CONNECTD_STATUS_MAX_BYTES,
+        )
+    except LocalControlClientError as error:
+        return 503, {
+            "ok": False,
+            "opened": False,
+            "auth_url_present": False,
+            "error": {
+                "code": error.code,
+                "message": error.message,
+            },
+        }
 
 
 def advertised_pairling_connect_routes(status: dict[str, Any]) -> list[dict[str, Any]]:

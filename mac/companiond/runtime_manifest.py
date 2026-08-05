@@ -28,6 +28,11 @@ from runtime_contract import (
     TAILSCALE_VARIANT,
 )
 from runtime_paths import pairdrop_root, release_root_for
+from provider_runtime_assets import (
+    PROVIDER_RUNTIME_ASSET_DIGESTS,
+    PROVIDER_RUNTIME_ASSET_DIRECTORIES,
+    PROVIDER_RUNTIME_ASSET_RELATIVE_PATHS,
+)
 
 
 def sha256_file(path: Path) -> str:
@@ -47,6 +52,8 @@ PTY_BROKER_PAYLOAD_RELATIVE_PATHS = (
     "companiond/runtime_contract.py",
     "companiond/runtime_paths.py",
 )
+
+
 
 
 def ptybroker_payload_sha256(runtime_root: str | Path) -> str | None:
@@ -426,6 +433,48 @@ def _verify_runtime_payload(
                 break
             expected_directories[rel] = mode
 
+    raw_provider_assets = manifest.get("provider_runtime_assets")
+    if error is None:
+        if raw_provider_assets != list(PROVIDER_RUNTIME_ASSET_RELATIVE_PATHS):
+            error = "runtime manifest provider asset inventory is not canonical"
+        else:
+            expected_assets = set(PROVIDER_RUNTIME_ASSET_RELATIVE_PATHS)
+            actual_assets = {
+                rel
+                for rel in actual
+                if Path(rel).suffix in {".mjs", ".sb"}
+                and any(
+                    rel.startswith(f"{directory}/")
+                    for directory in PROVIDER_RUNTIME_ASSET_DIRECTORIES
+                )
+            }
+            missing_assets = sorted(expected_assets - actual_assets)
+            unexpected_assets = sorted(actual_assets - expected_assets)
+            if missing_assets:
+                error = "runtime provider assets missing from disk: " + ", ".join(
+                    missing_assets
+                )
+            elif unexpected_assets:
+                error = "runtime provider assets are unexpected: " + ", ".join(
+                    unexpected_assets
+                )
+            else:
+                for rel in PROVIDER_RUNTIME_ASSET_RELATIVE_PATHS:
+                    item = expected.get(rel)
+                    _, actual_kind, _, actual_mode = actual[rel]
+                    if item is None:
+                        error = f"runtime provider asset absent from manifest: {rel}"
+                        break
+                    if (item.get("kind") or "file") != "file" or actual_kind != "file":
+                        error = f"runtime provider asset must be a regular file: {rel}"
+                        break
+                    if item.get("mode") != "0444" or actual_mode != "0444":
+                        error = f"runtime provider asset must have mode 0444: {rel}"
+                        break
+                    if item.get("sha256") != PROVIDER_RUNTIME_ASSET_DIGESTS[Path(rel).name]:
+                        error = f"runtime provider asset digest is not canonical: {rel}"
+                        break
+
     if error is None:
         if writable:
             error = "runtime release contains writable entries: " + ", ".join(writable[:5])
@@ -680,9 +729,22 @@ def build_runtime_info(
     }
 
 
+PUBLIC_RUNTIME_FIELDS = (
+    "name",
+    "runtime_version",
+    "source_revision",
+    "contract_version",
+    "compat_mode",
+    "launchd_label",
+    "port",
+    "tailscale_variant",
+    "verified",
+)
+
+
 def public_runtime_info(info: dict[str, Any]) -> dict[str, Any]:
     """Return the unauthenticated-safe subset of runtime metadata."""
-    return {
+    projected = {
         "name": info.get("name") or RUNTIME_NAME,
         "runtime_version": info.get("runtime_version"),
         "source_revision": info.get("source_revision"),
@@ -693,6 +755,7 @@ def public_runtime_info(info: dict[str, Any]) -> dict[str, Any]:
         "tailscale_variant": info.get("tailscale_variant") or TAILSCALE_VARIANT,
         "verified": bool(info.get("verified")),
     }
+    return {field: projected[field] for field in PUBLIC_RUNTIME_FIELDS}
 
 
 def build_manifest_payload(
@@ -729,6 +792,15 @@ def build_manifest_payload(
                 },
             },
         },
+        "provider_controls": {
+            "schema_version": 1,
+            "catalog_source": "companiond",
+            "snapshot_route": "/provider-controls/snapshot",
+            "stream_route": "/provider-controls/stream",
+            "execute_route": "/provider-controls/execute",
+            "snapshot_scope": "sessions:read",
+            "execute_scope": "provider:control",
+        },
         "endpoints": {
             "public": ["/health", "/manifest", "/pair/start", "/pair/psk-activate", "/pair/psk-claim-v2"],
             "authenticated": [
@@ -746,6 +818,9 @@ def build_manifest_payload(
                 "/transcript",
                 "/transcript-stream",
                 "/send-text",
+                "/provider-controls/snapshot",
+                "/provider-controls/stream",
+                "/provider-controls/execute",
                 "/worker-kill",
                 "/pairling-tools/run",
                 "/phone-tools/activity",

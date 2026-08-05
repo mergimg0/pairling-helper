@@ -20,6 +20,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Callable, Iterable
 
+from pairling_assurance_policy import direct_attest_required as _direct_attest_required
 from pairling_devices import (
     CreatedDevice,
     DeviceRegistryError,
@@ -31,7 +32,14 @@ from pairling_devices import (
     normalize_install_id,
     resolve_install_id,
 )
-from runtime_contract import DEFAULT_DEVICE_SCOPES, PAIR_SERVICE_TYPE, PORT
+from runtime_contract import (
+    DEFAULT_DEVICE_ROLE,
+    DEFAULT_DEVICE_SCOPES,
+    PAIRABLE_DEVICE_ROLES,
+    PAIR_SERVICE_TYPE,
+    PORT,
+    device_scopes_for_role,
+)
 from runtime_paths import app_support_root
 
 try:
@@ -39,18 +47,22 @@ try:
 except Exception:
     RUNTIME_NAME = "pairling-mac-runtime"
 
-try:
-    from pairling_relay_claims import RelayClaimError, RelayClaimVerifier
-except Exception:
-    RelayClaimError = None
-    RelayClaimVerifier = None
 
+class _DirectAttestVerifierImportFailure(RuntimeError):
+    pass
+
+
+_DirectAttestVerifierUnavailable = _DirectAttestVerifierImportFailure
+_DIRECT_ATTEST_IMPORT_ERROR: Exception | None = None
 try:
-    from app_attest_lan import direct_attest_required as _direct_attest_required
+    from app_attest_lan import (
+        DirectAttestVerifierUnavailable as _DirectAttestVerifierUnavailable,
+    )
+    from app_attest_lan import require_verifier as _require_direct_attestation_verifier
     from app_attest_lan import verify_attestation as _verify_direct_attestation
-except Exception:
-    def _direct_attest_required() -> bool:
-        return False
+except Exception as exc:
+    _DIRECT_ATTEST_IMPORT_ERROR = exc
+    _require_direct_attestation_verifier = None
     _verify_direct_attestation = None
 
 try:
@@ -130,6 +142,7 @@ def pair_claim_request_canonical(
     protocol_version: int,
     seal_proof_secret: bool,
     activation_contract: str,
+    role: str | None = None,
     se_public_key_der: str | None = None,
     direct_attest_object: dict | None = None,
     attest_key_id: str | None = None,
@@ -152,6 +165,7 @@ def pair_claim_request_canonical(
         "1" if seal_proof_secret else "0",
         _claim_request_scalar(activation_contract, "activation_contract"),
     ]
+    _append_claim_request_optional(lines, role, "role")
     _append_claim_request_optional(
         lines, se_public_key_der, "se_public_key_der"
     )
@@ -300,6 +314,7 @@ def pair_claim_result_canonical(payload: dict) -> bytes:
     if scopes != normalized_scopes:
         raise ValueError("device.scopes must be sorted and unique")
     lines.extend((str(len(scopes)), *scopes))
+    _append_claim_result_optional(lines, device.get("role"), "device.role")
     _append_claim_result_optional(
         lines, device.get("relay_device_id"), "device.relay_device_id"
     )
@@ -507,6 +522,7 @@ class PairStart:
     mac_ake_pub: str = ""
     purpose: str | None = None
     lease_expires_at: float | None = None
+    role: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1029,6 +1045,7 @@ class PairingStore:
         ttl_seconds: int = DEFAULT_PAIR_TTL_SECONDS,
         purpose: str | None = None,
         scopes: Iterable[str] | None = None,
+        role: str | None = None,
         lease_ttl_seconds: int | None = None,
     ) -> PairStart:
         self._cleanup_pending_claims()
@@ -1036,10 +1053,17 @@ class PairingStore:
         self._prune_expired_records()
         normalized_purpose = str(purpose or "").strip()
         normalized_scopes: tuple[str, ...] | None = None
+        normalized_role: str | None = None
         smoke_lease_ttl: int | None = None
         if normalized_purpose:
             if normalized_purpose != SMOKE_DEVICE_PURPOSE:
                 raise PairingError("invalid_pair_purpose", 400, "unsupported pairing purpose")
+            if role is not None:
+                raise PairingError(
+                    "invalid_pair_role",
+                    400,
+                    "device roles are available only for interactive pairing",
+                )
             normalized_scopes = tuple(sorted(set(scopes or SMOKE_ALLOWED_SCOPES)))
             if not normalized_scopes or not set(normalized_scopes).issubset(SMOKE_ALLOWED_SCOPES):
                 raise PairingError(
@@ -1060,6 +1084,15 @@ class PairingStore:
             raise PairingError(
                 "invalid_pair_purpose", 400, "scoped leases require runtime_truth_smoke"
             )
+        else:
+            normalized_role = str(role or DEFAULT_DEVICE_ROLE).strip().lower()
+            if normalized_role not in PAIRABLE_DEVICE_ROLES:
+                raise PairingError(
+                    "invalid_pair_role",
+                    400,
+                    f"unsupported paired-device role: {normalized_role or '<empty>'}",
+                )
+            normalized_scopes = tuple(sorted(device_scopes_for_role(normalized_role)))
         ttl = max(MIN_PAIR_TTL_SECONDS, min(int(ttl_seconds), MAX_PAIR_TTL_SECONDS))
         pair_id = "pair_" + secrets.token_hex(8)
         secret = secrets.token_urlsafe(24)
@@ -1087,6 +1120,7 @@ class PairingStore:
             "purpose": normalized_purpose or None,
             "scopes": list(normalized_scopes or ()),
             "lease_ttl_seconds": smoke_lease_ttl,
+            "role": normalized_role,
         }
         path = self._record_path(pair_id)
         tmp = path.with_suffix(".json.tmp")
@@ -1147,11 +1181,20 @@ class PairingStore:
             "runtime_version": self._runtime_version(),
             "route_hint": os.environ.get("PAIRLING_ROUTE_HINT", "lan,bonjour,tailnet")[:64],
         }
+        if normalized_role is not None:
+            txt["role"] = normalized_role
         return PairStart(
-            pair_id, secret, expires_at, self.install_id, PAIR_SERVICE_TYPE, txt,
-            attest_challenge, mac_ake_pub,
+            pair_id,
+            secret,
+            expires_at,
+            self.install_id,
+            PAIR_SERVICE_TYPE,
+            txt,
+            attest_challenge,
+            mac_ake_pub,
             normalized_purpose or None,
             (time.time() + smoke_lease_ttl) if smoke_lease_ttl is not None else None,
+            normalized_role,
         )
 
     def _load_record(self, pair_id: str) -> tuple[dict, Path]:
@@ -1258,12 +1301,28 @@ class PairingStore:
         verified, False when none was required and none supplied. Raises on
         failure or when required-and-missing. force_production pins the
         environment so a funnel client cannot send 'development'."""
-        if not (require or _direct_attest_required() or attest_object):
+        required = require or _direct_attest_required()
+        if not (required or attest_object):
             return False
+        if (
+            _require_direct_attestation_verifier is None
+            or _verify_direct_attestation is None
+        ):
+            raise PairingError(
+                "direct_attest_unavailable",
+                503,
+                "app attest validator unavailable",
+            ) from _DIRECT_ATTEST_IMPORT_ERROR
+        try:
+            _require_direct_attestation_verifier()
+        except Exception as exc:
+            raise PairingError(
+                "direct_attest_unavailable",
+                503,
+                "app attest validator unavailable",
+            ) from exc
         if not attest_object:
             raise PairingError("direct_attest_required", 403, "app attest required")
-        if _verify_direct_attestation is None:
-            raise PairingError("direct_attest_unavailable", 503, "app attest validator unavailable")
         environment = "production" if force_production else attest_environment
         try:
             _verify_direct_attestation(
@@ -1273,10 +1332,18 @@ class PairingStore:
                 key_id=attest_key_id,
                 environment=environment,
             )
+        except _DirectAttestVerifierUnavailable as exc:
+            raise PairingError(
+                "direct_attest_unavailable",
+                503,
+                "app attest validator unavailable",
+            ) from exc
         except PairingError:
             raise
-        except Exception:
-            raise PairingError("direct_attest_invalid", 403, "app attest validation failed")
+        except Exception as exc:
+            raise PairingError(
+                "direct_attest_invalid", 403, "app attest validation failed"
+            ) from exc
         return True
 
     @staticmethod
@@ -1286,6 +1353,7 @@ class PairingStore:
         b_pub: bytes,
         confirm: bytes,
         device_name: str,
+        role: str | None,
         scopes: Iterable[str] | None,
         cert_pin: str | None,
         se_public_key_der: str,
@@ -1304,6 +1372,7 @@ class PairingStore:
             "b_pub": base64.b64encode(b_pub).decode("ascii"),
             "confirm": base64.b64encode(confirm).decode("ascii"),
             "device_name": device_name,
+            "role": role or "",
             "scopes": sorted(set(scopes or ())),
             "cert_pin": cert_pin or "",
             "se_public_key_der": se_public_key_der,
@@ -1384,6 +1453,7 @@ class PairingStore:
         now: float,
         device_name: str,
         host_chain: Iterable[str],
+        role: str | None,
         scopes: Iterable[str] | None,
         cert_pin: str | None,
         se_public_key_der: str,
@@ -1437,6 +1507,7 @@ class PairingStore:
             ) from exc
 
         record_purpose = str(record.get("purpose") or "").strip() or None
+        persisted_role: str | None = None
         if record_purpose == SMOKE_DEVICE_PURPOSE:
             normalized_scopes = tuple(sorted(set(record.get("scopes") or ())))
             if not normalized_scopes or not set(normalized_scopes).issubset(SMOKE_ALLOWED_SCOPES):
@@ -1449,7 +1520,27 @@ class PairingStore:
                 raise PairingError("pair_corrupt", 500, "smoke pairing lease is invalid")
             lease_expires_at = now + lease_ttl
         elif record_purpose is None:
-            normalized_scopes = tuple(sorted(set(scopes or DEFAULT_DEVICE_SCOPES)))
+            invited_role = str(record.get("role") or DEFAULT_DEVICE_ROLE).strip().lower()
+            if invited_role not in PAIRABLE_DEVICE_ROLES:
+                raise PairingError("pair_corrupt", 500, "pair role is invalid")
+            if role != invited_role:
+                raise PairingError(
+                    "pair_role_mismatch",
+                    403,
+                    "pairing role does not match the Mac invitation",
+                )
+            if scopes is not None:
+                raise PairingError(
+                    "pair_scopes_not_accepted",
+                    400,
+                    "ordinary pairing scopes are selected only by the Mac invitation",
+                )
+            invited_scopes = tuple(sorted(device_scopes_for_role(invited_role)))
+            recorded_scopes = tuple(sorted(set(record.get("scopes") or ())))
+            if recorded_scopes != invited_scopes:
+                raise PairingError("pair_corrupt", 500, "pair role scopes are inconsistent")
+            normalized_scopes = invited_scopes
+            persisted_role = invited_role
             lease_expires_at = None
         else:
             raise PairingError("pair_corrupt", 500, "pair purpose is invalid")
@@ -1463,11 +1554,15 @@ class PairingStore:
         verification = None
         relay_ticket_required = relay_required and record_purpose != SMOKE_DEVICE_PURPOSE
         if relay_ticket_required or attested_claim_ticket:
-            if not attested_claim_ticket:
-                raise PairingError("attested_claim_required", 403, "relay claim ticket required")
             if relay_claim_verifier is None:
                 raise PairingError(
-                    "attested_claim_invalid", 403, "relay claim verifier unavailable"
+                    "attested_claim_unavailable",
+                    503,
+                    "relay claim verifier unavailable",
+                )
+            if not attested_claim_ticket:
+                raise PairingError(
+                    "attested_claim_required", 403, "relay claim ticket required"
                 )
             try:
                 verification = relay_claim_verifier.verify(
@@ -1501,6 +1596,7 @@ class PairingStore:
             "request_binding": request_binding,
             "device": {
                 "id": device_id,
+                "role": persisted_role,
                 "scopes": list(normalized_scopes),
                 "relay_device_id": verified_relay_device_id,
                 "attestation_status": relay_status,
@@ -1560,6 +1656,7 @@ class PairingStore:
                 device_id=device_id,
                 scopes=normalized_scopes,
                 install_id=str(record.get("install_id") or self.install_id),
+                role=persisted_role,
                 relay_device_id=verified_relay_device_id,
                 attestation_status=relay_status,
                 device_display_name=device_name or "Pairling iPhone",
@@ -1634,6 +1731,7 @@ class PairingStore:
         confirm_b64: str,
         device_name: str,
         host_chain: Iterable[str],
+        role: str | None = None,
         scopes: Iterable[str] | None = None,
         cert_pin: str | None = None,
         se_public_key_der: str | None = None,
@@ -1676,6 +1774,7 @@ class PairingStore:
             expected_request_binding = pair_claim_request_binding(
                 request_contract=request_contract,
                 pair_id=pair_id,
+                role=role,
                 device_name=device_name,
                 protocol_version=protocol_version,
                 seal_proof_secret=seal_proof_secret,
@@ -1713,6 +1812,7 @@ class PairingStore:
             b_pub=b_pub,
             confirm=confirm,
             device_name=device_name,
+            role=role,
             scopes=scopes,
             cert_pin=cert_pin,
             se_public_key_der=se_public_key_der or "",
@@ -1825,6 +1925,7 @@ class PairingStore:
                 now=now,
                 device_name=device_name,
                 host_chain=host_chain,
+                role=role,
                 scopes=scopes,
                 cert_pin=cert_pin,
                 se_public_key_der=se_public_key_der or "",

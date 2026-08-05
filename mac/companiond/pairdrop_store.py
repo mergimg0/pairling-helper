@@ -22,9 +22,11 @@ import stat
 import tempfile
 import time
 import unicodedata
+from dataclasses import dataclass, field
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from public_diagnostics import redact_public_diagnostic
 from typing import Any
 
 
@@ -49,6 +51,35 @@ MAX_CREATE_IDEMPOTENCY_KEY_LENGTH = 200
 UPLOAD_LEASE_SECONDS = 24 * 60 * 60
 UPLOAD_PROGRESS_EVENT_BYTES = 64 * 1024 * 1024
 UPLOAD_TERMINAL_STATES = frozenset({"committed", "cancelled", "expired", "failed_terminal"})
+DEFAULT_ATTACHMENT_TTL_SECONDS = 24 * 60 * 60
+MAX_ATTACHMENT_TTL_SECONDS = 7 * 24 * 60 * 60
+SEND_STAGING_RETENTION_SECONDS = MAX_ATTACHMENT_TTL_SECONDS
+MAX_ATTACHMENT_IDEMPOTENCY_KEY_LENGTH = 200
+ATTACHMENT_HANDLE_PATTERN = re.compile(r"att_[a-f0-9]{48}")
+PROVIDER_QUALIFIED_SESSION_PATTERN = re.compile(
+    r"[a-z][a-z0-9_-]{0,31}:[A-Za-z0-9._:-]{1,256}"
+)
+
+@dataclass(frozen=True)
+class PreparedAttachment:
+    handle_id: str
+    sha256: str
+    size_bytes: int
+    mime_type: str
+    display_name: str | None
+
+    def materialize_local_path_for_send(self) -> Path:
+        """Copy verified bytes to a private, immutable path for deferred reads."""
+
+        return self._materialize_local_path()
+
+    _open_verified: Callable[[], Any] = field(repr=False, compare=False)
+    _materialize_local_path: Callable[[], Path] = field(repr=False, compare=False)
+
+    def open_verified(self):
+        """Open the same verified object without exposing its local path."""
+
+        return self._open_verified()
 
 
 def _bounded_environment_bytes(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -75,6 +106,9 @@ PAIRLING_PAIRDROP_FREE_SPACE_RESERVE_BYTES = _bounded_environment_bytes(
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+def _iso_from_epoch(value: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(value))
 
 
 def _safe_display_name(filename: str) -> str:
@@ -209,6 +243,7 @@ class PairDropStore:
         self.purge_dir = self.root / ".purge-recovery"
         self.thumbnails_dir = self.root / "thumbnails"
         self.exports_dir = self.root / "exports"
+        self.send_staging_dir = self.root / "send-staging"
         self.db_path = self.root / "index.sqlite"
         self.audit_path = self.root / "audit.jsonl"
         if legacy_root is not None:
@@ -232,6 +267,7 @@ class PairDropStore:
             self.purge_dir,
             self.thumbnails_dir,
             self.exports_dir,
+            self.send_staging_dir,
         ]
         for path in owned_directories:
             path.mkdir(parents=True, exist_ok=True)
@@ -245,6 +281,7 @@ class PairDropStore:
             # PairDrop stores private user files; the vault root must not be world-readable.
             os.chmod(self.root, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
             os.chmod(self.purge_dir, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+            os.chmod(self.send_staging_dir, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
         except OSError:
             pass
         with self._initialization_lock():
@@ -323,7 +360,7 @@ class PairDropStore:
 
     @contextmanager
     def _owned_child_directory_fd(self, name: str, error_code: str) -> Iterator[int]:
-        if name not in {"objects", "partials"}:
+        if name not in {"objects", "partials", "send-staging"}:
             raise PairDropStoreError(error_code)
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         root_fd = -1
@@ -736,10 +773,49 @@ class PairDropStore:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS attachment_handles (
+                handle TEXT PRIMARY KEY,
+                file_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                source_device_id TEXT NOT NULL,
+                source_install_id TEXT NOT NULL,
+                idempotency_key TEXT,
+                file_sha256 TEXT NOT NULL,
+                file_byte_size INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                revoked_at TEXT,
+                consumed_binding_id TEXT,
+                consumed_client_action_id TEXT
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pairdrop_files_deleted ON files(deleted_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pairdrop_files_created ON files(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pairdrop_upload_sessions_state ON upload_sessions(state)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pairdrop_upload_sessions_expires ON upload_sessions(expires_at)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_attachment_handles_file "
+            "ON attachment_handles(file_id, revoked_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_attachment_handles_session "
+            "ON attachment_handles(session_id, revoked_at)"
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_attachment_handles_idempotency
+                ON attachment_handles(
+                    session_id,
+                    source_device_id,
+                    source_install_id,
+                    idempotency_key
+                )
+             WHERE idempotency_key IS NOT NULL
+            """
+        )
         upload_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(upload_sessions)").fetchall()
         }
@@ -747,6 +823,16 @@ class PairDropStore:
             conn.execute(
                 "ALTER TABLE upload_sessions ADD COLUMN create_idempotency_key TEXT"
             )
+        attachment_columns = {
+            row[1] for row in conn.execute(
+                "PRAGMA table_info(attachment_handles)"
+            ).fetchall()
+        }
+        for column in ("consumed_binding_id", "consumed_client_action_id"):
+            if column not in attachment_columns:
+                conn.execute(
+                    f"ALTER TABLE attachment_handles ADD COLUMN {column} TEXT"
+                )
         conn.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_pairdrop_upload_create_idempotency
@@ -2253,6 +2339,14 @@ class PairDropStore:
                     """,
                     (file_id,),
                 )
+                conn.execute(
+                    """
+                    UPDATE attachment_handles
+                       SET revoked_at = ?
+                     WHERE file_id = ? AND revoked_at IS NULL
+                    """,
+                    (deleted_at, file_id),
+                )
                 self._record_event(
                     conn,
                     "deleted",
@@ -2499,42 +2593,595 @@ class PairDropStore:
             "recovered_cleanup": recovered_cleanup,
         }
 
-    def attach_descriptor(self, file_id: str, *, session_id: str = "") -> dict[str, Any]:
+    @staticmethod
+    def _validate_attachment_owner(
+        *,
+        session_id: str,
+        source_device_id: str,
+        source_install_id: str,
+    ) -> None:
+        if not PROVIDER_QUALIFIED_SESSION_PATTERN.fullmatch(str(session_id or "")):
+            raise PairDropStoreError("bad_attachment_session")
+        if not str(source_device_id or "") or not str(source_install_id or ""):
+            raise PairDropStoreError("attachment_owner_required")
+
+    @staticmethod
+    def _attachment_row_matches_owner(
+        row: sqlite3.Row,
+        *,
+        session_id: str,
+        source_device_id: str,
+        source_install_id: str,
+    ) -> None:
+        if (
+            str(row["session_id"] or "") != session_id
+            or str(row["source_device_id"] or "") != source_device_id
+            or str(row["source_install_id"] or "") != source_install_id
+        ):
+            raise PairDropStoreError("attachment_owner_mismatch")
+        if row["revoked_at"] is not None:
+            raise PairDropStoreError("attachment_revoked")
+        if float(row["expires_at"] or 0) <= time.time():
+            raise PairDropStoreError("attachment_expired")
+
+    def create_attachment_handle(
+        self,
+        file_id: str,
+        *,
+        session_id: str,
+        source_device_id: str,
+        source_install_id: str,
+        idempotency_key: str | None = None,
+        expires_in_seconds: int = DEFAULT_ATTACHMENT_TTL_SECONDS,
+    ) -> dict[str, Any]:
+        self._validate_attachment_owner(
+            session_id=session_id,
+            source_device_id=source_device_id,
+            source_install_id=source_install_id,
+        )
+        key = str(idempotency_key or "").strip() or None
+        if key is not None and (
+            len(key) > MAX_ATTACHMENT_IDEMPOTENCY_KEY_LENGTH
+            or not re.fullmatch(r"[A-Za-z0-9._:-]{8,200}", key)
+        ):
+            raise PairDropStoreError("bad_attachment_idempotency_key")
+        if type(expires_in_seconds) is not int or expires_in_seconds <= 0:
+            raise PairDropStoreError("bad_attachment_expiry")
+        ttl = min(expires_in_seconds, MAX_ATTACHMENT_TTL_SECONDS)
         descriptor = self.verified_read_descriptor(file_id)
         item = descriptor["item"]
-        path = descriptor["path"]
-        now = _now_iso()
+        now_epoch = time.time()
+        now = _iso_from_epoch(now_epoch)
+        expires_at = now_epoch + ttl
+        handle_id = "att_" + secrets.token_hex(24)
+        idempotent = False
         with self._connect() as conn:
             self._ensure_schema(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            existing = None
+            if key is not None:
+                existing = conn.execute(
+                    """
+                    SELECT * FROM attachment_handles
+                     WHERE session_id = ?
+                       AND source_device_id = ?
+                       AND source_install_id = ?
+                       AND idempotency_key = ?
+                    """,
+                    (session_id, source_device_id, source_install_id, key),
+                ).fetchone()
+            if existing is not None:
+                if str(existing["file_id"] or "") != file_id:
+                    raise PairDropStoreError("attachment_idempotency_conflict")
+                handle_id = str(existing["handle"])
+                expires_at = float(existing["expires_at"])
+                idempotent = True
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO attachment_handles(
+                        handle, file_id, session_id, source_device_id,
+                        source_install_id, idempotency_key, file_sha256,
+                        file_byte_size, created_at, expires_at, revoked_at,
+                        consumed_binding_id, consumed_client_action_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                    """,
+                    (
+                        handle_id,
+                        file_id,
+                        session_id,
+                        source_device_id,
+                        source_install_id,
+                        key,
+                        str(item["sha256"]),
+                        int(item["byte_size"]),
+                        now,
+                        expires_at,
+                    ),
+                )
+                self._record_event(
+                    conn,
+                    "attached",
+                    file_id,
+                    {"handle_sha256": hashlib.sha256(handle_id.encode()).hexdigest()},
+                )
             conn.execute(
                 "UPDATE files SET last_opened_at = ?, updated_at = ? WHERE id = ?",
                 (now, now, file_id),
             )
-            self._record_event(conn, "attached", file_id, {"session": bool(session_id)})
-            conn.commit()
-        self._audit("file.attached", {"file_id": file_id, "session": bool(session_id)})
+        if not idempotent:
+            self._audit(
+                "file.attached",
+                {
+                    "file_id": file_id,
+                    "handle_sha256": hashlib.sha256(handle_id.encode()).hexdigest(),
+                },
+            )
         return {
             "ok": True,
             "id": file_id,
             "display_name": item["display_name"],
             "content_type": item["content_type"],
-            "byte_size": item["byte_size"],
+            "byte_size": int(item["byte_size"]),
             "sha256": item["sha256"],
-            "path": str(path),
+            "handle_id": handle_id,
+            "expires_at": _iso_from_epoch(expires_at),
+            "idempotent": idempotent,
         }
+
+    def _attachment_row(
+        self,
+        handle_id: str,
+        *,
+        session_id: str,
+        source_device_id: str,
+        source_install_id: str,
+    ) -> sqlite3.Row:
+        if not ATTACHMENT_HANDLE_PATTERN.fullmatch(str(handle_id or "")):
+            raise PairDropStoreError("bad_attachment_handle")
+        self._validate_attachment_owner(
+            session_id=session_id,
+            source_device_id=source_device_id,
+            source_install_id=source_install_id,
+        )
+        with self._connect() as conn:
+            self._ensure_schema(conn)
+            row = conn.execute(
+                "SELECT * FROM attachment_handles WHERE handle = ?",
+                (handle_id,),
+            ).fetchone()
+        if row is None:
+            raise PairDropStoreError("attachment_not_found")
+        self._attachment_row_matches_owner(
+            row,
+            session_id=session_id,
+            source_device_id=source_device_id,
+            source_install_id=source_install_id,
+        )
+        return row
+
+    def _bind_attachment_consumption(
+        self,
+        handle_ids: list[str],
+        *,
+        session_id: str,
+        source_device_id: str,
+        source_install_id: str,
+        binding_id: str,
+        client_action_id: str,
+    ) -> None:
+        if not binding_id or not client_action_id:
+            raise PairDropStoreError("attachment_consumer_required")
+        with self._connect() as conn:
+            self._ensure_schema(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            for handle_id in handle_ids:
+                row = conn.execute(
+                    "SELECT * FROM attachment_handles WHERE handle = ?",
+                    (handle_id,),
+                ).fetchone()
+                if row is None:
+                    raise PairDropStoreError("attachment_not_found")
+                self._attachment_row_matches_owner(
+                    row,
+                    session_id=session_id,
+                    source_device_id=source_device_id,
+                    source_install_id=source_install_id,
+                )
+                consumed_binding = str(row["consumed_binding_id"] or "")
+                consumed_action = str(row["consumed_client_action_id"] or "")
+                if consumed_binding or consumed_action:
+                    if (
+                        consumed_binding != binding_id
+                        or consumed_action != client_action_id
+                    ):
+                        raise PairDropStoreError("attachment_consume_conflict")
+                    continue
+                changed = conn.execute(
+                    """
+                    UPDATE attachment_handles
+                       SET consumed_binding_id = ?,
+                           consumed_client_action_id = ?
+                     WHERE handle = ?
+                       AND consumed_binding_id IS NULL
+                       AND consumed_client_action_id IS NULL
+                    """,
+                    (binding_id, client_action_id, handle_id),
+                ).rowcount
+                if changed != 1:
+                    raise PairDropStoreError("attachment_consume_conflict")
+
+    def resolve_attachment_handle(
+        self,
+        handle_id: str,
+        *,
+        session_id: str,
+        source_device_id: str,
+        source_install_id: str,
+        binding_id: str = "send-text",
+        client_action_id: str = "send-text-direct",
+    ) -> dict[str, Any]:
+        row = self._attachment_row(
+            handle_id,
+            session_id=session_id,
+            source_device_id=source_device_id,
+            source_install_id=source_install_id,
+        )
+        self._bind_attachment_consumption(
+            [handle_id],
+            session_id=session_id,
+            source_device_id=source_device_id,
+            source_install_id=source_install_id,
+            binding_id=binding_id,
+            client_action_id=client_action_id,
+        )
+        descriptor = self.verified_read_descriptor(str(row["file_id"]))
+        item = descriptor["item"]
+        if (
+            str(item.get("sha256") or "") != str(row["file_sha256"] or "")
+            or int(item.get("byte_size") or 0) != int(row["file_byte_size"] or 0)
+        ):
+            raise PairDropStoreError("attachment_metadata_mismatch")
+        return descriptor
+
+    def _open_committed_object_fd(self, item: dict[str, Any]) -> int:
+        relpath = str(item.get("storage_relpath") or "")
+        fd = -1
+        try:
+            with self._object_parent_directory_fd(relpath) as (parent_fd, name):
+                fd = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_fd,
+                )
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise PairDropStoreError("unsafe_object_path")
+            return fd
+        except OSError as exc:
+            if fd >= 0:
+                os.close(fd)
+            if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR}:
+                raise PairDropStoreError("unsafe_object_path") from exc
+            if exc.errno == errno.ENOENT:
+                raise PairDropStoreError("missing_object") from exc
+            raise
+        except Exception:
+            if fd >= 0:
+                os.close(fd)
+            raise
+
+
+    @contextmanager
+    def _open_prepared_attachment(
+        self,
+        file_id: str,
+        expected_sha256: str,
+        expected_size: int,
+    ) -> Iterator[Any]:
+        item = self.get_file(file_id)
+        if (
+            str(item.get("sha256") or "") != expected_sha256
+            or int(item.get("byte_size") or 0) != expected_size
+        ):
+            raise PairDropStoreError("attachment_metadata_mismatch")
+        fd = -1
+        handle = None
+        try:
+            fd = self._open_committed_object_fd(item)
+            before = os.fstat(fd)
+            if before.st_size != expected_size:
+                raise PairDropStoreError("byte_size_mismatch")
+            hasher = hashlib.sha256()
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+            after = os.fstat(fd)
+            if (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ):
+                raise PairDropStoreError("attachment_changed")
+            if hasher.hexdigest() != expected_sha256:
+                raise PairDropStoreError("sha256_mismatch")
+            os.lseek(fd, 0, os.SEEK_SET)
+            handle = os.fdopen(fd, "rb")
+            fd = -1
+            yield handle
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR}:
+                raise PairDropStoreError("missing_object") from exc
+            raise
+        finally:
+            if handle is not None:
+                handle.close()
+            if fd >= 0:
+                os.close(fd)
+
+    def _cleanup_send_staging(self, *, now: float | None = None) -> None:
+        cutoff = (
+            time.time() if now is None else float(now)
+        ) - SEND_STAGING_RETENTION_SECONDS
+        with self._owned_child_directory_fd(
+            "send-staging",
+            "unsafe_send_staging_path",
+        ) as staging_fd:
+            for name in os.listdir(staging_fd):
+                if not (
+                    name.startswith("send_")
+                    or (name.startswith(".send_") and name.endswith(".tmp"))
+                ):
+                    continue
+                try:
+                    entry = os.stat(
+                        name,
+                        dir_fd=staging_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(entry.st_mode):
+                    os.unlink(name, dir_fd=staging_fd)
+                    continue
+                if not stat.S_ISREG(entry.st_mode):
+                    raise PairDropStoreError("unsafe_send_staging_path")
+                if entry.st_mtime <= cutoff:
+                    os.unlink(name, dir_fd=staging_fd)
+            os.fsync(staging_fd)
+
+    def _materialize_prepared_attachment(
+        self,
+        file_id: str,
+        expected_sha256: str,
+        expected_size: int,
+        display_name: str | None,
+    ) -> Path:
+        self._cleanup_send_staging()
+        token = secrets.token_hex(16)
+        temporary_name = f".send_{token}.tmp"
+        final_name = f"send_{token}_{_safe_display_name(display_name or 'attachment.bin')}"
+        descriptor = -1
+        published = False
+        try:
+            with (
+                self._open_prepared_attachment(
+                    file_id,
+                    expected_sha256,
+                    expected_size,
+                ) as source,
+                self._owned_child_directory_fd(
+                    "send-staging",
+                    "unsafe_send_staging_path",
+                ) as staging_fd,
+            ):
+                flags = (
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                descriptor = os.open(
+                    temporary_name,
+                    flags,
+                    0o600,
+                    dir_fd=staging_fd,
+                )
+                copied = 0
+                hasher = hashlib.sha256()
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    copied += len(chunk)
+                    if copied > expected_size:
+                        raise PairDropStoreError("byte_size_mismatch")
+                    hasher.update(chunk)
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(descriptor, view)
+                        if written <= 0:
+                            raise OSError(errno.EIO, "short attachment staging write")
+                        view = view[written:]
+                if copied != expected_size:
+                    raise PairDropStoreError("byte_size_mismatch")
+                if hasher.hexdigest() != expected_sha256:
+                    raise PairDropStoreError("sha256_mismatch")
+                os.fchmod(descriptor, 0o400)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+                os.fsync(descriptor)
+                os.close(descriptor)
+                descriptor = -1
+                os.replace(
+                    temporary_name,
+                    final_name,
+                    src_dir_fd=staging_fd,
+                    dst_dir_fd=staging_fd,
+                )
+                published = True
+                os.fsync(staging_fd)
+                return self.send_staging_dir / final_name
+        except OSError as exc:
+            if exc.errno in {
+                errno.ELOOP,
+                errno.EISDIR,
+                errno.ENOTDIR,
+            }:
+                raise PairDropStoreError("unsafe_send_staging_path") from exc
+            if exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}:
+                raise PairDropStoreError("insufficient_storage") from exc
+            raise
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if not published:
+                try:
+                    with self._owned_child_directory_fd(
+                        "send-staging",
+                        "unsafe_send_staging_path",
+                    ) as staging_fd:
+                        os.unlink(temporary_name, dir_fd=staging_fd)
+                except FileNotFoundError:
+                    pass
+
+    def prepare_attachment_handles(
+        self,
+        records: Any,
+        *,
+        session_id: str,
+        source_device_id: str,
+        source_install_id: str,
+        binding_id: str,
+        client_action_id: str,
+    ) -> tuple[PreparedAttachment, ...]:
+        if not isinstance(records, list):
+            raise PairDropStoreError("bad_attachment_records")
+        if len(records) > 8:
+            raise PairDropStoreError("too_many_attachments")
+        prepared_rows: list[tuple[sqlite3.Row, dict[str, Any]]] = []
+        aggregate_size = 0
+        for record in records:
+            if not isinstance(record, dict) or set(record) - {
+                "handle_id",
+                "sha256",
+                "size_bytes",
+                "mime_type",
+                "display_name",
+            }:
+                raise PairDropStoreError("bad_attachment_records")
+            handle_id = str(record.get("handle_id") or "")
+            digest = str(record.get("sha256") or "")
+            size = record.get("size_bytes")
+            mime_type = str(record.get("mime_type") or "")
+            display_name = record.get("display_name")
+            if (
+                not ATTACHMENT_HANDLE_PATTERN.fullmatch(handle_id)
+                or not re.fullmatch(r"[a-f0-9]{64}", digest)
+                or type(size) is not int
+                or size < 1
+                or not mime_type
+                or not re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9.+-]*/[A-Za-z0-9][A-Za-z0-9.+-]*",
+                    mime_type,
+                )
+                or (display_name is not None and not isinstance(display_name, str))
+            ):
+                raise PairDropStoreError("bad_attachment_records")
+            if size > 2 * 1024 * 1024:
+                raise PairDropStoreError("attachment_too_large")
+            aggregate_size += size
+            if aggregate_size > 8 * 1024 * 1024:
+                raise PairDropStoreError("attachments_too_large")
+            row = self._attachment_row(
+                handle_id,
+                session_id=session_id,
+                source_device_id=source_device_id,
+                source_install_id=source_install_id,
+            )
+            descriptor = self.verified_read_descriptor(str(row["file_id"]))
+            item = descriptor["item"]
+            expected_name = str(item.get("display_name") or "")
+            if (
+                digest != str(row["file_sha256"] or "")
+                or size != int(row["file_byte_size"] or 0)
+                or digest != str(item.get("sha256") or "")
+                or size != int(item.get("byte_size") or 0)
+                or mime_type != str(item.get("content_type") or "")
+                or (
+                    display_name is not None
+                    and str(display_name) != expected_name
+                )
+            ):
+                raise PairDropStoreError("attachment_metadata_mismatch")
+            prepared_rows.append((row, item))
+        self._bind_attachment_consumption(
+            [str(row["handle"]) for row, _item in prepared_rows],
+            session_id=session_id,
+            source_device_id=source_device_id,
+            source_install_id=source_install_id,
+            binding_id=binding_id,
+            client_action_id=client_action_id,
+        )
+        return tuple(
+            PreparedAttachment(
+                handle_id=str(row["handle"]),
+                sha256=str(row["file_sha256"]),
+                size_bytes=int(row["file_byte_size"]),
+                mime_type=str(item.get("content_type") or ""),
+                display_name=str(item.get("display_name") or "") or None,
+                _open_verified=lambda file_id=str(row["file_id"]),
+                digest=str(row["file_sha256"]),
+                size=int(row["file_byte_size"]): self._open_prepared_attachment(
+                    file_id,
+                    digest,
+                    size,
+                ),
+                _materialize_local_path=lambda file_id=str(row["file_id"]),
+                digest=str(row["file_sha256"]),
+                size=int(row["file_byte_size"]),
+                name=str(item.get("display_name") or "") or None:
+                    self._materialize_prepared_attachment(
+                        file_id,
+                        digest,
+                        size,
+                        name,
+                    ),
+            )
+            for row, item in prepared_rows
+        )
+
+    def revoke_attachments_for_session(self, session_id: str) -> int:
+        if not PROVIDER_QUALIFIED_SESSION_PATTERN.fullmatch(str(session_id or "")):
+            return 0
+        now = _now_iso()
+        with self._connect() as conn:
+            self._ensure_schema(conn)
+            return conn.execute(
+                """
+                UPDATE attachment_handles
+                   SET revoked_at = ?
+                 WHERE session_id = ? AND revoked_at IS NULL
+                """,
+                (now, session_id),
+            ).rowcount
 
     def download_descriptor(self, file_id: str) -> dict[str, Any]:
         item = self.get_file(file_id)
-        path = self._object_path(item)
-        if path.is_symlink() or not path.is_file():
-            raise PairDropStoreError("missing_object")
-        resolved_root = self.root.resolve()
-        resolved_path = path.resolve()
-        if not str(resolved_path).startswith(str(resolved_root) + os.sep):
-            raise PairDropStoreError("object_escape")
-        stat_result = path.stat()
-        if int(item.get("byte_size") or 0) != stat_result.st_size:
-            raise PairDropStoreError("byte_size_mismatch")
+        descriptor = self._open_committed_object_fd(item)
+        try:
+            opened = os.fstat(descriptor)
+            if int(item.get("byte_size") or 0) != opened.st_size:
+                raise PairDropStoreError("byte_size_mismatch")
+        finally:
+            os.close(descriptor)
+        path = self.root / str(item.get("storage_relpath") or "")
         now = _now_iso()
         with self._connect() as conn:
             self._ensure_schema(conn)
@@ -2547,6 +3194,31 @@ class PairDropStore:
         self._audit("file.downloaded", {"file_id": file_id, "byte_size": item.get("byte_size", 0)})
         updated = self.get_file(file_id)
         return {"item": updated, "path": path}
+
+    @contextmanager
+    def open_download(self, file_id: str) -> Iterator[dict[str, Any]]:
+        """Open the audited object once and keep that verified inode for streaming."""
+        descriptor = self.download_descriptor(file_id)
+        item = descriptor["item"]
+        fd = self._open_committed_object_fd(item)
+        handle = None
+        try:
+            opened = os.fstat(fd)
+            if int(item.get("byte_size") or 0) != opened.st_size:
+                raise PairDropStoreError("byte_size_mismatch")
+            handle = os.fdopen(fd, "rb", closefd=True)
+            fd = -1
+            yield {
+                "item": item,
+                "path": descriptor["path"],
+                "handle": handle,
+                "stat": opened,
+            }
+        finally:
+            if handle is not None:
+                handle.close()
+            if fd >= 0:
+                os.close(fd)
 
     def verified_read_descriptor(
         self,
@@ -2567,21 +3239,39 @@ class PairDropStore:
                 raise PairDropStoreError("wrong_source")
         if required_source_route is not None and item.get("source_route") != required_source_route:
             raise PairDropStoreError("wrong_source_route")
-        path = self._object_path(item)
-        if path.is_symlink() or not path.is_file():
-            raise PairDropStoreError("missing_object")
-        root = self.root.resolve()
-        resolved = path.resolve()
-        if resolved != root and root not in resolved.parents:
-            raise PairDropStoreError("object_escape")
-        byte_size = int(item.get("byte_size") or 0)
-        if path.stat().st_size != byte_size:
-            raise PairDropStoreError("byte_size_mismatch")
-        expected_sha256 = str(item.get("sha256") or "")
-        if not re.fullmatch(r"[a-f0-9]{64}", expected_sha256):
-            raise PairDropStoreError("missing_sha256")
-        if self._sha256_regular_file(path) != expected_sha256:
-            raise PairDropStoreError("sha256_mismatch")
+        fd = self._open_committed_object_fd(item)
+        path = self.root / str(item.get("storage_relpath") or "")
+        try:
+            before = os.fstat(fd)
+            byte_size = int(item.get("byte_size") or 0)
+            if before.st_size != byte_size:
+                raise PairDropStoreError("byte_size_mismatch")
+            expected_sha256 = str(item.get("sha256") or "")
+            if not re.fullmatch(r"[a-f0-9]{64}", expected_sha256):
+                raise PairDropStoreError("missing_sha256")
+            hasher = hashlib.sha256()
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+            after = os.fstat(fd)
+            if (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ):
+                raise PairDropStoreError("object_changed")
+            if hasher.hexdigest() != expected_sha256:
+                raise PairDropStoreError("sha256_mismatch")
+        finally:
+            os.close(fd)
         return {"item": item, "path": path}
 
     def events_since(self, seq: int = 0, limit: int = 100) -> list[dict[str, Any]]:
@@ -3056,10 +3746,10 @@ class PairDropStore:
 
         try:
             self.audit_path.parent.mkdir(parents=True, exist_ok=True)
-            safe_detail = {
+            safe_detail = redact_public_diagnostic({
                 key: value for key, value in detail.items()
                 if key not in {"path", "body", "request_body", "contents"}
-            }
+            })
             record = {
                 "ts": _now_iso(),
                 "event": event,

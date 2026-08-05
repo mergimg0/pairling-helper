@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -63,10 +65,20 @@ func run(args []string) int {
 	appSupport := runtimecfg.DefaultAppSupportRoot(home)
 	defaultStateDir := runtimecfg.DefaultStateDir(home)
 	defaultHostname := runtimecfg.StableHostname(appSupport, defaultStateDir)
+	defaultControlSocket := strings.TrimSpace(os.Getenv("PAIRLING_CONNECTD_CONTROL_SOCKET"))
+	if defaultControlSocket == "" {
+		defaultControlSocket = filepath.Join(home, ".claude", "companion", "connectd-control.sock")
+	}
+	defaultPairlingControlSocket := strings.TrimSpace(os.Getenv("PAIRLING_CONTROL_SOCKET"))
+	if defaultPairlingControlSocket == "" {
+		defaultPairlingControlSocket = filepath.Join(home, ".claude", "companion", "control.sock")
+	}
 
 	upstreamRaw := fs.String("upstream", "http://127.0.0.1:7773", "Pairling daemon upstream URL")
 	listenAddr := fs.String("listen", ":7773", "tailnet-only service listen address")
 	statusAddr := fs.String("status-addr", "127.0.0.1:7774", "loopback status server address")
+	controlSocket := fs.String("control-socket", defaultControlSocket, "same-UID Unix status/control socket path")
+	pairlingControlSocket := fs.String("pairling-control-socket", defaultPairlingControlSocket, "pairlingd same-UID Unix control socket path")
 	stateDir := fs.String("state-dir", defaultStateDir, "tsnet state directory")
 	hostname := fs.String("hostname", defaultHostname, "tailnet hostname for this Pairling Connect node")
 	controlURL := fs.String("control-url", "", "advanced: custom Tailscale-compatible control server URL")
@@ -118,12 +130,19 @@ func run(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	statusServer, err := startStatusServer(*statusAddr, statusStore)
+	authOpener := newAuthOpenGate()
+	statusServer, err := startStatusServer(*statusAddr, statusStore, home, authOpener)
 	if err != nil {
 		log.Printf("cannot start status server: %v", err)
 		return 1
 	}
 	defer shutdownHTTPServer(statusServer)
+	controlServer, err := startUnixControlServer(*controlSocket, statusStore, authOpener)
+	if err != nil {
+		log.Printf("cannot start Unix control server: %v", err)
+		return 1
+	}
+	defer controlServer.Close()
 
 	srv := &tsnet.Server{
 		Dir:        *stateDir,
@@ -164,7 +183,7 @@ func run(args []string) int {
 		return 1
 	}
 	go monitorUpstream(ctx, upstream, statusStore, func(probeContext context.Context) bool {
-		return handler.ProbeRoute(probeContext, loadInternalHookToken(home))
+		return probePairlingRoute(probeContext, *pairlingControlSocket, statusStore)
 	})
 
 	ln, err := srv.Listen("tcp", *listenAddr)
@@ -206,7 +225,13 @@ func run(args []string) int {
 			statusStore.SetLastError(ferr.Error())
 			log.Printf("cannot start funnel listener: %v", ferr)
 		} else {
-			funnelServer = &http.Server{Handler: funnelHandler, ReadHeaderTimeout: 10 * time.Second}
+			funnelServer = &http.Server{
+				Handler:           funnelHandler,
+				ReadHeaderTimeout: 10 * time.Second,
+				ReadTimeout:       15 * time.Second,
+				WriteTimeout:      30 * time.Second,
+				IdleTimeout:       60 * time.Second,
+			}
 			if domains := srv.CertDomains(); len(domains) > 0 {
 				statusStore.SetFunnelHostname(domains[0])
 				log.Printf("pairling-connectd funnel listener open host=%s", domains[0])
@@ -385,19 +410,27 @@ func ensurePrivateDir(path string) error {
 	return os.Chmod(cleaned, 0o700)
 }
 
-func startStatusServer(addr string, store *status.Store) (*http.Server, error) {
+func newStatusHandler(home string, store *status.Store, openers ...*authOpenGate) http.Handler {
 	mux := http.NewServeMux()
+	authOpener := newAuthOpenGate()
+	if len(openers) > 0 && openers[0] != nil {
+		authOpener = openers[0]
+	}
 	mux.Handle("/status", store.Handler())
 	mux.HandleFunc("/auth/open", func(w http.ResponseWriter, r *http.Request) {
-		handleAuthOpen(w, r, store)
+		handleAuthOpen(w, r, store, authOpener)
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}` + "\n"))
 	})
+	return requireInternalStatusToken(home, mux)
+}
+
+func startStatusServer(addr string, store *status.Store, home string, openers ...*authOpenGate) (*http.Server, error) {
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           newStatusHandler(home, store, openers...),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	listener, err := net.Listen("tcp", addr)
@@ -413,11 +446,118 @@ func startStatusServer(addr string, store *status.Store) (*http.Server, error) {
 	return server, nil
 }
 
-var openAuthURL = func(rawURL string) error {
-	return exec.Command("/usr/bin/open", rawURL).Start()
+const internalStatusTokenHeader = "X-Pairling-Internal-Token"
+
+func requireInternalStatusToken(home string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isLoopbackRemote(r.RemoteAddr) {
+			http.Error(w, "loopback required", http.StatusForbidden)
+			return
+		}
+		expected := loadInternalHookToken(home)
+		provided := strings.TrimSpace(r.Header.Get(internalStatusTokenHeader))
+		if expected == "" {
+			http.Error(w, "internal status authentication unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if len(provided) != len(expected) || subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
-func handleAuthOpen(w http.ResponseWriter, r *http.Request, store *status.Store) {
+const authOpenRetryCooldown = 30 * time.Second
+
+type authOpenProcess interface {
+	Wait() error
+}
+
+type authOpenStarter func(rawURL string) (authOpenProcess, error)
+
+type authOpenOutcome uint8
+
+const (
+	authOpenStarted authOpenOutcome = iota
+	authOpenAlreadyRequested
+	authOpenRetryBlocked
+)
+
+type authOpenGate struct {
+	mu                   sync.Mutex
+	currentURL           string
+	lastAttempt          time.Time
+	lastStartSucceeded   bool
+	inFlight             bool
+	retryCooldown        time.Duration
+	now                  func() time.Time
+	start                authOpenStarter
+	runWorker            func(func())
+}
+
+func newAuthOpenGate() *authOpenGate {
+	return &authOpenGate{
+		retryCooldown: authOpenRetryCooldown,
+		now:           time.Now,
+		start: func(rawURL string) (authOpenProcess, error) {
+			command := exec.Command("/usr/bin/open", rawURL)
+			if err := command.Start(); err != nil {
+				return nil, err
+			}
+			return command, nil
+		},
+		runWorker: func(work func()) {
+			go work()
+		},
+	}
+}
+
+func (g *authOpenGate) open(rawURL string) (authOpenOutcome, error) {
+	now := g.now()
+	g.mu.Lock()
+	urlChanged := rawURL != g.currentURL
+	if urlChanged {
+		g.currentURL = rawURL
+		g.lastAttempt = time.Time{}
+		g.lastStartSucceeded = false
+	}
+	if g.inFlight {
+		g.mu.Unlock()
+		if urlChanged {
+			return authOpenRetryBlocked, nil
+		}
+		return authOpenAlreadyRequested, nil
+	}
+	if !g.lastAttempt.IsZero() && now.Before(g.lastAttempt.Add(g.retryCooldown)) {
+		startSucceeded := g.lastStartSucceeded
+		g.mu.Unlock()
+		if startSucceeded {
+			return authOpenAlreadyRequested, nil
+		}
+		return authOpenRetryBlocked, nil
+	}
+	g.lastAttempt = now
+	process, err := g.start(rawURL)
+	if err != nil {
+		g.lastStartSucceeded = false
+		g.mu.Unlock()
+		return authOpenRetryBlocked, err
+	}
+	g.lastStartSucceeded = true
+	g.inFlight = true
+	g.mu.Unlock()
+
+	g.runWorker(func() {
+		_ = process.Wait()
+		g.mu.Lock()
+		g.inFlight = false
+		g.mu.Unlock()
+	})
+	return authOpenStarted, nil
+}
+
+func handleAuthOpen(w http.ResponseWriter, r *http.Request, store *status.Store, opener *authOpenGate) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST required", http.StatusMethodNotAllowed)
 		return
@@ -426,6 +566,10 @@ func handleAuthOpen(w http.ResponseWriter, r *http.Request, store *status.Store)
 		http.Error(w, "loopback required", http.StatusForbidden)
 		return
 	}
+	writeAuthOpenResponse(w, store, opener)
+}
+
+func writeAuthOpenResponse(w http.ResponseWriter, store *status.Store, opener *authOpenGate) {
 
 	w.Header().Set("Content-Type", "application/json")
 	rawURL, ok := store.AuthURLForOpen()
@@ -439,7 +583,8 @@ func handleAuthOpen(w http.ResponseWriter, r *http.Request, store *status.Store)
 		})
 		return
 	}
-	if err := openAuthURL(rawURL); err != nil {
+	outcome, err := opener.open(rawURL)
+	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ok":               false,
@@ -449,11 +594,25 @@ func handleAuthOpen(w http.ResponseWriter, r *http.Request, store *status.Store)
 		})
 		return
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	if outcome == authOpenRetryBlocked {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":               false,
+			"opened":           false,
+			"auth_url_present": true,
+			"error":            "Pairling Connect browser approval is temporarily unavailable.",
+		})
+		return
+	}
+	response := map[string]any{
 		"ok":               true,
-		"opened":           true,
+		"opened":           outcome == authOpenStarted,
 		"auth_url_present": true,
-	})
+	}
+	if outcome == authOpenAlreadyRequested {
+		response["error"] = "Pairling Connect browser approval was already requested."
+	}
+	_ = json.NewEncoder(w).Encode(response)
 }
 
 func isLoopbackRemote(remoteAddr string) bool {
@@ -516,10 +675,9 @@ func refreshUpstreamStatus(
 		verified := routeProbe(probeContext)
 		cancel()
 		if !verified {
-			// ProbeRoute normally records the exact gateway result through its
-			// logger. Record a fail-closed result here as well for failures that
-			// occur before the request can enter the handler, such as a missing
-			// internal route token.
+			// The Unix route probe records verified successes. Record a
+			// fail-closed result for transport, peer-auth, and validation
+			// failures that never produce a trusted route proof.
 			store.RecordGatewayEvent(http.MethodGet, "/routez", 0, "validation_failed")
 			return
 		}

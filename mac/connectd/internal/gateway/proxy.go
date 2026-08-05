@@ -17,6 +17,7 @@ import (
 
 const defaultMaxBodyBytes int64 = 1_000_000
 const prePairMaxBodyBytes int64 = 16 * 1024
+const funnelBodyAdmissionSlots = 8
 const composeSyncMaxBodyBytes int64 = 2 * 1024 * 1024
 const pairDropSmallFileMaxBodyBytes int64 = 10 * 1024 * 1024
 const pairDropUploadChunkMaxBodyBytes int64 = 1024 * 1024
@@ -97,6 +98,12 @@ type Options struct {
 	FunnelLimiter *FunnelLimiter
 }
 
+// processFunnelBodyAdmission is shared by every Funnel handler so a second
+// handler cannot multiply the number of unauthenticated request bodies being
+// read concurrently. Admission is nonblocking; the public listener sheds excess
+// work instead of tying up another server goroutine on a semaphore wait.
+var processFunnelBodyAdmission = make(chan struct{}, funnelBodyAdmissionSlots)
+
 type Handler struct {
 	upstream         *url.URL
 	maxBodyBytes     int64
@@ -106,10 +113,10 @@ type Handler struct {
 	peerNodeResolver PeerNodeResolver
 	funnelMacIDHash  string
 	funnelLimiter    *FunnelLimiter
+	funnelAdmission  chan struct{}
 	proxy            *httputil.ReverseProxy
 }
 
-type routeProbeTokenKey struct{}
 
 type RateLimiter interface {
 	Allow(remoteAddr, method, path string) bool
@@ -149,6 +156,7 @@ func NewHandler(opts Options) (*Handler, error) {
 		peerNodeResolver: opts.PeerNodeResolver,
 		funnelMacIDHash:  opts.FunnelMacIDHash,
 		funnelLimiter:    opts.FunnelLimiter,
+		funnelAdmission:  processFunnelBodyAdmission,
 	}
 	h.proxy = &httputil.ReverseProxy{
 		Rewrite:       h.rewrite,
@@ -158,28 +166,6 @@ func NewHandler(opts Options) (*Handler, error) {
 	return h, nil
 }
 
-// ProbeRoute runs the semantic route check through the same allowlist,
-// rewrite, reverse proxy, response validation, and event logger as a tailnet
-// request. The internal token is carried only in an in-process context value;
-// inbound headers are still deleted before the upstream hop.
-func (h *Handler) ProbeRoute(ctx context.Context, internalToken string) bool {
-	if h == nil || strings.TrimSpace(internalToken) == "" {
-		return false
-	}
-	request, err := http.NewRequestWithContext(
-		context.WithValue(ctx, routeProbeTokenKey{}, internalToken),
-		http.MethodGet,
-		"http://pairling.internal/routez",
-		nil,
-	)
-	if err != nil {
-		return false
-	}
-	request.RemoteAddr = "127.0.0.1:0"
-	response := &probeResponseWriter{header: make(http.Header), status: http.StatusOK}
-	h.ServeHTTP(response, request)
-	return response.status >= 200 && response.status < 400 && routeResponseIsValid(response.body.Bytes())
-}
 
 // isFunnelSynthesizedPath reports the funnel-mode GET paths connectd answers
 // itself with a minimal body, so the upstream's identity, version, install
@@ -221,30 +207,56 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.reject(w, r, http.StatusNotFound, "path_not_allowed")
 		return
 	}
+	if h.mode == ExposureModeFunnelBootstrap && r.Method == http.MethodGet && r.ContentLength != 0 {
+		h.reject(w, r, http.StatusRequestEntityTooLarge, "request_too_large")
+		return
+	}
 	if h.mode == ExposureModeFunnelBootstrap && r.Method == http.MethodGet && isFunnelSynthesizedPath(path) {
 		h.writeFunnelHealth(w, r, path)
 		return
 	}
-	if h.funnelLimiter != nil && h.mode == ExposureModeFunnelBootstrap && r.Method == http.MethodPost && isFunnelRateLimitedPath(path) {
+	if h.mode == ExposureModeFunnelBootstrap && r.Method == http.MethodPost {
+		// net/http has already validated and normalized a single
+		// Content-Length value before the handler runs. A zero length means the
+		// public caller omitted framing (or supplied no JSON body); transfer
+		// encodings are likewise rejected so admission never buffers an
+		// attacker-controlled stream without a declared finite size.
+		if r.ContentLength <= 0 || len(r.TransferEncoding) != 0 {
+			h.reject(w, r, http.StatusLengthRequired, "content_length_required")
+			return
+		}
+		if r.ContentLength > prePairMaxBodyBytes {
+			h.reject(w, r, http.StatusRequestEntityTooLarge, "request_too_large")
+			return
+		}
+		select {
+		case h.funnelAdmission <- struct{}{}:
+			defer func() { <-h.funnelAdmission }()
+		default:
+			h.reject(w, r, http.StatusTooManyRequests, "rate_limited")
+			return
+		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, prePairMaxBodyBytes+1))
 		if err != nil || int64(len(body)) > prePairMaxBodyBytes {
 			h.reject(w, r, http.StatusRequestEntityTooLarge, "request_too_large")
 			return
 		}
-		pairID := extractPairID(body)
-		var release func()
-		var ok bool
-		if isFunnelECDHClaimPath(path) {
-			release, ok = h.funnelLimiter.Acquire(pairID)
-		} else {
-			ok = h.funnelLimiter.Allow(pairID)
-		}
-		if !ok {
-			h.reject(w, r, http.StatusTooManyRequests, "rate_limited")
-			return
-		}
-		if release != nil {
-			defer release()
+		if h.funnelLimiter != nil && isFunnelRateLimitedPath(path) {
+			pairID := extractPairID(body)
+			var release func()
+			var ok bool
+			if isFunnelECDHClaimPath(path) {
+				release, ok = h.funnelLimiter.Acquire(pairID)
+			} else {
+				ok = h.funnelLimiter.Allow(pairID)
+			}
+			if !ok {
+				h.reject(w, r, http.StatusTooManyRequests, "rate_limited")
+				return
+			}
+			if release != nil {
+				defer release()
+			}
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
@@ -295,9 +307,6 @@ func (h *Handler) rewrite(r *httputil.ProxyRequest) {
 	r.Out.Header.Del(peerNodeHeader)
 	r.Out.Header.Del(peerProvenanceHeader)
 	r.Out.Header.Del(funnelOriginHeader)
-	if token, ok := in.Context().Value(routeProbeTokenKey{}).(string); ok && strings.TrimSpace(token) != "" {
-		r.Out.Header.Set(internalTokenHeader, token)
-	}
 	if h.mode == ExposureModeFunnelBootstrap {
 		r.Out.Header.Set(funnelOriginHeader, "1")
 	}
@@ -477,19 +486,6 @@ type statusRecorder struct {
 	body        bytes.Buffer
 }
 
-type probeResponseWriter struct {
-	header http.Header
-	status int
-	body   bytes.Buffer
-}
-
-func (r *probeResponseWriter) Header() http.Header { return r.header }
-
-func (r *probeResponseWriter) WriteHeader(status int) { r.status = status }
-
-func (r *probeResponseWriter) Write(payload []byte) (int, error) {
-	return r.body.Write(payload)
-}
 
 func (r *statusRecorder) WriteHeader(status int) {
 	r.status = status
@@ -526,6 +522,12 @@ func routeResponseIsValid(payload []byte) bool {
 		response.ContractVersion == "pairling-runtime-v1" &&
 		response.Runtime.Verified &&
 		response.Runtime.ContractVersion == "pairling-runtime-v1"
+}
+
+// RouteResponseIsValid validates the bounded semantic route proof returned by
+// pairlingd's same-UID control socket.
+func RouteResponseIsValid(payload []byte) bool {
+	return routeResponseIsValid(payload)
 }
 
 func supportedMethod(method string) bool {
@@ -628,6 +630,9 @@ func (h *Handler) requestBodyLimit(method, path string) int64 {
 }
 
 func (h *Handler) rateLimitPath(method, path string) bool {
+	if h.mode == ExposureModeSSH {
+		return true
+	}
 	return method == http.MethodPost && isPrePairClaimPath(path) && (h.mode == ExposureModePrePair || h.mode == ExposureModePairlingConnect || h.mode == ExposureModeFunnelBootstrap)
 }
 
@@ -736,7 +741,7 @@ func dynamicGETPath(path string) bool {
 }
 
 func dynamicPOSTPath(path string) bool {
-	return pickerMCPRestartPath(path) || orchestrationStopPath(path) || pairDropAttachPath(path) || pairDropUploadCompletePath(path) || raceFinishPath(path)
+	return orchestrationStopPath(path) || pairDropAttachPath(path) || pairDropUploadCompletePath(path) || raceFinishPath(path)
 }
 
 func dynamicPUTPath(path string) bool {
@@ -778,10 +783,6 @@ func postureItemPath(path string) bool {
 
 func sessionExportPath(path string) bool {
 	return strings.HasPrefix(path, "/sessions/") && strings.HasSuffix(path, "/export")
-}
-
-func pickerMCPRestartPath(path string) bool {
-	return strings.HasPrefix(path, "/pickers/mcp/") && strings.HasSuffix(path, "/restart")
 }
 
 func pairDropFileItemPath(path string) bool {

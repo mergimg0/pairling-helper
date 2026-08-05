@@ -55,6 +55,7 @@ import errno
 import fcntl
 import hashlib
 import html
+import ipaddress
 import json
 import math
 import os
@@ -64,7 +65,10 @@ import secrets
 import shlex
 import signal
 import socket
+import socketserver
 import sqlite3
+import stat
+import struct
 import subprocess
 import sys
 import traceback
@@ -74,6 +78,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import MappingProxyType
 from urllib.parse import urlparse, parse_qs, quote, unquote
+from pairling_assurance_policy import relay_claims_required
+from public_diagnostics import redact_public_diagnostic, redact_public_text
+from safe_filesystem import (
+    UnsafeFilesystemPath,
+    authorize_path,
+    ensure_directory_fd,
+    open_child_directory_fd,
+    open_child_regular_file_fd,
+    open_directory_fd,
+    open_regular_file_fd,
+)
 
 _DAEMON_SCRIPT_PATH = Path(__file__).resolve()
 
@@ -95,10 +110,11 @@ try:
         TAILSCALE_VARIANT as RUNTIME_TAILSCALE_VARIANT,
     )
     from runtime_paths import app_support_root, devices_db_path, pairdrop_root
-    from pairling_devices import DeviceAuthResult, DeviceRegistry
+    from pairling_devices import DeviceAuthResult, DeviceRegistry, DeviceRegistryError
     from pairling_connectd_status import (
         advertised_pairling_connect_routes,
         fetch_connectd_status,
+        open_connectd_auth,
         redacted_connectd_summary,
     )
     from pairling_pairing import (
@@ -133,6 +149,7 @@ except Exception:
     DeviceRegistry = None
     advertised_pairling_connect_routes = None
     fetch_connectd_status = None
+    open_connectd_auth = None
     redacted_connectd_summary = None
     DEFAULT_PAIR_TTL_SECONDS = 180
     DEFAULT_SMOKE_LEASE_TTL_SECONDS = 600
@@ -161,26 +178,75 @@ except Exception:
     ComposeRecordingStore = None
     ComposeRecordingStoreError = ValueError
 
+PUBLIC_RUNTIME_FIELDS = (
+    "name",
+    "runtime_version",
+    "source_revision",
+    "contract_version",
+    "compat_mode",
+    "launchd_label",
+    "port",
+    "tailscale_variant",
+    "verified",
+)
+
+
+def _public_runtime_info(info: dict) -> dict:
+    """Project runtime metadata without relying on optional runtime helpers."""
+    if not isinstance(info, dict):
+        raise TypeError("runtime metadata must be an object")
+    projected = {
+        "name": info.get("name") or RUNTIME_NAME,
+        "runtime_version": info.get("runtime_version"),
+        "source_revision": info.get("source_revision"),
+        "contract_version": (
+            info.get("contract_version") or RUNTIME_CONTRACT_VERSION
+        ),
+        "compat_mode": info.get("compat_mode") or "pairling-v1",
+        "launchd_label": info.get("launchd_label") or RUNTIME_DAEMON_LABEL,
+        "port": info.get("port") or PORT,
+        "tailscale_variant": (
+            info.get("tailscale_variant") or RUNTIME_TAILSCALE_VARIANT
+        ),
+        "verified": bool(info.get("verified")),
+    }
+    return {field: projected[field] for field in PUBLIC_RUNTIME_FIELDS}
+
+
+
 try:
     from runtime_manifest import (
         build_manifest_payload as _build_manifest_payload,
         build_runtime_info as _build_runtime_info,
         classify_ptybroker_identity as _classify_ptybroker_identity,
         ptybroker_payload_sha256 as _ptybroker_payload_sha256,
-        public_runtime_info as _public_runtime_info,
     )
 except Exception:
     _build_manifest_payload = None
     _build_runtime_info = None
     _classify_ptybroker_identity = None
     _ptybroker_payload_sha256 = None
-    _public_runtime_info = None
 
+_RELAY_CLAIM_VERIFIER_IMPORT_ERROR: Exception | None = None
 try:
-    from pairling_relay_claims import RelayClaimVerifier, relay_claims_required
-except Exception:
+    from pairling_relay_claims import RelayClaimVerifier
+except Exception as exc:
+    _RELAY_CLAIM_VERIFIER_IMPORT_ERROR = exc
     RelayClaimVerifier = None
-    relay_claims_required = None
+
+
+def _initialize_relay_claim_verifier(verifier_type, pairing_store):
+    if verifier_type is None:
+        return None, _RELAY_CLAIM_VERIFIER_IMPORT_ERROR
+    if pairing_store is None:
+        return None, None
+    try:
+        return (
+            verifier_type.from_environment(mac_install_id=pairing_store.install_id),
+            None,
+        )
+    except Exception as exc:
+        return None, exc
 
 try:
     from push_dispatcher import PairlingPushDispatcher, PushDispatcherError
@@ -347,7 +413,32 @@ except Exception:
     SentinelNotificationError = None
 
 try:
-    from providers.base import provider_detail_payload, provider_snapshot_payload
+    from managed_provider_sessions import (
+        ManagedProviderDriverUnavailable as _ManagedProviderDriverUnavailable,
+        ManagedProviderAuthUnavailable as _ManagedProviderAuthUnavailable,
+        ManagedProviderProfileStale as _ManagedProviderProfileStale,
+        ManagedProviderVersionUnavailable as _ManagedProviderVersionUnavailable,
+        ManagedProviderSessionCollision as _ManagedProviderSessionCollision,
+        ManagedProviderSessionManager as _ManagedProviderSessionManager,
+        ManagedProviderSessionStore as _ManagedProviderSessionStore,
+        managed_provider_launch_profile as _managed_provider_launch_profile,
+    )
+except Exception:
+    _ManagedProviderDriverUnavailable = RuntimeError
+    _ManagedProviderAuthUnavailable = RuntimeError
+    _ManagedProviderProfileStale = RuntimeError
+    _ManagedProviderVersionUnavailable = RuntimeError
+    _ManagedProviderSessionCollision = RuntimeError
+    _ManagedProviderSessionManager = None
+    _ManagedProviderSessionStore = None
+    _managed_provider_launch_profile = None
+
+try:
+    from providers.base import (
+        TerminalLaunchProfile as _TerminalLaunchProfile,
+        provider_detail_payload,
+        provider_snapshot_payload,
+    )
     from providers.registry import (
         known_provider_ids as _provider_known_ids,
         provider_descriptors as _provider_registry_descriptors,
@@ -369,6 +460,7 @@ try:
 except Exception:
     provider_detail_payload = None
     provider_snapshot_payload = None
+    _TerminalLaunchProfile = None
     _provider_known_ids = None
     _provider_registry_descriptors = None
     _provider_registry_ids = None
@@ -381,6 +473,41 @@ except Exception:
     _catalog_annotate_first_seen = None
     _pending_review_collect = None
     _KeepAwakeManager = None
+
+try:
+    from providers.controls import (
+        ControlContractError as _ProviderControlContractError,
+        OperationResultStatus as _ProviderOperationResultStatus,
+        ProviderControlBinding as _ProviderControlBinding,
+        ProviderOperationCorrelation as _ProviderOperationCorrelation,
+        execute_provider_operation as _execute_provider_operation,
+        recover_provider_operation as _recover_provider_operation,
+        provider_control_status_payload as _provider_control_status_payload,
+        validated_driver_snapshot as _validated_driver_snapshot,
+    )
+    from providers.operations import (
+        REVIEWED_OPERATION_CATALOG as _REVIEWED_OPERATION_CATALOG,
+        Risk as _ProviderOperationRisk,
+        operation_manifest_payload as _provider_operation_manifest_payload,
+    )
+    from providers.registry import (
+        get_control_driver as _provider_get_control_driver,
+        get_provider as _provider_get_adapter,
+    )
+except Exception:
+    _ProviderControlContractError = ValueError
+    _ProviderOperationResultStatus = None
+    _ProviderControlBinding = None
+    _ProviderOperationCorrelation = None
+    _execute_provider_operation = None
+    _recover_provider_operation = None
+    _provider_control_status_payload = None
+    _validated_driver_snapshot = None
+    _REVIEWED_OPERATION_CATALOG = None
+    _ProviderOperationRisk = None
+    _provider_operation_manifest_payload = None
+    _provider_get_control_driver = None
+    _provider_get_adapter = None
 
 import postures
 
@@ -419,9 +546,13 @@ DEFAULT_COORDINATOR_HOST = (
     or "pairling-mac"
 )
 LEGACY_TOKEN_FILE = HOME / LEGACY_TOKEN_RELATIVE_PATH
-PROJECTS_DIR = HOME / ".claude" / "projects" / re.sub(r"[/._]", "-", str(HOME))
+CLAUDE_PROJECTS_DIR = HOME / ".claude" / "projects"
+PROJECTS_DIR = CLAUDE_PROJECTS_DIR / re.sub(r"[/._]", "-", str(HOME))
 QUEUE_DIR = HOME / ".claude" / "hooks" / "queue"
 COMPANION_DIR = HOME / ".claude" / "companion"
+CONTROL_SOCKET_PATH = Path(
+    os.environ.get("PAIRLING_CONTROL_SOCKET", str(COMPANION_DIR / "control.sock"))
+).expanduser()
 ORCHESTRATIONS_ROUTE = "/orchestrations"
 ORCHESTRATIONS_DIR = COMPANION_DIR / "orchestrations"
 HANDOFFS_DIR = COMPANION_DIR / "handoffs"
@@ -454,6 +585,14 @@ _SESSION_FILE_WATCHER = None
 _SESSION_FILE_WATCHER_LOCK = threading.Lock()
 _BROKER_OUTPUT_LISTENER = None
 _BROKER_OUTPUT_LISTENER_LOCK = threading.Lock()
+
+MANAGED_PROVIDER_SESSION_DB = COMPANION_DIR / "managed-provider-sessions.sqlite"
+MANAGED_PROVIDER_SESSION_STORE = None
+MANAGED_PROVIDER_SESSION_MANAGER = None
+# Private aliases remain injectable for focused daemon tests.
+_MANAGED_PROVIDER_SESSION_STORE = None
+_MANAGED_PROVIDER_SESSION_MANAGER = None
+_MANAGED_PROVIDER_SESSION_LOCK = threading.RLock()
 
 
 def _ensure_session_file_watcher():
@@ -621,6 +760,620 @@ def _ensure_session_log_ingestor():
                 normalize_codex=lambda data, native_id: _normalize_codex_ndjson(data, native_id, include_event_fallback=False),
             )
         return _SESSION_LOG_INGESTOR
+
+def _managed_event_publisher(session_id: str, event: dict) -> None:
+    if SESSION_EVENT_HUB is None:
+        return
+    payload = {
+        "type": "managed_provider_event",
+        "session_id": session_id,
+        "seq": int(event.get("seq") or 0),
+        "kind": event.get("kind"),
+    }
+    for topic in (
+        f"log:{session_id}",
+        f"transcript:{session_id}",
+        f"turn:{session_id}",
+        SESSION_SUMMARIES_TOPIC,
+    ):
+        SESSION_EVENT_HUB.publish(topic, payload)
+
+
+def _ambient_session_identity_exists(session_id: str) -> bool:
+    provider, native_id = _parse_agent_session_ref(session_id)
+    if not native_id:
+        return False
+    try:
+        if _agent_registry_get(provider, native_id) is not None:
+            return True
+    except Exception:
+        # Collision checks fail closed when the ambient registry is unreadable.
+        return True
+    try:
+        broker = PTY_BROKER.get(_qualified_session_id(provider, native_id)) if PTY_BROKER else None
+        if broker is not None:
+            return True
+    except Exception:
+        return True
+    return False
+
+
+def _structured_provider_control_driver(provider: str, binding_id: str):
+    """Resolve one driver through its adapter's explicit launch contract."""
+    try:
+        from providers.controls import ProviderControlBinding
+        from providers.registry import get_control_driver, get_provider
+
+        adapter = get_provider(provider, home=HOME)
+        if adapter is None:
+            raise _ManagedProviderDriverUnavailable(
+                f"{provider} has no structured provider adapter"
+            )
+        descriptor = getattr(adapter, "descriptor", None)
+        contract = getattr(descriptor, "managed_launch", None)
+        if contract is None:
+            raise _ManagedProviderDriverUnavailable(
+                f"{provider} has no reviewed managed-launch contract"
+            )
+        probe = adapter.probe()
+        availability = probe.availability
+        diagnostics = probe.diagnostics
+        if str(getattr(availability, "provider_id", "") or "") != provider:
+            raise _ManagedProviderDriverUnavailable(
+                f"{provider} probe returned a different provider identity"
+            )
+        setup = contract.setup_diagnostic(
+            availability,
+            version=getattr(diagnostics, "version", None),
+        )
+        if setup is not None:
+            message = f"{provider}: {setup.message}"
+            if setup.category == "version":
+                raise _ManagedProviderVersionUnavailable(message)
+            if setup.category == "authentication":
+                raise _ManagedProviderAuthUnavailable(message)
+            if setup.category == "configuration":
+                raise _ManagedProviderProfileStale(message)
+            raise _ManagedProviderDriverUnavailable(message)
+        binding = ProviderControlBinding(
+            provider_id=provider,
+            provider_version=str(diagnostics.version),
+            provider_channel=contract.control_channel,
+            binding_id=binding_id,
+        )
+        driver = get_control_driver(binding, home=HOME)
+        if driver is None:
+            raise _ManagedProviderDriverUnavailable(
+                f"{provider} has no reviewed structured control driver"
+            )
+        if getattr(driver, "binding", None) != binding:
+            raise _ManagedProviderDriverUnavailable(
+                f"{provider} returned a binding-mismatched control driver"
+            )
+        if getattr(driver, "safe_launch_profile", True) is False:
+            raise _ManagedProviderProfileStale(
+                f"{provider} managed launch profile is stale"
+            )
+        if contract.require_post_launch_verification:
+            verify_launch = getattr(driver, "verify_managed_launch", None)
+            if not callable(verify_launch):
+                raise _ManagedProviderProfileStale(
+                    f"{provider} managed launch verification is unavailable"
+                )
+            safe_profile = getattr(driver, "safe_launch_profile", None)
+            provider_profile = getattr(driver, "profile", None)
+            safe_profile_reviewed = (
+                isinstance(safe_profile, dict)
+                and safe_profile.get("reviewed") is True
+                and safe_profile.get("provider_id") == provider
+            )
+            profile_digest = getattr(provider_profile, "safe_launch_digest", None)
+            acp_profile_reviewed = (
+                isinstance(profile_digest, str)
+                and re.fullmatch(r"[a-f0-9]{64}", profile_digest) is not None
+            )
+            if not safe_profile_reviewed and not acp_profile_reviewed:
+                raise _ManagedProviderProfileStale(
+                    f"{provider} managed launch proof is not reviewed"
+                )
+        return driver
+    except _ManagedProviderDriverUnavailable:
+        raise
+    except Exception as exc:
+        raise _ManagedProviderDriverUnavailable(
+            f"{provider} structured driver resolution failed"
+        ) from exc
+
+
+def _provider_spawn_contract(
+    probe_result,
+) -> tuple[list[str], list[dict], list[dict]]:
+    """Return exact advertised backends, profiles, and typed setup diagnostics."""
+    availability = getattr(probe_result, "availability", None)
+    descriptor = getattr(probe_result, "descriptor", None)
+    provider = str(getattr(availability, "provider_id", "") or "")
+    backends: list[str] = []
+    profiles: list[dict] = []
+    setup_diagnostics: list[dict] = []
+    terminal_contract = getattr(descriptor, "terminal_launch", None)
+    if (
+        provider
+        and bool(getattr(availability, "launchable", False))
+        and provider in _agent_provider_ids()
+        and terminal_contract is not None
+    ):
+        backends.extend(terminal_contract.backends)
+    managed_contract = getattr(descriptor, "managed_launch", None)
+    if managed_contract is None:
+        return backends, profiles, setup_diagnostics
+    driver = None
+    try:
+        driver = _structured_provider_control_driver(
+            provider,
+            "availability_" + secrets.token_hex(16),
+        )
+        if not callable(getattr(driver, "launch_session", None)):
+            raise _ManagedProviderDriverUnavailable(
+                f"{provider} has no reviewed structured launch method"
+            )
+        if _managed_provider_launch_profile is None:
+            raise _ManagedProviderProfileStale(
+                f"{provider} managed profile builder is unavailable"
+            )
+        profile = _managed_provider_launch_profile(
+            driver,
+            provider,
+            display_name=str(
+                getattr(availability, "display_name", "") or provider
+            ),
+        )
+        profiles.append(profile)
+        backends.append("managed_provider")
+    except _ManagedProviderDriverUnavailable as exc:
+        code = str(
+            getattr(exc, "code", None) or "managed_provider_unavailable"
+        )
+        category = {
+            "managed_provider_auth_unavailable": "authentication",
+            "managed_provider_version_unavailable": "version",
+            "managed_provider_profile_stale": "configuration",
+        }.get(code, "availability")
+        setup_diagnostics.append(
+            {
+                "code": code,
+                "category": category,
+                "message": (
+                    "Managed launch is unavailable until this provider's "
+                    "reviewed setup contract is satisfied."
+                ),
+                "setup_actions": list(
+                    getattr(availability, "setup_actions", ()) or ()
+                ),
+            }
+        )
+    except Exception:
+        setup_diagnostics.append(
+            {
+                "code": "managed_provider_unavailable",
+                "category": "availability",
+                "message": (
+                    "Managed launch is unavailable because its reviewed "
+                    "profile could not be constructed."
+                ),
+                "setup_actions": list(
+                    getattr(availability, "setup_actions", ()) or ()
+                ),
+            }
+        )
+    finally:
+        if driver is not None:
+            try:
+                driver.close()
+            except Exception:
+                pass
+    return backends, profiles, setup_diagnostics
+
+
+def _reviewed_terminal_launch_contract(provider: str):
+    if _provider_registry_descriptors is None:
+        return None
+    try:
+        descriptors = _provider_registry_descriptors()
+    except Exception:
+        return None
+    matches = [
+        descriptor
+        for descriptor in descriptors
+        if str(getattr(descriptor, "provider_id", "") or "") == provider
+    ]
+    if len(matches) != 1:
+        return None
+    return getattr(matches[0], "terminal_launch", None)
+
+
+def _reviewed_provider_launch_command(
+    provider: str,
+    project: str,
+    backend: str,
+) -> tuple[str, bool]:
+    """Build one exact reviewed legacy command without a provider fallback."""
+    contract = _reviewed_terminal_launch_contract(provider)
+    if contract is None or backend not in contract.backends:
+        raise ValueError("provider has no reviewed command for this spawn backend")
+    profile = contract.profile
+    if profile is _TerminalLaunchProfile.CODEX_WORKSPACE:
+        command = (
+            f"exec codex -c check_for_update_on_startup=false "
+            f"-C {shlex.quote(project)} --add-dir {shlex.quote(project)}"
+            if backend == "broker"
+            else (
+                f"cd {shlex.quote(project)} && exec codex "
+                f"-C {shlex.quote(project)} --add-dir {shlex.quote(project)}"
+            )
+        )
+        return command, backend == "terminal_app"
+    if profile is _TerminalLaunchProfile.CLAUDE_PHONE:
+        command = _direct_claude_phone_command()
+        if not command:
+            raise ValueError("reviewed Claude launch command is unavailable")
+        if backend == "terminal_app":
+            command = f"cd {shlex.quote(project)} && {command}"
+        return command, False
+    raise ValueError("provider launch profile is not implemented")
+
+
+def _recover_managed_provider_fork(reservation: dict):
+    """Recover a prepared fork only through the central exact-proof contract."""
+    if (
+        _recover_provider_operation is None
+        or _ProviderOperationCorrelation is None
+        or not isinstance(reservation, dict)
+    ):
+        return None
+    manager = MANAGED_PROVIDER_SESSION_MANAGER
+    store = MANAGED_PROVIDER_SESSION_STORE
+    parent_session_id = str(
+        reservation.get("parent_session_id") or ""
+    )
+    if manager is None or store is None or not parent_session_id:
+        return None
+    driver = manager.driver(parent_session_id)
+    truth = store.session_truth(parent_session_id)
+    if driver is None or not isinstance(truth, dict):
+        return None
+    if (
+        truth.get("binding_id") != reservation.get("parent_binding_id")
+        or truth.get("capability_generation")
+        != reservation.get("parent_capability_generation")
+        or truth.get("session_instance_id")
+        != reservation.get("parent_session_instance_id")
+        or truth.get("provider_id") != reservation.get("provider")
+        or truth.get("provider_version")
+        != reservation.get("provider_version")
+        or truth.get("provider_channel")
+        != reservation.get("provider_channel")
+        or truth.get("provider_profile_id")
+        != reservation.get("provider_profile_id")
+    ):
+        return None
+    provider_operation_id = str(
+        reservation.get("provider_operation_id") or ""
+    )
+    if not provider_operation_id:
+        return None
+    correlation = _ProviderOperationCorrelation(
+        provider_operation_id=provider_operation_id,
+        provider_cursor=reservation.get("provider_cursor"),
+    )
+    return _recover_provider_operation(
+        driver,
+        operation_id="session.fork",
+        binding_id=str(reservation["parent_binding_id"]),
+        capability_generation=int(
+            reservation["parent_capability_generation"]
+        ),
+        session_id=parent_session_id,
+        client_action_id=str(reservation["client_action_id"]),
+        provider_correlation=correlation,
+        session_truth=truth,
+    )
+
+
+def _ensure_managed_provider_session_store():
+    global MANAGED_PROVIDER_SESSION_STORE, _MANAGED_PROVIDER_SESSION_STORE
+    injected = _MANAGED_PROVIDER_SESSION_STORE
+    if injected is not None:
+        return injected
+    if MANAGED_PROVIDER_SESSION_STORE is not None:
+        return MANAGED_PROVIDER_SESSION_STORE
+    if _ManagedProviderSessionStore is None:
+        return None
+    with _MANAGED_PROVIDER_SESSION_LOCK:
+        if MANAGED_PROVIDER_SESSION_STORE is None:
+            MANAGED_PROVIDER_SESSION_STORE = _ManagedProviderSessionStore(
+                MANAGED_PROVIDER_SESSION_DB
+            )
+        _MANAGED_PROVIDER_SESSION_STORE = MANAGED_PROVIDER_SESSION_STORE
+        return MANAGED_PROVIDER_SESSION_STORE
+
+
+def _ensure_managed_provider_session_manager():
+    global MANAGED_PROVIDER_SESSION_MANAGER, _MANAGED_PROVIDER_SESSION_MANAGER
+    injected = _MANAGED_PROVIDER_SESSION_MANAGER
+    if injected is not None:
+        return injected
+    if MANAGED_PROVIDER_SESSION_MANAGER is not None:
+        return MANAGED_PROVIDER_SESSION_MANAGER
+    store = _ensure_managed_provider_session_store()
+    if store is None or _ManagedProviderSessionManager is None:
+        return None
+    with _MANAGED_PROVIDER_SESSION_LOCK:
+        if MANAGED_PROVIDER_SESSION_MANAGER is None:
+            manager = _ManagedProviderSessionManager(
+                store,
+                driver_factory=_structured_provider_control_driver,
+                ambient_identity_exists=_ambient_session_identity_exists,
+                event_publisher=_managed_event_publisher,
+                fork_recovery=_recover_managed_provider_fork,
+            )
+            MANAGED_PROVIDER_SESSION_MANAGER = manager
+            _MANAGED_PROVIDER_SESSION_MANAGER = manager
+            manager.reconcile()
+        _MANAGED_PROVIDER_SESSION_MANAGER = MANAGED_PROVIDER_SESSION_MANAGER
+        return MANAGED_PROVIDER_SESSION_MANAGER
+
+
+def _managed_session_rows(
+    *,
+    provider_filter: str = "all",
+    live_only: bool = False,
+    active_within_min: int | None = None,
+    limit: int = 500,
+) -> list[dict]:
+    manager = _ensure_managed_provider_session_manager()
+    if manager is None:
+        return []
+    try:
+        return manager.list_rows(
+            provider=provider_filter,
+            live_only=live_only,
+            active_within_min=active_within_min,
+            limit=limit,
+            poll_live=True,
+        )
+    except Exception:
+        return []
+
+
+def _merge_managed_session_rows(
+    ambient_rows: list[dict], managed_rows: list[dict]
+) -> list[dict]:
+    """Merge without allowing a managed record to commandeer ambient truth."""
+    merged = list(ambient_rows)
+    owned_ids = {
+        str(row.get("id") or _qualified_session_id(
+            str(row.get("provider") or "claude"),
+            str(row.get("native_id") or row.get("id") or ""),
+        ))
+        for row in ambient_rows
+    }
+    store = _ensure_managed_provider_session_store()
+    for row in managed_rows:
+        session_id = str(row.get("id") or row.get("session_id") or "")
+        if not session_id or session_id in owned_ids:
+            if session_id and store is not None:
+                try:
+                    store.mark_driver_unavailable(
+                        session_id,
+                        reason="ambient session owns this provider identity",
+                    )
+                except Exception:
+                    pass
+            continue
+        merged.append(row)
+        owned_ids.add(session_id)
+    return merged
+
+
+def _managed_transcript_ndjson(
+    session_id: str, *, since: int = 0, limit: int = 500
+) -> tuple[bytes, int, int]:
+    store = _ensure_managed_provider_session_store()
+    if store is None or store.get(session_id) is None:
+        return b"", max(0, int(since)), 0
+    manager = _ensure_managed_provider_session_manager()
+    if manager is not None:
+        manager.poll(session_id)
+    rows = store.history(
+        session_id,
+        since_seq=max(0, int(since)),
+        limit=max(1, min(int(limit), 1000)),
+    )
+    lines = [
+        json.dumps(
+            {
+                "schema_version": 1,
+                "session_id": session_id,
+                **row,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        for row in rows
+    ]
+    next_since = int(rows[-1]["seq"]) if rows else max(0, int(since))
+    return b"".join(lines), next_since, store.last_seq(session_id)
+
+
+def _managed_session_events_v2_page(
+    session_id: str, *, since_seq: int = 0, limit: int = 200
+) -> dict:
+    store = _ensure_managed_provider_session_store()
+    row = store.get(session_id) if store is not None else None
+    if row is None:
+        raise KeyError(session_id)
+    manager = _ensure_managed_provider_session_manager()
+    if manager is not None:
+        manager.poll(session_id)
+    events = store.history(
+        session_id,
+        since_seq=max(0, int(since_seq)),
+        limit=max(1, min(int(limit), SESSION_EVENTS_V2_PAGE_MAX_ROWS)),
+    )
+    wire_rows = []
+    for event in events:
+        payload = dict(event.get("payload") or {})
+        metadata = dict(event.get("metadata") or {})
+        if metadata:
+            payload["provider_metadata"] = metadata
+        wire_rows.append(_session_event_v2_wire_row(session_id, {
+            "seq": int(event["seq"]),
+            "kind": event["kind"],
+            "payload": payload,
+            "ingested_at": float(event["observed_at"]),
+            "raw": None,
+        }))
+    last_seq = store.last_seq(session_id)
+    return {
+        "schema_version": SESSION_EVENTS_V2_SCHEMA_VERSION,
+        "session_key": session_id,
+        "events": wire_rows,
+        "last_seq": last_seq,
+        "generation": int(row["capability_generation"]),
+        "first_seq": wire_rows[0]["seq"] if wire_rows else None,
+        "has_more_before": bool(wire_rows and wire_rows[0]["seq"] > 1),
+        "page_limited_by_bytes": False,
+        "page_limited_by_source_bytes": False,
+        "source_bytes": sum(_wire_json_size(item) for item in wire_rows),
+    }
+
+
+def _managed_session_runtime_truth(
+    session_id: str, expected_source_revision: str | None = None
+) -> dict | None:
+    store = _ensure_managed_provider_session_store()
+    row = store.get(session_id) if store is not None else None
+    if row is None:
+        return None
+    manager = _ensure_managed_provider_session_manager()
+    if manager is not None:
+        manager.poll(session_id)
+        row = store.get(session_id) or row
+    provider = str(row["provider"])
+    native_id = str(row["native_id"])
+    controllable = row.get("control_state") == "controllable"
+    readable_state = str(row.get("readable_state") or "stale")
+    last_seen_at = float(row.get("updated_at") or row.get("last_heartbeat") or 0)
+    stream = {
+        "byte_stream_available": False,
+        "surface_stream_available": False,
+        "transcript_stream_available": True,
+        "source": "managed_provider_events",
+        "backend": "normalized_events",
+        "can_control": controllable,
+        "can_send_text": controllable,
+        "can_interrupt": controllable,
+        "can_terminate": controllable,
+        "fallback_reason": row.get("blocked_reason"),
+    }
+    terminal = {
+        "state": "not_applicable",
+        "backend": "none",
+        "selected_surface": "none",
+        "surface_agreement": "not_applicable",
+        "v1": None,
+        "v2": None,
+        "pending_input": None,
+        "pending_input_detection": {
+            "status": "not_applicable",
+            "parser_version": None,
+            "surface": "managed_provider_events",
+            "confidence": None,
+            "reason": "structured provider sessions have no terminal surface",
+        },
+        "stream": stream,
+        "user_message": row.get("working_on") or "Structured provider session",
+    }
+    blocked_reason = row.get("blocked_reason")
+    control = {
+        "state": "eligible" if controllable else "read_only",
+        "basis_surface": "managed_provider_events",
+        "schema_version": 1,
+        "screen_hash": None,
+        "nonce": None,
+        "generation": int(row["capability_generation"]),
+        "visible_surface_matches_control_basis": controllable,
+        "blocked_reason": blocked_reason,
+        "supported_actions": ["provider_control"] if controllable else [],
+    }
+    registry = {
+        "state": row.get("turn_state"),
+        "readable_state": readable_state,
+        "control_state": row.get("control_state"),
+        "working_on": row.get("working_on"),
+        "stale_seconds": max(0, int(_time.time() - last_seen_at)) if last_seen_at else 0,
+        "source_freshness": (
+            "managed_driver_live" if controllable else "managed_driver_unavailable"
+        ),
+        "last_seen_at": last_seen_at or None,
+        "project": row.get("project"),
+        "binding_id": row.get("binding_id"),
+        "capability_generation": int(row["capability_generation"]),
+        "session_instance_id": row.get("session_instance_id"),
+    }
+    return {
+        "schema_version": 1,
+        "session_id": session_id,
+        "provider": provider,
+        "native_id": native_id,
+        "project": row.get("project"),
+        "checked_at": _time.time(),
+        "runtime": _runtime_freshness_truth(
+            expected_source_revision=expected_source_revision
+        ),
+        "registry": registry,
+        "process": {
+            "state": "driver_owned" if controllable else "driver_unavailable",
+            "source": "managed_provider_session_store",
+            "identity_verified": controllable,
+            "session_instance_id": registry["session_instance_id"],
+        },
+        "turn": {
+            "state": row.get("turn_state"),
+            "source": "managed_provider_events",
+            "observed_at": last_seen_at or None,
+            "age_seconds": max(0, _time.time() - last_seen_at) if last_seen_at else None,
+            "reconciled_role": "primary",
+        },
+        "transcript": {
+            "state": "archived" if readable_state == "closed" else "live",
+            "http_status": 200,
+            "reason": None,
+            "durable": True,
+            "searchable": True,
+            "latest_offset": store.last_seq(session_id),
+            "path": None,
+            "source": "managed_provider_events",
+            "user_message": None,
+        },
+        "terminal": terminal,
+        "stream": stream,
+        "control": control,
+        "summary": {
+            "primary_label": row.get("working_on") or "Structured provider session",
+            "secondary_label": blocked_reason or "",
+            "tone": "normal" if controllable else "muted",
+            "requires_attention": row.get("turn_state") == "blocked",
+            "blocks_control": not controllable,
+            "selected_surface": "none",
+            "degradation_codes": (
+                [] if controllable else ["provider_driver_unavailable"]
+            ),
+            "contradiction_codes": [],
+        },
+        "contradictions": [],
+        "degradations": [],
+    }
 
 
 def _truncate_utf8(text: str, limit: int) -> str:
@@ -1161,11 +1914,11 @@ PAIRING_STORE = (
 REAUTH_STORE = ReauthStore(DEVICE_REGISTRY) if ReauthStore and DEVICE_REGISTRY else None
 _PAIRDROP_STORE_SINGLETON = None
 _PAIRDROP_STORE_SINGLETON_LOCK = threading.Lock()
-RELAY_CLAIM_VERIFIER = (
-    RelayClaimVerifier.from_environment(mac_install_id=PAIRING_STORE.install_id)
-    if RelayClaimVerifier and PAIRING_STORE
-    else None
-)
+(
+    RELAY_CLAIM_VERIFIER,
+    RELAY_CLAIM_VERIFIER_ERROR,
+) = _initialize_relay_claim_verifier(RelayClaimVerifier, PAIRING_STORE)
+
 SAFETY_MONITOR = SafetyMonitorBridge(APP_SUPPORT_ROOT, HOME) if SafetyMonitorBridge else None
 PUSH_DISPATCHER = (
     PairlingPushDispatcher(APP_SUPPORT_ROOT / "push-devices.json")
@@ -1835,11 +2588,17 @@ def _broker_raw_log_path(session) -> Path | None:
         return Path(str(raw))
     return None
 
+def _ensure_handoff_storage_directory() -> None:
+    """Create handoff storage without following any path component symlink."""
+    for path in (COMPANION_DIR, HANDOFFS_DIR):
+        directory_fd = ensure_directory_fd(path, root=HOME, mode=0o700)
+        os.close(directory_fd)
+
+
 QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 ORCHESTRATIONS_DIR.mkdir(parents=True, exist_ok=True)
-HANDOFFS_DIR.mkdir(parents=True, exist_ok=True)
+_ensure_handoff_storage_directory()
 ORCHESTRATIONS_DIR.chmod(0o700)
-HANDOFFS_DIR.chmod(0o700)
 CROSS_PROVIDER_DIR.mkdir(parents=True, exist_ok=True)
 TURN_STATE_DIR.mkdir(parents=True, exist_ok=True)
 TERMINAL_CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
@@ -2458,13 +3217,20 @@ class _RuntimeAdmission:
             pass
         self._released = True
 
-PUBLIC_ENDPOINTS = {"/health", "/healthz", "/readyz", "/manifest", "/power-state", "/pair/start", "/pair/psk-claim-v2", "/pair/psk-activate", "/pair/reauth-challenge", "/pair/reauth-claim"}
+PUBLIC_ENDPOINTS = {"/health", "/healthz", "/readyz", "/manifest", "/power-state", "/pair/psk-claim-v2", "/pair/psk-activate", "/pair/reauth-challenge", "/pair/reauth-claim"}
+
+LOCAL_CONTROL_PATHS = {
+    "/pair/start",
+    "/connect/auth/open",
+    "/routez",
+}
 
 # Internal hook tier: loopback-only endpoints used by Claude Code hooks to
 # write the session registry without device pairing. Gated by client IP AND
 # the shared-secret token file the daemon mints at boot — these never count
 # toward (or weaken) device Bearer auth.
 INTERNAL_LOOPBACK_PATHS = {
+    "/pair/start",
     "/internal/session-register",
     "/internal/session-heartbeat",
     "/internal/session-close",
@@ -2597,6 +3363,13 @@ def _discard_session_ready_event(session_id: str) -> None:
     with _SESSION_READY_EVENTS_LOCK:
         _SESSION_READY_EVENTS.pop(session_id, None)
 
+READ_ONLY_PICKER_ENDPOINTS = frozenset({
+    "/pickers/permissions",
+    "/pickers/hooks",
+    "/pickers/memory",
+})
+
+
 POST_ONLY_ENDPOINTS = {
     "/pair/start",
     "/pair/psk-claim-v2",
@@ -2628,11 +3401,10 @@ POST_ONLY_ENDPOINTS = {
     "/spawn-session",
     "/mirror/flush",
     "/mirror/resume",
-    "/resume-session",
-    "/cross-provider-action",
     "/compose/recordings/sync",
     "/send-text",
     "/terminal-control",
+    "/provider-controls/execute",
     "/terminal-input",
     "/push/permission/allow",
     "/push/permission/deny",
@@ -2674,11 +3446,10 @@ HIGH_RISK_ENDPOINTS = {
     "/spawn-session",
     "/mirror/flush",
     "/mirror/resume",
-    "/resume-session",
-    "/cross-provider-action",
     "/compose/recordings/sync",
     "/send-text",
     "/terminal-control",
+    "/provider-controls/execute",
     "/terminal-input",
     "/sigint",
     "/sigterm",
@@ -2713,10 +3484,147 @@ PROOF_REQUIRED_ENDPOINTS = HIGH_RISK_ENDPOINTS | {
 }
 
 MAX_REQUEST_BODY_BYTES = 1_000_000
+MAX_FUNNEL_BOOTSTRAP_BODY_BYTES = 16 * 1024
 MAX_COMPOSE_SYNC_BODY_BYTES = 2 * 1024 * 1024
 MAX_UPLOAD_BODY_BYTES = 100 * 1024 * 1024
 MAX_PAIRDROP_SMALL_BODY_BYTES = 10 * 1024 * 1024
 MAX_PAIRDROP_UPLOAD_CHUNK_BYTES = 1024 * 1024
+ONESTREAM_HANDOFF_MAX_STORED_BYTES = MAX_REQUEST_BODY_BYTES * 2 + 64 * 1024
+ONESTREAM_HANDOFF_MAX_RESPONSE_BYTES = ONESTREAM_HANDOFF_MAX_STORED_BYTES
+ONESTREAM_HANDOFF_MAX_PENDING = 100
+ONESTREAM_HANDOFF_MAX_DIRECTORY_SCAN = 1_000
+ONESTREAM_HANDOFF_FILENAME_RE = re.compile(r"onestream-[0-9a-f]{12}\.json")
+
+
+def _open_handoffs_directory_fd() -> int:
+    """Open the exact handoff directory through the authorized home root."""
+    return open_directory_fd(HANDOFFS_DIR, root=HOME)
+
+
+def _onestream_handoff_names(directory_fd: int) -> list[str]:
+    names: list[str] = []
+    with os.scandir(directory_fd) as entries:
+        for index, entry in enumerate(entries):
+            if index >= ONESTREAM_HANDOFF_MAX_DIRECTORY_SCAN:
+                break
+            if ONESTREAM_HANDOFF_FILENAME_RE.fullmatch(entry.name):
+                names.append(entry.name)
+    names.sort()
+    return names[:ONESTREAM_HANDOFF_MAX_PENDING]
+
+
+def _read_onestream_handoff_record(
+    directory_fd: int,
+    filename: str,
+) -> dict[str, Any] | None:
+    if ONESTREAM_HANDOFF_FILENAME_RE.fullmatch(filename) is None:
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        file_fd = os.open(filename, flags, dir_fd=directory_fd)
+    except OSError:
+        return None
+    try:
+        metadata = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size < 0
+            or metadata.st_size > ONESTREAM_HANDOFF_MAX_STORED_BYTES
+        ):
+            return None
+        chunks: list[bytes] = []
+        remaining = ONESTREAM_HANDOFF_MAX_STORED_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(file_fd, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(file_fd)
+    body = b"".join(chunks)
+    if len(body) > ONESTREAM_HANDOFF_MAX_STORED_BYTES:
+        return None
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _write_onestream_handoff_record(
+    filename: str,
+    body: bytes,
+) -> None:
+    if ONESTREAM_HANDOFF_FILENAME_RE.fullmatch(filename) is None:
+        raise ValueError("invalid handoff filename")
+    if len(body) > ONESTREAM_HANDOFF_MAX_STORED_BYTES:
+        raise ValueError("handoff record is too large")
+    directory_fd = _open_handoffs_directory_fd()
+    temporary_name = f".{filename}.{secrets.token_hex(8)}.tmp"
+    temporary_exists = False
+    lock_fd = -1
+    try:
+        lock_flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        lock_fd = os.open(
+            ".onestream-handoff.lock",
+            lock_flags,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        lock_metadata = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_metadata.st_mode):
+            raise OSError(errno.ELOOP, "unsafe handoff lock")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if len(_onestream_handoff_names(directory_fd)) >= ONESTREAM_HANDOFF_MAX_PENDING:
+            raise OSError(errno.ENOSPC, "handoff capacity exhausted")
+
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        file_fd = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+        temporary_exists = True
+        try:
+            remaining = memoryview(body)
+            while remaining:
+                written = os.write(file_fd, remaining)
+                if written <= 0:
+                    raise OSError(errno.EIO, "short handoff write")
+                remaining = remaining[written:]
+            os.fsync(file_fd)
+        finally:
+            os.close(file_fd)
+        os.replace(
+            temporary_name,
+            filename,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary_exists = False
+        os.fsync(directory_fd)
+    finally:
+        if temporary_exists:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except OSError:
+                pass
+        if lock_fd >= 0:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+        os.close(directory_fd)
+
+
 
 
 def _pairdrop_file_id_from_path(path: str) -> str | None:
@@ -2884,6 +3792,10 @@ def _required_scopes_for_request(path: str, method: str) -> set[str]:
         # Read rides the same scope as /provider-status; the toggle is a
         # settings mutation (SPEC-p1 §2.3).
         return {"health:read"} if method == "GET" else {"pair:admin"}
+    if path in {"/provider-controls/snapshot", "/provider-controls/stream"}:
+        return {"sessions:read"}
+    if path == "/provider-controls/execute":
+        return {"provider:control"}
     if path in {"/health", "/healthz", "/readyz", "/routez", "/health-stream", "/power-state", "/provider-status", "/status", "/aperture-cli/status", "/aperture-cli/providers", "/aperture-cli/launch-contexts"}:
         return {"health:read"}
     if path == "/manifest":
@@ -2911,9 +3823,9 @@ def _required_scopes_for_request(path: str, method: str) -> set[str]:
     if path == "/push/status":
         return {"health:read"}
     if path in {"/push/preferences", "/push/test", "/push/live-activity-token", "/push/live-activity-test"}:
-        return {"pair:admin"}
+        return {"push:manage"}
     if path in {"/push/permission/allow", "/push/permission/deny"}:
-        return {"session:signal"}
+        return {"approval:decide"}
     if path == "/sentinel/preferences":
         return {"worker:read"} if method == "GET" else {"pair:admin"}
     if path in {"/sentinel/status", "/sentinel/events"}:
@@ -2930,7 +3842,7 @@ def _required_scopes_for_request(path: str, method: str) -> set[str]:
         return {"session:send"}
     if path in {"/sigint", "/sigterm"}:
         return {"session:signal"}
-    if path in {"/spawn-session", "/resume-session", "/cross-provider-action"}:
+    if path == "/spawn-session":
         return {"session:spawn"}
     if path == "/onestream-handoff":
         return {"sessions:read"} if method == "GET" else {"session:spawn"}
@@ -2959,6 +3871,40 @@ def _required_scopes_for_request(path: str, method: str) -> set[str]:
     if path.startswith("/workstate") or path.startswith("/model-status") or path.startswith("/substrate"):
         return {"sessions:read"}
     return {"sessions:read"} if method == "GET" else {"pair:admin"}
+
+AUTHORIZATION_ADVERTISEMENT_CONTRACT = "pairling.authorization.v1"
+AUTHORIZATION_ADVERTISEMENT_TTL_SECONDS = 120.0
+AUTHORIZATION_CONTROL_ROUTES = {
+    "approval.decide": (
+        ("POST", "/push/permission/allow"),
+        ("POST", "/push/permission/deny"),
+    ),
+    "session.send": (("POST", "/send-text"),),
+    "session.signal": (("POST", "/sigint"),),
+    "session.spawn": (("POST", "/spawn-session"),),
+    "provider.control": (("POST", "/provider-controls/execute"),),
+    "worker.control": (("POST", "/worker-kill"),),
+    "llm.route": (("POST", "/llm-route"),),
+    "pairling-tools.run": (("POST", "/pairling-tools/run"),),
+    "phone-tools.reverse": (("POST", "/phone-tools/result"),),
+    "push.manage": (("POST", "/push/preferences"),),
+    "files.upload": (("POST", "/upload"),),
+    "files.write": (("POST", "/deepfield/observation"),),
+    "files.delete": (("DELETE", "/sessions/delete-transcript"),),
+    "pair.admin": (("POST", "/sessions/remove"),),
+}
+
+
+def _authorization_controls_for_scopes(scopes: Iterable[str]) -> list[str]:
+    granted = frozenset(str(scope) for scope in scopes)
+    return sorted(
+        control
+        for control, routes in AUTHORIZATION_CONTROL_ROUTES.items()
+        if all(
+            _required_scopes_for_request(path, method).issubset(granted)
+            for method, path in routes
+        )
+    )
 
 
 def _self_device_target(auth_result, requested_device_id) -> tuple[str | None, dict | None]:
@@ -3028,6 +3974,17 @@ def _funnel_origin_request(headers, client_address) -> bool:
 
 def _pair_claim_requires_app_attest(headers, client_address) -> bool:
     return _funnel_origin_request(headers, client_address) or not _loopback_client_address(client_address)
+
+
+def _relay_claim_assurance():
+    required = relay_claims_required()
+    if required and RELAY_CLAIM_VERIFIER is None:
+        raise PairingError(
+            "attested_claim_unavailable",
+            503,
+            "relay claim verifier unavailable",
+        ) from RELAY_CLAIM_VERIFIER_ERROR
+    return required, RELAY_CLAIM_VERIFIER
 
 
 def _connectd_peer_node_id(headers) -> str:
@@ -3220,7 +4177,6 @@ def _client_workflow_route_family(path: str) -> str | None:
     if first_segment in {
         "aperture-cli",
         "compose",
-        "cross-provider-action",
         "deepfield",
         "filesystem",
         "fleet",
@@ -3630,6 +4586,7 @@ def _agent_registry_bootstrap_schema(conn) -> None:
             screen_nonce    TEXT,
             screen_bound_at REAL,
             state           TEXT NOT NULL DEFAULT 'pending',
+            owner_instance  TEXT,
             created_at      REAL NOT NULL,
             resolved_at     REAL
         )
@@ -3665,6 +4622,8 @@ def _agent_registry_bootstrap_schema(conn) -> None:
             conn.execute("ALTER TABLE pending_approvals ADD COLUMN screen_nonce TEXT")
         if "screen_bound_at" not in approval_columns:
             conn.execute("ALTER TABLE pending_approvals ADD COLUMN screen_bound_at REAL")
+        if "owner_instance" not in approval_columns:
+            conn.execute("ALTER TABLE pending_approvals ADD COLUMN owner_instance TEXT")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_agent_sessions_claude_uuid "
             "ON agent_sessions(provider, claude_uuid)"
@@ -3991,9 +4950,18 @@ def _pending_approval_cas(request_nonce: str, expected: str, new: str) -> bool:
     try:
         with _agent_registry_conn() as conn:
             cur = conn.execute(
-                "UPDATE pending_approvals SET state=?, resolved_at=? "
+                "UPDATE pending_approvals SET state=?, resolved_at=?, "
+                "owner_instance=CASE WHEN ? IN ('allowed', 'denying') "
+                "THEN ? ELSE owner_instance END "
                 "WHERE request_nonce=? AND state=?",
-                (new, _time.time(), request_nonce, expected),
+                (
+                    new,
+                    _time.time(),
+                    new,
+                    _CONTROL_RECEIPT_INSTANCE_ID,
+                    request_nonce,
+                    expected,
+                ),
             )
             changed = cur.rowcount > 0
         if changed:
@@ -5068,6 +6036,10 @@ def _races_write(data: dict) -> None:
 
 
 def _race_git(project: str, args: list[str], timeout: float = 10.0) -> tuple[bool, str, str]:
+    try:
+        project = _revalidate_canonical_user_directory(project, allow_tmp=False)
+    except (FileNotFoundError, NotADirectoryError, PermissionError, RuntimeError, OSError, ValueError) as error:
+        return False, "", f"project path is no longer safe: {error}"
     return _run_text(["git", "-C", project] + args, timeout=timeout)
 
 
@@ -5082,6 +6054,10 @@ def _race_prepare(project: str) -> dict:
     and the readiness-gated prompt delivery are reused, not re-implemented.
 
     Refuses a dirty tree: a race must start from one truth."""
+    try:
+        project = _canonical_user_directory(project, allow_tmp=False)
+    except (FileNotFoundError, NotADirectoryError, PermissionError, RuntimeError, OSError, ValueError):
+        return {"ok": False, "status": 400, "code": "not_a_git_repo", "message": "the project is not a safe git repository"}
     ok, out, err = _race_git(project, ["rev-parse", "--is-inside-work-tree"])
     if not ok or out.strip() != "true":
         return {"ok": False, "status": 400, "code": "not_a_git_repo", "message": "the project is not a git repository"}
@@ -5302,6 +6278,23 @@ def _fleet_digest_payload(since_epoch: float, until_epoch: float) -> dict:
         },
         "pushes": {"sent": pushes_sent, "failed": pushes_failed},
     }
+
+
+def _recover_orphaned_approval_decisions_on_startup() -> int:
+    """Seal decisions whose terminal write result was lost with their process."""
+    with _agent_registry_conn() as conn:
+        cur = conn.execute(
+            "UPDATE pending_approvals SET state='outcome_unknown', resolved_at=?, "
+            "owner_instance=? WHERE state IN ('allowed', 'denying') "
+            "AND (owner_instance IS NULL OR owner_instance<>?)",
+            (
+                _time.time(),
+                _CONTROL_RECEIPT_INSTANCE_ID,
+                _CONTROL_RECEIPT_INSTANCE_ID,
+            ),
+        )
+        recovered = cur.rowcount
+    return recovered
 
 
 def _pending_approvals_open() -> list[dict]:
@@ -8153,9 +9146,20 @@ def _clear_health_probe_caches_for_tests() -> None:
         _health_payload_cache.clear()
 
 
-def _run_text(cmd: list[str], timeout: float = 3.0) -> tuple[bool, str, str]:
+def _run_text(
+    cmd: list[str],
+    timeout: float = 3.0,
+    env: dict[str, str] | None = None,
+) -> tuple[bool, str, str]:
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        run_kwargs = {"env": env} if env is not None else {}
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            **run_kwargs,
+        )
         return proc.returncode == 0, proc.stdout or "", proc.stderr or ""
     except Exception as exc:
         return False, "", f"{type(exc).__name__}: {exc}"
@@ -8179,6 +9183,7 @@ def _process_start_epoch(pid: int) -> float:
     ok, out, _ = _run_text(
         ["/bin/ps", "-o", "lstart=", "-p", str(int(pid))],
         timeout=2,
+        env={**os.environ, "LC_ALL": "C"},
     )
     if not ok:
         return 0.0
@@ -8387,6 +9392,25 @@ def _lan_ips() -> list[str]:
     return _cached_probe("lan_ips", _HEALTH_PROBE_CACHE_SECONDS, _probe_lan_ips)
 
 
+def _bonjour_hostname(raw_hostname: str | None) -> str | None:
+    hostname = str(raw_hostname or "").strip().rstrip(".")
+    if not hostname:
+        return None
+    try:
+        ipaddress.ip_address(hostname.strip("[]"))
+        return None
+    except ValueError:
+        pass
+    label = hostname.removesuffix(".local").split(".", 1)[0]
+    if (
+        not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+        or label.isdigit()
+        or label.lower() == "localhost"
+    ):
+        return None
+    return f"{label}.local"
+
+
 def _probe_listener_entries() -> list[str]:
     host = BOUND_HOST or os.environ.get("PAIRLING_BOUND_HOST", "")
     entries: list[str] = []
@@ -8590,6 +9614,41 @@ def _health_source_identity(auth_result=None, runtime_info: dict | None = None) 
         "hostname": hostname,
     }
 
+def _authorization_health_snapshot(auth_result, *, now: float | None = None) -> dict:
+    generated_at = _time.time() if now is None else float(now)
+    device_id = str(getattr(auth_result, "device_id", "") or "").strip()
+    install_id = str(getattr(auth_result, "install_id", "") or "").strip()
+    scopes = frozenset(getattr(auth_result, "scopes", ()) or ())
+    role = str(getattr(auth_result, "role", "") or "").strip().lower() or None
+    expires_at = generated_at + AUTHORIZATION_ADVERTISEMENT_TTL_SECONDS
+    credential_expires_at = getattr(auth_result, "credential_expires_at", None)
+    if credential_expires_at is not None:
+        try:
+            expires_at = min(expires_at, float(credential_expires_at))
+        except (TypeError, ValueError, OverflowError):
+            expires_at = generated_at
+    controls = (
+        _authorization_controls_for_scopes(scopes)
+        if (
+            getattr(auth_result, "ok", False)
+            and device_id
+            and install_id
+            and expires_at > generated_at
+        )
+        else []
+    )
+    return {
+        "contract_version": AUTHORIZATION_ADVERTISEMENT_CONTRACT,
+        "generated_at": generated_at,
+        "expires_at": expires_at,
+        "device_id": device_id,
+        "install_id": install_id,
+        "role": role,
+        "scopes": sorted(str(scope) for scope in scopes),
+        "controls": controls,
+    }
+
+
 
 def _routez_payload(auth_result=None) -> dict:
     runtime_info = _runtime_info_snapshot()
@@ -8623,6 +9682,28 @@ def _routez_payload(auth_result=None) -> dict:
     }
 
 
+def _public_health_payload(*, ok: bool, runtime_info: dict) -> dict:
+    """Return the exact unauthenticated health contract, not a redacted private snapshot."""
+    runtime = {
+        "contract_version": runtime_info.get("contract_version") or RUNTIME_CONTRACT_VERSION,
+        "compat_mode": runtime_info.get("compat_mode") or "pairling-v1",
+        "verified": runtime_info.get("verified") is True,
+    }
+    return {
+        "ok": bool(ok),
+        "schema_version": 1,
+        "contract_version": RUNTIME_CONTRACT_VERSION,
+        "pairing_contracts": dict(PAIRING_CONTRACTS),
+        "pairing_activation_contracts": [PAIRING_ACTIVATION_CONTRACT],
+        "runtime": runtime,
+        "auth": {
+            "mode": RUNTIME_AUTH_MODE,
+            "required": True,
+            "legacy_global_token": False,
+        },
+    }
+
+
 def _health_payload(authenticated: bool = False, auth_result=None) -> dict:
     connect = _pairling_connect_health()
     coordinator = _coordinator_from_pairling_connect(connect)
@@ -8636,7 +9717,8 @@ def _health_payload(authenticated: bool = False, auth_result=None) -> dict:
         and request_proof.get("ok") is True
     )
     runtime_info = _runtime_info_snapshot()
-    public_runtime = _public_runtime_info(runtime_info) if _public_runtime_info else runtime_info
+    if not authenticated:
+        return _public_health_payload(ok=ok, runtime_info=runtime_info)
     payload = {
         "ok": ok,
         "schema_version": 1,
@@ -8644,7 +9726,7 @@ def _health_payload(authenticated: bool = False, auth_result=None) -> dict:
         "pairing_contracts": dict(PAIRING_CONTRACTS),
         "pairing_activation_contracts": [PAIRING_ACTIVATION_CONTRACT],
         "ts": _time.time(),
-        "runtime": runtime_info if authenticated else public_runtime,
+        "runtime": runtime_info,
         "auth": {
             "mode": RUNTIME_AUTH_MODE,
             "required": True,
@@ -8653,15 +9735,29 @@ def _health_payload(authenticated: bool = False, auth_result=None) -> dict:
         "daemon": _daemon_snapshot(),
         "coordinator": coordinator,
         "request_proof": request_proof,
+        "provider_controls": {
+            "schema_version": PROVIDER_CONTROL_SCHEMA_VERSION,
+            "available": all((
+                _validated_driver_snapshot is not None,
+                _execute_provider_operation is not None,
+                _provider_operation_manifest_payload is not None,
+            )),
+            "catalog_source": "companiond",
+            "snapshot_route": "/provider-controls/snapshot",
+            "stream_route": "/provider-controls/stream",
+            "execute_route": "/provider-controls/execute",
+            "snapshot_scope": "sessions:read",
+            "execute_scope": "provider:control",
+        },
     }
     if authenticated:
         payload["source"] = _health_source_identity(auth_result, runtime_info=runtime_info)
+        payload["authorization"] = _authorization_health_snapshot(auth_result)
         payload["routes"] = routes
         payload["sessions"] = _sessions_health_snapshot()
         payload["streams"] = _stream_stats_snapshot()
         # The push-plane dead-man's switch: the phone banners on degraded so
-        # a silently dead APNs provider (env-stripped creds, FD exhaustion,
-        # revoked key) is visible at the next health read instead of never.
+        # a silently dead APNs provider is visible at the next health read.
         if PUSH_DISPATCHER is not None:
             try:
                 push_device_id = str(getattr(auth_result, "device_id", "") or "") or None
@@ -8697,7 +9793,9 @@ def _health_payload(authenticated: bool = False, auth_result=None) -> dict:
 def _cached_health_payload(authenticated: bool = False, auth_result=None) -> dict:
     device_id = str(getattr(auth_result, "device_id", "") or "")
     install_id = str(getattr(auth_result, "install_id", "") or "")
-    key = (bool(authenticated), device_id, install_id)
+    scopes = tuple(sorted(getattr(auth_result, "scopes", ()) or ()))
+    role = str(getattr(auth_result, "role", "") or "")
+    key = (bool(authenticated), device_id, install_id, role, scopes)
     now = _time.time()
     with _health_payload_cache_lock:
         cached = _health_payload_cache.get(key)
@@ -9024,6 +10122,7 @@ def _scan_process_snapshot() -> tuple[bool, dict[int, dict]]:
             capture_output=True,
             text=True,
             timeout=2,
+            env={**os.environ, "LC_ALL": "C"},
         )
     except Exception:
         return False, {}
@@ -9424,6 +10523,7 @@ _claude_terminal_scan_lock = threading.Lock()
 _sessions_membership_snapshot_lock = threading.Lock()
 _SESSION_MEMBERSHIP_PROVIDERS = frozenset({"claude", "codex"})
 _SESSION_INVENTORY_FRESH_SECONDS = 5.0
+_SESSION_INVENTORY_REFRESH_WAIT_SECONDS = 4.0
 _sessions_inventory_bundle_lock = threading.Lock()
 _sessions_inventory_bundle: dict[str, object] = {
     "generation": 0,
@@ -10222,6 +11322,8 @@ def _refresh_sessions_inventory_bundle(
 
 def _sessions_provider_inventory_bundle(
     requested: set[str],
+    *,
+    wait_timeout: float = 0.0,
 ) -> tuple[dict[str, dict], str, int, int]:
     requested = set(requested) & set(_SESSION_MEMBERSHIP_PROVIDERS)
     if not requested:
@@ -10233,6 +11335,7 @@ def _sessions_provider_inventory_bundle(
         return {}, "ready", generation, membership_generation
     now = _time.time()
     start_refresh = False
+    refresh_timed_out = False
     refresh_generation = 0
     membership_generation = 0
     refresh_providers: set[str] = set()
@@ -10291,6 +11394,48 @@ def _sessions_provider_inventory_bundle(
                 generation = int(_sessions_inventory_bundle["generation"])
             refreshing = False
 
+    if wait_timeout > 0 and stale and refreshing:
+        deadline = _time.monotonic() + wait_timeout
+        # ponytail: Poll the existing state; add a condition only if this
+        # bounded request wait becomes measurable lock contention.
+        while True:
+            with _sessions_inventory_bundle_lock:
+                refreshing = bool(_sessions_inventory_bundle.get("refreshing"))
+                if not refreshing:
+                    stored = copy.deepcopy(
+                        _sessions_inventory_bundle.get("inventories") or {}
+                    )
+                    error = (
+                        str(_sessions_inventory_bundle.get("error") or "")
+                        or None
+                    )
+                    generation = int(
+                        _sessions_inventory_bundle.get("generation") or 0
+                    )
+                    membership_generation = int(
+                        _sessions_inventory_bundle.get(
+                            "membership_generation"
+                        ) or 0
+                    )
+                    break
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                refresh_timed_out = True
+                break
+            _time.sleep(min(0.01, remaining))
+        if not refresh_timed_out:
+            now = _time.time()
+            provider_fresh = {
+                provider: (
+                    isinstance(stored.get(provider), dict)
+                    and float(stored[provider].get("checked_at") or 0) > 0
+                    and now - float(stored[provider].get("checked_at") or 0)
+                    < _SESSION_INVENTORY_FRESH_SECONDS
+                )
+                for provider in requested
+            }
+            stale = any(not fresh for fresh in provider_fresh.values())
+
     fresh = not stale
     exact = fresh and all(
         isinstance(stored.get(provider), dict)
@@ -10298,7 +11443,9 @@ def _sessions_provider_inventory_bundle(
         and bool(stored[provider].get("membership_complete"))
         for provider in requested
     )
-    if fresh:
+    if refresh_timed_out:
+        state = "timeout"
+    elif fresh:
         state = "ready" if exact else "incomplete"
     elif refreshing:
         state = "refreshing" if any(provider_fresh.values()) else "warming"
@@ -11589,6 +12736,44 @@ def _path_is_relative_to(path: Path, root: Path) -> bool:
     except ValueError:
         return False
 
+def _authorized_user_path(raw_path: str, *, allow_tmp: bool):
+    roots = [HOME]
+    if allow_tmp:
+        roots.append(Path("/tmp"))
+    return authorize_path(raw_path, roots=roots)
+
+
+def _canonical_user_directory(raw_path: str, *, allow_tmp: bool) -> str:
+    """Validate one existing non-symlink directory under canonical user roots."""
+    raw_path = (raw_path or "").strip()
+    if not raw_path:
+        raise ValueError("directory path is required")
+    authorized = _authorized_user_path(raw_path, allow_tmp=allow_tmp)
+    descriptor = open_directory_fd(authorized.path, root=authorized.root)
+    os.close(descriptor)
+    return str(authorized.path)
+
+
+def _canonical_user_path(raw_path: str, *, allow_tmp: bool) -> str:
+    """Validate a regular file or directory without following any symlink."""
+    raw_path = (raw_path or "").strip()
+    if not raw_path:
+        raise ValueError("path is required")
+    authorized = _authorized_user_path(raw_path, allow_tmp=allow_tmp)
+    try:
+        descriptor = open_directory_fd(authorized.path, root=authorized.root)
+    except (NotADirectoryError, ValueError):
+        descriptor = open_regular_file_fd(authorized.path, root=authorized.root)
+    os.close(descriptor)
+    return str(authorized.path)
+
+
+def _revalidate_canonical_user_directory(path: str, *, allow_tmp: bool) -> str:
+    resolved = _canonical_user_directory(path, allow_tmp=allow_tmp)
+    if resolved != path:
+        raise PermissionError(f"directory path changed after validation: {path}")
+    return resolved
+
 
 def _codex_skill_roots() -> list[Path]:
     roots = [
@@ -12241,27 +13426,26 @@ def _meaningful_transcript_turn_at(row: dict) -> float | None:
     return None
 
 
-def _reverse_jsonl_line_spans(path: Path):
+def _reverse_jsonl_line_spans(handle):
     """Yield non-empty JSONL byte ranges from newest to oldest."""
-    with path.open("rb") as handle:
-        handle.seek(0, os.SEEK_END)
-        size = handle.tell()
-        cursor = size
-        line_end = size
-        while cursor > 0:
-            start = max(0, cursor - _REVERSE_JSONL_CHUNK_BYTES)
-            handle.seek(start)
-            chunk = handle.read(cursor - start)
-            for index in range(len(chunk) - 1, -1, -1):
-                if chunk[index] != 0x0A:
-                    continue
-                newline = start + index
-                if newline + 1 < line_end:
-                    yield newline + 1, line_end
-                line_end = newline
-            cursor = start
-        if line_end > 0:
-            yield 0, line_end
+    handle.seek(0, os.SEEK_END)
+    size = handle.tell()
+    cursor = size
+    line_end = size
+    while cursor > 0:
+        start = max(0, cursor - _REVERSE_JSONL_CHUNK_BYTES)
+        handle.seek(start)
+        chunk = handle.read(cursor - start)
+        for index in range(len(chunk) - 1, -1, -1):
+            if chunk[index] != 0x0A:
+                continue
+            newline = start + index
+            if newline + 1 < line_end:
+                yield newline + 1, line_end
+            line_end = newline
+        cursor = start
+    if line_end > 0:
+        yield 0, line_end
 
 
 def _timestamp_from_json_prefix(prefix: str) -> float | None:
@@ -12494,8 +13678,8 @@ def _last_meaningful_transcript_turn_at(
     if provider not in _SUPPORTED_TRANSCRIPT_PROVIDERS:
         raise _UnsupportedTranscriptProviderError(provider)
     try:
-        with path.open("rb") as handle:
-            for start, end in _reverse_jsonl_line_spans(path):
+        with _open_session_transcript_file(path) as handle:
+            for start, end in _reverse_jsonl_line_spans(handle):
                 length = max(0, end - start)
                 if length <= 0:
                     continue
@@ -12570,13 +13754,37 @@ def _session_workspace_identity(project: str | None) -> dict:
     )
 
 
+def _transcript_root_for_path(path: Path | str) -> tuple[Path, Path]:
+    authorized = authorize_path(
+        path,
+        roots=(CLAUDE_PROJECTS_DIR, CODEX_SESSIONS_DIR),
+    )
+    return authorized.root, authorized.path
+
+
+def _session_transcript_handle(path: Path | str):
+    root, target = _transcript_root_for_path(path)
+    descriptor = open_regular_file_fd(target, root=root)
+    try:
+        return os.fdopen(descriptor, "rb", closefd=True)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+@contextmanager
+def _open_session_transcript_file(path: Path | str):
+    handle = _session_transcript_handle(path)
+    with handle:
+        yield handle
+
+
 def _tail_lines(path: Path | str, *, max_lines: int = 240, max_bytes: int = TRANSCRIPT_TAIL_SCAN_BYTES) -> list[bytes]:
-    target = Path(path)
     max_lines = max(1, int(max_lines or 1))
     max_bytes = max(1, int(max_bytes or 1))
     try:
-        size = target.stat().st_size
-        with target.open("rb") as f:
+        with _open_session_transcript_file(path) as f:
+            size = os.fstat(f.fileno()).st_size
             start = max(0, size - max_bytes)
             f.seek(start)
             data = f.read(min(size, max_bytes))
@@ -12620,7 +13828,8 @@ def _session_transcript_stats(path: Path | str | None, provider: str, native_id:
         }
     target = Path(path)
     try:
-        stat = target.stat()
+        with _open_session_transcript_file(target) as handle:
+            stat = os.fstat(handle.fileno())
     except OSError:
         return {
             "turn_count": None,
@@ -12630,7 +13839,7 @@ def _session_transcript_stats(path: Path | str | None, provider: str, native_id:
         }
 
     key = (
-        str(target.resolve()),
+        str(target),
         provider,
         native_id,
         int(stat.st_mtime_ns),
@@ -12650,12 +13859,15 @@ def _session_transcript_stats(path: Path | str | None, provider: str, native_id:
                 max_lines=2500,
                 max_bytes=TRANSCRIPT_STATS_MAX_SCAN_BYTES,
             )]
-        elif provider == "codex":
-            with target.open(encoding="utf-8", errors="replace") as f:
-                iterable = list(f)
-        elif provider == "claude":
-            with target.open("rb") as f:
-                iterable = list(f)
+        elif provider in {"codex", "claude"}:
+            with _open_session_transcript_file(target) as f:
+                if provider == "codex":
+                    iterable = [
+                        raw.decode("utf-8", errors="replace")
+                        for raw in f
+                    ]
+                else:
+                    iterable = list(f)
         else:
             raise _UnsupportedTranscriptProviderError(provider)
         if provider == "codex":
@@ -13376,6 +14588,9 @@ def _start_standard_turn_push_publisher():
         turn_state_dir=TURN_STATE_DIR,
         push_dispatcher=PUSH_DISPATCHER,
         claude_session_resolver=_lookup_claude_session_for_uuid,
+        device_authorization_fn=(
+            DEVICE_REGISTRY.authorization_for_device if DEVICE_REGISTRY is not None else None
+        ),
         mac_install_id=getattr(PAIRING_STORE, "install_id", "") if PAIRING_STORE else "",
         logger=lambda msg: print(f"[standard-turn-publisher] {msg}", file=sys.stderr, flush=True),
     )
@@ -14265,11 +15480,21 @@ def _terminal_attention_from_snapshot(snapshot: dict | None) -> dict | None:
     pending = snapshot.get("pending_input")
     if not isinstance(pending, dict):
         return None
+
+    def cleaned(value: object, max_characters: int) -> str | None:
+        if not isinstance(value, str):
+            return None
+        text = " ".join(_clean_terminal_display_text(value).split()).strip()
+        return text[:max_characters] or None
+
     return {
         "needs_input": True,
-        "state": pending.get("state"),
+        "state": cleaned(pending.get("state"), 64),
         "source": snapshot.get("source"),
         "changed_at": snapshot.get("changed_at"),
+        "prompt": cleaned(pending.get("prompt"), 512),
+        "confidence": cleaned(pending.get("confidence"), 32),
+        "kind": cleaned(pending.get("kind"), 64),
     }
 
 
@@ -14902,25 +16127,179 @@ def _session_runtime_truth_stream_digest(truth: dict) -> str:
     return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
 
 
+def _public_truth_issue(issue: dict) -> dict:
+    return {
+        key: (
+            redact_public_diagnostic(issue.get(key))
+            if key in {"detail", "user_message"}
+            else issue.get(key)
+        )
+        for key in (
+            "code",
+            "severity",
+            "user_message",
+            "detail",
+            "sources",
+            "blocks_control",
+        )
+    }
+
+
+def _public_session_runtime_truth(truth: dict) -> dict:
+    runtime = truth.get("runtime") or {}
+    registry = truth.get("registry") or {}
+    process = truth.get("process") or {}
+    turn = truth.get("turn") or {}
+    transcript = truth.get("transcript") or {}
+    terminal = truth.get("terminal") or {}
+    control = truth.get("control") or {}
+    summary = truth.get("summary") or {}
+    return {
+        "schema_version": truth.get("schema_version"),
+        "session_id": truth.get("session_id"),
+        "provider": truth.get("provider"),
+        "native_id": truth.get("native_id"),
+        "checked_at": truth.get("checked_at"),
+        "runtime": {
+            key: runtime.get(key)
+            for key in (
+                "runtime_version",
+                "source_revision",
+                "branch",
+                "installed_at",
+                "source_dirty",
+                "runtime_matches_app_source",
+                "runtime_match_confidence",
+                "mismatch_reason",
+            )
+        },
+        "registry": {
+            key: (
+                redact_public_diagnostic(registry.get(key))
+                if key == "working_on"
+                else registry.get(key)
+            )
+            for key in (
+                "state",
+                "readable_state",
+                "control_state",
+                "working_on",
+                "stale_seconds",
+                "source_freshness",
+                "last_seen_at",
+            )
+        },
+        "process": {
+            key: redact_public_diagnostic(process.get(key))
+            if key == "reason"
+            else process.get(key)
+            for key in (
+                "state",
+                "source",
+                "pid",
+                "process_alive",
+                "registry_state",
+                "last_heartbeat",
+                "closed_at",
+                "terminal_tty",
+                "reason",
+            )
+        },
+        "turn": {
+            key: turn.get(key)
+            for key in (
+                "state",
+                "source",
+                "observed_at",
+                "age_seconds",
+                "reconciled_role",
+            )
+        },
+        "transcript": {
+            key: (
+                redact_public_diagnostic(transcript.get(key))
+                if key in {"reason", "user_message"}
+                else transcript.get(key)
+            )
+            for key in (
+                "state",
+                "http_status",
+                "reason",
+                "durable",
+                "searchable",
+                "latest_offset",
+                "user_message",
+            )
+        },
+        "terminal": {
+            key: (
+                redact_public_diagnostic(terminal.get(key))
+                if key in {"pending_input_detection", "user_message"}
+                else terminal.get(key)
+            )
+            for key in (
+                "state",
+                "backend",
+                "selected_surface",
+                "surface_agreement",
+                "pending_input",
+                "pending_input_detection",
+                "user_message",
+            )
+        },
+        "control": {
+            key: control.get(key)
+            for key in (
+                "state",
+                "basis_surface",
+                "schema_version",
+                "screen_hash",
+                "nonce",
+                "generation",
+                "visible_surface_matches_control_basis",
+                "blocked_reason",
+                "supported_actions",
+            )
+        },
+        "summary": {
+            key: (
+                redact_public_diagnostic(summary.get(key))
+                if key in {"primary_label", "secondary_label"}
+                else summary.get(key)
+            )
+            for key in (
+                "primary_label",
+                "secondary_label",
+                "tone",
+                "requires_attention",
+                "blocks_control",
+                "selected_surface",
+                "degradation_codes",
+                "contradiction_codes",
+            )
+        },
+        "contradictions": [
+            _public_truth_issue(issue)
+            for issue in (truth.get("contradictions") or [])
+            if isinstance(issue, dict)
+        ],
+        "degradations": [
+            _public_truth_issue(issue)
+            for issue in (truth.get("degradations") or [])
+            if isinstance(issue, dict)
+        ],
+    }
+
+
 def _session_runtime_truth_stream_payload(truth: dict) -> dict:
-    """Truth payload for SSE streams. The raw v1/v2 surface bodies are
-    stripped: the phone's truth decoder ignores them, and a tall Terminal
-    screen pushes the event past the 64KB SSE cap — which wedged
-    session-live-events at `event_too_large` right after `hello` once the
-    v1 surface read was repaired. Screen bodies ride the dedicated surface
-    endpoints/streams instead."""
-    terminal = truth.get("terminal")
-    if not isinstance(terminal, dict):
-        return truth
-    slim = dict(truth)
-    slim["terminal"] = {k: v for k, v in terminal.items() if k not in ("v1", "v2")}
-    return slim
+    """Return the path-free, stable truth projection used by public streams."""
+    return _public_session_runtime_truth(truth)
 
 
 def _session_live_truth_events(truth: dict, slim_truth: dict) -> list[tuple[str, dict, str]]:
     """Build the ordered truth events written by the multiplexed live stream."""
     events = [("truth", slim_truth, "session-runtime-truth")]
-    turn = truth.get("turn") if isinstance(truth.get("turn"), dict) else {}
+    turn = slim_truth.get("turn") if isinstance(slim_truth.get("turn"), dict) else {}
     if turn:
         events.append(("turn_state", turn, "turn-state"))
     return events
@@ -14930,6 +16309,9 @@ def _terminal_stream_diagnostics_from_truth(truth: dict) -> dict:
     terminal = truth.get("terminal") or {}
     v1 = terminal.get("v1") or {}
     v2 = terminal.get("v2") or {}
+    stream = terminal.get("stream") or {}
+    transcript = truth.get("transcript") or {}
+    control = truth.get("control") or {}
     return {
         "ok": True,
         "schema_version": 1,
@@ -14939,39 +16321,93 @@ def _terminal_stream_diagnostics_from_truth(truth: dict) -> dict:
         "checked_at": _time.time(),
         "selected_source": v2.get("source") or v1.get("source") or "unavailable",
         "selected_backend": terminal.get("backend"),
-        "stream": terminal.get("stream") or {},
+        "stream": {
+            key: stream.get(key)
+            for key in (
+                "byte_stream_available",
+                "surface_stream_available",
+                "transcript_stream_available",
+                "source",
+                "backend",
+                "can_control",
+                "can_send_text",
+                "can_interrupt",
+                "can_terminate",
+                "control_profile",
+                "last_chunk_at",
+                "capacity_state",
+                "capacity_verified",
+            )
+        } | {
+            "fallback_reason": redact_public_diagnostic(stream.get("fallback_reason"))
+        },
         "surfaces": {
             "v1": {
                 "available": bool(v1),
                 "source": v1.get("source"),
                 "generation": v1.get("generation"),
-                "screen_hash": v1.get("screen_hash"),
-                "pending_input_state": _surface_pending_input_state(v1, version="v1") if v1 else "unknown",
+                "pending_input_state": (
+                    _surface_pending_input_state(v1, version="v1")
+                    if v1 else "unknown"
+                ),
             },
             "v2": {
                 "available": bool(v2),
                 "source": v2.get("source"),
                 "generation": v2.get("generation"),
-                "screen_hash": v2.get("screen_hash"),
-                "pending_input_state": _surface_pending_input_state(v2, version="v2") if v2 else "unknown",
-                "pending_input_detection": _surface_detection(v2, version="v2") if v2 else None,
+                "pending_input_state": (
+                    _surface_pending_input_state(v2, version="v2")
+                    if v2 else "unknown"
+                ),
+                "pending_input_detection": redact_public_diagnostic(
+                    _surface_detection(v2, version="v2") if v2 else None
+                ),
             },
             "agreement": terminal.get("surface_agreement"),
         },
-        "transcript": truth.get("transcript") or {},
-        "control": truth.get("control") or {},
+        "transcript": {
+            key: transcript.get(key)
+            for key in (
+                "state",
+                "http_status",
+                "reason",
+                "durable",
+                "searchable",
+                "latest_offset",
+                "user_message",
+            )
+        },
+        "control": {
+            key: control.get(key)
+            for key in (
+                "state",
+                "basis_surface",
+                "schema_version",
+                "generation",
+                "visible_surface_matches_control_basis",
+                "blocked_reason",
+                "supported_actions",
+            )
+        },
         "runtime": {
             "source_revision": (truth.get("runtime") or {}).get("source_revision"),
-            "runtime_matches_app_source": (truth.get("runtime") or {}).get("runtime_matches_app_source"),
+            "runtime_matches_app_source": (
+                truth.get("runtime") or {}
+            ).get("runtime_matches_app_source"),
         },
-        "contradictions": truth.get("contradictions") or [],
-        "degradations": truth.get("degradations") or [],
+        "contradictions": redact_public_diagnostic(
+            truth.get("contradictions") or []
+        ),
+        "degradations": redact_public_diagnostic(
+            truth.get("degradations") or []
+        ),
     }
 
 
 def _terminal_workspace_from_truth(truth: dict) -> dict:
     terminal = truth.get("terminal") or {}
     v2 = terminal.get("v2") if isinstance(terminal.get("v2"), dict) else None
+    public_truth = _session_runtime_truth_stream_payload(truth)
     workspace = {
         "ok": True,
         "schema_version": 1,
@@ -14979,12 +16415,14 @@ def _terminal_workspace_from_truth(truth: dict) -> dict:
         "provider": truth.get("provider"),
         "native_id": truth.get("native_id"),
         "checked_at": _time.time(),
-        "truth": truth,
+        "truth": public_truth,
+        # Terminal rows and cells are user content, not diagnostics. They use
+        # their dedicated stable surface schema and are intentionally intact.
         "terminal_surface_v2": v2,
         "diagnostics": _terminal_stream_diagnostics_from_truth(truth),
-        "transcript": truth.get("transcript") or {},
-        "control": truth.get("control") or {},
-        "summary": truth.get("summary") or {},
+        "transcript": public_truth["transcript"],
+        "control": public_truth["control"],
+        "summary": public_truth["summary"],
         "stream_policy": {
             "default_streams": ["terminal-workspace-stream"],
             "included": ["session_runtime_truth", "terminal_surface_v2", "stream_diagnostics", "transcript_truth", "control_basis"],
@@ -15009,13 +16447,10 @@ def _terminal_workspace_stream_digest(workspace: dict) -> str:
 
 TERMINAL_CONTROL_AUDIT_PATH = HOME / ".claude" / "audit" / "terminal-control.jsonl"
 CONTROL_RECEIPT_AUDIT_PATH = HOME / ".claude" / "audit" / "control-receipts.jsonl"
+TERMINAL_CONTROL_STALE_SCREEN_CODE = "stale_screen"
 _CONTROL_RECEIPT_INSTANCE_ID = secrets.token_hex(16)
 _CONTROL_RECEIPT_SCHEMA_LOCK = threading.Lock()
 _CONTROL_RECEIPT_BOOTSTRAPPED_PATHS: set[str] = set()
-_ACTIVE_RECEIPTED_MUTATIONS_LOCK = threading.Lock()
-_ACTIVE_RECEIPTED_MUTATIONS: set[str] = set()
-_VISIBLE_RESUME_RESERVATIONS_LOCK = threading.Lock()
-_VISIBLE_RESUME_RESERVATIONS: dict[tuple[str, str], str] = {}
 _RECEIPTED_REQUEST_LOCAL = threading.local()
 TERMINAL_CONTROL_ALLOWED_KEYS = {
     "enter",
@@ -15036,6 +16471,76 @@ TERMINAL_CONTROL_KEY_CODES = {
     "right": 124,
 }
 TERMINAL_CONTROL_TEXT_MAX_CHARS = TERMINAL_TEXT_SUBMIT_MAX_CHARS
+_RECEIPT_EXECUTION_STATES = frozenset({
+    "queued",
+    "running",
+    "succeeded",
+    "failed",
+    "indeterminate",
+})
+_RECEIPT_TERMINAL_EXECUTION_STATES = frozenset({
+    "succeeded",
+    "failed",
+    "indeterminate",
+})
+_RECEIPT_EXECUTION_TRANSITIONS = {
+    "queued": frozenset({"running", "failed", "indeterminate"}),
+    "running": frozenset({"succeeded", "failed", "indeterminate"}),
+    "indeterminate": frozenset(),
+    "succeeded": frozenset(),
+    "failed": frozenset(),
+}
+
+def _receipt_action_requires_running(action_kind: str) -> bool:
+    normalized = str(action_kind or "").strip()
+    return (
+        normalized == "send_text"
+        or normalized == "terminal_control"
+        or normalized.startswith("terminal_input_")
+        or normalized.startswith("provider_control:")
+        or normalized.startswith("provider_operation:")
+    )
+
+
+def _receipt_execution_state(receipt: dict | None) -> str:
+    receipt = receipt if isinstance(receipt, dict) else {}
+    explicit = str(receipt.get("execution_state") or "").strip().lower()
+    if explicit in _RECEIPT_EXECUTION_STATES:
+        return explicit
+    # Legacy phase/state fields do not prove that a side effect crossed the
+    # durable running boundary or reached a terminal outcome.
+    return "indeterminate"
+
+def _execution_state_for_current_receipt_state(state: str) -> str:
+    try:
+        return {
+            "received": "queued",
+            "validated": "running",
+            "applied": "succeeded",
+            "rejected": "failed",
+            "failed": "failed",
+            "indeterminate": "indeterminate",
+        }[str(state or "").strip().lower()]
+    except KeyError as exc:
+        raise ValueError(f"unsupported receipt state: {state}") from exc
+
+
+def _receipt_legacy_state(execution_state: str, *, failed_state: str = "failed") -> str:
+    return {
+        "queued": "received",
+        "running": "validated",
+        "succeeded": "applied",
+        "failed": "rejected" if failed_state == "rejected" else "failed",
+        "indeterminate": "indeterminate",
+    }[execution_state]
+
+
+def _receipt_transition_allowed(current: str, next_state: str) -> bool:
+    return (
+        current == next_state
+        or next_state in _RECEIPT_EXECUTION_TRANSITIONS.get(current, ())
+    )
+
 
 
 def _receipt_body_hash(material) -> str:
@@ -15055,36 +16560,6 @@ def _receipt_key(device_id: str | None, session_id: str, client_action_id: str) 
     return "|".join([normalized_device_id, session_id, client_action_id])
 
 
-def _reserve_visible_resume(
-    context: dict,
-    *,
-    provider: str,
-    canonical_native_id: str,
-) -> bool:
-    """Reserve one visible provider process for a canonical session."""
-    reservation_key = (
-        str(provider or "").strip().lower(),
-        str(canonical_native_id or "").strip(),
-    )
-    owner_key = _receipt_key(
-        context.get("device_id"),
-        str(context.get("receipt_scope") or ""),
-        str(context.get("client_action_id") or ""),
-    )
-    with _VISIBLE_RESUME_RESERVATIONS_LOCK:
-        if reservation_key in _VISIBLE_RESUME_RESERVATIONS:
-            return False
-        _VISIBLE_RESUME_RESERVATIONS[reservation_key] = owner_key
-    return True
-
-
-def _release_visible_resume_reservation(owner_key: str) -> None:
-    if not owner_key:
-        return
-    with _VISIBLE_RESUME_RESERVATIONS_LOCK:
-        for reservation_key, owner in list(_VISIBLE_RESUME_RESERVATIONS.items()):
-            if owner == owner_key:
-                _VISIBLE_RESUME_RESERVATIONS.pop(reservation_key, None)
 
 
 def _valid_client_action_id(value: str) -> bool:
@@ -15101,6 +16576,20 @@ def _control_receipt_bootstrap_schema(conn: sqlite3.Connection) -> None:
             body_hash TEXT NOT NULL,
             action_kind TEXT NOT NULL,
             state TEXT NOT NULL CHECK (state IN ('in_progress', 'final')),
+            execution_state TEXT CHECK (
+                execution_state IN (
+                    'queued', 'running', 'succeeded', 'failed', 'indeterminate'
+                )
+            ),
+            provider_id TEXT,
+            provider_version TEXT,
+            provider_channel TEXT,
+            operation_id TEXT,
+            binding_id TEXT,
+            capability_generation INTEGER,
+            provider_operation_id TEXT,
+            provider_cursor TEXT,
+            recovery_correlation_json TEXT,
             receipt_json TEXT,
             owner_instance TEXT NOT NULL,
             created_at REAL NOT NULL,
@@ -15109,6 +16598,80 @@ def _control_receipt_bootstrap_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    control_columns = {
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA table_info(control_action_receipts)"
+        ).fetchall()
+    }
+    control_column_migrations = {
+        "execution_state": (
+            "TEXT CHECK (execution_state IN "
+            "('queued', 'running', 'succeeded', 'failed', 'indeterminate'))"
+        ),
+        "provider_id": "TEXT",
+        "provider_version": "TEXT",
+        "provider_channel": "TEXT",
+        "operation_id": "TEXT",
+        "binding_id": "TEXT",
+        "capability_generation": "INTEGER",
+        "provider_operation_id": "TEXT",
+        "provider_cursor": "TEXT",
+        "recovery_correlation_json": "TEXT",
+    }
+    for column, declaration in control_column_migrations.items():
+        if column not in control_columns:
+            conn.execute(
+                f"ALTER TABLE control_action_receipts "
+                f"ADD COLUMN {column} {declaration}"
+            )
+
+    legacy_rows = conn.execute(
+        "SELECT * FROM control_action_receipts WHERE execution_state IS NULL"
+    ).fetchall()
+    for row in legacy_rows:
+        try:
+            receipt = json.loads(row["receipt_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            receipt = {}
+        if not isinstance(receipt, dict):
+            receipt = {}
+        execution_state = "indeterminate"
+        receipt = {
+            "client_action_id": str(row["client_action_id"]),
+            "state": "indeterminate",
+            "execution_state": execution_state,
+            "deduped": False,
+            "idempotent": True,
+            "phases": {
+                "received": True,
+                "validated": False,
+                "applied": False,
+                "pty_written": None,
+                "pty_write_state": "unknown",
+            },
+            "server_ts": float(row["updated_at"]),
+            "http_status": 409,
+            "error_code": "action_outcome_unknown",
+            "error_message": (
+                "this legacy receipt did not record durable execution proof; "
+                "check current state before starting a new attempt"
+            ),
+        }
+        storage_state = "final"
+        conn.execute(
+            "UPDATE control_action_receipts SET state=?, execution_state=?, "
+            "receipt_json=? WHERE device_id=? AND session_id=? "
+            "AND client_action_id=?",
+            (
+                storage_state,
+                execution_state,
+                json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+                str(row["device_id"]),
+                str(row["session_id"]),
+                str(row["client_action_id"]),
+            ),
+        )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS session_live_receipts (
@@ -15225,10 +16788,6 @@ def _control_receipt_conn():
 
 def _clear_control_receipt_ledger() -> None:
     """Test helper. Production code never discards idempotency evidence."""
-    with _ACTIVE_RECEIPTED_MUTATIONS_LOCK:
-        _ACTIVE_RECEIPTED_MUTATIONS.clear()
-    with _VISIBLE_RESUME_RESERVATIONS_LOCK:
-        _VISIBLE_RESUME_RESERVATIONS.clear()
     reservations = getattr(_RECEIPTED_REQUEST_LOCAL, "reservations", None)
     if isinstance(reservations, dict):
         reservations.clear()
@@ -15311,17 +16870,22 @@ def _insert_session_live_receipt(
             latest_receipt = json.loads(latest["receipt_json"] or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):
             latest_receipt = {}
-        latest_state = str(
-            latest_receipt.get("state") if isinstance(latest_receipt, dict) else ""
-        ).strip().lower()
-        next_state = str(receipt.get("state") or "").strip().lower()
-        if latest_state == next_state:
+        latest_execution_state = _receipt_execution_state(latest_receipt)
+        next_execution_state = _receipt_execution_state(receipt)
+        if latest_execution_state == next_execution_state:
             return _session_live_receipt_event_from_row(latest), False
-        valid_transition = (
-            action_kind == "first_prompt_delivery"
-            and latest_state == "indeterminate"
-            and next_state in {"applied", "failed"}
+        valid_transition = _receipt_transition_allowed(
+            latest_execution_state,
+            next_execution_state,
         )
+        if (
+            action_kind == "first_prompt_delivery"
+            and latest_execution_state == "indeterminate"
+            and next_execution_state in {"succeeded", "failed"}
+        ):
+            # This legacy broker-delivery stream predates durable mutation
+            # receipts and can acquire conclusive delivery evidence later.
+            valid_transition = True
         if not valid_transition:
             return _session_live_receipt_event_from_row(latest), False
         next_revision = int(latest["receipt_revision"]) + 1
@@ -15536,6 +17100,7 @@ def _make_action_receipt(
     *,
     client_action_id: str | None,
     state: str,
+    execution_state: str | None = None,
     deduped: bool = False,
     idempotent: bool | None = None,
     phases: dict | None = None,
@@ -15547,9 +17112,14 @@ def _make_action_receipt(
 ) -> dict:
     if idempotent is None:
         idempotent = bool(client_action_id)
+    if execution_state is None:
+        execution_state = _execution_state_for_current_receipt_state(state)
+    if execution_state not in _RECEIPT_EXECUTION_STATES:
+        raise ValueError(f"unsupported receipt execution state: {execution_state}")
     receipt = {
         "client_action_id": client_action_id,
         "state": state,
+        "execution_state": execution_state,
         "deduped": bool(deduped),
         "idempotent": bool(idempotent),
         "phases": phases or _receipt_phases(validated=False, applied=False, pty_written=False),
@@ -15683,6 +17253,18 @@ def _track_request_receipt_reservation(context: dict) -> None:
     if not isinstance(reservations, dict):
         return
     reservations[str(context["reservation_key"])] = dict(context)
+def _update_tracked_receipt_reservation(
+    reservation_key: str,
+    **updates,
+) -> None:
+    reservations = getattr(_RECEIPTED_REQUEST_LOCAL, "reservations", None)
+    if not isinstance(reservations, dict):
+        return
+    context = reservations.get(reservation_key)
+    if isinstance(context, dict):
+        context.update(updates)
+
+
 
 
 def _untrack_request_receipt_reservation(reservation_key: str) -> None:
@@ -15692,13 +17274,21 @@ def _untrack_request_receipt_reservation(reservation_key: str) -> None:
 
 
 def _finalize_abandoned_request_receipts(reservations: dict[str, dict]) -> None:
-    """Fail closed when a request leaves a reserved mutation unfinished."""
+    """Leave queued work reclaimable; fail closed once execution may have started."""
     for reservation_key, context in list(reservations.items()):
+        execution_state = str(
+            context.get("execution_state") or "queued"
+        ).strip().lower()
+        if execution_state == "queued":
+            reservations.pop(reservation_key, None)
+            continue
+
         receipt = _make_action_receipt(
             client_action_id=context.get("client_action_id"),
             state="indeterminate",
+            execution_state="indeterminate",
             phases=_receipt_phases(
-                validated=False,
+                validated=True,
                 applied=False,
                 pty_written=None,
             ),
@@ -15708,8 +17298,8 @@ def _finalize_abandoned_request_receipts(reservations: dict[str, dict]) -> None:
             http_status=409,
             error_code="action_outcome_unknown",
             error_message=(
-                "the request stopped before this action outcome was recorded; "
-                "check current state before starting a new attempt"
+                "execution started but the request stopped before its outcome "
+                "was recorded; check current state before starting a new attempt"
             ),
         )
         try:
@@ -15720,12 +17310,9 @@ def _finalize_abandoned_request_receipts(reservations: dict[str, dict]) -> None:
                 str(context.get("body_hash") or ""),
                 receipt,
                 action_kind=str(context.get("action_kind") or "mutation"),
-                audit_action={"type": "abandoned_request_reconciled"},
+                audit_action={"type": "abandoned_running_action_reconciled"},
             )
         except Exception as exc:
-            # The ledger itself may be unavailable. The active marker is still
-            # removed by _store_action_receipt, so the next retry reconciles the
-            # durable in-progress row instead of waiting until daemon restart.
             _append_control_receipt_audit({
                 "ts": _time.time(),
                 "device_id": context.get("device_id"),
@@ -15768,66 +17355,113 @@ def _receipt_duplicate_response(
     body_hash: str,
     *,
     action_kind: str = "control_action",
+    recover_uncertain=None,
+    reserve_missing: bool = True,
+    defer_running: bool = False,
 ) -> tuple[dict | None, dict | None]:
     if not client_action_id:
         return None, None
     normalized_device_id = str(device_id or "").strip()
     if not normalized_device_id:
         raise ValueError("authenticated device_id is required for mutation receipts")
-    now = _time.time()
+
+    reservation_key = (
+        _receipt_key(device_id, session_id, client_action_id)
+        if reserve_missing
+        else ""
+    )
+    queued_receipt = None
+    queued_receipt_json = None
+    now = None
+    if reserve_missing:
+        now = _time.time()
+        queued_receipt = _make_action_receipt(
+            client_action_id=client_action_id,
+            state="received",
+            execution_state="queued",
+            phases=_receipt_phases(
+                validated=False,
+                applied=False,
+                pty_written=False,
+            ),
+        )
+        queued_receipt_json = json.dumps(
+            queued_receipt,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     inserted_reservation = False
-    reservation_key = _receipt_key(device_id, session_id, client_action_id)
-    active_marker_added = False
+    outbox_event: dict | None = None
+    outbox_inserted = False
     existing = None
     try:
         with _control_receipt_conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            inserted = conn.execute(
-                "INSERT OR IGNORE INTO control_action_receipts "
-                "(device_id, session_id, client_action_id, body_hash, action_kind, state, "
-                "receipt_json, owner_instance, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, 'in_progress', NULL, ?, ?, ?)",
-                (
-                    normalized_device_id,
-                    session_id,
-                    client_action_id,
-                    body_hash,
-                    action_kind,
-                    _CONTROL_RECEIPT_INSTANCE_ID,
-                    now,
-                    now,
-                ),
-            )
-            if inserted.rowcount == 1:
-                inserted_reservation = True
-                # Publish same-process ownership before the reservation commit.
-                # A duplicate can read the row as soon as that commit lands.
-                with _ACTIVE_RECEIPTED_MUTATIONS_LOCK:
-                    _ACTIVE_RECEIPTED_MUTATIONS.add(reservation_key)
-                active_marker_added = True
-            else:
+            if reserve_missing:
+                conn.execute("BEGIN IMMEDIATE")
+                inserted = conn.execute(
+                    "INSERT OR IGNORE INTO control_action_receipts "
+                    "(device_id, session_id, client_action_id, body_hash, "
+                    "action_kind, state, execution_state, receipt_json, "
+                    "owner_instance, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'in_progress', 'queued', ?, ?, ?, ?)",
+                    (
+                        normalized_device_id,
+                        session_id,
+                        client_action_id,
+                        body_hash,
+                        action_kind,
+                        queued_receipt_json,
+                        _CONTROL_RECEIPT_INSTANCE_ID,
+                        now,
+                        now,
+                    ),
+                )
+                if inserted.rowcount == 1:
+                    inserted_reservation = True
+                    if len(_session_live_receipt_aliases(session_id)) == 1:
+                        outbox_event, outbox_inserted = _insert_session_live_receipt(
+                            conn,
+                            device_id=device_id,
+                            session_id=session_id,
+                            client_action_id=client_action_id,
+                            action_kind=action_kind,
+                            receipt=queued_receipt,
+                            audit_action={"type": "action_queued"},
+                        )
+            if not inserted_reservation:
                 existing = conn.execute(
                     "SELECT * FROM control_action_receipts "
                     "WHERE device_id=? AND session_id=? AND client_action_id=?",
                     (normalized_device_id, session_id, client_action_id),
                 ).fetchone()
     except (OSError, sqlite3.Error) as exc:
-        if active_marker_added:
-            with _ACTIVE_RECEIPTED_MUTATIONS_LOCK:
-                _ACTIVE_RECEIPTED_MUTATIONS.discard(reservation_key)
         receipt = _make_action_receipt(
             client_action_id=client_action_id,
             state="indeterminate",
+            execution_state="indeterminate",
             deduped=True,
-            phases=_receipt_phases(validated=False, applied=False, pty_written=None),
+            phases=_receipt_phases(
+                validated=False,
+                applied=False,
+                pty_written=None,
+            ),
         )
         return None, {
             "ok": False,
             "session_id": session_id,
             "receipt": receipt,
-            "error": {"code": "idempotency_unavailable", "message": f"action ledger unavailable: {type(exc).__name__}"},
+            "error": {
+                "code": "idempotency_unavailable",
+                "message": (
+                    "action ledger unavailable: "
+                    f"{type(exc).__name__}"
+                ),
+            },
             "status": 503,
         }
+
+    if outbox_inserted and outbox_event is not None:
+        _publish_session_live_receipt_event(outbox_event)
     if inserted_reservation:
         _track_request_receipt_reservation({
             "reservation_key": reservation_key,
@@ -15836,89 +17470,189 @@ def _receipt_duplicate_response(
             "client_action_id": client_action_id,
             "body_hash": body_hash,
             "action_kind": action_kind,
+            "execution_state": "queued",
         })
         return None, None
     if existing is None:
         return None, None
     if existing["body_hash"] != body_hash or existing["action_kind"] != action_kind:
-        mismatch = "different content" if existing["body_hash"] != body_hash else "a different action kind"
+        mismatch = (
+            "different content"
+            if existing["body_hash"] != body_hash
+            else "a different action kind"
+        )
         receipt = _make_action_receipt(
             client_action_id=client_action_id,
             state="rejected",
+            execution_state="failed",
             deduped=True,
-            phases=_receipt_phases(validated=False, applied=False, pty_written=False),
+            phases=_receipt_phases(
+                validated=False,
+                applied=False,
+                pty_written=False,
+            ),
         )
         return None, {
             "ok": False,
             "session_id": session_id,
             "receipt": receipt,
-            "error": {"code": "idempotency_conflict", "message": f"client_action_id was reused with {mismatch}"},
+            "error": {
+                "code": "idempotency_conflict",
+                "message": (
+                    "client_action_id was reused with "
+                    f"{mismatch}"
+                ),
+            },
             "status": 409,
         }
-    if existing["state"] != "final":
-        restarted = existing["owner_instance"] != _CONTROL_RECEIPT_INSTANCE_ID
-        reservation_key = _receipt_key(device_id, session_id, client_action_id)
-        with _ACTIVE_RECEIPTED_MUTATIONS_LOCK:
-            active_here = reservation_key in _ACTIVE_RECEIPTED_MUTATIONS
-        if restarted or not active_here:
-            receipt = _make_action_receipt(
-                client_action_id=client_action_id,
-                state="indeterminate",
-                deduped=True,
-                phases=_receipt_phases(
-                    validated=False,
-                    applied=False,
-                    pty_written=None,
-                ),
+
+    try:
+        stored_receipt = json.loads(existing["receipt_json"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        stored_receipt = {}
+    if not isinstance(stored_receipt, dict):
+        stored_receipt = {}
+    execution_state = str(
+        existing["execution_state"]
+        or _receipt_execution_state(stored_receipt)
+    )
+
+    if execution_state == "queued":
+        if queued_receipt is None:
+            queued_receipt = dict(stored_receipt)
+            if not queued_receipt:
+                queued_receipt = _make_action_receipt(
+                    client_action_id=client_action_id,
+                    state="received",
+                    execution_state="queued",
+                    phases=_receipt_phases(
+                        validated=False,
+                        applied=False,
+                        pty_written=False,
+                    ),
+                )
+        queued_receipt["deduped"] = True
+        return None, {
+            "ok": False,
+            "session_id": session_id,
+            "receipt": queued_receipt,
+            "error": {
+                "code": "action_in_progress",
+                "message": "an identical action is queued",
+            },
+            "status": 409,
+        }
+
+    if execution_state == "running":
+        if defer_running:
+            return None, None
+        try:
+            recovery_correlation = json.loads(
+                existing["recovery_correlation_json"] or "{}"
             )
-            _receipt_attach_response(
-                receipt,
-                http_status=409,
-                error_code="action_outcome_unknown",
-                error_message=(
-                    "the daemon restarted before this action outcome was recorded; "
-                    "check current state before starting a new attempt"
-                    if restarted
-                    else "the action stopped before its outcome was recorded; "
-                    "check current state before starting a new attempt"
+        except (TypeError, ValueError, json.JSONDecodeError):
+            recovery_correlation = {}
+        if not isinstance(recovery_correlation, dict):
+            recovery_correlation = {}
+        recovery_context = {
+            "device_id": normalized_device_id,
+            "receipt_scope": session_id,
+            "client_action_id": client_action_id,
+            "action_kind": action_kind,
+            "execution_state": execution_state,
+            "provider_id": existing["provider_id"],
+            "provider_version": existing["provider_version"],
+            "provider_channel": existing["provider_channel"],
+            "operation_id": existing["operation_id"],
+            "binding_id": existing["binding_id"],
+            "capability_generation": existing["capability_generation"],
+            "recovery_correlation": {
+                "provider_operation_id": (
+                    existing["provider_operation_id"]
+                    or recovery_correlation.get("provider_operation_id")
                 ),
-            )
+                "provider_cursor": (
+                    existing["provider_cursor"]
+                    if existing["provider_cursor"] is not None
+                    else recovery_correlation.get("provider_cursor")
+                ),
+            },
+        }
+        recovered_receipt = None
+        if recover_uncertain:
+            try:
+                recovered_receipt = recover_uncertain(recovery_context)
+            except Exception as exc:
+                _append_control_receipt_audit({
+                    "ts": _time.time(),
+                    "device_id": normalized_device_id,
+                    "session_id": session_id,
+                    "client_action_id": client_action_id,
+                    "action_kind": action_kind,
+                    "body_hash": body_hash,
+                    "action": {
+                        "type": "action_recovery_proof_failed",
+                        "error": type(exc).__name__,
+                    },
+                    "persisted": False,
+                })
+        if isinstance(recovered_receipt, dict):
+            recovered_state = _receipt_execution_state(recovered_receipt)
+            if recovered_state not in {"succeeded", "failed"}:
+                raise RuntimeError(
+                    "proof-only recovery returned a non-conclusive outcome"
+                )
             _store_action_receipt(
                 device_id,
                 session_id,
                 client_action_id,
                 body_hash,
-                receipt,
+                recovered_receipt,
                 action_kind=action_kind,
-                audit_action={"type": "abandoned_action_reconciled"},
-                allow_owner_takeover=restarted,
+                audit_action={"type": "action_recovered_from_provider_proof"},
+                allow_owner_takeover=True,
+                recovery_only=True,
             )
-            return receipt, None
-        code = "action_outcome_unknown" if restarted else "action_in_progress"
-        message = (
-            "the daemon restarted before this action outcome was recorded; refresh before trying another action"
-            if restarted
-            else "an identical action is already in progress"
-        )
-        receipt = _make_action_receipt(
+            result = dict(recovered_receipt)
+            result["deduped"] = True
+            return result, None
+
+        indeterminate = _make_action_receipt(
             client_action_id=client_action_id,
-            state="indeterminate" if restarted else "received",
+            state="indeterminate",
+            execution_state="indeterminate",
             deduped=True,
-            phases=_receipt_phases(validated=False, applied=False, pty_written=None),
+            phases=_receipt_phases(
+                validated=True,
+                applied=False,
+                pty_written=None,
+            ),
         )
-        return None, {
-            "ok": False,
-            "session_id": session_id,
-            "receipt": receipt,
-            "error": {"code": code, "message": message},
-            "status": 409,
-        }
-    try:
-        receipt = json.loads(existing["receipt_json"] or "{}")
-    except (TypeError, ValueError, json.JSONDecodeError):
-        receipt = {}
-    receipt["deduped"] = True
-    return receipt, None
+        _receipt_attach_response(
+            indeterminate,
+            http_status=409,
+            error_code="action_outcome_unknown",
+            error_message=(
+                "the provider could not prove the outcome; check current "
+                "state before starting a new attempt"
+            ),
+        )
+        _store_action_receipt(
+            device_id,
+            session_id,
+            client_action_id,
+            body_hash,
+            indeterminate,
+            action_kind=action_kind,
+            audit_action={"type": "action_recovery_proof_unavailable"},
+            allow_owner_takeover=True,
+            recovery_only=True,
+        )
+        return indeterminate, None
+
+    stored_receipt["execution_state"] = execution_state
+    stored_receipt["deduped"] = True
+    return stored_receipt, None
 
 
 def _store_action_receipt(
@@ -15932,7 +17666,15 @@ def _store_action_receipt(
     audit_action: dict | None = None,
     persist: bool = True,
     allow_owner_takeover: bool = False,
+    recovery_only: bool = False,
 ) -> None:
+    if not isinstance(receipt, dict):
+        raise TypeError("receipt must be a dictionary")
+    next_execution_state = _receipt_execution_state(receipt)
+    if next_execution_state not in _RECEIPT_TERMINAL_EXECUTION_STATES:
+        raise RuntimeError("final receipt must have a terminal execution state")
+    receipt["execution_state"] = next_execution_state
+
     outbox_event: dict | None = None
     outbox_inserted = False
     publish_live_receipt = bool(
@@ -15951,64 +17693,110 @@ def _store_action_receipt(
             with _control_receipt_conn() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 existing = conn.execute(
-                    "SELECT body_hash, action_kind, state, receipt_json, owner_instance "
-                    "FROM control_action_receipts "
+                    "SELECT * FROM control_action_receipts "
                     "WHERE device_id=? AND session_id=? AND client_action_id=?",
                     (normalized_device_id, session_id, client_action_id),
                 ).fetchone()
                 if existing is None:
                     conn.execute(
                         "INSERT INTO control_action_receipts "
-                        "(device_id, session_id, client_action_id, body_hash, action_kind, state, "
-                        "receipt_json, owner_instance, created_at, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?, 'final', ?, ?, ?, ?)",
+                        "(device_id, session_id, client_action_id, body_hash, "
+                        "action_kind, state, execution_state, receipt_json, "
+                        "owner_instance, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, 'final', ?, ?, ?, ?, ?)",
                         (
                             normalized_device_id,
                             session_id,
                             client_action_id,
                             body_hash,
                             action_kind,
+                            next_execution_state,
                             json.dumps(receipt, sort_keys=True),
                             _CONTROL_RECEIPT_INSTANCE_ID,
                             now,
                             now,
                         ),
                     )
-                elif existing["body_hash"] != body_hash:
-                    raise RuntimeError("refusing to overwrite an idempotency receipt with different content")
-                elif existing["action_kind"] != action_kind:
-                    raise RuntimeError("refusing to finalize an idempotency receipt with a different action kind")
-                elif existing["state"] == "final":
-                    try:
-                        stored_receipt = json.loads(existing["receipt_json"] or "{}")
-                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                else:
+                    if existing["body_hash"] != body_hash:
                         raise RuntimeError(
-                            "refusing to trust an unreadable final idempotency receipt"
-                        ) from exc
-                    if stored_receipt != receipt:
-                        raise RuntimeError(
-                            "refusing to replace a final idempotency receipt with a different outcome"
+                            "refusing to overwrite an idempotency receipt "
+                            "with different content"
                         )
-                elif existing["state"] == "in_progress":
+                    if existing["action_kind"] != action_kind:
+                        raise RuntimeError(
+                            "refusing to finalize an idempotency receipt "
+                            "with a different action kind"
+                        )
                     if (
                         existing["owner_instance"] != _CONTROL_RECEIPT_INSTANCE_ID
                         and not allow_owner_takeover
                     ):
-                        raise RuntimeError("refusing to finalize an action reserved by another daemon instance")
-                    conn.execute(
-                        "UPDATE control_action_receipts SET state='final', receipt_json=?, "
-                        "action_kind=?, owner_instance=?, updated_at=? "
-                        "WHERE device_id=? AND session_id=? AND client_action_id=?",
-                        (
-                            json.dumps(receipt, sort_keys=True),
-                            action_kind,
-                            _CONTROL_RECEIPT_INSTANCE_ID,
-                            now,
-                            normalized_device_id,
-                            session_id,
-                            client_action_id,
-                        ),
+                        raise RuntimeError(
+                            "refusing to finalize an action reserved by "
+                            "another daemon instance"
+                        )
+                    try:
+                        stored_receipt = json.loads(
+                            existing["receipt_json"] or "{}"
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise RuntimeError(
+                            "refusing to trust an unreadable idempotency receipt"
+                        ) from exc
+                    if not isinstance(stored_receipt, dict):
+                        raise RuntimeError(
+                            "refusing to trust a malformed idempotency receipt"
+                        )
+                    current_execution_state = str(
+                        existing["execution_state"]
+                        or _receipt_execution_state(stored_receipt)
                     )
+                    if (
+                        current_execution_state
+                        in _RECEIPT_TERMINAL_EXECUTION_STATES
+                    ):
+                        if (
+                            current_execution_state != next_execution_state
+                            or stored_receipt != receipt
+                        ):
+                            raise RuntimeError(
+                                "refusing to replace a final idempotency "
+                                "receipt with a different outcome"
+                            )
+                    else:
+                        transition_allowed = _receipt_transition_allowed(
+                            current_execution_state,
+                            next_execution_state,
+                        )
+                        if (
+                            current_execution_state == "queued"
+                            and next_execution_state == "succeeded"
+                            and not _receipt_action_requires_running(action_kind)
+                        ):
+                            transition_allowed = True
+                        if not transition_allowed:
+                            raise RuntimeError(
+                                "refusing invalid receipt transition "
+                                f"{current_execution_state}->{next_execution_state}"
+                            )
+                        conn.execute(
+                            "UPDATE control_action_receipts "
+                            "SET state='final', execution_state=?, "
+                            "receipt_json=?, action_kind=?, owner_instance=?, "
+                            "updated_at=? WHERE device_id=? AND session_id=? "
+                            "AND client_action_id=?",
+                            (
+                                next_execution_state,
+                                json.dumps(receipt, sort_keys=True),
+                                action_kind,
+                                _CONTROL_RECEIPT_INSTANCE_ID,
+                                now,
+                                normalized_device_id,
+                                session_id,
+                                client_action_id,
+                            ),
+                        )
                 if publish_live_receipt:
                     outbox_event, outbox_inserted = _insert_session_live_receipt(
                         conn,
@@ -16021,11 +17809,8 @@ def _store_action_receipt(
                     )
             stored_durably = True
         finally:
-            with _ACTIVE_RECEIPTED_MUTATIONS_LOCK:
-                _ACTIVE_RECEIPTED_MUTATIONS.discard(reservation_key)
-            _release_visible_resume_reservation(reservation_key)
-        if stored_durably:
-            _untrack_request_receipt_reservation(reservation_key)
+            if stored_durably:
+                _untrack_request_receipt_reservation(reservation_key)
     _append_control_receipt_audit({
         "ts": _time.time(),
         "device_id": device_id,
@@ -16050,6 +17835,220 @@ def _store_action_receipt(
         _publish_session_live_receipt_event(outbox_event)
 
 
+def _mark_receipted_mutation_running(
+    context: dict,
+    *,
+    provider_id: str,
+    provider_version: str,
+    provider_channel: str,
+    operation_id: str,
+    binding_id: str,
+    capability_generation: int,
+    recovery_correlation: dict,
+) -> dict:
+    """Commit the exactly-once dispatch boundary before the driver call."""
+    normalized = {
+        "provider_id": str(provider_id or "").strip().lower(),
+        "provider_version": str(provider_version or "").strip(),
+        "provider_channel": str(provider_channel or "").strip(),
+        "operation_id": str(operation_id or "").strip(),
+        "binding_id": str(binding_id or "").strip(),
+    }
+    if not all(normalized.values()):
+        raise ValueError(
+            "running receipt requires exact provider binding and operation"
+        )
+    if not isinstance(capability_generation, int) or capability_generation <= 0:
+        raise ValueError("running receipt requires a positive capability generation")
+    if not isinstance(recovery_correlation, dict):
+        raise ValueError("running receipt requires safe recovery correlation")
+    provider_operation_id = str(
+        recovery_correlation.get("provider_operation_id") or ""
+    ).strip()
+    provider_cursor_value = recovery_correlation.get("provider_cursor")
+    provider_cursor = (
+        str(provider_cursor_value).strip()
+        if provider_cursor_value is not None
+        else None
+    )
+    if not provider_operation_id or len(provider_operation_id) > 256:
+        raise ValueError("running receipt requires a bounded provider operation ID")
+    if provider_cursor is not None and len(provider_cursor) > 512:
+        raise ValueError("provider recovery cursor is too large")
+    safe_correlation = {
+        "provider_operation_id": provider_operation_id,
+        "provider_cursor": provider_cursor,
+    }
+
+    device_id = context.get("device_id")
+    session_id = str(context.get("receipt_scope") or "")
+    client_action_id = str(context.get("client_action_id") or "")
+    body_hash = str(context.get("body_hash") or "")
+    action_kind = str(context.get("action_kind") or "mutation")
+    normalized_device_id = str(device_id or "").strip()
+    if not normalized_device_id or not client_action_id:
+        raise ValueError("running receipt requires a durable mutation identity")
+
+    receipt = _make_action_receipt(
+        client_action_id=client_action_id,
+        state="validated",
+        execution_state="running",
+        phases=_receipt_phases(
+            validated=True,
+            applied=False,
+            pty_written=False,
+        ),
+    )
+    receipt["provider_operation_id"] = provider_operation_id
+    receipt["provider_cursor"] = provider_cursor
+    _receipt_attach_response(
+        receipt,
+        http_status=409,
+        error_code="action_in_progress",
+        error_message="the provider operation is running",
+    )
+    outbox_event: dict | None = None
+    outbox_inserted = False
+    now = _time.time()
+    with _control_receipt_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT * FROM control_action_receipts "
+            "WHERE device_id=? AND session_id=? AND client_action_id=?",
+            (normalized_device_id, session_id, client_action_id),
+        ).fetchone()
+        if existing is None:
+            raise RuntimeError("running receipt has no queued reservation")
+        if existing["body_hash"] != body_hash or existing["action_kind"] != action_kind:
+            raise RuntimeError("running receipt identity does not match its reservation")
+        if existing["owner_instance"] != _CONTROL_RECEIPT_INSTANCE_ID:
+            raise RuntimeError("running receipt is owned by another daemon instance")
+        if existing["execution_state"] != "queued":
+            raise RuntimeError(
+                "only a queued receipt may cross the provider dispatch boundary"
+            )
+        updated = conn.execute(
+            "UPDATE control_action_receipts SET execution_state='running', "
+            "receipt_json=?, provider_id=?, provider_version=?, "
+            "provider_channel=?, operation_id=?, binding_id=?, "
+            "capability_generation=?, provider_operation_id=?, "
+            "provider_cursor=?, recovery_correlation_json=?, updated_at=? "
+            "WHERE device_id=? AND session_id=? AND client_action_id=? "
+            "AND execution_state='queued' AND owner_instance=?",
+            (
+                json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+                normalized["provider_id"],
+                normalized["provider_version"],
+                normalized["provider_channel"],
+                normalized["operation_id"],
+                normalized["binding_id"],
+                capability_generation,
+                provider_operation_id,
+                provider_cursor,
+                json.dumps(
+                    safe_correlation,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                now,
+                normalized_device_id,
+                session_id,
+                client_action_id,
+                _CONTROL_RECEIPT_INSTANCE_ID,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError("queued receipt ownership changed before dispatch")
+        if len(_session_live_receipt_aliases(session_id)) == 1:
+            outbox_event, outbox_inserted = _insert_session_live_receipt(
+                conn,
+                device_id=device_id,
+                session_id=session_id,
+                client_action_id=client_action_id,
+                action_kind=action_kind,
+                receipt=receipt,
+                audit_action={
+                    "type": "action_running",
+                    "provider_id": normalized["provider_id"],
+                    "operation_id": normalized["operation_id"],
+                },
+            )
+    reservation_key = _receipt_key(device_id, session_id, client_action_id)
+    context["running_committed"] = True
+    context["execution_state"] = "running"
+    _update_tracked_receipt_reservation(
+        reservation_key,
+        execution_state="running",
+        running_committed=True,
+    )
+    if outbox_inserted and outbox_event is not None:
+        _publish_session_live_receipt_event(outbox_event)
+    return receipt
+
+
+def _mark_send_text_running(
+    context: dict,
+    *,
+    provider_id: str,
+    binding_id: str,
+) -> dict | None:
+    """Commit the send dispatch boundary without persisting prompt content."""
+    if (
+        context.get("action_kind") != "send_text"
+        or not context.get("receipt_scope")
+    ):
+        # Internal helper probes do not own a durable request reservation.
+        return None
+    boundary = context.get("confirmation_boundary")
+    capability_generation = (
+        int(boundary.get("log_generation") or 0)
+        if isinstance(boundary, dict)
+        else 0
+    )
+    if capability_generation <= 0:
+        raise RuntimeError("send_text dispatch requires a durable proof generation")
+    client_action_id = str(context.get("client_action_id") or "")
+    return _mark_receipted_mutation_running(
+        context,
+        provider_id=provider_id,
+        provider_version="terminal-surface-v2",
+        provider_channel=(
+            str(binding_id).partition(":")[0].strip() or "terminal"
+        ),
+        operation_id="session.prompt.send",
+        binding_id=binding_id,
+        capability_generation=capability_generation,
+        recovery_correlation={
+            "provider_operation_id": client_action_id,
+            "provider_cursor": None,
+        },
+    )
+
+
+def _send_receipted_mutation_duplicate(
+    handler,
+    stored_receipt: dict | None,
+    conflict: dict | None,
+) -> bool:
+    if conflict is not None:
+        conflict_code = str((conflict.get("error") or {}).get("code") or "")
+        if conflict_code in {"action_in_progress", "action_outcome_unknown"}:
+            conflict["outcome_indeterminate"] = True
+        handler._send_json(conflict, status=int(conflict["status"]))
+        return True
+    if stored_receipt is not None:
+        body, status = _receipt_replay_response(
+            stored_receipt,
+            {
+                "ok": _receipt_execution_state(stored_receipt) == "succeeded",
+                "deduped": True,
+            },
+        )
+        handler._send_json(body, status=status)
+        return True
+    return False
+
+
 def _begin_receipted_mutation(
     handler,
     *,
@@ -16057,6 +18056,7 @@ def _begin_receipted_mutation(
     action_kind: str,
     material,
     action_label: str,
+    recover_uncertain=None,
 ) -> dict | None:
     """Reserve one durable mutation before any external side effect."""
     headers = getattr(handler, "headers", {}) or {}
@@ -16088,22 +18088,13 @@ def _begin_receipted_mutation(
         client_action_id,
         body_hash,
         action_kind=action_kind,
+        recover_uncertain=recover_uncertain,
     )
-    if conflict is not None:
-        conflict_code = str((conflict.get("error") or {}).get("code") or "")
-        if conflict_code in {"action_in_progress", "action_outcome_unknown"}:
-            conflict["outcome_indeterminate"] = True
-        handler._send_json(conflict, status=int(conflict["status"]))
-        return None
-    if stored_receipt is not None:
-        body, status = _receipt_replay_response(
-            stored_receipt,
-            {
-                "ok": stored_receipt.get("state") == "applied",
-                "deduped": True,
-            },
-        )
-        handler._send_json(body, status=status)
+    if _send_receipted_mutation_duplicate(
+        handler,
+        stored_receipt,
+        conflict,
+    ):
         return None
     return {
         "device_id": device_id,
@@ -16111,6 +18102,7 @@ def _begin_receipted_mutation(
         "client_action_id": client_action_id,
         "body_hash": body_hash,
         "action_kind": action_kind,
+        "execution_state": "queued",
     }
 
 
@@ -16129,6 +18121,7 @@ def _finalize_receipted_mutation(
     receipt = _make_action_receipt(
         client_action_id=context.get("client_action_id"),
         state=state,
+        execution_state=_execution_state_for_current_receipt_state(state),
         phases=_receipt_phases(
             validated=state != "rejected",
             applied=state == "applied",
@@ -16221,7 +18214,7 @@ def _terminal_control_validate_screen(payload: dict, snapshot: dict, action: dic
         return _terminal_control_error("missing_screen_nonce", "latest screen nonce is required", 409)
     if screen_hash != snapshot.get("screen_hash") or nonce != snapshot.get("nonce"):
         return {
-            **_terminal_control_error("stale_screen", "terminal screen advanced; refresh before sending control", 409),
+            **_terminal_control_error(TERMINAL_CONTROL_STALE_SCREEN_CODE, "terminal screen advanced; refresh before sending control", 409),
             "current_screen_hash": snapshot.get("screen_hash"),
             "current_nonce": snapshot.get("nonce"),
         }
@@ -16235,7 +18228,7 @@ def _terminal_control_validate_screen(payload: dict, snapshot: dict, action: dic
             }
         if payload_generation != snapshot_generation:
             return {
-                **_terminal_control_error("stale_screen", "terminal generation advanced; refresh before sending control", 409),
+                **_terminal_control_error(TERMINAL_CONTROL_STALE_SCREEN_CODE, "terminal generation advanced; refresh before sending control", 409),
                 "current_screen_hash": snapshot.get("screen_hash"),
                 "current_nonce": snapshot.get("nonce"),
                 "current_generation": snapshot_generation,
@@ -16280,7 +18273,7 @@ def _append_terminal_control_audit(entry: dict) -> None:
     try:
         TERMINAL_CONTROL_AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(TERMINAL_CONTROL_AUDIT_PATH, "a") as f:
-            f.write(json.dumps(entry, sort_keys=True) + "\n")
+            f.write(json.dumps(redact_public_diagnostic(entry), sort_keys=True) + "\n")
     except Exception:
         pass
 
@@ -16741,7 +18734,7 @@ def _iter_jsonl_prefix_lines(
     stop("unknown")
     remaining = max(1, int(max_bytes))
     try:
-        with path.open("rb") as handle:
+        with _open_session_transcript_file(path) as handle:
             for _ in range(max(1, int(max_lines))):
                 raw = handle.readline(remaining + 1)
                 if not raw:
@@ -16979,22 +18972,16 @@ def _approved_codex_transcript_path(path: Path, native_id: str) -> Path | None:
     if path.suffix != ".jsonl":
         return None
     try:
-        root = CODEX_SESSIONS_DIR.resolve(strict=True)
-        resolved = path.resolve(strict=True)
-    except OSError:
-        return None
-    try:
-        resolved.relative_to(root)
-    except ValueError:
-        return None
-    try:
-        if path.is_symlink():
+        root, target = _transcript_root_for_path(path)
+        if root != CODEX_SESSIONS_DIR.expanduser().resolve(strict=True):
             return None
-    except OSError:
+        with _open_session_transcript_file(target):
+            pass
+    except (OSError, ValueError):
         return None
-    meta = _codex_rollout_meta(resolved)
+    meta = _codex_rollout_meta(target)
     if meta is not None:
-        return resolved if meta.get("id") == native_id else None
+        return target if meta.get("id") == native_id else None
     return None
 
 
@@ -19463,13 +21450,14 @@ class ClientDisconnected(Exception):
 
 
 class RequestBodyRejected(Exception):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, *, status: int = 400):
         super().__init__(message)
         self.code = code
         self.message = message
+        self.status = status
 
 
-def _validated_request_content_length(headers) -> int:
+def _validated_request_content_length(headers, *, required: bool = False) -> int:
     def values(name: str) -> list[str]:
         get_all = getattr(headers, "get_all", None)
         if callable(get_all):
@@ -19485,19 +21473,968 @@ def _validated_request_content_length(headers) -> int:
         )
     content_lengths = values("Content-Length")
     if not content_lengths:
+        if required:
+            raise RequestBodyRejected(
+                "content_length_required",
+                "exactly one Content-Length is required",
+                status=411,
+            )
         return 0
     if len(content_lengths) != 1:
         raise RequestBodyRejected("bad_content_length", "exactly one Content-Length is required")
     raw = str(content_lengths[0]).strip()
-    if len(raw) > 20 or re.fullmatch(r"[0-9]+", raw) is None:
+    if re.fullmatch(r"[0-9]+", raw) is None:
         raise RequestBodyRejected("bad_content_length", "Content-Length must be a nonnegative integer")
+    if len(raw) > 20:
+        raise RequestBodyRejected(
+            "request_too_large",
+            "Content-Length exceeds the supported range",
+            status=413,
+        )
     try:
         return int(raw)
     except ValueError as error:
         raise RequestBodyRejected("bad_content_length", "Content-Length is invalid") from error
 
 
+PROVIDER_CONTROL_SCHEMA_VERSION = 1
+PROVIDER_CONTROL_STREAM_SECONDS = 600.0
+PROVIDER_CONTROL_STREAM_POLL_SECONDS = 1.0
+PROVIDER_CONTROL_STREAM_KEEPALIVE_SECONDS = 20.0
+_PROVIDER_CONTROL_DRIVER_CACHE_MAX = 128
+_PROVIDER_CONTROL_DRIVER_CACHE_LOCK = threading.Lock()
+_PROVIDER_CONTROL_DRIVER_CACHE: dict[tuple[str, str, str, str], object] = {}
+_PROVIDER_CONTROL_DRIVER_OWNERS: dict[str, tuple[str, str, str, str]] = {}
+_PROVIDER_CONTROL_CONFIRMATION_TTL_SECONDS = 90.0
+_PROVIDER_CONTROL_CONFIRMATION_MAX = 512
+_PROVIDER_CONTROL_CONFIRMATION_PER_DEVICE_MAX = 16
+_PROVIDER_CONTROL_CONFIRMATION_LOCK = threading.Lock()
+_PROVIDER_CONTROL_CONFIRMATIONS: dict[str, dict] = {}
+_PROVIDER_CONTROL_SENSITIVE_KEY = re.compile(
+    r"(?i)(?:authorization|cookie|credential|password|secret|token|api[_-]?key|"
+    r"raw(?:_provider)?_payload|provider_raw|request_headers|response_headers|"
+    r"environment|env|file_path|local_path|absolute_path)"
+)
+_PROVIDER_CONTROL_SECRET_VALUE = re.compile(
+    r"(?i)(?:bearer\s+[A-Za-z0-9._~+/=-]{8,}|"
+    r"\bsk-[A-Za-z0-9_-]{8,}|"
+    r"\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+)"
+)
+
+
+class _ProviderControlRouteError(RuntimeError):
+    def __init__(self, code: str, message: str, *, status: int) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status = int(status)
+
+def _provider_control_confirmation_clear() -> None:
+    with _PROVIDER_CONTROL_CONFIRMATION_LOCK:
+        _PROVIDER_CONTROL_CONFIRMATIONS.clear()
+
+
+def _provider_control_confirmation_prune_locked(now: float) -> None:
+    for digest, row in tuple(_PROVIDER_CONTROL_CONFIRMATIONS.items()):
+        if now >= float(row["expires_at"]):
+            _PROVIDER_CONTROL_CONFIRMATIONS.pop(digest, None)
+
+
+def _provider_control_confirmation_issue(
+    binding: dict,
+    *,
+    prepared_attachments: tuple,
+    now: float | None = None,
+) -> tuple[str, float]:
+    current = _time.time() if now is None else float(now)
+    if not math.isfinite(current):
+        raise _ProviderControlRouteError(
+            "confirmation_challenge_unavailable",
+            "provider confirmation is temporarily unavailable",
+            status=503,
+        )
+    expires_at = current + _PROVIDER_CONTROL_CONFIRMATION_TTL_SECONDS
+    with _PROVIDER_CONTROL_CONFIRMATION_LOCK:
+        _provider_control_confirmation_prune_locked(current)
+        if len(_PROVIDER_CONTROL_CONFIRMATIONS) >= _PROVIDER_CONTROL_CONFIRMATION_MAX:
+            raise _ProviderControlRouteError(
+                "confirmation_challenge_unavailable",
+                "too many provider confirmations are pending",
+                status=503,
+            )
+        device_pending = sum(
+            1
+            for row in _PROVIDER_CONTROL_CONFIRMATIONS.values()
+            if row["device_id"] == binding["device_id"]
+            and row["profile_install_id"] == binding["profile_install_id"]
+        )
+        if device_pending >= _PROVIDER_CONTROL_CONFIRMATION_PER_DEVICE_MAX:
+            raise _ProviderControlRouteError(
+                "confirmation_challenge_rate_limited",
+                "too many provider confirmations are pending for this device",
+                status=429,
+            )
+        while True:
+            artifact = secrets.token_urlsafe(32)
+            digest = hashlib.sha256(artifact.encode("ascii")).hexdigest()
+            if digest not in _PROVIDER_CONTROL_CONFIRMATIONS:
+                break
+        _PROVIDER_CONTROL_CONFIRMATIONS[digest] = {
+            **binding,
+            "expires_at": expires_at,
+            "prepared_attachments": tuple(prepared_attachments),
+        }
+    return artifact, expires_at
+
+
+def _provider_control_confirmation_consume(
+    artifact,
+    expected: dict,
+    *,
+    now: float | None = None,
+) -> tuple:
+    value = str(artifact or "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{43,128}", value):
+        raise _ProviderControlRouteError(
+            "confirmation_challenge_invalid",
+            "provider confirmation challenge is invalid or already used",
+            status=409,
+        )
+    current = _time.time() if now is None else float(now)
+    digest = hashlib.sha256(value.encode("ascii")).hexdigest()
+    with _PROVIDER_CONTROL_CONFIRMATION_LOCK:
+        row = _PROVIDER_CONTROL_CONFIRMATIONS.pop(digest, None)
+        if row is None:
+            raise _ProviderControlRouteError(
+                "confirmation_challenge_invalid",
+                "provider confirmation challenge is invalid or already used",
+                status=409,
+            )
+        if not math.isfinite(current) or current >= float(row["expires_at"]):
+            raise _ProviderControlRouteError(
+                "confirmation_challenge_expired",
+                "provider confirmation challenge expired",
+                status=409,
+            )
+        bound_fields = (
+            "device_id",
+            "profile_install_id",
+            "provider_id",
+            "session_id",
+            "binding_id",
+            "capability_generation",
+            "operation_id",
+            "input_hash",
+            "client_action_id",
+        )
+        if any(row.get(field) != expected.get(field) for field in bound_fields):
+            raise _ProviderControlRouteError(
+                "confirmation_challenge_mismatch",
+                "provider confirmation challenge does not match this action",
+                status=409,
+            )
+        return tuple(row["prepared_attachments"])
+
+
+def _provider_control_confirmation_identity(handler) -> tuple[str, str]:
+    auth = getattr(handler, "pairling_auth", None)
+    device_id = str(getattr(auth, "device_id", "") or "").strip()
+    profile_install_id = str(getattr(auth, "install_id", "") or "").strip()
+    if not device_id or not profile_install_id:
+        raise _ProviderControlRouteError(
+            "confirmation_identity_unavailable",
+            "an authenticated device and install profile are required",
+            status=401,
+        )
+    return device_id, profile_install_id
+
+
+def _provider_control_canonical_input_hash(normalized_input: dict) -> str:
+    try:
+        canonical = json.dumps(
+            normalized_input,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise _ProviderControlRouteError(
+            "invalid_operation_input",
+            "operation input cannot be bound for confirmation",
+            status=400,
+        ) from exc
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _provider_control_confirmation_action(
+    target: dict,
+    definition,
+    normalized_input: dict,
+) -> dict:
+    operation_id = str(definition.operation_id)
+    risk = str(getattr(definition.risk, "value", definition.risk))
+    requirement = str(
+        getattr(
+            definition.confirmation_requirement,
+            "value",
+            definition.confirmation_requirement,
+        )
+    )
+
+    def exact_label(value) -> str:
+        return json.dumps(str(value or ""), ensure_ascii=True)
+
+    session_label = exact_label(target["session_id"])
+    provider_label = exact_label(target["provider_id"])
+    title = {
+        "session.prompt.send": "Send Prompt",
+        "session.turn.steer": "Steer Turn",
+        "session.turn.interrupt": "Interrupt Turn",
+        "session.terminate": "Terminate Session",
+        "session.resume": "Resume Session",
+        "session.fork": "Fork Session",
+        "session.compact": "Compact Context",
+        "session.rewind": "Rewind Session",
+        "session.model.set": "Change Model",
+        "session.reasoning.set": "Change Reasoning",
+        "session.permissions.set": "Change Permissions",
+        "session.collaboration_mode.set": "Change Collaboration Mode",
+        "session.approval.decide": "Decide Provider Approval",
+        "session.question.answer": "Answer Provider Questions",
+        "session.review.start": "Start Review",
+        "session.plan.start": "Start Plan",
+        "provider.mcp.reload": "Reload MCP Server",
+        "provider.mcp.reconnect": "Reconnect MCP Server",
+        "provider.mcp.set_enabled": "Change MCP Server",
+    }.get(operation_id, "Confirm Provider Action")
+    button = title
+    message = f"{title} for provider session {session_label}."
+    if operation_id == "session.terminate":
+        message = (
+            f"Terminate provider session {session_label}. "
+            "This ends that exact provider session."
+        )
+    elif operation_id == "session.resume":
+        target_label = exact_label(normalized_input.get("target_session"))
+        message = (
+            f"Resume archived provider session {target_label} using "
+            f"current provider session {session_label}."
+        )
+    elif operation_id == "session.rewind":
+        turn_label = exact_label(normalized_input.get("turn_id"))
+        message = (
+            f"Rewind provider session {session_label} to exact turn "
+            f"{turn_label}."
+        )
+    elif operation_id == "session.permissions.set":
+        permissions_label = exact_label(normalized_input.get("permissions"))
+        title = button = "Set Provider Permissions"
+        message = (
+            f"Set permissions for provider session {session_label} to "
+            f"{permissions_label}."
+        )
+    elif operation_id == "session.approval.decide":
+        decision = str(normalized_input.get("decision") or "").strip().lower()
+        if decision in {
+            "allow",
+            "accept",
+            "once",
+            "session",
+            "always",
+            "proceed_once",
+        }:
+            title = button = "Allow Provider Request"
+            message = (
+                "Allow the pending provider request for provider session "
+                f"{session_label} with reviewed decision "
+                f"{exact_label(decision)}."
+            )
+        elif decision in {"deny", "decline", "reject"}:
+            title = button = "Deny Provider Request"
+            message = (
+                "Deny the pending provider request for provider session "
+                f"{session_label} with reviewed decision "
+                f"{exact_label(decision)}."
+            )
+        elif decision == "cancel":
+            title = button = "Cancel Provider Request"
+            message = (
+                "Cancel the pending provider request for provider session "
+                f"{session_label}."
+            )
+        else:
+            raise _ProviderControlRouteError(
+                "confirmation_action_unavailable",
+                "provider approval decision cannot be rendered safely",
+                status=409,
+            )
+    elif operation_id == "session.question.answer":
+        answers = normalized_input.get("answers")
+        answer_count = len(answers) if isinstance(answers, list) else 0
+        title = button = "Submit Provider Answers"
+        message = (
+            f"Submit {answer_count} reviewed answer"
+            f"{'' if answer_count == 1 else 's'} to provider session "
+            f"{session_label}."
+        )
+    elif operation_id in {
+        "provider.mcp.reload",
+        "provider.mcp.reconnect",
+        "provider.mcp.set_enabled",
+    }:
+        server_label = exact_label(normalized_input.get("server_id"))
+        if operation_id == "provider.mcp.reload":
+            title = button = "Reload MCP Server"
+            message = (
+                f"Reload MCP server {server_label} for provider "
+                f"{provider_label}."
+            )
+        elif operation_id == "provider.mcp.reconnect":
+            title = button = "Reconnect MCP Server"
+            message = (
+                f"Reconnect MCP server {server_label} for provider session "
+                f"{session_label}."
+            )
+        else:
+            enabled = normalized_input.get("enabled") is True
+            verb = "Enable" if enabled else "Disable"
+            title = button = f"{verb} MCP Server"
+            message = (
+                f"{verb} MCP server {server_label} for provider session "
+                f"{session_label}."
+            )
+    if len(title) > 200 or len(message) > 500 or len(button) > 200:
+        raise _ProviderControlRouteError(
+            "confirmation_action_unavailable",
+            "provider confirmation action cannot be rendered safely",
+            status=409,
+        )
+    return {
+        "title": title,
+        "message": message,
+        "confirm_button_label": button,
+        "risk": risk,
+        "confirmation_requirement": requirement,
+    }
+
+def _provider_control_exact_session_id(raw_session) -> tuple[str, str, str]:
+    value = str(raw_session or "").strip()
+    if ":" not in value:
+        raise _ProviderControlRouteError(
+            "provider_qualified_session_required",
+            "session_id must be provider-qualified",
+            status=400,
+        )
+    provider, native_id = _parse_agent_session_ref(value)
+    if (
+        not provider
+        or not native_id
+        or not _safe_agent_native_id(native_id)
+        or value != _qualified_session_id(provider, native_id)
+    ):
+        raise _ProviderControlRouteError(
+            "bad_session_id",
+            "session_id is not a valid provider-qualified session",
+            status=400,
+        )
+    return value, provider, native_id
+
+
+def _provider_control_public_json(value, *, depth: int = 0):
+    """Return bounded public JSON while dropping provider-owned secret fields."""
+    if depth > 8:
+        raise _ProviderControlRouteError(
+            "provider_payload_invalid",
+            "provider result exceeds the public nesting limit",
+            status=502,
+        )
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        bounded = value[:65536]
+        return "[redacted]" if _PROVIDER_CONTROL_SECRET_VALUE.search(bounded) else bounded
+    if isinstance(value, dict):
+        if len(value) > 128:
+            raise _ProviderControlRouteError(
+                "provider_payload_invalid",
+                "provider result contains too many fields",
+                status=502,
+            )
+        public = {}
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            if len(key) > 160 or _PROVIDER_CONTROL_SENSITIVE_KEY.search(key):
+                continue
+            public[key] = _provider_control_public_json(item, depth=depth + 1)
+        return public
+    if isinstance(value, (list, tuple)):
+        if len(value) > 256:
+            raise _ProviderControlRouteError(
+                "provider_payload_invalid",
+                "provider result contains too many items",
+                status=502,
+            )
+        return [
+            _provider_control_public_json(item, depth=depth + 1)
+            for item in value
+        ]
+    raise _ProviderControlRouteError(
+        "provider_payload_invalid",
+        "provider result is not public JSON",
+        status=502,
+    )
+
+def _provider_control_instance_id(
+    provider: str,
+    native_id: str,
+    row: dict,
+) -> str:
+    metadata = _registry_metadata_from_row(row)
+    material = {
+        "provider_id": provider,
+        "native_id": native_id,
+        "started_at": row.get("started_at"),
+        "pid": row.get("pid") or row.get("claude_pid"),
+        "process_start": (
+            metadata.get("process_start")
+            or metadata.get("process_started_at")
+            or metadata.get("process_birth")
+        ),
+    }
+    digest = hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return f"{provider}:{native_id}:{digest[:24]}"
+
+
+def _provider_control_binding_cache_key(binding) -> tuple[str, str, str, str]:
+    return (
+        str(binding.provider_id),
+        str(binding.provider_version),
+        str(binding.provider_channel),
+        str(binding.binding_id),
+    )
+
+
+def _provider_control_close_driver(driver) -> None:
+    close = getattr(driver, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def _provider_control_cached_driver(binding, *, owner_id: str):
+    """Own one stateful driver per exact binding and stable session owner."""
+    if _provider_get_control_driver is None:
+        return None
+    cache_key = _provider_control_binding_cache_key(binding)
+    stale_driver = None
+    with _PROVIDER_CONTROL_DRIVER_CACHE_LOCK:
+        previous_key = _PROVIDER_CONTROL_DRIVER_OWNERS.get(owner_id)
+        if previous_key is not None and previous_key != cache_key:
+            stale_driver = _PROVIDER_CONTROL_DRIVER_CACHE.pop(previous_key, None)
+            _PROVIDER_CONTROL_DRIVER_OWNERS.pop(owner_id, None)
+        cached = _PROVIDER_CONTROL_DRIVER_CACHE.get(cache_key)
+        if cached is not None:
+            _PROVIDER_CONTROL_DRIVER_OWNERS[owner_id] = cache_key
+    if stale_driver is not None:
+        _provider_control_close_driver(stale_driver)
+    if cached is not None:
+        if getattr(cached, "binding", None) == binding:
+            return cached
+        with _PROVIDER_CONTROL_DRIVER_CACHE_LOCK:
+            _PROVIDER_CONTROL_DRIVER_CACHE.pop(cache_key, None)
+            _PROVIDER_CONTROL_DRIVER_OWNERS.pop(owner_id, None)
+        _provider_control_close_driver(cached)
+    driver = _provider_get_control_driver(binding, home=HOME)
+    if driver is None:
+        return None
+    stale_driver = None
+    with _PROVIDER_CONTROL_DRIVER_CACHE_LOCK:
+        existing = _PROVIDER_CONTROL_DRIVER_CACHE.get(cache_key)
+        if existing is not None and getattr(existing, "binding", None) == binding:
+            _PROVIDER_CONTROL_DRIVER_OWNERS[owner_id] = cache_key
+            winner = existing
+        else:
+            if len(_PROVIDER_CONTROL_DRIVER_CACHE) >= _PROVIDER_CONTROL_DRIVER_CACHE_MAX:
+                evicted_key, stale_driver = next(
+                    iter(_PROVIDER_CONTROL_DRIVER_CACHE.items())
+                )
+                _PROVIDER_CONTROL_DRIVER_CACHE.pop(evicted_key, None)
+                for stale_owner, stale_key in tuple(
+                    _PROVIDER_CONTROL_DRIVER_OWNERS.items()
+                ):
+                    if stale_key == evicted_key:
+                        _PROVIDER_CONTROL_DRIVER_OWNERS.pop(stale_owner, None)
+            _PROVIDER_CONTROL_DRIVER_CACHE[cache_key] = driver
+            _PROVIDER_CONTROL_DRIVER_OWNERS[owner_id] = cache_key
+            winner = driver
+    if winner is not driver:
+        _provider_control_close_driver(driver)
+    if stale_driver is not None:
+        _provider_control_close_driver(stale_driver)
+    return winner
+
+
+def _provider_control_managed_target(session_id: str, provider: str):
+    ensure_store = globals().get("_ensure_managed_provider_session_store")
+    store = ensure_store() if callable(ensure_store) else None
+    truth = store.session_truth(session_id) if store is not None else None
+    if not isinstance(truth, dict):
+        return None
+    if (
+        truth.get("provider_id") != provider
+        or truth.get("session_id") != session_id
+    ):
+        raise _ProviderControlRouteError(
+            "provider_mismatch",
+            "managed session provider identity is mismatched",
+            status=409,
+        )
+    ensure_manager = globals().get("_ensure_managed_provider_session_manager")
+    manager = ensure_manager() if callable(ensure_manager) else None
+    driver = manager.driver(session_id) if manager is not None else None
+    lifecycle = str(truth.get("lifecycle") or "")
+    available = bool(truth.get("driver_available"))
+    normalized = dict(truth)
+    normalized["is_live"] = bool(
+        available
+        and lifecycle in {"launching", "running", "waiting", "blocked", "closing"}
+    )
+    normalized["controllable"] = bool(
+        available and lifecycle in {"launching", "running", "waiting"}
+    )
+    normalized["session_instance_id"] = str(truth.get("binding_id") or "")
+    return {
+        "driver": driver,
+        "provider_id": provider,
+        "session_id": session_id,
+        "managed": True,
+        "manager": manager,
+        "session_truth": normalized,
+    }
+
+def _default_provider_control_target(handler, raw_session: str) -> dict:
+    _requested, provider, native_id = _provider_control_exact_session_id(raw_session)
+    if provider not in _agent_provider_ids():
+        raise _ProviderControlRouteError(
+            "unsupported_provider",
+            f"provider {provider} does not expose structured sessions",
+            status=400,
+        )
+    canonical_native_id = _agent_registry_resolve_native_alias(provider, native_id)
+    canonical_session_id = _qualified_session_id(provider, canonical_native_id)
+    managed = _provider_control_managed_target(canonical_session_id, provider)
+    if managed is not None:
+        return managed
+
+    receipt_scope, row = _session_mutation_receipt_identity(
+        handler,
+        canonical_session_id,
+    )
+    if not isinstance(row, dict):
+        raise _ProviderControlRouteError(
+            "session_not_found",
+            "no exact daemon session truth exists for this session",
+            status=404,
+        )
+    row_provider = str(row.get("provider") or provider).strip().lower()
+    row_native_id = str(row.get("native_id") or canonical_native_id).strip()
+    canonical_session_id = _qualified_session_id(row_provider, row_native_id)
+    if row_provider != provider or receipt_scope != canonical_session_id:
+        raise _ProviderControlRouteError(
+            "provider_mismatch",
+            "resolved session provider identity is mismatched",
+            status=409,
+        )
+    if row.get("closed_at") is not None:
+        raise _ProviderControlRouteError(
+            "session_not_controllable",
+            "closed sessions cannot execute provider controls",
+            status=409,
+        )
+    verifier = getattr(handler, "_registry_row_has_verified_control", None)
+    verified = bool(
+        callable(verifier)
+        and verifier(
+            row,
+            provider=provider,
+            native_id=row_native_id,
+        )
+    )
+    instance_id = _provider_control_instance_id(provider, row_native_id, row)
+    adapter = _provider_get_adapter(provider, home=HOME) if _provider_get_adapter else None
+    driver = None
+    if adapter is not None and _ProviderControlBinding is not None:
+        try:
+            probe = adapter.probe()
+        except Exception:
+            probe = None
+        diagnostics = getattr(probe, "diagnostics", None)
+        descriptor = getattr(adapter, "descriptor", None)
+        metadata = _registry_metadata_from_row(row)
+        version = str(
+            metadata.get("provider_version")
+            or getattr(diagnostics, "version", None)
+            or "unknown"
+        )[:160]
+        channel = str(
+            metadata.get("provider_channel")
+            or getattr(descriptor, "kind", None)
+            or "local"
+        )[:80]
+        binding = _ProviderControlBinding(
+            provider_id=provider,
+            provider_version=version,
+            provider_channel=channel,
+            binding_id=f"pairling:{hashlib.sha256(instance_id.encode()).hexdigest()[:32]}",
+        )
+        driver = (
+            _provider_control_cached_driver(binding, owner_id=canonical_session_id)
+            if verified
+            else None
+        )
+    driver_binding = getattr(driver, "binding", None)
+    generation = int(getattr(driver, "capability_generation", 1) or 1)
+    if driver_binding is not None:
+        binding_id = str(driver_binding.binding_id)
+    else:
+        binding_id = (
+            f"pairling:{hashlib.sha256(instance_id.encode()).hexdigest()[:32]}"
+        )
+    truth = {
+        "provider_id": provider,
+        "session_id": canonical_session_id,
+        "native_id": row_native_id,
+        "binding_id": binding_id,
+        "capability_generation": max(1, generation),
+        "is_live": verified,
+        "controllable": verified,
+        "session_instance_id": instance_id,
+        "project": str(row.get("project") or ""),
+        "cwd": str(row.get("project") or ""),
+    }
+    return {
+        "driver": driver,
+        "provider_id": provider,
+        "session_id": canonical_session_id,
+        "session_truth": truth,
+    }
+
+
+_PROVIDER_CONTROL_TARGET_RESOLVER = _default_provider_control_target
+
+def _provider_control_fork_parent(
+    target: dict,
+    normalized_input: dict,
+) -> str:
+    manager = target.get("manager")
+    driver = target.get("driver")
+    truth = target.get("session_truth")
+    if (
+        manager is None
+        or driver is None
+        or not isinstance(truth, dict)
+    ):
+        raise _ProviderControlRouteError(
+            "fork_parent_unavailable",
+            "the fork parent could not be proven",
+            status=409,
+        )
+    raw_target = normalized_input.get("target_session")
+    provider = str(target.get("provider_id") or "").strip().lower()
+    current_session_id = str(target.get("session_id") or "").strip()
+    native_id = str(truth.get("native_id") or "").strip()
+    if (
+        not isinstance(raw_target, str)
+        or not raw_target
+        or raw_target not in {native_id, current_session_id}
+    ):
+        raise _ProviderControlRouteError(
+            "fork_parent_mismatch",
+            "the fork parent does not map to this managed session",
+            status=409,
+        )
+    row = manager.store.get(current_session_id)
+    if (
+        not isinstance(row, dict)
+        or str(row.get("provider") or "").strip().lower() != provider
+        or str(row.get("native_id") or "").strip() != native_id
+        or str(row.get("binding_id") or "") != str(truth.get("binding_id") or "")
+        or int(row.get("capability_generation") or 0)
+        != int(truth.get("capability_generation") or 0)
+        or str(row.get("provider_profile_id") or "")
+        != str(truth.get("provider_profile_id") or "")
+        or str(row.get("project") or "") != str(truth.get("project") or "")
+        or str(row.get("lifecycle") or "")
+        not in {"launching", "running", "waiting"}
+        or manager.driver(current_session_id) is not driver
+    ):
+        raise _ProviderControlRouteError(
+            "fork_parent_stale",
+            "the fork parent mapping is stale",
+            status=409,
+        )
+    return current_session_id
+
+
+def _provider_control_filter_fork_status(
+    target: dict,
+    status: dict,
+) -> dict:
+    operations = status.get("advertised_operations")
+    if not isinstance(operations, list) or "session.fork" not in operations:
+        return status
+    choices = status.get("choices")
+    operation_choices = (
+        choices.get("session.fork")
+        if isinstance(choices, dict)
+        else None
+    )
+    rows = (
+        operation_choices.get("target_session")
+        if isinstance(operation_choices, dict)
+        else None
+    )
+    valid_rows = []
+    if isinstance(rows, list):
+        for row in rows:
+            value = row.get("value") if isinstance(row, dict) else None
+            try:
+                _provider_control_fork_parent(
+                    target,
+                    {"target_session": value},
+                )
+            except _ProviderControlRouteError:
+                continue
+            valid_rows.append(row)
+    if valid_rows:
+        operation_choices["target_session"] = valid_rows
+        return status
+    status["advertised_operations"] = [
+        operation_id
+        for operation_id in operations
+        if operation_id != "session.fork"
+    ]
+    values = status.get("values")
+    if isinstance(values, dict):
+        values.pop("session.fork", None)
+    if isinstance(choices, dict):
+        choices.pop("session.fork", None)
+    return status
+
+
+def _provider_control_content_hash(session_id: str, status: dict) -> str:
+    stable_status = dict(status)
+    stable_status.pop("observed_at", None)
+    stable_status.pop("valid_until", None)
+    material = {
+        "schema_version": PROVIDER_CONTROL_SCHEMA_VERSION,
+        "session_id": session_id,
+        "status": stable_status,
+    }
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _provider_control_snapshot_renewal_at(envelope: dict) -> float:
+    status = envelope["status"]
+    observed_at = float(status["observed_at"])
+    valid_until = float(status["valid_until"])
+    return observed_at + ((valid_until - observed_at) / 2.0)
+
+
+def _provider_control_contract_error(exc: Exception) -> dict:
+    message = str(exc)[:300] or "provider control validation failed"
+    lowered = message.lower()
+    if "stale" in lowered or "generation" in lowered:
+        code, status = "provider_control_stale", 409
+    elif "blocked" in lowered:
+        code, status = "provider_control_blocked", 409
+    elif "did not advertise" in lowered or "unadvertised" in lowered:
+        code, status = "operation_not_available", 409
+    elif "runtime truth" in lowered or "not controllable" in lowered:
+        code, status = "session_not_controllable", 409
+    elif "unknown operation" in lowered or "not reviewed" in lowered:
+        code, status = "unknown_operation", 400
+    elif "provider operation result" in lowered:
+        code, status = "provider_result_invalid", 409
+    else:
+        code, status = "invalid_operation_input", 400
+    return {"code": code, "message": message, "status": status}
+
+
+def _provider_control_merge_provider_wide_status(
+    session_status: dict,
+    provider_status: dict,
+) -> dict:
+    identity_fields = (
+        "provider_id",
+        "provider_version",
+        "provider_channel",
+        "binding_id",
+        "capability_generation",
+    )
+    if any(
+        provider_status.get(field) != session_status.get(field)
+        for field in identity_fields
+    ):
+        return session_status
+    if provider_status.get("blocked_reason") is not None:
+        return session_status
+
+    observed_at = max(
+        float(session_status["observed_at"]),
+        float(provider_status["observed_at"]),
+    )
+    valid_until = min(
+        float(session_status["valid_until"]),
+        float(provider_status["valid_until"]),
+    )
+    if observed_at >= valid_until:
+        return session_status
+
+    session_operations = list(session_status.get("advertised_operations", ()))
+    provider_operations = []
+    for operation_id in provider_status.get("advertised_operations", ()):
+        definition = _REVIEWED_OPERATION_CATALOG.require(operation_id)
+        lifecycle = str(
+            getattr(definition.lifecycle, "value", definition.lifecycle)
+        )
+        if lifecycle == "provider_wide" and operation_id not in session_operations:
+            provider_operations.append(operation_id)
+    if not provider_operations:
+        return session_status
+
+    merged = dict(session_status)
+    merged["observed_at"] = observed_at
+    merged["valid_until"] = valid_until
+    merged["advertised_operations"] = session_operations + provider_operations
+    for field in ("values", "choices"):
+        rows = {
+            operation_id: dict(operation_rows)
+            for operation_id, operation_rows in session_status.get(field, {}).items()
+        }
+        provider_rows = provider_status.get(field, {})
+        for operation_id in provider_operations:
+            if operation_id in provider_rows:
+                rows[operation_id] = dict(provider_rows[operation_id])
+        merged[field] = rows
+    return merged
+
+
+def _provider_control_snapshot_envelope(target: dict, *, now: float | None = None) -> dict:
+    if (
+        _validated_driver_snapshot is None
+        or _provider_control_status_payload is None
+        or _provider_operation_manifest_payload is None
+    ):
+        raise _ProviderControlRouteError(
+            "provider_controls_unavailable",
+            "provider control contracts are unavailable",
+            status=503,
+        )
+    driver = target.get("driver")
+    if driver is None:
+        raise _ProviderControlRouteError(
+            "provider_driver_unavailable",
+            "the session has no live structured provider driver",
+            status=409,
+        )
+    observed_now = _time.time() if now is None else now
+    try:
+        snapshot = _validated_driver_snapshot(
+            driver,
+            session_id=target["session_id"],
+            session_truth=target["session_truth"],
+            now=observed_now,
+        )
+        status = _provider_control_status_payload(snapshot, now=observed_now)
+        status = _provider_control_filter_fork_status(target, status)
+        try:
+            provider_snapshot = _validated_driver_snapshot(
+                driver,
+                session_id=None,
+                session_truth=None,
+                now=observed_now,
+            )
+            provider_status = _provider_control_status_payload(
+                provider_snapshot,
+                now=observed_now,
+            )
+        except _ProviderControlContractError:
+            provider_status = None
+        if provider_status is not None:
+            status = _provider_control_merge_provider_wide_status(
+                status,
+                provider_status,
+            )
+    except _ProviderControlContractError as exc:
+        error = _provider_control_contract_error(exc)
+        raise _ProviderControlRouteError(
+            error["code"],
+            error["message"],
+            status=error["status"],
+        ) from exc
+    public_status = _provider_control_public_json(status)
+    content_hash = _provider_control_content_hash(
+        target["session_id"],
+        public_status,
+    )
+    return {
+        "ok": True,
+        "schema_version": PROVIDER_CONTROL_SCHEMA_VERSION,
+        "session_id": target["session_id"],
+        "operation_catalog": _provider_operation_manifest_payload(),
+        "status": public_status,
+        "content_hash": content_hash,
+    }
+
+
+def _provider_control_attachment_error(exc: Exception) -> dict:
+    code = str(getattr(exc, "code", None) or "attachment_proof_invalid")
+    malformed = {
+        "bad_attachment_records",
+        "too_many_attachments",
+        "attachment_too_large",
+        "attachments_too_large",
+        "bad_attachment_handle",
+    }
+    missing = {"attachment_not_found", "attachment_deleted", "missing_object"}
+    status = 400 if code in malformed else (404 if code in missing else 409)
+    return {
+        "code": code,
+        "message": "attachment resource proof could not be validated",
+        "status": status,
+    }
+
+
+def _provider_control_send_error(handler, error) -> None:
+    handler._send_json(
+        {
+            "ok": False,
+            "error": {
+                "code": str(error.code),
+                "message": redact_public_diagnostic(str(error.message)),
+            },
+        },
+        status=int(error.status),
+    )
+
 class Handler(BaseHTTPRequestHandler):
+    def send_error(self, code, message=None, explain=None):
+        safe_message = (
+            None if message is None else redact_public_text(str(message))
+        )
+        safe_explain = (
+            None if explain is None else redact_public_text(str(explain))
+        )
+        return super().send_error(code, safe_message, safe_explain)
+
     timeout = REQUEST_READ_TIMEOUT_SECONDS
 
     def _release_runtime_admission(self) -> None:
@@ -19520,7 +22457,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({
                     "ok": False,
                     "error": {"code": error.code, "message": error.message},
-                }, status=400)
+                }, status=error.status)
             except ClientDisconnected:
                 return
 
@@ -19556,17 +22493,23 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         self._cached_body = None
+        funnel_origin = _funnel_origin_request(self.headers, self.client_address)
         try:
-            content_length = _validated_request_content_length(self.headers)
+            content_length = _validated_request_content_length(
+                self.headers,
+                required=funnel_origin and self.command == "POST",
+            )
         except RequestBodyRejected as error:
             self.close_connection = True
             self._send_json({
                 "ok": False,
                 "error": {"code": error.code, "message": error.message},
-            }, status=400)
+            }, status=error.status)
             return
         self._expected_body_length = content_length
-        if u.path == "/upload":
+        if funnel_origin and self.command == "POST":
+            max_body = MAX_FUNNEL_BOOTSTRAP_BODY_BYTES
+        elif u.path == "/upload":
             max_body = MAX_UPLOAD_BODY_BYTES
         elif u.path == "/compose/recordings/sync" and self.command == "POST":
             max_body = MAX_COMPOSE_SYNC_BODY_BYTES
@@ -19577,6 +22520,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             max_body = MAX_REQUEST_BODY_BYTES
         if content_length > max_body:
+            self.close_connection = True
             self._send_json({
                 "ok": False,
                 "error": {
@@ -19601,6 +22545,88 @@ class Handler(BaseHTTPRequestHandler):
 
         self.pairling_auth = None
 
+        if getattr(self.server, "pairling_local_control", False):
+            try:
+                if u.path not in LOCAL_CONTROL_PATHS:
+                    self._send_json({
+                        "ok": False,
+                        "error": {
+                            "code": "local_control_path_not_found",
+                            "message": "unknown local control path",
+                        },
+                    }, status=404)
+                    return
+                if u.path == "/routez":
+                    if self.command != "GET" or content_length != 0:
+                        self._send_json({
+                            "ok": False,
+                            "error": {
+                                "code": "local_control_method_not_allowed",
+                                "message": "bodyless GET required",
+                            },
+                        }, status=405)
+                    else:
+                        self._handle_routez(q)
+                    return
+                if self.command != "POST":
+                    self._send_json({
+                        "ok": False,
+                        "error": {
+                            "code": "local_control_method_not_allowed",
+                            "message": "POST required",
+                        },
+                    }, status=405)
+                    return
+                if u.path == "/pair/start":
+                    self._handle_pair_start(q)
+                    return
+                if content_length != 0:
+                    self._send_json({
+                        "ok": False,
+                        "error": {
+                            "code": "local_control_body_not_allowed",
+                            "message": "request body must be empty",
+                        },
+                    }, status=400)
+                    return
+                if open_connectd_auth is None:
+                    self._send_json({
+                        "ok": False,
+                        "opened": False,
+                        "auth_url_present": False,
+                        "error": {
+                            "code": "connectd_control_unavailable",
+                            "message": "Pairling Connect control is unavailable",
+                        },
+                    }, status=503)
+                    return
+                try:
+                    status, payload = open_connectd_auth(timeout_seconds=5.0)
+                except Exception:
+                    status, payload = 503, {
+                        "ok": False,
+                        "opened": False,
+                        "auth_url_present": False,
+                        "error": {
+                            "code": "connectd_control_unavailable",
+                            "message": "Pairling Connect control is unavailable",
+                        },
+                    }
+                if not isinstance(payload, dict):
+                    status, payload = 502, {
+                        "ok": False,
+                        "opened": False,
+                        "auth_url_present": False,
+                        "error": {
+                            "code": "connectd_control_invalid_response",
+                            "message": "Pairling Connect returned an invalid control response",
+                        },
+                    }
+                self._send_json(payload, status=status if 100 <= int(status) <= 599 else 502)
+            finally:
+                admission.release()
+            return
+
         if u.path in INTERNAL_LOOPBACK_PATHS:
             # Internal hook tier — loopback IP AND minted token required.
             # Handled entirely outside device auth: a device Bearer never
@@ -19624,6 +22650,12 @@ class Handler(BaseHTTPRequestHandler):
                 }, status=403)
                 return
             try:
+                if u.path == "/pair/start":
+                    if self.command != "POST":
+                        self.send_error(405, "POST required")
+                    else:
+                        self._handle_pair_start(q)
+                    return
                 if u.path == "/internal/session-register":
                     self._handle_internal_session_register(q)
                 elif u.path == "/internal/session-heartbeat":
@@ -19712,6 +22744,15 @@ class Handler(BaseHTTPRequestHandler):
             }, status=403)
             return
 
+        read_only_picker_path = (
+            u.path in READ_ONLY_PICKER_ENDPOINTS
+            or u.path.startswith("/pickers/memory/")
+        )
+        if read_only_picker_path and self.command != "GET":
+            admission.release()
+            self.send_error(405, "GET required")
+            return
+
         if u.path in POST_ONLY_ENDPOINTS and self.command != "POST":
             admission.release()
             self.send_error(405, "POST required")
@@ -19719,10 +22760,6 @@ class Handler(BaseHTTPRequestHandler):
         if u.path in GET_OR_POST_ENDPOINTS and self.command not in {"GET", "POST"}:
             admission.release()
             self.send_error(405, "GET or POST required")
-            return
-        if u.path.startswith("/pickers/mcp/") and u.path.endswith("/restart") and self.command != "POST":
-            admission.release()
-            self.send_error(405, "POST required")
             return
 
         if self.pairling_auth is not None and _is_high_risk_endpoint(u.path) and DEVICE_REGISTRY is not None:
@@ -20044,10 +23081,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_spawn_session(q)
             elif u.path == "/onestream-handoff":
                 self._handle_onestream_handoff(q)
-            elif u.path == "/resume-session":
-                self._handle_resume_session(q)
-            elif u.path == "/cross-provider-action":
-                self._handle_cross_provider_action(q)
             elif u.path == "/compose/recordings/sync":
                 self._handle_compose_recording_sync()
             elif u.path == "/send-text":
@@ -20076,6 +23109,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_invocations_stream(q)
             elif u.path == "/provider-status":
                 self._handle_provider_status(q)
+            elif u.path == "/provider-controls/snapshot":
+                if self.command != "GET":
+                    self.send_error(405, "GET required")
+                else:
+                    self._handle_provider_controls_snapshot(q)
+            elif u.path == "/provider-controls/stream":
+                if self.command != "GET":
+                    self.send_error(405, "GET required")
+                else:
+                    self._handle_provider_controls_stream(q)
+            elif u.path == "/provider-controls/execute":
+                self._handle_provider_controls_execute(q)
             elif u.path == "/providers/visibility":
                 if (getattr(self, "command", "") or "").upper() == "POST":
                     self._handle_providers_visibility_post(q)
@@ -20097,9 +23142,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_pickers_memory_one(q, u.path[len("/pickers/memory/"):])
             elif u.path == "/pickers/mcp":
                 self._handle_pickers_mcp(q)
-            elif u.path.startswith("/pickers/mcp/") and u.path.endswith("/restart"):
-                name = u.path[len("/pickers/mcp/"):-len("/restart")]
-                self._handle_pickers_mcp_restart(q, name)
             elif u.path == "/search":
                 self._handle_search(q)
             elif u.path.startswith("/sessions/") and u.path.endswith("/export"):
@@ -20413,16 +23455,31 @@ class Handler(BaseHTTPRequestHandler):
 
     # ----- /open: open path on Mac (existing behavior) -----
     def _handle_open(self, q):
-        path = q.get("path", [""])[0]
+        raw_path = q.get("path", [""])[0]
         app = q.get("app", ["sublime"])[0]
-        if not path or not os.path.exists(path):
-            self.send_error(404, "path not found")
+        try:
+            path = _canonical_user_path(raw_path, allow_tmp=True)
+            if app == "finder":
+                command = ["/usr/bin/open", path]
+            else:
+                command = ["/usr/bin/open", "-a", SUBLIME_APP, path]
+            subprocess.run(command, check=True, timeout=5.0)
+        except ValueError:
+            self._send_error(400, "invalid_path", "Path is invalid")
             return
-        if app == "finder":
-            subprocess.run(["open", path], check=False)
-        else:
-            subprocess.run(["open", "-a", SUBLIME_APP, path], check=False)
-        self._send_text(200, b"ok\n")
+        except PermissionError:
+            self._send_error(403, "path_not_allowed", "Path is outside allowed roots")
+            return
+        except FileNotFoundError:
+            self._send_error(404, "path_not_found", "Path not found")
+            return
+        except subprocess.TimeoutExpired:
+            self._send_error(503, "open_timeout", "Open request timed out")
+            return
+        except (subprocess.CalledProcessError, OSError):
+            self._send_error(502, "open_failed", "Open request failed")
+            return
+        self._send_json({"ok": True})
 
     # ----- /healthz + /health-stream: coordinator health -----
     def _handle_health(self, q):
@@ -20445,27 +23502,46 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(_routez_payload(auth_result=self.pairling_auth))
 
     def _handle_manifest(self, q):
-        runtime_info = _runtime_info_snapshot()
-        if _build_manifest_payload is None:
-            payload = {
-                "ok": True,
+        authenticated = self.pairling_auth is not None
+        try:
+            runtime_info = _runtime_info_snapshot()
+            if not authenticated:
+                runtime_info = _public_runtime_info(runtime_info)
+            if _build_manifest_payload is None:
+                payload = {
+                    "ok": True,
+                    "schema_version": 1,
+                    "contract_version": RUNTIME_CONTRACT_VERSION,
+                    "runtime": runtime_info,
+                    "auth": {
+                        "mode": RUNTIME_AUTH_MODE,
+                        "required": True,
+                        "legacy_global_token": False,
+                        "authenticated": authenticated,
+                    },
+                }
+            else:
+                payload = _build_manifest_payload(
+                    runtime_info,
+                    authenticated=authenticated,
+                    device_id=getattr(self.pairling_auth, "device_id", None),
+                    scopes=list(getattr(self.pairling_auth, "scopes", []) or []),
+                )
+            if not authenticated:
+                payload["runtime"] = runtime_info
+        except Exception:
+            if authenticated:
+                raise
+            self._send_json({
+                "ok": False,
                 "schema_version": 1,
                 "contract_version": RUNTIME_CONTRACT_VERSION,
-                "runtime": runtime_info,
-                "auth": {
-                    "mode": RUNTIME_AUTH_MODE,
-                    "required": True,
-                    "legacy_global_token": False,
-                    "authenticated": self.pairling_auth is not None,
+                "error": {
+                    "code": "manifest_unavailable",
+                    "message": "Runtime manifest is unavailable",
                 },
-            }
-        else:
-            payload = _build_manifest_payload(
-                runtime_info,
-                authenticated=self.pairling_auth is not None,
-                device_id=getattr(self.pairling_auth, "device_id", None),
-                scopes=list(getattr(self.pairling_auth, "scopes", []) or []),
-            )
+            }, status=503)
+            return
         self._send_json(payload)
 
     def _read_json_object(self) -> dict:
@@ -20818,9 +23894,11 @@ class Handler(BaseHTTPRequestHandler):
         if tailnet_ip:
             hosts.append(tailnet_ip)
         hosts.extend(_lan_ips()[:2])
-        hostname = os.environ.get("PAIRLING_HOSTNAME") or os.uname().nodename.split(".")[0]
+        hostname = _bonjour_hostname(
+            os.environ.get("PAIRLING_HOSTNAME") or os.uname().nodename
+        )
         if hostname:
-            hosts.append(f"{hostname}.local")
+            hosts.append(hostname)
         seen: set[str] = set()
         deduped: list[str] = []
         for host in hosts:
@@ -20901,6 +23979,11 @@ class Handler(BaseHTTPRequestHandler):
             ttl = int(payload.get("ttl_seconds") or DEFAULT_PAIR_TTL_SECONDS)
             purpose = str(payload.get("purpose") or "").strip()
             start_kwargs = {"ttl_seconds": ttl}
+            raw_role = payload.get("role")
+            if raw_role is not None:
+                if not isinstance(raw_role, str) or not raw_role.strip():
+                    raise ValueError("role must be a non-empty string")
+                start_kwargs["role"] = raw_role
             if purpose:
                 raw_scopes = payload.get("scopes")
                 if raw_scopes is not None and (
@@ -20944,6 +24027,7 @@ class Handler(BaseHTTPRequestHandler):
             "install_id": started.install_id,
             "runtime_port": PORT,
             "purpose": started.purpose,
+            "role": started.role,
             "lease_expires_at": started.lease_expires_at,
             "pair_service": {
                 "type": started.service_type,
@@ -20958,6 +24042,7 @@ class Handler(BaseHTTPRequestHandler):
                 "secret": started.secret,
                 "attest_challenge": started.attest_challenge,
                 "mac_ake_pub": started.mac_ake_pub,
+                "role": started.role,
                 "pv": "2",
             },
         })
@@ -21038,11 +24123,13 @@ class Handler(BaseHTTPRequestHandler):
             ) else "http-local"
             funnel_origin = _funnel_origin_request(headers, self.client_address)
             require_direct_attest = _pair_claim_requires_app_attest(headers, self.client_address)
+            relay_required, relay_claim_verifier = _relay_claim_assurance()
             sealed_claim = PAIRING_STORE.psk_claim_pair(
                 pair_id=pair_id,
                 b_pub_b64=str(payload.get("b_pub") or ""),
                 confirm_b64=str(payload.get("confirm") or ""),
                 device_name=str(payload.get("device_name") or "Pairling iPhone"),
+                role=(payload.get("role") if "role" in payload else None),
                 host_chain=host_chain,
                 se_public_key_der=(
                     payload.get("se_public_key_der")
@@ -21063,8 +24150,8 @@ class Handler(BaseHTTPRequestHandler):
                     else None
                 ),
                 relay_device_id=(payload.get("relay_device_id") if "relay_device_id" in payload else None),
-                relay_required=bool(relay_claims_required and relay_claims_required()),
-                relay_claim_verifier=RELAY_CLAIM_VERIFIER,
+                relay_required=relay_required,
+                relay_claim_verifier=relay_claim_verifier,
                 funnel_origin=funnel_origin,
                 require_direct_attest=require_direct_attest,
                 seal_proof_secret=True,
@@ -21400,8 +24487,28 @@ class Handler(BaseHTTPRequestHandler):
             signature = base64.b64decode(signature_b64, validate=True) if signature_b64 else b""
         except Exception:
             signature = b""
+        expected_token_hash = DEVICE_REGISTRY.rotation_token_hash(device_id)
         verified = REAUTH_STORE.verify_and_consume(device_id, challenge, signature)
-        new_token = DEVICE_REGISTRY.rotate_token(device_id) if verified else None
+        if not verified or expected_token_hash is None:
+            new_token = None
+        else:
+            try:
+                new_token = DEVICE_REGISTRY.rotate_token(
+                    device_id,
+                    expected_token_hash=expected_token_hash,
+                )
+            except DeviceRegistryError as exc:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": exc.code,
+                            "message": exc.message,
+                        },
+                    },
+                    status=exc.status,
+                )
+                return
         if not verified or not new_token:
             # Uniform failure: never distinguish unknown device / no SE key /
             # bad signature / expired-or-used challenge. No enumeration oracle.
@@ -21455,7 +24562,26 @@ class Handler(BaseHTTPRequestHandler):
         device_id = self._resolve_self_device_target(payload.get("device_id"))
         if device_id is None:
             return
-        token = DEVICE_REGISTRY.rotate_token(device_id)
+        expected_token_hash = str(
+            getattr(self.pairling_auth, "token_hash", "") or ""
+        )
+        try:
+            token = DEVICE_REGISTRY.rotate_token(
+                device_id,
+                expected_token_hash=expected_token_hash,
+            )
+        except DeviceRegistryError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": exc.code,
+                        "message": exc.message,
+                    },
+                },
+                status=exc.status,
+            )
+            return
         if token is None:
             self._send_json({"ok": False, "error": {"code": "device_not_found"}}, status=404)
             return
@@ -21740,17 +24866,19 @@ class Handler(BaseHTTPRequestHandler):
             limit = max(1, min(int(q.get("limit", ["100"])[0]), 250))
         except (TypeError, ValueError):
             limit = 100
-        root = os.path.expanduser(raw_root) if raw_root else os.path.expanduser("~")
-        root = os.path.abspath(root)
-        home = os.path.abspath(os.path.expanduser("~"))
-        tmp = os.path.abspath("/tmp")
-
-        allowed = root == home or root.startswith(home + os.sep) or root == tmp or root.startswith(tmp + os.sep)
-        if not allowed:
-            self.send_error(403, "directory root must be under the user's home directory or /tmp")
+        root_input = os.path.expanduser(raw_root) if raw_root else os.path.expanduser("~")
+        try:
+            root = _canonical_user_directory(root_input, allow_tmp=True)
+            home = _canonical_user_directory(str(HOME), allow_tmp=False)
+            tmp = str(Path("/tmp").resolve(strict=True))
+        except PermissionError:
+            self.send_error(403, "directory root must resolve under the user's home directory or /tmp")
             return
-        if not os.path.isdir(root):
-            self.send_error(404, f"directory not found: {root}")
+        except (FileNotFoundError, NotADirectoryError):
+            self.send_error(404, f"directory not found: {os.path.abspath(root_input)}")
+            return
+        except ValueError as error:
+            self.send_error(400, str(error))
             return
 
         try:
@@ -21768,28 +24896,26 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(payload)
 
     def _filesystem_directories_payload(self, root: str, home: str, tmp: str, offset: int, limit: int) -> dict:
+        authorized = _authorized_user_path(root, allow_tmp=True)
+        directory_fd = open_directory_fd(authorized.path, root=authorized.root)
         try:
-            names = os.listdir(root)
-        except PermissionError:
-            raise
-        except OSError as exc:
-            raise exc
-
-        items = []
-        for name in names:
-            if name in {".", ".."}:
-                continue
-            path = os.path.join(root, name)
-            try:
-                is_dir = os.path.isdir(path)
-            except OSError:
-                is_dir = False
-            if not is_dir:
-                continue
-            items.append({
-                "name": name,
-                "path": path,
-            })
+            names = os.listdir(directory_fd)
+            items = []
+            for name in names:
+                if name in {".", ".."}:
+                    continue
+                try:
+                    child_fd = open_child_directory_fd(directory_fd, name)
+                except (FileNotFoundError, NotADirectoryError, PermissionError, ValueError):
+                    continue
+                else:
+                    os.close(child_fd)
+                items.append({
+                    "name": name,
+                    "path": str(authorized.path / name),
+                })
+        finally:
+            os.close(directory_fd)
 
         items.sort(key=lambda item: (item["name"].startswith("."), item["name"].lower()))
         page = items[offset:offset + limit]
@@ -21797,9 +24923,10 @@ class Handler(BaseHTTPRequestHandler):
         has_more = next_offset < len(items)
         parent = None
         if root != home and root != tmp:
-            candidate = os.path.dirname(root)
-            if candidate and (candidate == home or candidate.startswith(home + os.sep) or candidate == tmp or candidate.startswith(tmp + os.sep)):
-                parent = candidate
+            try:
+                parent = _canonical_user_directory(os.path.dirname(root), allow_tmp=True)
+            except (FileNotFoundError, NotADirectoryError, PermissionError, ValueError):
+                parent = None
 
         return {
             "root": root,
@@ -22032,6 +25159,17 @@ class Handler(BaseHTTPRequestHandler):
             )
             for row in codex_rows:
                 rows.append(row)
+        managed_rows = _managed_session_rows(
+            provider_filter=provider_filter,
+            live_only=live_only,
+            active_within_min=active_within_min,
+            limit=max(limit, 50),
+        )
+        managed_rows = [
+            row for row in managed_rows
+            if str(row.get("provider") or "") in visible
+        ]
+        rows = _merge_managed_session_rows(rows, managed_rows)
 
         rows = _filter_tombstoned_session_rows(rows)
         rows = _collapse_live_session_rows_by_terminal(rows)
@@ -22057,7 +25195,7 @@ class Handler(BaseHTTPRequestHandler):
 
         enriched_rows: list[dict] = []
         for row in rows:
-            if row.get("provider") == "claude":
+            if row.get("provider") == "claude" and not row.get("managed"):
                 native_id = row.get("native_id") or row.get("id") or ""
                 claude_uuid = row.get("claude_uuid") or ""
                 signal = self._recent_session_signal(
@@ -22068,6 +25206,9 @@ class Handler(BaseHTTPRequestHandler):
                 row["recent_anomaly"] = signal.get("anomaly")
                 row["latest_command"] = signal.get("latest_command")
                 row["latest_edit"] = signal.get("latest_edit")
+            if row.get("managed"):
+                enriched_rows.append(row)
+                continue
             if provider_inventory is None:
                 enriched_rows.append(self._decorate_session_lifecycle_row(row))
             else:
@@ -22080,24 +25221,30 @@ class Handler(BaseHTTPRequestHandler):
         rows = enriched_rows
 
         if live_only:
-            if provider_inventory is None:
-                projected_rows = [
-                    self._strict_live_projection(
+            projected_rows = []
+            for row in rows:
+                if row.get("managed"):
+                    if (
+                        row.get("closed_at") is None
+                        and row.get("lifecycle")
+                        in {"launching", "running", "waiting", "blocked", "closing"}
+                    ):
+                        projected_rows.append(row)
+                    continue
+                if provider_inventory is None:
+                    projected = self._strict_live_projection(
                         row,
                         codex_live_terminal_rows,
                     )
-                    for row in rows
-                ]
-            else:
-                projected_rows = [
-                    self._strict_live_projection(
+                else:
+                    projected = self._strict_live_projection(
                         row,
                         codex_live_terminal_rows,
                         claude_live_terminal_rows,
                     )
-                    for row in rows
-                ]
-            rows = [row for row in projected_rows if row is not None]
+                if projected is not None:
+                    projected_rows.append(projected)
+            rows = projected_rows
         rows.sort(key=_session_meaningful_sort_key)
         pre_limit_count = len(rows)
         rows = self._limit_visible_session_rows(
@@ -22147,6 +25294,12 @@ class Handler(BaseHTTPRequestHandler):
             return rows
 
         def is_strictly_live(row: dict) -> bool:
+            if row.get("managed"):
+                return (
+                    row.get("closed_at") is None
+                    and row.get("lifecycle")
+                    in {"launching", "running", "waiting", "blocked", "closing"}
+                )
             if claude_live_terminal_rows is None:
                 return cls._session_row_is_strictly_live(
                     row,
@@ -22453,6 +25606,7 @@ class Handler(BaseHTTPRequestHandler):
         provider_filter: str,
         *,
         bypass_snapshot_cache: bool = False,
+        wait_for_inventory: bool = False,
     ) -> dict:
         visible = _visible_agent_provider_ids()
         requested = (
@@ -22466,7 +25620,14 @@ class Handler(BaseHTTPRequestHandler):
             inventory_generation,
             membership_generation,
         ) = (
-            _sessions_provider_inventory_bundle(requested)
+            _sessions_provider_inventory_bundle(
+                requested,
+                wait_timeout=(
+                    _SESSION_INVENTORY_REFRESH_WAIT_SECONDS
+                    if wait_for_inventory
+                    else 0.0
+                ),
+            )
         )
 
         def load_snapshot() -> dict:
@@ -22528,7 +25689,9 @@ class Handler(BaseHTTPRequestHandler):
                     != membership_generation
                 )
             final_inventory_state = (
-                "refreshing" if generation_changed else inventory_state
+                inventory_state
+                if inventory_state == "timeout"
+                else ("refreshing" if generation_changed else inventory_state)
             )
             if generation_changed:
                 membership_complete = False
@@ -22874,6 +26037,7 @@ class Handler(BaseHTTPRequestHandler):
             snapshot = self._collect_sessions_stream_snapshot(
                 provider_filter,
                 bypass_snapshot_cache=True,
+                wait_for_inventory=True,
             )
             snapshot["source"] = _sessions_stream_source()
             snapshot["count"] = len(snapshot.get("items") or [])
@@ -22892,6 +26056,19 @@ class Handler(BaseHTTPRequestHandler):
         # and is not even scanned, so exclusion is also cheap.
         if provider_filter != "all" and not _provider_visible(provider_filter):
             self._send_json({"count": 0, "items": []})
+            return
+        if provider_filter not in {"all", "claude", "codex"}:
+            rows = _managed_session_rows(
+                provider_filter=provider_filter,
+                live_only=False,
+                active_within_min=within_min,
+                limit=50,
+            )
+            rows = _filter_tombstoned_session_rows(rows)
+            rows.sort(key=_session_meaningful_sort_key)
+            rows = rows[:50]
+            _record_sessions_scan(rows)
+            self._send_json({"count": len(rows), "items": rows})
             return
 
         if provider_filter == "codex":
@@ -22924,6 +26101,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._decorate_session_lifecycle_row(row)
                 for row in codex_rows
             ]
+            rows = _merge_managed_session_rows(
+                rows,
+                _managed_session_rows(
+                    provider_filter="codex",
+                    live_only=False,
+                    active_within_min=within_min,
+                    limit=50,
+                ),
+            )
+            rows.sort(key=_session_meaningful_sort_key)
             rows = _filter_tombstoned_session_rows(rows)
             rows = _collapse_live_session_rows_by_terminal(rows)
             rows = rows[:50]
@@ -23024,10 +26211,35 @@ class Handler(BaseHTTPRequestHandler):
                     self._decorate_session_lifecycle_row(row)
                     for row in _list_codex_sessions(live_only=live_only, active_within_min=within_min)
                 )
+            rows = _merge_managed_session_rows(
+                rows,
+                [
+                    row
+                    for row in _managed_session_rows(
+                        provider_filter="all",
+                        live_only=False,
+                        active_within_min=within_min,
+                        limit=100,
+                    )
+                    if _provider_visible(str(row.get("provider") or ""))
+                ],
+            )
             rows = _filter_tombstoned_session_rows(rows)
             rows = _collapse_live_session_rows_by_terminal(rows)
             rows.sort(key=_session_meaningful_sort_key)
             rows = rows[:50]
+        elif provider_filter == "claude":
+            rows = _merge_managed_session_rows(
+                rows,
+                _managed_session_rows(
+                    provider_filter="claude",
+                    live_only=False,
+                    active_within_min=within_min,
+                    limit=50,
+                ),
+            )
+            rows = _filter_tombstoned_session_rows(rows)
+            rows = _collapse_live_session_rows_by_terminal(rows)
         else:
             rows = _filter_tombstoned_session_rows(rows)
             rows = _collapse_live_session_rows_by_terminal(rows)
@@ -23346,6 +26558,51 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
         provider, native_id = _parse_agent_session_ref(session_id)
+        managed_session_id = (
+            _qualified_session_id(provider, native_id) if native_id else ""
+        )
+        managed_store = _ensure_managed_provider_session_store()
+        managed_row = (
+            managed_store.get(managed_session_id)
+            if managed_store is not None and managed_session_id
+            else None
+        )
+        if managed_row is not None:
+            data, next_since, total = _managed_transcript_ndjson(
+                managed_session_id,
+                since=max(0, since),
+            )
+            if max_bytes is not None and len(data) > max_bytes:
+                selected = bytearray()
+                selected_next = max(0, since)
+                for line in data.splitlines(keepends=True):
+                    if selected and len(selected) + len(line) > max_bytes:
+                        break
+                    if len(line) > max_bytes:
+                        break
+                    selected.extend(line)
+                    try:
+                        selected_next = int(
+                            json.loads(line).get("seq") or selected_next
+                        )
+                    except Exception:
+                        pass
+                data = bytes(selected)
+                next_since = selected_next
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("X-Total-Bytes", str(total))
+            self.send_header("X-Bytes-Read", str(len(data)))
+            self.send_header("X-Next-Since", str(next_since))
+            self.send_header("X-Offset-Unit", "normalized-event-sequence")
+            self.send_header(
+                "X-Log-Generation",
+                str(int(managed_row["capability_generation"])),
+            )
+            self.send_header("X-Resolved-Path", "managed-provider-events")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         launch_context = _session_launch_context_from_metadata(
             _registry_metadata_from_row(_agent_registry_get(provider, native_id))
         ) if native_id else None
@@ -23363,12 +26620,12 @@ class Handler(BaseHTTPRequestHandler):
                 status=422,
             )
             return
-        if path is None or not path.exists():
+        if path is None:
             self.send_error(404, f"no transcript resolvable for session={session_id}")
             return
 
         try:
-            with open(path, "rb") as f:
+            with _open_session_transcript_file(path) as f:
                 stat = os.fstat(f.fileno())
                 size = max(0, int(stat.st_size))
                 session_key = _qualified_session_id(provider, native_id)
@@ -23420,6 +26677,61 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _handle_managed_transcript_stream(
+        self, session_id: str, since: int
+    ) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("X-Offset-Unit", "normalized-event-sequence")
+        self.end_headers()
+        cursor = max(0, int(since))
+        last_keepalive = _time.time()
+        deadline = _time.time() + 600.0
+        subscription = (
+            SESSION_EVENT_HUB.subscribe(f"log:{session_id}")
+            if SESSION_EVENT_HUB is not None
+            else None
+        )
+        try:
+            while _time.time() < deadline:
+                data, next_since, total = _managed_transcript_ndjson(
+                    session_id,
+                    since=cursor,
+                )
+                if data:
+                    if not _sse_write_json_event(
+                        self.wfile,
+                        "tail",
+                        {
+                            "next_since": next_since,
+                            "total_bytes": total,
+                            "ndjson": data.decode("utf-8", errors="replace"),
+                            "offset_unit": "normalized_event_sequence",
+                        },
+                        max_bytes=SSE_TRANSCRIPT_MAX_EVENT_BYTES,
+                    ):
+                        return
+                    cursor = next_since
+                    last_keepalive = _time.time()
+                    continue
+                if subscription is not None:
+                    subscription.get(timeout=1.0)
+                else:
+                    _time.sleep(0.25)
+                if _time.time() - last_keepalive >= 20.0:
+                    if not _sse_write_json_event(self.wfile, "keepalive", {}):
+                        return
+                    last_keepalive = _time.time()
+            _sse_write_json_event(self.wfile, "done", {})
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        finally:
+            if subscription is not None:
+                subscription.close()
+
     # ----- /transcript-stream: live SSE feed of a session's JSONL -----
     def _handle_transcript_stream(self, q):
         """SSE stream of one session's JSONL. Resolves the path ONCE at
@@ -23455,6 +26767,20 @@ class Handler(BaseHTTPRequestHandler):
             since = 0
 
         provider, native_id = _parse_agent_session_ref(session_id)
+        managed_session_id = (
+            _qualified_session_id(provider, native_id) if native_id else ""
+        )
+        managed_store = _ensure_managed_provider_session_store()
+        if (
+            managed_store is not None
+            and managed_session_id
+            and managed_store.get(managed_session_id) is not None
+        ):
+            self._handle_managed_transcript_stream(
+                managed_session_id,
+                since,
+            )
+            return
         try:
             path = self._resolve_session_transcript_path(
                 provider,
@@ -23469,7 +26795,7 @@ class Handler(BaseHTTPRequestHandler):
                 status=422,
             )
             return
-        if path is None or not path.exists():
+        if path is None:
             self.send_error(404, f"no transcript resolvable for session={session_id}")
             return
 
@@ -23502,7 +26828,7 @@ class Handler(BaseHTTPRequestHandler):
 
         f = None
         try:
-            f = open(path, "rb")
+            f = _session_transcript_handle(path)
             opened_stat = os.fstat(f.fileno())
             last_emitted_offset = _bounded_transcript_stream_start(since=since, size=opened_stat.st_size)
             if last_emitted_offset > 0:
@@ -23725,10 +27051,10 @@ class Handler(BaseHTTPRequestHandler):
             native_id,
             raw_session,
         )
-        if path is None or not path.exists():
+        if path is None:
             return None
         try:
-            handle = open(path, "rb")
+            handle = _session_transcript_handle(path)
         except OSError:
             return None
         with handle:
@@ -23944,11 +27270,163 @@ class Handler(BaseHTTPRequestHandler):
         payload["raw_byte_count"] = len(send_data)
         return payload
 
+    def _handle_managed_session_live_events(
+        self,
+        q,
+        *,
+        session_id: str,
+        provider: str,
+        native_id: str,
+    ) -> None:
+        try:
+            transcript_offset = max(
+                0, int(q.get("since_transcript", ["0"])[0])
+            )
+        except ValueError:
+            transcript_offset = 0
+        try:
+            receipt_seq = max(0, int(q.get("client_event_seq", ["0"])[0]))
+        except ValueError:
+            receipt_seq = 0
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        event_seq = 0
+        last_keepalive = _time.time()
+        last_truth_hash = ""
+        last_receipt_check = 0.0
+        deadline = _time.time() + 600.0
+        subscription = (
+            SESSION_EVENT_HUB.subscribe(f"log:{session_id}")
+            if SESSION_EVENT_HUB is not None
+            else None
+        )
+
+        def emit(event_type: str, payload: dict, *, source: str) -> bool:
+            nonlocal event_seq, last_keepalive
+            event_seq += 1
+            envelope = self._session_live_event_envelope(
+                event_seq=event_seq,
+                event_type=event_type,
+                session_id=session_id,
+                provider=provider,
+                native_id=native_id,
+                payload=payload,
+                truth=_managed_session_runtime_truth(session_id),
+                source=source,
+                terminal_offset=0,
+                transcript_offset=transcript_offset,
+                log_generation=None,
+            )
+            ok = _sse_write_json_event(
+                self.wfile,
+                event_type,
+                envelope,
+                max_bytes=(
+                    SSE_TRANSCRIPT_MAX_EVENT_BYTES
+                    if event_type == "transcript_entries"
+                    else SSE_MAX_EVENT_BYTES
+                ),
+            )
+            if ok:
+                last_keepalive = _time.time()
+            return ok
+
+        try:
+            if not emit("hello", {
+                "session_id": session_id,
+                "since_terminal": 0,
+                "since_transcript": transcript_offset,
+                "client_event_seq": receipt_seq,
+                "stream": "session-live-events",
+                "terminal_backed": False,
+            }, source="managed-provider-sessions"):
+                return
+            while _time.time() < deadline:
+                truth = _managed_session_runtime_truth(session_id)
+                if truth is None:
+                    emit("error", {
+                        "reason": "managed_session_missing",
+                        "message": "Managed session binding is unavailable.",
+                    }, source="managed-provider-sessions")
+                    return
+                digest = _session_runtime_truth_stream_digest(truth)
+                if digest != last_truth_hash:
+                    last_truth_hash = digest
+                    if not emit(
+                        "truth",
+                        _session_runtime_truth_stream_payload(truth),
+                        source="session-runtime-truth",
+                    ):
+                        return
+                data, next_since, total = _managed_transcript_ndjson(
+                    session_id,
+                    since=transcript_offset,
+                )
+                if data:
+                    transcript_offset = next_since
+                    if not emit("transcript_entries", {
+                        "next_since": next_since,
+                        "total_bytes": total,
+                        "ndjson": data.decode("utf-8", errors="replace"),
+                        "offset_unit": "normalized_event_sequence",
+                    }, source="managed-provider-events"):
+                        return
+                    continue
+                now = _time.time()
+                if now - last_receipt_check >= 2.0:
+                    last_receipt_check = now
+                    for receipt_event in _session_live_control_receipts_since(
+                        session_id,
+                        receipt_seq,
+                        identity_keys={session_id},
+                    ):
+                        receipt_seq = max(
+                            receipt_seq,
+                            int(receipt_event.get("receipt_seq") or 0),
+                        )
+                        if not emit(
+                            "control_receipt",
+                            receipt_event,
+                            source="control-receipts",
+                        ):
+                            return
+                if subscription is not None:
+                    subscription.get(timeout=1.0)
+                else:
+                    _time.sleep(0.25)
+                if _time.time() - last_keepalive >= 20.0:
+                    if not _sse_write_json_event(self.wfile, "keepalive", {}):
+                        return
+                    last_keepalive = _time.time()
+            emit("done", {}, source="managed-provider-sessions")
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        finally:
+            if subscription is not None:
+                subscription.close()
+
     def _handle_session_live_events(self, q):
         raw_session = q.get("session", [""])[0]
         provider, native_id = _parse_agent_session_ref(raw_session)
         if not native_id:
             self.send_error(400, "session required")
+            return
+        session_id = _qualified_session_id(provider, native_id)
+        managed_store = _ensure_managed_provider_session_store()
+        if (
+            managed_store is not None
+            and managed_store.get(session_id) is not None
+        ):
+            self._handle_managed_session_live_events(
+                q,
+                session_id=session_id,
+                provider=provider,
+                native_id=native_id,
+            )
             return
         if provider not in _SUPPORTED_TRANSCRIPT_PROVIDERS:
             _send_unsupported_provider(
@@ -23958,7 +27436,7 @@ class Handler(BaseHTTPRequestHandler):
                 status=422,
             )
             return
-        session_id = _qualified_session_id(provider, native_id)
+
         expected_source_revision = self._expected_source_revision_for_request(q)
         try:
             terminal_offset = int(q.get("since_terminal", ["0"])[0])
@@ -24367,6 +27845,158 @@ class Handler(BaseHTTPRequestHandler):
 
     # ----- Contract v2: session event log endpoints -------------------------
 
+    def _handle_managed_session_events_v2(
+        self, q, session_key: str
+    ) -> None:
+        try:
+            since_seq = max(0, int(q.get("since_seq", ["0"])[0]))
+        except ValueError:
+            self.send_error(400, "since_seq must be int")
+            return
+        try:
+            client_generation = max(
+                0, int(q.get("generation", ["0"])[0])
+            )
+        except ValueError:
+            self.send_error(400, "generation must be int")
+            return
+        store = _ensure_managed_provider_session_store()
+        row = store.get(session_key) if store is not None else None
+        if row is None:
+            self.send_error(404, "managed session not found")
+            return
+        server_generation = int(row["capability_generation"])
+        if q.get("once", ["0"])[0] in {"1", "true"}:
+            try:
+                limit = max(
+                    1,
+                    min(
+                        SESSION_EVENTS_V2_PAGE_MAX_ROWS,
+                        int(q.get("limit", ["200"])[0]),
+                    ),
+                )
+            except ValueError:
+                self.send_error(400, "limit must be int")
+                return
+            page = _managed_session_events_v2_page(
+                session_key,
+                since_seq=since_seq,
+                limit=limit,
+            )
+            if client_generation and client_generation != server_generation:
+                self._send_json({
+                    "ok": False,
+                    "error": {
+                        "code": "log_generation_mismatch",
+                        "message": (
+                            "The managed provider binding changed. "
+                            "Restart history from sequence zero."
+                        ),
+                    },
+                    "generation": server_generation,
+                    "client_generation": client_generation,
+                    "last_seq": page["last_seq"],
+                    "reset_required": True,
+                }, status=409)
+                return
+            self._send_json(page)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        cursor = since_seq
+        last_keepalive = _time.time()
+        deadline = _time.time() + 600.0
+        subscription = (
+            SESSION_EVENT_HUB.subscribe(f"log:{session_key}")
+            if SESSION_EVENT_HUB is not None
+            else None
+        )
+        try:
+            page = _managed_session_events_v2_page(
+                session_key, since_seq=cursor, limit=1
+            )
+            if not _sse_write_json_event(self.wfile, "hello", {
+                "schema_versions": [SESSION_EVENTS_V2_SCHEMA_VERSION],
+                "session_key": session_key,
+                "since_seq": cursor,
+                "last_seq": page["last_seq"],
+                "generation": server_generation,
+                "client_generation": client_generation,
+                "stream": "session-events-v2",
+                "source": "managed_provider_events",
+            }, stats_key="v2_hello"):
+                return
+            if (
+                client_generation != server_generation
+                or cursor > page["last_seq"]
+            ):
+                if not _sse_write_json_event(self.wfile, "log_reset", {
+                    "reason": (
+                        "generation_mismatch"
+                        if client_generation != server_generation
+                        else "cursor_ahead"
+                    ),
+                    "generation": server_generation,
+                    "client_generation": client_generation,
+                    "requested_since_seq": cursor,
+                    "last_seq": page["last_seq"],
+                    "replay_since_seq": 0,
+                }, stats_key="v2_log_reset"):
+                    return
+                cursor = 0
+            cursor, backlog_gap = _bounded_session_event_cursor(
+                cursor, page["last_seq"]
+            )
+            if backlog_gap is not None:
+                if not _sse_write_json_event(self.wfile, "backlog_gap", {
+                    **backlog_gap,
+                    "generation": server_generation,
+                }, stats_key="v2_backlog_gap"):
+                    return
+            while _time.time() < deadline:
+                page = _managed_session_events_v2_page(
+                    session_key,
+                    since_seq=cursor,
+                    limit=SESSION_EVENTS_V2_BACKLOG_LIMIT,
+                )
+                for event in page["events"]:
+                    if not _sse_write_json_event(
+                        self.wfile,
+                        "session_event",
+                        event,
+                        max_bytes=SSE_TRANSCRIPT_MAX_EVENT_BYTES,
+                        stats_key="v2_session_event",
+                    ):
+                        return
+                    cursor = max(cursor, int(event.get("seq") or 0))
+                    last_keepalive = _time.time()
+                if page["events"]:
+                    continue
+                if subscription is not None:
+                    subscription.get(timeout=1.0)
+                else:
+                    _time.sleep(0.25)
+                if _time.time() - last_keepalive >= 20.0:
+                    if not _sse_write_json_event(
+                        self.wfile,
+                        "keepalive",
+                        {},
+                        stats_key="v2_keepalive",
+                    ):
+                        return
+                    last_keepalive = _time.time()
+            _sse_write_json_event(self.wfile, "done", {})
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        finally:
+            if subscription is not None:
+                subscription.close()
+
     def _v2_session_key_and_ensure(self, raw_session: str) -> tuple[str, str, str] | None:
         provider, native_id = _parse_agent_session_ref(raw_session)
         if not native_id:
@@ -24390,6 +28020,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_session_events_v2(self, q):
         raw_session = q.get("session", [""])[0]
+        provider, native_id = _parse_agent_session_ref(raw_session)
+        managed_session_key = (
+            _qualified_session_id(provider, native_id) if native_id else ""
+        )
+        managed_store = _ensure_managed_provider_session_store()
+        if (
+            managed_store is not None
+            and managed_session_key
+            and managed_store.get(managed_session_key) is not None
+        ):
+            self._handle_managed_session_events_v2(q, managed_session_key)
+            return
         try:
             resolved = self._v2_session_key_and_ensure(raw_session)
         except _UnsupportedTranscriptProviderError as error:
@@ -24676,6 +28318,63 @@ class Handler(BaseHTTPRequestHandler):
         caps content and text fields inline; this serves the whole value so
         the phone never re-parses provider formats to recover it."""
         raw_session = q.get("session", [""])[0]
+        managed_provider, managed_native_id = _parse_agent_session_ref(
+            raw_session
+        )
+        managed_session_key = (
+            _qualified_session_id(managed_provider, managed_native_id)
+            if managed_native_id
+            else ""
+        )
+        managed_store = _ensure_managed_provider_session_store()
+        managed_row = (
+            managed_store.get(managed_session_key)
+            if managed_store is not None and managed_session_key
+            else None
+        )
+        if managed_row is not None:
+            try:
+                seq = int(q.get("seq", ["0"])[0])
+                client_generation = max(
+                    0, int(q.get("generation", ["0"])[0])
+                )
+            except ValueError:
+                self.send_error(400, "seq and generation must be ints")
+                return
+            server_generation = int(managed_row["capability_generation"])
+            if client_generation != server_generation:
+                self._send_json({
+                    "ok": False,
+                    "error": {
+                        "code": "log_generation_mismatch",
+                        "message": (
+                            "The managed provider binding changed. "
+                            "Refresh before loading full content."
+                        ),
+                    },
+                    "generation": server_generation,
+                    "client_generation": client_generation,
+                    "reset_required": True,
+                }, status=409)
+                return
+            page = _managed_session_events_v2_page(
+                managed_session_key,
+                since_seq=max(0, seq - 1),
+                limit=1,
+            )
+            if not page["events"] or page["events"][0]["seq"] != seq:
+                self.send_error(404, f"no event at seq={seq}")
+                return
+            event = page["events"][0]
+            self._send_json({
+                "schema_version": SESSION_EVENTS_V2_SCHEMA_VERSION,
+                "session_key": managed_session_key,
+                "seq": seq,
+                "kind": event["kind"],
+                "payload": event["payload"],
+                "generation": server_generation,
+            })
+            return
         try:
             resolved = self._v2_session_key_and_ensure(raw_session)
         except _UnsupportedTranscriptProviderError as error:
@@ -24738,6 +28437,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_session_events_v2_raw(self, q):
         raw_session = q.get("session", [""])[0]
+        managed_provider, managed_native_id = _parse_agent_session_ref(
+            raw_session
+        )
+        managed_session_key = (
+            _qualified_session_id(managed_provider, managed_native_id)
+            if managed_native_id
+            else ""
+        )
+        managed_store = _ensure_managed_provider_session_store()
+        if (
+            managed_store is not None
+            and managed_session_key
+            and managed_store.get(managed_session_key) is not None
+        ):
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "raw_provider_event_unavailable",
+                    "message": (
+                        "Managed sessions expose only normalized, redacted "
+                        "provider events."
+                    ),
+                },
+            }, status=404)
+            return
         try:
             resolved = self._v2_session_key_and_ensure(raw_session)
         except _UnsupportedTranscriptProviderError as error:
@@ -25102,7 +28826,14 @@ class Handler(BaseHTTPRequestHandler):
             if path_is_resolved
             else self._resolve_session_transcript_path(provider, native_id, raw_session)
         )
-        if path is None or not path.exists():
+        latest_offset = None
+        if path is not None:
+            try:
+                with _open_session_transcript_file(path) as handle:
+                    latest_offset = os.fstat(handle.fileno()).st_size
+            except OSError:
+                path = None
+        if path is None:
             return {
                 "state": "missing",
                 "http_status": 404,
@@ -25113,11 +28844,6 @@ class Handler(BaseHTTPRequestHandler):
                 "path": None,
                 "user_message": "Live terminal only - not in transcript",
             }
-        try:
-            stat = path.stat()
-            latest_offset = stat.st_size
-        except OSError:
-            latest_offset = None
         return {
             "state": "live",
             "http_status": 200,
@@ -25518,9 +29244,16 @@ class Handler(BaseHTTPRequestHandler):
         provider, native_id = _parse_agent_session_ref(raw_session)
         if not native_id:
             raise ValueError("session required")
+        session_id = _qualified_session_id(provider, native_id)
+        managed_truth = _managed_session_runtime_truth(
+            session_id,
+            expected_source_revision=expected_source_revision,
+        )
+        if managed_truth is not None:
+            return managed_truth
         if provider not in _agent_provider_ids():
             raise ValueError(f"unsupported provider: {provider}")
-        session_id = _qualified_session_id(provider, native_id)
+
         try:
             transcript_path = self._resolve_session_transcript_path(
                 provider,
@@ -25599,9 +29332,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(400, str(e))
             return
         except Exception as e:
-            self._send_json({"ok": False, "error": "session_runtime_truth_unavailable", "message": str(e)[:200]}, status=502)
+            self._send_json({"ok": False, "error": "session_runtime_truth_unavailable", "message": redact_public_text(str(e))[:200]}, status=502)
             return
-        self._send_json({"ok": True, "truth": truth})
+        self._send_json({"ok": True, "truth": _public_session_runtime_truth(truth)})
 
     def _handle_session_runtime_truth_stream(self, q):
         raw_session = q.get("session", [""])[0]
@@ -25634,10 +29367,10 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     last_keepalive = _time.time()
             except ValueError as e:
-                _sse_write_json_event(self.wfile, "error", {"reason": "bad_session", "message": str(e)[:200]}, max_bytes=SSE_MAX_EVENT_BYTES)
+                _sse_write_json_event(self.wfile, "error", {"reason": "bad_session", "message": redact_public_text(str(e))[:200]}, max_bytes=SSE_MAX_EVENT_BYTES)
                 return
             except Exception as e:
-                _sse_write_json_event(self.wfile, "error", {"reason": "session_runtime_truth_unavailable", "message": str(e)[:200]}, max_bytes=SSE_MAX_EVENT_BYTES)
+                _sse_write_json_event(self.wfile, "error", {"reason": "session_runtime_truth_unavailable", "message": redact_public_text(str(e))[:200]}, max_bytes=SSE_MAX_EVENT_BYTES)
             _time.sleep(1.0)
         _sse_write_json_event(self.wfile, "done", {}, max_bytes=SSE_MAX_EVENT_BYTES)
 
@@ -25660,7 +29393,7 @@ class Handler(BaseHTTPRequestHandler):
                     raw_session, window_start=window_start, window_size=window_size
                 )
             except Exception as e:
-                self._send_json({"ok": False, "error": "terminal_workspace_unavailable", "message": str(e)[:200]}, status=502)
+                self._send_json({"ok": False, "error": "terminal_workspace_unavailable", "message": redact_public_text(str(e))[:200]}, status=502)
                 return
             if surface is None:
                 self._send_json({
@@ -25678,7 +29411,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(400, str(e))
             return
         except Exception as e:
-            self._send_json({"ok": False, "error": "terminal_workspace_unavailable", "message": str(e)[:200]}, status=502)
+            self._send_json({"ok": False, "error": "terminal_workspace_unavailable", "message": redact_public_text(str(e))[:200]}, status=502)
             return
         self._send_json(workspace)
 
@@ -25718,10 +29451,26 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     last_keepalive = _time.time()
             except ValueError as e:
-                _sse_write_json_event(self.wfile, "error", {"reason": "bad_session", "message": str(e)[:200]}, max_bytes=SSE_MAX_EVENT_BYTES)
+                _sse_write_json_event(
+                    self.wfile,
+                    "error",
+                    {
+                        "reason": "bad_session",
+                        "message": redact_public_text(str(e)[:200]),
+                    },
+                    max_bytes=SSE_MAX_EVENT_BYTES,
+                )
                 return
             except Exception as e:
-                _sse_write_json_event(self.wfile, "error", {"reason": "terminal_workspace_unavailable", "message": str(e)[:200]}, max_bytes=SSE_MAX_EVENT_BYTES)
+                _sse_write_json_event(
+                    self.wfile,
+                    "error",
+                    {
+                        "reason": "terminal_workspace_unavailable",
+                        "message": redact_public_text(str(e)[:200]),
+                    },
+                    max_bytes=SSE_MAX_EVENT_BYTES,
+                )
             # 0.35s keeps the phone's raw-terminal mirror near-realtime when
             # someone types on the Mac; truth composition is local state +
             # files, no PG, so the tighter cadence is cheap.
@@ -25737,7 +29486,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(400, str(e))
             return
         except Exception as e:
-            self._send_json({"ok": False, "error": "terminal_stream_diagnostics_unavailable", "message": str(e)[:200]}, status=502)
+            self._send_json({"ok": False, "error": "terminal_stream_diagnostics_unavailable", "message": redact_public_text(str(e))[:200]}, status=502)
             return
         self._send_json(_terminal_stream_diagnostics_from_truth(truth))
 
@@ -26723,6 +30472,25 @@ class Handler(BaseHTTPRequestHandler):
         client_action_id = mutation["client_action_id"]
         now = _time.time()
 
+        def mark_terminal_input_running(
+            *,
+            binding_id: str,
+            capability_generation: int,
+        ) -> None:
+            _mark_receipted_mutation_running(
+                mutation,
+                provider_id=provider,
+                provider_version="terminal-surface-v2",
+                provider_channel="pty_broker",
+                operation_id=action_kind,
+                binding_id=binding_id,
+                capability_generation=max(1, capability_generation),
+                recovery_correlation={
+                    "provider_operation_id": client_action_id,
+                    "provider_cursor": None,
+                },
+            )
+
         def reject(
             code: str,
             message: str,
@@ -26868,6 +30636,15 @@ class Handler(BaseHTTPRequestHandler):
                         409,
                     )
                     return
+            mark_terminal_input_running(
+                binding_id=broker_id,
+                capability_generation=(
+                    int(payload.get("generation"))
+                    if isinstance(payload.get("generation"), int)
+                    and not isinstance(payload.get("generation"), bool)
+                    else 1
+                ),
+            )
             try:
                 broker_exit = PTY_BROKER.control(broker_id, {
                     "type": "input_mode_exit",
@@ -26964,14 +30741,43 @@ class Handler(BaseHTTPRequestHandler):
                     409,
                 )
                 return
+            _surface_schema_version, proof_version_error = (
+                _terminal_control_surface_schema_version(payload)
+            )
+            if proof_version_error is not None:
+                reject(
+                    str(proof_version_error["error"]["code"]),
+                    str(proof_version_error["error"]["message"]),
+                    int(proof_version_error["status"]),
+                )
+                return
+            proof_error = _terminal_control_v2_availability_error(context["v2"])
+            if proof_error is None:
+                proof_error = _terminal_control_validate_screen(
+                    payload,
+                    context["v2"],
+                    {"type": "input_mode_enter"},
+                )
+            if proof_error is not None:
+                reject(
+                    str(proof_error["error"]["code"]),
+                    str(proof_error["error"]["message"]),
+                    int(proof_error["status"]),
+                )
+                return
             input_epoch = hashlib.sha256(
                 f"{device_id or 'device'}\0{session_key}\0{client_action_id}".encode()
             ).hexdigest()[:32]
+            mark_terminal_input_running(
+                binding_id=str(target["broker_id"]),
+                capability_generation=int(context["v2"]["generation"]),
+            )
             try:
                 broker_mode = PTY_BROKER.control(target["broker_id"], {
                     "type": "input_mode_enter",
                     "input_epoch": input_epoch,
                     "device_id": str(device_id or ""),
+                    "control_proof": dict(context["control_proof"]),
                 })
             except PTYBrokerOutcomeUnknownError:
                 reject(
@@ -27047,8 +30853,7 @@ class Handler(BaseHTTPRequestHandler):
             if state is not None and now - float(state.get("last_input_at") or 0) > TYPE_MODE_IDLE_SECONDS:
                 _TYPE_MODE_SESSIONS.pop(session_key, None)
                 state = "expired"
-            elif state is not None:
-                state["last_input_at"] = now
+        recovered_state = False
         requested_input_epoch = str(payload.get("input_epoch") or "").strip()
         if state is None and PTY_BROKER is not None:
             try:
@@ -27073,8 +30878,7 @@ class Handler(BaseHTTPRequestHandler):
                     "input_epoch": requested_input_epoch,
                     "next_sequence": int(broker_mode.get("next_sequence") or 1),
                 }
-                with _TYPE_MODE_LOCK:
-                    _TYPE_MODE_SESSIONS[session_key] = state
+                recovered_state = True
         if state is None:
             reject("type_mode_not_active", "Enter type mode before streaming input.", 409)
             return
@@ -27140,7 +30944,8 @@ class Handler(BaseHTTPRequestHandler):
         if PTY_BROKER is None:
             reject("broker_unavailable", "PTY broker is unavailable", 503)
             return
-        if current_atomic_context() is None:
+        input_control_context = current_atomic_context()
+        if input_control_context is None:
             with _TYPE_MODE_LOCK:
                 _TYPE_MODE_SESSIONS.pop(session_key, None)
             reject(
@@ -27149,12 +30954,16 @@ class Handler(BaseHTTPRequestHandler):
                 409,
             )
             return
+        mark_terminal_input_running(
+            binding_id=str(target["broker_id"]),
+            capability_generation=int(input_control_context["v2"]["generation"]),
+        )
         try:
             result = PTY_BROKER.control(target["broker_id"], {
                 "type": "input",
                 "b64": b64,
-                "expected_generation": generation,
                 "input_epoch": input_epoch,
+                "expected_generation": generation,
                 "input_sequence": input_sequence,
                 "device_id": str(device_id or ""),
             })
@@ -27294,6 +31103,19 @@ class Handler(BaseHTTPRequestHandler):
                 current_state["next_sequence"] = int(
                     result.get("next_sequence") or (input_sequence + 1)
                 )
+            elif (
+                recovered_state
+                and current_state is None
+                and isinstance(state, dict)
+                and state_input_epoch == input_epoch
+            ):
+                accepted_state = dict(state)
+                accepted_state["entered_at"] = now
+                accepted_state["last_input_at"] = now
+                accepted_state["next_sequence"] = int(
+                    result.get("next_sequence") or (input_sequence + 1)
+                )
+                _TYPE_MODE_SESSIONS[session_key] = accepted_state
         receipt = _make_action_receipt(
             client_action_id=client_action_id,
             state="applied",
@@ -27580,6 +31402,7 @@ class Handler(BaseHTTPRequestHandler):
         LAST_HUMAN_ACTIVITY_AT = _time.time()
         _append_terminal_control_audit({**audit, "phase": "validated"})
 
+
         if target.get("source") == "broker_vt":
             broker_action = dict(action)
             if surface_schema_version == 2:
@@ -27599,6 +31422,21 @@ class Handler(BaseHTTPRequestHandler):
                     "write_outcome": "none",
                 }
             else:
+                _mark_receipted_mutation_running(
+                    mutation,
+                    provider_id=provider,
+                    provider_version="terminal-surface-v2",
+                    provider_channel="pty_broker",
+                    operation_id=f"terminal_control.{action['type']}",
+                    binding_id=str(target["broker_id"]),
+                    capability_generation=int(
+                        broker_control_proof["generation"]
+                    ),
+                    recovery_correlation={
+                        "provider_operation_id": client_action_id,
+                        "provider_cursor": snapshot.get("screen_hash"),
+                    },
+                )
                 try:
                     result = PTY_BROKER.control(target["broker_id"], broker_action)
                 except PTYBrokerOutcomeUnknownError as exc:
@@ -27627,8 +31465,34 @@ class Handler(BaseHTTPRequestHandler):
                         "outcome_indeterminate": False,
                     }
         elif action["type"] == "key" and action["key"] == "ctrl_c":
+            _mark_receipted_mutation_running(
+                mutation,
+                provider_id=provider,
+                provider_version="terminal-surface-v2",
+                provider_channel=str(target.get("source") or "terminal"),
+                operation_id="terminal_control.key",
+                binding_id=str(target.get("broker_id") or target.get("tty")),
+                capability_generation=int(snapshot["generation"]),
+                recovery_correlation={
+                    "provider_operation_id": client_action_id,
+                    "provider_cursor": snapshot.get("screen_hash"),
+                },
+            )
             result = self._terminal_control_signal(target, signal.SIGINT, "SIGINT")
         else:
+            _mark_receipted_mutation_running(
+                mutation,
+                provider_id=provider,
+                provider_version="terminal-surface-v2",
+                provider_channel=str(target.get("source") or "terminal"),
+                operation_id=f"terminal_control.{action['type']}",
+                binding_id=str(target.get("broker_id") or target.get("tty")),
+                capability_generation=int(snapshot["generation"]),
+                recovery_correlation={
+                    "provider_operation_id": client_action_id,
+                    "provider_cursor": snapshot.get("screen_hash"),
+                },
+            )
             result = self._terminal_control_run_in_terminal(target, action)
 
         ok = bool(result.get("ok"))
@@ -27733,7 +31597,15 @@ class Handler(BaseHTTPRequestHandler):
             error_message=response_message if not ok else None,
             fields=response_fields,
         )
-        _store_action_receipt(device_id, receipt_session_id, client_action_id or None, body_hash, receipt, action_kind="terminal_control", audit_action=audit.get("action"))
+        _store_action_receipt(
+            device_id,
+            receipt_session_id,
+            client_action_id or None,
+            body_hash,
+            receipt,
+            action_kind="terminal_control",
+            audit_action=audit.get("action"),
+        )
         response = {
             "ok": ok,
             **response_fields,
@@ -27750,52 +31622,59 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(response, status=status)
 
     def _resolve_transcript(self, session_id: str):
-        """Map an iOS app session_id (which may be a Claude Code UUID OR a
-        continuous-claude PG session id like 's-moj0ydy9') to the on-disk JSONL.
-
-        Strategy:
-          1. Direct filename match: `<session_id>.jsonl` anywhere under projects/
-          2. **PG claude_uuid lookup**: for continuous-claude `s-…` ids, fetch
-             claude_uuid + project from PG and exact-match `<claude_uuid>.jsonl`
-             in the encoded project dir. This is essential when N sessions
-             share a project (e.g. 4 terminals all in /Users/example) — without
-             it, all N collide on the most-recent-JSONL fallback.
-
-        Pairling never substitutes the newest transcript in a project. A
-        missing exact identity is not enough evidence to choose a file.
-        """
+        """Resolve one exact Claude transcript without following path aliases."""
         native_id = _claude_native_session_id(session_id)
         if not native_id:
             return None
         session_id = _agent_registry_resolve_native_alias("claude", native_id)
-        projects_root = HOME / ".claude" / "projects"
+
+        def accepted(candidate: Path) -> Path | None:
+            try:
+                with _open_session_transcript_file(candidate):
+                    return candidate
+            except (OSError, ValueError):
+                return None
 
         if _safe_session_id(session_id) and session_id.startswith("s-"):
             claude_uuid = self._lookup_pg_field(session_id, "claude_uuid")
             project = self._lookup_pg_project(session_id)
             if claude_uuid and project:
-                candidate = projects_root / _encode_project_dir(project) / f"{claude_uuid}.jsonl"
-                return candidate if candidate.exists() else None
+                candidate = (
+                    CLAUDE_PROJECTS_DIR
+                    / _encode_project_dir(project)
+                    / f"{claude_uuid}.jsonl"
+                )
+                return accepted(candidate)
 
-        # Strategy 1: direct filename match.
-        for project_dir in projects_root.iterdir():
-            if not project_dir.is_dir():
-                continue
-            candidate = project_dir / f"{session_id}.jsonl"
-            if candidate.exists():
-                return candidate
+        try:
+            projects_fd = open_directory_fd(CLAUDE_PROJECTS_DIR, root=HOME)
+        except (OSError, ValueError):
+            return None
+        try:
+            for name in os.listdir(projects_fd):
+                try:
+                    project_fd = open_child_directory_fd(projects_fd, name)
+                except (OSError, ValueError):
+                    continue
+                else:
+                    os.close(project_fd)
+                candidate = CLAUDE_PROJECTS_DIR / name / f"{session_id}.jsonl"
+                if accepted(candidate) is not None:
+                    return candidate
+        finally:
+            os.close(projects_fd)
 
         if not _safe_session_id(session_id):
             return None
-
-        # Strategy 2: PG claude_uuid → exact JSONL match. Per-session unique.
         claude_uuid = self._lookup_pg_field(session_id, "claude_uuid")
         project = self._lookup_pg_project(session_id)
         if claude_uuid and project:
-            encoded = _encode_project_dir(project)
-            candidate = projects_root / encoded / f"{claude_uuid}.jsonl"
-            return candidate if candidate.exists() else None
-
+            candidate = (
+                CLAUDE_PROJECTS_DIR
+                / _encode_project_dir(project)
+                / f"{claude_uuid}.jsonl"
+            )
+            return accepted(candidate)
         return None
 
     def _lookup_pg_project(self, session_id: str):
@@ -27834,17 +31713,22 @@ class Handler(BaseHTTPRequestHandler):
         }
 
         path = self._resolve_transcript(session_id)
-        if path and path.exists():
-            meta["transcriptFile"] = path.name
-            meta["transcriptSize"] = path.stat().st_size
-            with open(path, "rb") as f:
-                meta["lineCount"] = sum(1 for _ in f)
-
+        if path:
             head = ""
             try:
-                with open(path, encoding="utf-8", errors="replace") as f:
-                    head = "".join(line for _, line in zip(range(120), f))
-            except Exception:
+                head_lines = []
+                line_count = 0
+                with _open_session_transcript_file(path) as f:
+                    opened = os.fstat(f.fileno())
+                    for raw_line in f:
+                        if line_count < 120:
+                            head_lines.append(raw_line.decode("utf-8", errors="replace"))
+                        line_count += 1
+                meta["transcriptFile"] = path.name
+                meta["transcriptSize"] = opened.st_size
+                meta["lineCount"] = line_count
+                head = "".join(head_lines)
+            except OSError:
                 head = ""
 
             sm = re.search(r"\.claude/sentinel/modes/([A-Za-z0-9_-]+)/", head)
@@ -27933,7 +31817,10 @@ class Handler(BaseHTTPRequestHandler):
                 }
             self._send_json(body, status=status)
 
-        if not DEEPFIELD_INBOX_DIR.parent.parent.is_dir():
+        deepfield_root = DEEPFIELD_INBOX_DIR.parent.parent
+        try:
+            project_fd = open_directory_fd(deepfield_root, root=HOME)
+        except (FileNotFoundError, NotADirectoryError, PermissionError, OSError, ValueError):
             finish(
                 state="rejected",
                 status=404,
@@ -27941,6 +31828,8 @@ class Handler(BaseHTTPRequestHandler):
                 error_message="deepfield is not present on this Mac",
             )
             return
+        else:
+            os.close(project_fd)
         if not raw.strip():
             finish(
                 state="rejected",
@@ -27958,16 +31847,27 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         published_path: Path | None = None
-        tmp: Path | None = None
+        directory_fd = -1
+        temporary_name: str | None = None
         try:
-            DEEPFIELD_INBOX_DIR.mkdir(parents=True, exist_ok=True)
+            directory_fd = ensure_directory_fd(
+                DEEPFIELD_INBOX_DIR,
+                root=deepfield_root,
+                mode=0o700,
+            )
             stamp = _time.strftime("%Y-%m-%d-%H%M%S")
             header = f"<!-- caught {_time.strftime('%Y-%m-%d %H:%M:%S %Z')} via pairling-blurt, unprocessed -->\n\n".encode()
             payload = header + raw + (b"" if raw.endswith(b"\n") else b"\n")
-            tmp = DEEPFIELD_INBOX_DIR / (
+            temporary_name = (
                 f".{stamp}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
             )
-            fd = os.open(str(tmp), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            flags = (
+                os.O_CREAT
+                | os.O_EXCL
+                | os.O_WRONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            fd = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
             try:
                 view = memoryview(payload)
                 written = 0
@@ -27986,20 +31886,21 @@ class Handler(BaseHTTPRequestHandler):
             suffix = 1
             while True:
                 name = f"{stamp}.md" if suffix == 1 else f"{stamp}-{suffix}.md"
-                path = DEEPFIELD_INBOX_DIR / name
                 try:
-                    os.link(tmp, path)
-                    published_path = path
+                    os.link(
+                        temporary_name,
+                        name,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    published_path = DEEPFIELD_INBOX_DIR / name
                     break
                 except FileExistsError:
                     suffix += 1
                     if suffix > 100000:
                         raise
-            directory_fd = os.open(str(DEEPFIELD_INBOX_DIR), os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            os.fsync(directory_fd)
         except Exception as exc:
             finish(
                 state="indeterminate" if published_path is not None else "failed",
@@ -28014,11 +31915,13 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         finally:
-            if tmp is not None:
-                try:
-                    tmp.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            if directory_fd >= 0:
+                if temporary_name is not None:
+                    try:
+                        os.unlink(temporary_name, dir_fd=directory_fd)
+                    except OSError:
+                        pass
+                os.close(directory_fd)
         finish(state="applied", status=200, file_name=published_path.name)
 
     def _handle_postures_list(self, q):
@@ -29308,16 +33211,17 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self._send_json({"ok": False, "error": {"code": "bad_json", "message": "invalid JSON"}}, status=400)
             return
-        project = str(payload.get("project") or "").strip()
-        if not project or not project.startswith("/") or ".." in project.split("/"):
+        project_input = str(payload.get("project") or "").strip()
+        try:
+            project = _canonical_user_directory(project_input, allow_tmp=False)
+        except ValueError:
             self._send_json({"ok": False, "error": {"code": "bad_project", "message": "absolute project path required"}}, status=400)
             return
-        home = str(HOME)
-        if not (project == home or project.startswith(home + "/")):
-            self._send_json({"ok": False, "error": {"code": "path_not_allowed", "message": "project must live under the home directory"}}, status=400)
-            return
-        if not os.path.isdir(project):
+        except (FileNotFoundError, NotADirectoryError):
             self._send_json({"ok": False, "error": {"code": "missing_project", "message": "project directory does not exist"}}, status=404)
+            return
+        except (PermissionError, RuntimeError, OSError):
+            self._send_json({"ok": False, "error": {"code": "path_not_allowed", "message": "project must resolve under the home directory"}}, status=400)
             return
         context = _begin_receipted_mutation(
             self,
@@ -30377,32 +34281,31 @@ class Handler(BaseHTTPRequestHandler):
         })
         del events[:-80]
 
-    def _orchestration_validate_project(self, project: str) -> str | None:
+    def _orchestration_validate_project(self, project: str) -> tuple[str | None, str | None]:
         project = (project or "").strip()
         if not project:
-            return "project required"
-        if not project.startswith("/"):
-            return "project must be absolute path"
-        if ".." in project.split("/"):
-            return "path traversal rejected"
-        home = str(HOME)
-        if project == home or project.startswith(home + "/") or project in ("/tmp", "/private/tmp") or project.startswith("/private/tmp/") or project.startswith("/tmp/"):
-            pass
-        else:
-            return f"project path must be under $HOME or /tmp: {project}"
-        if not os.path.isdir(project):
-            return f"directory not found: {project}"
-        return None
+            return None, "project required"
+        try:
+            return _canonical_user_directory(project, allow_tmp=True), None
+        except ValueError as error:
+            return None, str(error)
+        except FileNotFoundError:
+            return None, f"directory not found: {project}"
+        except NotADirectoryError:
+            return None, f"not a directory: {project}"
+        except (PermissionError, RuntimeError, OSError) as error:
+            return None, str(error)
 
     def _orchestration_project_dirty(self, project: str) -> bool:
         try:
+            project = _revalidate_canonical_user_directory(project, allow_tmp=True)
             proc = subprocess.run(
                 ["git", "-C", project, "status", "--porcelain"],
                 capture_output=True, text=True, timeout=4,
             )
             return proc.returncode == 0 and bool(proc.stdout.strip())
         except Exception:
-            return False
+            return True
 
     def _orchestration_claude_bin(self) -> Path | None:
         for candidate in (
@@ -30536,7 +34439,10 @@ class Handler(BaseHTTPRequestHandler):
             self._orchestration_write(self._orchestration_refresh(run))
 
     def _orchestration_launch_role(self, run: dict, role: str, prompt_path: Path, title_suffix: str) -> dict:
-        project = run["project"]
+        try:
+            project = _revalidate_canonical_user_directory(run["project"], allow_tmp=True)
+        except (FileNotFoundError, NotADirectoryError, PermissionError, RuntimeError, OSError, ValueError) as error:
+            return {"provider": "claude", "role": role, "ok": False, "error": f"project path is no longer safe: {error}"}
         claude_bin = self._orchestration_claude_bin()
         if not claude_bin:
             return {"role": role, "ok": False, "error": "claude CLI not found"}
@@ -30604,7 +34510,10 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def _orchestration_launch_codex_role(self, run: dict, role: str, prompt_path: Path, title_suffix: str) -> dict:
-        project = run["project"]
+        try:
+            project = _revalidate_canonical_user_directory(run["project"], allow_tmp=True)
+        except (FileNotFoundError, NotADirectoryError, PermissionError, RuntimeError, OSError, ValueError) as error:
+            return {"provider": "codex", "role": role, "ok": False, "error": f"project path is no longer safe: {error}"}
         codex_bin = self._orchestration_codex_bin()
         if not codex_bin:
             return {"provider": "codex", "role": role, "ok": False, "error": "codex CLI not found"}
@@ -31180,10 +35089,10 @@ Worker instructions:
         if not isinstance(payload, dict):
             reject_create(400, "invalid_body", "body must be a JSON object")
             return
-        project = (payload.get("project") or "").strip()
-        project_error = self._orchestration_validate_project(project)
-        if project_error:
-            reject_create(400, "invalid_project", project_error)
+        project_input = (payload.get("project") or "").strip()
+        project, project_error = self._orchestration_validate_project(project_input)
+        if project_error or project is None:
+            reject_create(400, "invalid_project", project_error or "project required")
             return
         objective = (payload.get("objective") or "").strip()
         if not objective:
@@ -32003,8 +35912,13 @@ Worker instructions:
             self._send_json(replay, status=replay_status)
             return
 
-        # If filter=stale, populate target_ids from /worker-stats logic
-        if kill_filter == "stale" and not target_ids:
+        # If filter=stale, bind the kill set to a freshly recomputed stale
+        # set. Explicit session_ids are the user-confirmed upper bound: kill
+        # exactly the intersection and skip anything that recovered or was
+        # never requested, even if it is stale now.
+        stale_intersection_skips: list[str] = []
+        if kill_filter == "stale":
+            fresh_stale_ids: list[str] = []
             if provider_filter in ("all", "claude"):
                 worker_patterns = [
                     "biotech-labs/synth-synth-",
@@ -32017,11 +35931,27 @@ Worker instructions:
                         continue
                     project = self._lookup_pg_project(sid) or ""
                     if any(p in project for p in worker_patterns):
-                        target_ids.append(sid)
+                        fresh_stale_ids.append(sid)
             if provider_filter in ("all", "codex"):
                 for worker in self._collect_codex_workers(since_min=60 * 24):
                     if worker.get("stale"):
-                        target_ids.append(worker.get("id") or "")
+                        fresh_stale_ids.append(worker.get("id") or "")
+            if target_ids:
+                requested_ids = [str(item) for item in target_ids]
+                fresh_stale_set = {
+                    _parse_agent_session_ref(str(item))
+                    for item in fresh_stale_ids
+                    if str(item)
+                }
+                still_stale: list[str] = []
+                for rid in requested_ids:
+                    if _parse_agent_session_ref(rid) in fresh_stale_set:
+                        still_stale.append(rid)
+                    else:
+                        stale_intersection_skips.append(f"{rid} (no longer stale)")
+                target_ids = still_stale
+            else:
+                target_ids = fresh_stale_ids
 
         # SAFETY: never kill anything with a recent heartbeat (<5 min)
         # SAFETY: refuse mass kills > 100 to avoid runaway
@@ -32066,7 +35996,7 @@ Worker instructions:
             return
 
         killed: list[str] = []
-        skipped: list[str] = []
+        skipped: list[str] = list(stale_intersection_skips)
         errors: list[str] = []
         identity_drift = False
         broker_runtime_mismatch = False
@@ -32364,11 +36294,18 @@ Worker instructions:
         }
         self._send_json(response, status=response_status)
 
-    def _handle_spawn_session_broker(self, project: str, provider: str, launch_context: dict | None = None,
-                                     native_id_override: str | None = None,
-                                     first_prompt: str = "",
-                                     spawn_action_id: str = "",
-                                     spawn_body_hash: str = "") -> None:
+    def _handle_spawn_session_broker(
+        self,
+        project: str,
+        provider: str,
+        launch_context: dict | None = None,
+        native_id_override: str | None = None,
+        first_prompt: str = "",
+        spawn_action_id: str = "",
+        spawn_body_hash: str = "",
+        requested_session_mode: str = "terminal",
+        structured_fallback_reason: str | None = None,
+    ) -> None:
         spawn_device_id = getattr(getattr(self, "pairling_auth", None), "device_id", None)
         if PTY_BROKER is None:
             message = "PTY broker unavailable"
@@ -32426,30 +36363,23 @@ Worker instructions:
             generated = launch_context.get("generated") if isinstance(launch_context.get("generated"), dict) else {}
             broker_env = generated.get("env") if isinstance(generated.get("env"), dict) else None
             command = _aperture_cli_command_for_context(launch_context, project) if _aperture_cli_command_for_context else ""
-        elif provider == "codex":
-            # Inherit the user's OWN host posture (~/.codex/config.toml:
-            # approval_policy + sandbox_mode). Pairling imposes NO permission flag
-            # — we never twist the user's workspace to manufacture cards. The
-            # approval card is opportunistic: it surfaces ONLY if the user's own
-            # config prompts (codex approval detection is the Phase 5 screen-scrape,
-            # which touches no config).
-            #
-            # The broker has no local keyboard, so it cannot answer Codex's
-            # interactive update screen. Disable only that startup check for this
-            # process. Visible Terminal sessions still keep the user's normal
-            # update behavior.
-            command = (
-                f"exec codex -c check_for_update_on_startup=false "
-                f"-C {shlex.quote(project)} --add-dir {shlex.quote(project)}"
-            )
+            unavailable_code = "aperture_cli_launch_unavailable"
+            unavailable_message = "Aperture CLI launch command unavailable"
         else:
-            # Inherit the user's OWN host posture (~/.claude/settings.json). No
-            # imposed permission flag. The PermissionRequest producer hook is
-            # injected PER-SPAWN via --settings (phone sessions only) so the user's
-            # global settings stay untouched; the hook is an observer, never a mode.
-            command = _direct_claude_phone_command()
+            try:
+                command, _interactive = _reviewed_provider_launch_command(
+                    provider,
+                    project,
+                    "broker",
+                )
+            except ValueError:
+                command = ""
+            unavailable_code = "provider_spawn_backend_unavailable"
+            unavailable_message = (
+                f"{provider} has no reviewed broker launch command"
+            )
         if not command:
-            message = "Aperture CLI launch command unavailable"
+            message = unavailable_message
             receipt = _finalize_spawn_action(
                 device_id=spawn_device_id,
                 provider=provider,
@@ -32458,14 +36388,14 @@ Worker instructions:
                 state="failed",
                 http_status=503,
                 backend="pty_broker",
-                error_code="aperture_cli_launch_unavailable",
+                error_code=unavailable_code,
                 error_message=message,
                 fields={"outcome_indeterminate": False},
             )
             self._send_json({
                 "ok": False,
-                "error": {"code": "aperture_cli_launch_unavailable", "message": message},
-                "error_code": "aperture_cli_launch_unavailable",
+                "error": {"code": unavailable_code, "message": message},
+                "error_code": unavailable_code,
                 "outcome_indeterminate": False,
                 "receipt": receipt,
             }, status=503)
@@ -32697,6 +36627,10 @@ Worker instructions:
             "native_id": native_id,
             "session_id": broker_session_id,
             "send_scope_id": broker_session_id,
+            "session_mode": "terminal",
+            "requested_session_mode": requested_session_mode,
+            "structured_fallback_reason": structured_fallback_reason,
+            "terminal_backed": True,
             "tty": _broker_slave_tty(session),
             "pid": _broker_pid(session),
             "terminal_log": str(_broker_raw_log_path(session)) if _broker_raw_log_path(session) else None,
@@ -32732,94 +36666,205 @@ Worker instructions:
     def _handle_onestream_handoff(self, q):
         """OneStream -> Pairling handoff ingestion (W1b).
 
-        POST: validate (fail-closed, mirroring the iOS PairlingHandoffReader),
-              compose the steering draft, and store the handoff under
-              HANDOFFS_DIR using the schemaVersion-1 record shape. Returns the
-              composed draft so the caller can confirm what a session would
-              ingest.
-        GET:  list pending (unconsumed) OneStream handoffs.
-
-        Auth: POST requires session:spawn, GET requires sessions:read (see
-        _required_scopes_for_request). Additive route — does not spawn directly
-        (OneStream has no Mac project path); a consumer composes/spawns later.
+        POST validates the schema-version-1 envelope and writes one bounded,
+        owner-only record without following storage symlinks. GET returns only
+        a bounded projection of pending records. PUT/DELETE are rejected by the
+        route dispatcher before this method is reached.
         """
-        if self.command == "GET":
-            items = []
+        if self.command == "POST":
             try:
-                paths = sorted(HANDOFFS_DIR.glob("onestream-*.json"))
+                payload = json.loads(self._read_body() or b"{}")
+            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+                self._send_error(400, "invalid_json", "Invalid JSON body")
+                return
+            if not isinstance(payload, dict):
+                self._send_error(400, "invalid_payload", "Request body must be an object")
+                return
+            if payload.get("schemaVersion") != 1:
+                self._send_error(
+                    400,
+                    "unsupported_schema",
+                    "Unsupported or missing handoff schemaVersion",
+                )
+                return
+
+            source = payload.get("source", "OneStream")
+            suggested_prompt = payload.get("suggestedPrompt", "")
+            transcript_text = payload.get("transcriptText", "")
+            workflow_hint = payload.get("workflowHint")
+            generated_at = payload.get("generatedAt")
+            segments = payload.get("segments", [])
+            if not isinstance(source, str):
+                self._send_error(400, "invalid_source", "source must be a string")
+                return
+            if not isinstance(suggested_prompt, str):
+                self._send_error(
+                    400,
+                    "invalid_suggested_prompt",
+                    "suggestedPrompt must be a string",
+                )
+                return
+            if not isinstance(transcript_text, str):
+                self._send_error(
+                    400,
+                    "invalid_transcript",
+                    "transcriptText must be a string",
+                )
+                return
+            if workflow_hint is not None and not isinstance(workflow_hint, str):
+                self._send_error(
+                    400,
+                    "invalid_workflow_hint",
+                    "workflowHint must be a string or null",
+                )
+                return
+            if generated_at is not None and not isinstance(generated_at, str):
+                self._send_error(
+                    400,
+                    "invalid_generated_at",
+                    "generatedAt must be a string or null",
+                )
+                return
+            if not isinstance(segments, list):
+                self._send_error(400, "invalid_segments", "segments must be an array")
+                return
+
+            source = source.strip() or "OneStream"
+            suggested_prompt = suggested_prompt.strip()
+            transcript_text = transcript_text.strip()
+            if not suggested_prompt and not transcript_text:
+                self._send_error(
+                    400,
+                    "empty_handoff",
+                    "Handoff contains no prompt or transcript",
+                )
+                return
+            compose_parts = [
+                part
+                for part in (suggested_prompt, transcript_text)
+                if part
+            ]
+            compose_draft = "\n\n---\n\n".join(compose_parts)
+            handoff_id = f"onestream-{secrets.token_hex(6)}"
+            record = {
+                "handoff_id": handoff_id,
+                "schema_version": 1,
+                "source": source,
+                "generated_at": generated_at,
+                "workflow_hint": workflow_hint,
+                "suggested_prompt": suggested_prompt,
+                "transcript_text": transcript_text,
+                "compose_draft": compose_draft,
+                "segments": segments,
+                "received_at": int(_time.time()),
+                "consumed": False,
+            }
+            try:
+                record_body = json.dumps(
+                    record,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            except (TypeError, ValueError, RecursionError):
+                self._send_error(
+                    400,
+                    "invalid_handoff_fields",
+                    "Handoff contains invalid field values",
+                )
+                return
+            if len(record_body) > ONESTREAM_HANDOFF_MAX_STORED_BYTES:
+                self._send_error(413, "handoff_too_large", "Handoff record is too large")
+                return
+            try:
+                _write_onestream_handoff_record(f"{handoff_id}.json", record_body)
             except OSError:
-                paths = []
-            for p in paths:
-                try:
-                    rec = json.loads(p.read_text())
-                except (OSError, json.JSONDecodeError):
-                    continue
-                if not isinstance(rec, dict) or rec.get("consumed"):
-                    continue
-                items.append({
-                    "handoff_id": rec.get("handoff_id") or p.stem,
-                    "source": rec.get("source") or "OneStream",
-                    "generatedAt": rec.get("generatedAt"),
-                    "suggestedPrompt": rec.get("suggestedPrompt") or "",
-                    "transcriptText": rec.get("transcriptText") or "",
-                    "composeDraft": rec.get("composeDraft") or "",
-                    "workflowHint": rec.get("workflowHint"),
-                })
-            self._send_json({"ok": True, "handoffs": items})
-            return
-
-        # POST — store a new handoff.
-        try:
-            payload = json.loads(self._read_body() or b"{}")
-        except json.JSONDecodeError:
-            self.send_error(400, "body must be JSON")
-            return
-        if not isinstance(payload, dict):
-            self.send_error(400, "body must be JSON object")
-            return
-
-        # Fail-closed validation — mirror iOS PairlingHandoffReader.decode().
-        schema_version = payload.get("schemaVersion")
-        if schema_version != 1:
+                self._send_error(
+                    503,
+                    "handoff_storage_unavailable",
+                    "Handoff storage is unavailable",
+                )
+                return
             self._send_json(
-                {"ok": False, "error": f"unsupported schemaVersion {schema_version!r} (expected 1)"},
-                status=400,
+                {
+                    "ok": True,
+                    "handoff_id": handoff_id,
+                    "compose_draft": compose_draft,
+                },
+                status=200,
             )
             return
-        transcript_text = str(payload.get("transcriptText") or "").strip()
-        if not transcript_text:
-            self._send_json({"ok": False, "error": "handoff contains no transcript"}, status=400)
-            return
 
-        suggested_prompt = str(payload.get("suggestedPrompt") or "").strip()
-        # composeDraft mirrors PairlingHandoffReader.composeDraft(from:).
-        compose_draft = (
-            f"{suggested_prompt}\n\n---\n{transcript_text}" if suggested_prompt else transcript_text
-        )
-
-        handoff_id = "onestream-" + secrets.token_hex(6)
-        record = {
-            "schemaVersion": 1,
-            "handoff_id": handoff_id,
-            "source": str(payload.get("source") or "OneStream")[:64],
-            "generatedAt": payload.get("generatedAt"),
-            "receivedAt": _time.time(),
-            "workflowHint": payload.get("workflowHint"),
-            "suggestedPrompt": suggested_prompt,
-            "transcriptText": transcript_text,
-            "segments": payload.get("segments") if isinstance(payload.get("segments"), list) else [],
-            "composeDraft": compose_draft,
-            "consumed": False,
-        }
         try:
-            (HANDOFFS_DIR / f"{handoff_id}.json").write_text(
-                json.dumps(record, indent=2, sort_keys=True)
+            directory_fd = _open_handoffs_directory_fd()
+        except OSError:
+            self._send_error(
+                503,
+                "handoff_storage_unavailable",
+                "Handoff storage is unavailable",
             )
-        except OSError as exc:
-            self._send_json({"ok": False, "error": f"could not store handoff: {exc}"}, status=500)
             return
-
-        self._send_json({"ok": True, "handoff_id": handoff_id, "composeDraft": compose_draft})
+        try:
+            names = _onestream_handoff_names(directory_fd)
+            items = []
+            response_size = len(json.dumps({"ok": True, "handoffs": []}).encode())
+            for filename in names:
+                record = _read_onestream_handoff_record(directory_fd, filename)
+                if not isinstance(record, dict) or record.get("consumed"):
+                    continue
+                item = {
+                    "handoff_id": filename[:-5],
+                    "source": (
+                        record.get("source")
+                        if isinstance(record.get("source"), str)
+                        else "OneStream"
+                    ),
+                    "generated_at": (
+                        record.get("generated_at")
+                        if isinstance(record.get("generated_at"), str)
+                        else None
+                    ),
+                    "workflow_hint": (
+                        record.get("workflow_hint")
+                        if isinstance(record.get("workflow_hint"), str)
+                        else None
+                    ),
+                    "suggested_prompt": (
+                        record.get("suggested_prompt")
+                        if isinstance(record.get("suggested_prompt"), str)
+                        else ""
+                    ),
+                    "transcript_text": (
+                        record.get("transcript_text")
+                        if isinstance(record.get("transcript_text"), str)
+                        else ""
+                    ),
+                    "compose_draft": (
+                        record.get("compose_draft")
+                        if isinstance(record.get("compose_draft"), str)
+                        else ""
+                    ),
+                    "received_at": (
+                        record.get("received_at")
+                        if (
+                            isinstance(record.get("received_at"), int)
+                            and not isinstance(record.get("received_at"), bool)
+                        )
+                        else None
+                    ),
+                }
+                item_size = len(json.dumps(item).encode("utf-8"))
+                separator_size = 2 if items else 0
+                if (
+                    response_size + separator_size + item_size
+                    > ONESTREAM_HANDOFF_MAX_RESPONSE_BYTES
+                ):
+                    break
+                items.append(item)
+                response_size += separator_size + item_size
+        finally:
+            os.close(directory_fd)
+        self._send_json({"ok": True, "handoffs": items})
 
     def _handle_spawn_session(self, q):
         """Spawn a new Claude/Codex session. User-facing direct spawns open a
@@ -32854,7 +36899,10 @@ Worker instructions:
 
         query_material = {
             key: list(q.get(key, []))
-            for key in ("project", "provider", "launch_strategy")
+            for key in (
+                "project", "provider", "provider_id", "launch_strategy",
+                "spawn_backend", "provider_profile_id",
+            )
             if q.get(key)
         }
         mutation = _begin_receipted_mutation(
@@ -32872,10 +36920,32 @@ Worker instructions:
 
         aperture_payload = payload.get("aperture") if isinstance(payload.get("aperture"), dict) else {}
         launch_strategy = str(payload.get("launch_strategy") or q.get("launch_strategy", ["direct_pairling"])[0] or "direct_pairling").strip().lower()
-        requested_spawn_backend = str(payload.get("spawn_backend") or "").strip().lower()
+        session_mode = str(
+            payload.get("session_mode")
+            or q.get("session_mode", ["terminal"])[0]
+            or "terminal"
+        ).strip().lower()
+        requested_spawn_backend = str(
+            payload.get("spawn_backend") or ""
+        ).strip().lower()
+        provider_profile_id = str(
+            payload.get("provider_profile_id") or ""
+        ).strip()
         requested_native_id = str(payload.get("native_id") or "").strip()
-        project = str(payload.get("project") or q.get("project", [""])[0]).strip()
-        provider = str(payload.get("provider") or aperture_payload.get("client_id") or q.get("provider", ["claude"])[0]).lower()
+        structured_fallback_reason = None
+        project = str(
+            payload.get("project") or q.get("project", [""])[0]
+        ).strip()
+        body_provider = str(payload.get("provider") or "").strip().lower()
+        body_provider_id = str(
+            payload.get("provider_id") or ""
+        ).strip().lower()
+        provider = (
+            body_provider_id
+            or body_provider
+            or str(aperture_payload.get("client_id") or "").lower()
+            or str(q.get("provider", ["claude"])[0]).lower()
+        )
         client_action_id = mutation["client_action_id"]
         spawn_body_hash = mutation["body_hash"]
         device_id = str(mutation["device_id"])
@@ -32892,6 +36962,8 @@ Worker instructions:
                 "provider": provider or None,
                 "project": project or None,
                 "launch_strategy": launch_strategy or None,
+                "spawn_backend": requested_spawn_backend or None,
+                "provider_profile_id": provider_profile_id or None,
                 "outcome_indeterminate": state == "indeterminate",
                 **(fields or {}),
             }
@@ -32940,8 +37012,75 @@ Worker instructions:
                 "launch_strategy must be direct_pairling or aperture_cli",
             )
             return
-        if requested_spawn_backend not in {"", "terminal_app", "broker"}:
-            reject_spawn(400, "invalid_spawn_backend", "spawn_backend must be terminal_app or broker")
+        if session_mode != "terminal":
+            reject_spawn(
+                400,
+                "invalid_session_mode",
+                "session_mode is terminal-only; use spawn_backend=managed_provider",
+            )
+            return
+        if (
+            body_provider
+            and body_provider_id
+            and body_provider != body_provider_id
+        ):
+            reject_spawn(
+                409,
+                "provider_mismatch",
+                "provider_id does not match provider",
+            )
+            return
+        if requested_spawn_backend not in {
+            "", "terminal_app", "broker", "managed_provider",
+        }:
+            reject_spawn(
+                400,
+                "invalid_spawn_backend",
+                (
+                    "spawn_backend must be terminal_app, broker, "
+                    "or managed_provider"
+                ),
+            )
+            return
+        managed_spawn = requested_spawn_backend == "managed_provider"
+        if managed_spawn and launch_strategy != "direct_pairling":
+            reject_spawn(
+                400,
+                "managed_provider_launch_strategy_conflict",
+                "managed_provider requires direct_pairling launch_strategy",
+            )
+            return
+        if managed_spawn and requested_native_id:
+            reject_spawn(
+                400,
+                "managed_provider_native_id_rejected",
+                "managed_provider owns the native session identity",
+            )
+            return
+        if managed_spawn and not provider_profile_id:
+            reject_spawn(
+                400,
+                "managed_provider_profile_required",
+                "provider_profile_id is required for managed_provider",
+            )
+            return
+        if not managed_spawn and provider_profile_id:
+            reject_spawn(
+                400,
+                "provider_profile_backend_mismatch",
+                "provider_profile_id is supported only by managed_provider",
+            )
+            return
+        forbidden_managed_fields = {
+            "cwd", "profile", "provider_version", "provider_channel",
+            "argv", "command", "env", "credentials",
+        }
+        if managed_spawn and forbidden_managed_fields.intersection(payload):
+            reject_spawn(
+                400,
+                "managed_provider_unsafe_override_rejected",
+                "managed provider runtime identity is server-owned",
+            )
             return
         if requested_native_id and re.fullmatch(r"pending-[a-f0-9]{16}", requested_native_id) is None:
             reject_spawn(
@@ -32978,6 +37117,43 @@ Worker instructions:
         if not _provider_visible(provider):
             reject_spawn(409, "provider_hidden", f"{provider} is hidden in Pairling")
             return
+        if managed_spawn:
+            spawn_backend = "managed_provider"
+        elif launch_strategy == "aperture_cli":
+            if requested_spawn_backend not in {"", "broker"}:
+                reject_spawn(
+                    409,
+                    "aperture_spawn_backend_mismatch",
+                    "aperture_cli launches require the broker backend",
+                )
+                return
+            spawn_backend = "broker"
+        else:
+            spawn_backend = (
+                requested_spawn_backend
+                or os.environ.get("PAIRLING_SPAWN_BACKEND", "terminal_app")
+            ).lower()
+            if spawn_backend not in {"terminal_app", "broker"}:
+                reject_spawn(
+                    400,
+                    "invalid_spawn_backend",
+                    "spawn_backend must be terminal_app or broker",
+                )
+                return
+            launch_contract = _reviewed_terminal_launch_contract(provider)
+            if (
+                launch_contract is None
+                or spawn_backend not in launch_contract.backends
+            ):
+                reject_spawn(
+                    409,
+                    "provider_spawn_backend_unavailable",
+                    (
+                        f"{provider} has no reviewed {spawn_backend} "
+                        "launch command"
+                    ),
+                )
+                return
         if not project:
             reject_spawn(400, "project_required", "project required")
             return
@@ -32988,22 +37164,22 @@ Worker instructions:
             reject_spawn(400, "path_traversal_rejected", "path traversal rejected")
             return
 
-        home = str(HOME)
-        # Allow $HOME itself plus anything under it; plus shared tmp dirs.
-        # Phone-side path validation already blocks `..`, so we trust
-        # canonical-prefix membership.
-        if project == home:
-            pass  # exactly $HOME — fine
-        elif project.startswith(home + "/"):
-            pass  # any subdir of $HOME — fine
-        elif project.startswith("/private/tmp/") or project.startswith("/tmp/"):
-            pass
-        else:
-            reject_spawn(403, "project_not_allowed", f"project path must be under $HOME or /tmp: {project}")
+        try:
+            project = _canonical_user_directory(project, allow_tmp=True)
+        except ValueError:
+            reject_spawn(400, "invalid_project", "project path is invalid")
             return
-
-        if not os.path.isdir(project):
-            reject_spawn(404, "project_not_found", f"directory not found: {project}")
+        except (FileNotFoundError, NotADirectoryError):
+            reject_spawn(
+                404, "project_not_found", f"directory not found: {project}"
+            )
+            return
+        except (PermissionError, OSError):
+            reject_spawn(
+                403,
+                "project_not_allowed",
+                f"project path must be a real directory under $HOME or /tmp: {project}",
+            )
             return
 
         deterministic_native_id = requested_native_id or (
@@ -33088,6 +37264,29 @@ Worker instructions:
             )
             self._send_json(response)
             return
+        reviewed_terminal_command = ""
+        reviewed_terminal_interactive_shell = False
+        if not managed_spawn and launch_strategy == "direct_pairling":
+            try:
+                (
+                    reviewed_terminal_command,
+                    reviewed_terminal_interactive_shell,
+                ) = _reviewed_provider_launch_command(
+                    provider,
+                    project,
+                    spawn_backend,
+                )
+            except ValueError:
+                reject_spawn(
+                    503,
+                    "provider_spawn_backend_unavailable",
+                    (
+                        f"{provider} has no available reviewed "
+                        f"{spawn_backend} launch command"
+                    ),
+                    state="failed",
+                )
+                return
         # Rate limit: single global key. _inject_rate_check enforces 30/min
         # AND a 1-second cooldown between consecutive calls. For spawn, that's
         # plenty — actual launch takes ~2-3s anyway.
@@ -33100,6 +37299,151 @@ Worker instructions:
                 fields={"retry_after": retry},
             )
             return
+        if managed_spawn:
+            managed_store = _ensure_managed_provider_session_store()
+            manager = _ensure_managed_provider_session_manager()
+            try:
+                existing_managed = (
+                    managed_store.find_launch(
+                        client_action_id,
+                        spawn_body_hash,
+                    )
+                    if managed_store is not None
+                    else None
+                )
+            except _ManagedProviderSessionCollision as exc:
+                reject_spawn(
+                    409,
+                    "managed_launch_idempotency_conflict",
+                    str(exc)[:200],
+                )
+                return
+            if existing_managed is not None:
+                response = {
+                    "ok": True,
+                    "deduped": True,
+                    "project": existing_managed["project"],
+                    "provider": existing_managed["provider"],
+                    "native_id": existing_managed["native_id"],
+                    "session_id": existing_managed["id"],
+                    "send_scope_id": existing_managed["id"],
+                    "spawn_backend": "managed_provider",
+                    "provider_profile_id": existing_managed["provider_profile_id"],
+                    "terminal_backed": False,
+                    "binding_id": existing_managed["binding_id"],
+                    "capability_generation": int(
+                        existing_managed["capability_generation"]
+                    ),
+                    "capabilities": existing_managed["capabilities"],
+                    "control_state": existing_managed["control_state"],
+                }
+                response["receipt"] = _finalize_spawn_action(
+                    device_id=device_id,
+                    provider=provider,
+                    client_action_id=client_action_id,
+                    body_hash=spawn_body_hash,
+                    state="applied",
+                    http_status=200,
+                    backend="managed_provider",
+                    fields={
+                        key: value
+                        for key, value in response.items()
+                        if key != "deduped"
+                    },
+                )
+                self._send_json(response)
+                return
+            try:
+                if manager is None:
+                    raise _ManagedProviderDriverUnavailable(
+                        "managed provider session runtime is unavailable"
+                    )
+                auth_result = getattr(self, "pairling_auth", None)
+                source_install_id = str(
+                    getattr(auth_result, "install_id", None) or device_id
+                )
+                title = str(
+                    payload.get("title")
+                    or Path(project).name
+                    or f"{provider} session"
+                ).strip()[:500]
+                managed_row = manager.launch(
+                    provider=provider,
+                    project=project,
+                    title=title,
+                    source_install_id=source_install_id,
+                    provider_profile_id=provider_profile_id,
+                    first_prompt=first_prompt or "",
+                    launch_action_id=client_action_id,
+                    launch_body_hash=spawn_body_hash,
+                )
+            except _ManagedProviderSessionCollision as exc:
+                reject_spawn(
+                    409,
+                    "managed_session_id_collision",
+                    str(exc)[:200],
+                    state="failed",
+                )
+                return
+            except Exception as exc:
+                error_code = str(
+                    getattr(exc, "code", None)
+                    or "managed_provider_unavailable"
+                )
+                reject_spawn(
+                    503,
+                    error_code,
+                    str(exc)[:200]
+                    or "Managed provider launch is unavailable.",
+                    state="failed",
+                )
+                return
+            else:
+                _bump_catalog_epoch()
+                if SESSION_EVENT_HUB is not None:
+                    SESSION_EVENT_HUB.publish(SESSION_SUMMARIES_TOPIC, {
+                        "type": "managed_session_registered",
+                        "session_id": managed_row["id"],
+                        "provider": provider,
+                    })
+                response = {
+                    "ok": True,
+                    "deduped": False,
+                    "project": managed_row["project"],
+                    "provider": managed_row["provider"],
+                    "native_id": managed_row["native_id"],
+                    "session_id": managed_row["id"],
+                    "send_scope_id": managed_row["id"],
+                    "spawn_backend": "managed_provider",
+                    "provider_profile_id": managed_row["provider_profile_id"],
+                    "terminal_backed": False,
+                    "binding_id": managed_row["binding_id"],
+                    "capability_generation": int(
+                        managed_row["capability_generation"]
+                    ),
+                    "capabilities": managed_row["capabilities"],
+                    "control_state": managed_row["control_state"],
+                    "first_prompt_scheduled": bool(first_prompt),
+                    "first_prompt_delivery_state": (
+                        "provider_submitted" if first_prompt else None
+                    ),
+                }
+                response["receipt"] = _finalize_spawn_action(
+                    device_id=device_id,
+                    provider=provider,
+                    client_action_id=client_action_id,
+                    body_hash=spawn_body_hash,
+                    state="applied",
+                    http_status=200,
+                    backend="managed_provider",
+                    fields={
+                        key: value
+                        for key, value in response.items()
+                        if key != "deduped"
+                    },
+                )
+                self._send_json(response)
+                return
 
         aperture_launch_context = None
         if launch_strategy == "aperture_cli":
@@ -33128,7 +37472,6 @@ Worker instructions:
                 )
                 return
 
-        spawn_backend = requested_spawn_backend or os.environ.get("PAIRLING_SPAWN_BACKEND", "terminal_app").lower()
         if requested_native_id and spawn_backend != "broker":
             reject_spawn(
                 400,
@@ -33154,33 +37497,23 @@ Worker instructions:
                 first_prompt=first_prompt,
                 spawn_action_id=client_action_id,
                 spawn_body_hash=spawn_body_hash,
+                requested_session_mode=session_mode,
+                structured_fallback_reason=structured_fallback_reason,
             )
             return
 
-        capture_id = ""
-        capture_log_path: Path | None = None
+        capture_id = hashlib.sha256(
+            f"{device_id}\0{client_action_id}\0{provider}".encode()
+        ).hexdigest()[:24]
+        capture_log_path: Path | None = (
+            TERMINAL_CAPTURE_DIR / f"{provider}-{capture_id}.log"
+        )
         spawn_marker_path: Path | None = None
-        if provider == "codex":
-            capture_id = hashlib.sha256(
-                f"{device_id}\0{client_action_id}\0{provider}".encode()
-            ).hexdigest()[:24]
-            capture_log_path = TERMINAL_CAPTURE_DIR / f"codex-{capture_id}.log"
-            inner = (
-                f"cd {shlex.quote(project)} && "
-                f"exec codex "
-                f"-C {shlex.quote(project)} --add-dir {shlex.quote(project)}"
-            )
-            shell_cmd = _terminal_script_command(capture_log_path, inner, interactive_shell=True)
-        else:
-            capture_id = hashlib.sha256(
-                f"{device_id}\0{client_action_id}\0{provider}".encode()
-            ).hexdigest()[:24]
-            capture_log_path = TERMINAL_CAPTURE_DIR / f"claude-{capture_id}.log"
-            inner = (
-                f"cd {shlex.quote(project)} && "
-                f"{_direct_claude_phone_command()}"
-            )
-            shell_cmd = _terminal_script_command(capture_log_path, inner)
+        shell_cmd = _terminal_script_command(
+            capture_log_path,
+            reviewed_terminal_command,
+            interactive_shell=reviewed_terminal_interactive_shell,
+        )
         spawn_marker_path = TERMINAL_CAPTURE_DIR / f"spawn-{capture_id}.tty"
         try:
             spawn_marker_path.unlink(missing_ok=True)
@@ -33376,6 +37709,10 @@ Worker instructions:
             "native_id": native_id,
             "session_id": _qualified_session_id(provider, native_id),
             "send_scope_id": _qualified_session_id(provider, native_id),
+            "session_mode": "terminal",
+            "requested_session_mode": session_mode,
+            "structured_fallback_reason": structured_fallback_reason,
+            "terminal_backed": True,
             "tty": tty,
             "pid": pid,
             "terminal_log": str(capture_log_path) if capture_log_path else None,
@@ -33556,962 +37893,8 @@ Worker instructions:
             "outcome_indeterminate": outcome_indeterminate,
         }
 
-    def _handle_cross_provider_action(self, q):
-        try:
-            payload = json.loads(self._read_body() or b"{}")
-        except json.JSONDecodeError:
-            self.send_error(400, "body must be JSON")
-            return
-        kind = str(payload.get("kind") or "").lower()
-        if kind not in {"compare", "handoff", "arbitrate"}:
-            self.send_error(400, "kind must be compare, handoff, or arbitrate")
-            return
-        source_ref = str(payload.get("source_session") or "").strip()
-        if ":" not in source_ref:
-            self._send_json({
-                "ok": False,
-                "error": {
-                    "code": "provider_required",
-                    "message": "source_session must be provider-qualified",
-                },
-            }, status=400)
-            return
-        source_provider, source_native_id = _parse_agent_session_ref(source_ref)
-        if (
-            not source_native_id
-            or not _safe_agent_native_id(source_native_id)
-            or re.fullmatch(r"[a-z0-9_]{1,48}", source_provider) is None
-        ):
-            self._send_json({
-                "ok": False,
-                "error": {
-                    "code": "bad_session",
-                    "message": "source_session must name a supported provider and session",
-                },
-            }, status=400)
-            return
-        canonical_source = _qualified_session_id(source_provider, source_native_id)
-        other = "codex" if source_provider == "claude" else "claude"
-        target_provider = str(payload.get("target_provider") or other).lower()
-        if re.fullmatch(r"[a-z0-9_]{1,48}", target_provider) is None:
-            self._send_json(_unknown_provider_payload(target_provider), status=400)
-            return
-        providers = ["claude", "codex"] if kind == "compare" else [target_provider]
 
-        receipt_context = _begin_receipted_mutation(
-            self,
-            receipt_scope=f"cross-provider:{canonical_source}",
-            action_kind="cross_provider_action",
-            material={
-                "kind": kind,
-                "source_session": canonical_source,
-                "target_provider": target_provider,
-                "providers": providers,
-            },
-            action_label="cross-provider launch",
-        )
-        if receipt_context is None:
-            return
 
-        for provider in [source_provider, *providers]:
-            if not _valid_provider_filter(provider, allow_all=False):
-                body = _unknown_provider_payload(provider)
-                receipt = _finalize_receipted_mutation(
-                    receipt_context,
-                    state="rejected",
-                    http_status=400,
-                    backend="cross_provider",
-                    error_code="unknown_provider",
-                    error_message=str(body["error"]["message"]),
-                    fields={"source_session": canonical_source, "provider": provider},
-                    audit_action={"type": "cross_provider_action", "kind": kind},
-                )
-                body["receipt"] = receipt
-                self._send_json(body, status=400)
-                return
-            if provider not in _agent_provider_ids():
-                body = _unsupported_provider_payload(provider, "cross_provider_action")
-                receipt = _finalize_receipted_mutation(
-                    receipt_context,
-                    state="rejected",
-                    http_status=400,
-                    backend="cross_provider",
-                    error_code="unsupported_provider",
-                    error_message=str(body["error"]["message"]),
-                    fields={"source_session": canonical_source, "provider": provider},
-                    audit_action={"type": "cross_provider_action", "kind": kind},
-                )
-                body["receipt"] = receipt
-                self._send_json(body, status=400)
-                return
-            if not _provider_visible(provider):
-                body = _provider_hidden_payload(provider)
-                receipt = _finalize_receipted_mutation(
-                    receipt_context,
-                    state="rejected",
-                    http_status=409,
-                    backend="cross_provider",
-                    error_code="provider_hidden",
-                    error_message=str(body["error"]["message"]),
-                    fields={"source_session": canonical_source, "provider": provider},
-                    audit_action={"type": "cross_provider_action", "kind": kind},
-                )
-                body["receipt"] = receipt
-                self._send_json(body, status=409)
-                return
-
-        source = self._session_context_for_workflow(canonical_source)
-        if not source:
-            message = "Source session context was not found."
-            receipt = _finalize_receipted_mutation(
-                receipt_context,
-                state="rejected",
-                http_status=404,
-                backend="cross_provider",
-                error_code="source_session_not_found",
-                error_message=message,
-                fields={"source_session": canonical_source},
-                audit_action={"type": "cross_provider_action", "kind": kind},
-            )
-            self._send_json({
-                "ok": False,
-                "error": {"code": "source_session_not_found", "message": message},
-                "source_session": canonical_source,
-                "receipt": receipt,
-            }, status=404)
-            return
-
-        workflow_id = "xprov-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(4)
-        artifact_path = CROSS_PROVIDER_DIR / f"{workflow_id}.json"
-        prompt_base = source.get("first_prompt") or source.get("last_assistant") or "Continue the work from the linked session."
-        transcript_context = (source.get("last_assistant") or "")[-6000:]
-        if kind == "compare":
-            task_prompt = (
-                "Run the same task independently for cross-provider comparison.\n\n"
-                f"Original request:\n{prompt_base}\n\n"
-                "Return concise findings, assumptions, and the next concrete implementation step."
-            )
-        elif kind == "handoff":
-            task_prompt = (
-                f"Continue this {source['provider']} session in {target_provider}.\n\n"
-                f"Source session: {source['session_id']}\n"
-                f"Original request:\n{prompt_base}\n\n"
-                f"Recent assistant context:\n{transcript_context}\n\n"
-                "Pick up the work directly. Preserve intent, call out uncertainty, and continue in this project."
-            )
-        else:
-            task_prompt = (
-                f"Review and arbitrate the recent output from {source['session_id']}.\n\n"
-                f"Original request:\n{prompt_base}\n\n"
-                f"Recent assistant output:\n{transcript_context}\n\n"
-                "Find correctness issues, missing tests, weak assumptions, and the strongest alternative approach."
-            )
-        prompt_path = CROSS_PROVIDER_DIR / f"{workflow_id}.prompt.txt"
-        try:
-            CROSS_PROVIDER_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-            CROSS_PROVIDER_DIR.chmod(0o700)
-            prompt_path.write_text(task_prompt, encoding="utf-8")
-            prompt_path.chmod(0o600)
-        except OSError as exc:
-            message = f"Could not store the cross-provider prompt: {type(exc).__name__}"
-            receipt = _finalize_receipted_mutation(
-                receipt_context,
-                state="failed",
-                http_status=500,
-                backend="terminal_app",
-                error_code="cross_provider_prompt_store_failed",
-                error_message=message,
-                audit_action={"type": "cross_provider_action", "kind": kind},
-            )
-            self._send_json({
-                "ok": False,
-                "error": {"code": "cross_provider_prompt_store_failed", "message": message},
-                "receipt": receipt,
-            }, status=500)
-            return
-        artifact = {
-            "id": workflow_id,
-            "kind": kind,
-            "source": source,
-            "target_provider": target_provider,
-            "prompt_path": str(prompt_path),
-            "artifact_path": str(artifact_path),
-            "created_at": _time.time(),
-            "launches": [],
-        }
-        launches = []
-        for provider in providers:
-            try:
-                launches.append(self._launch_provider_prompt(
-                    provider,
-                    source["project"],
-                    prompt_path,
-                    kind,
-                    {"kind": "cross_provider", "workflow_id": workflow_id, "workflow_kind": kind},
-                ))
-            except Exception as exc:
-                launches.append({
-                    "provider": provider,
-                    "ok": False,
-                    "native_id": None,
-                    "session_id": None,
-                    "tty": "",
-                    "pid": 0,
-                    "error": f"launch result unavailable: {type(exc).__name__}",
-                    "outcome_indeterminate": True,
-                })
-        artifact["launches"] = launches
-        artifact_persisted = True
-        try:
-            artifact_path.write_text(json.dumps(artifact, indent=2, sort_keys=True), encoding="utf-8")
-            artifact_path.chmod(0o600)
-        except OSError:
-            artifact_persisted = False
-
-        successful = [launch for launch in launches if launch.get("ok")]
-        unknown = [launch for launch in launches if launch.get("outcome_indeterminate")]
-        registry_unknown = [
-            launch
-            for launch in unknown
-            if launch.get("error_code") == "cross_provider_registry_unavailable"
-        ]
-        all_applied = len(successful) == len(launches)
-        partial = bool(successful) and not all_applied
-        outcome_indeterminate = bool(unknown or partial or not artifact_persisted)
-        fully_applied = all_applied and artifact_persisted
-        if fully_applied:
-            state = "applied"
-            status = 200
-            error_code = None
-            error_message = None
-        elif outcome_indeterminate:
-            state = "indeterminate"
-            status = 502
-            if registry_unknown and len(registry_unknown) == len(unknown):
-                error_code = "cross_provider_registry_unavailable"
-                error_message = (
-                    "Terminal launched the provider, but Pairling could not "
-                    "store its control identity. Do not retry this action."
-                )
-            else:
-                error_code = "cross_provider_launch_outcome_unknown"
-                error_message = "The provider launch or its workflow record could not be confirmed. Do not retry this action."
-        else:
-            state = "failed"
-            status = 502
-            error_code = "cross_provider_launch_failed"
-            error_message = "No provider launch completed."
-        response_fields = {
-            **artifact,
-            "outcome_indeterminate": outcome_indeterminate,
-            "artifact_persisted": artifact_persisted,
-        }
-        receipt = _finalize_receipted_mutation(
-            receipt_context,
-            state=state,
-            http_status=status,
-            backend="terminal_app",
-            error_code=error_code,
-            error_message=error_message,
-            fields=response_fields,
-            audit_action={
-                "type": "cross_provider_action",
-                "kind": kind,
-                "providers": providers,
-            },
-            pty_written=None if outcome_indeterminate else False,
-        )
-        response = {
-            "ok": fully_applied,
-            **response_fields,
-            "receipt": receipt,
-        }
-        if error_code:
-            response["error"] = {"code": error_code, "message": error_message}
-        self._send_json(response, status=status)
-
-    def _handle_resume_session_broker(
-        self,
-        *,
-        provider: str,
-        project: str,
-        native_id: str,
-        prompt: str,
-        receipt_context: dict,
-    ) -> None:
-        if PTY_BROKER is None:
-            message = "PTY broker unavailable"
-            receipt = _finalize_receipted_mutation(
-                receipt_context,
-                state="failed",
-                http_status=503,
-                backend="pty_broker",
-                error_code="broker_unavailable",
-                error_message=message,
-                audit_action={"type": "resume_session", "provider": provider},
-            )
-            self._send_json({
-                "ok": False,
-                "error": {"code": "broker_unavailable", "message": message},
-                "receipt": receipt,
-            }, status=503)
-            return
-        if not _broker_is_current_runtime():
-            message = "Resume requires the current terminal broker. A session still owned by the previous runtime remains read-only until it finishes."
-            receipt = _finalize_receipted_mutation(
-                receipt_context,
-                state="rejected",
-                http_status=409,
-                backend="pty_broker",
-                error_code="broker_requires_current_runtime",
-                error_message=message,
-                audit_action={"type": "resume_session", "provider": provider},
-            )
-            self._send_json({
-                "ok": False,
-                "error": {
-                    "code": "broker_requires_current_runtime",
-                    "message": message,
-                },
-                "receipt": receipt,
-            }, status=409)
-            return
-        broker_session_id = _qualified_session_id(provider, native_id)
-        existing = PTY_BROKER.get(broker_session_id)
-        if existing is not None:
-            if not _broker_session_owns_identity(existing, provider, native_id):
-                message = "Existing broker session identity does not match the requested resume."
-                receipt = _finalize_receipted_mutation(
-                    receipt_context,
-                    state="rejected",
-                    http_status=409,
-                    backend="pty_broker",
-                    error_code="process_identity_unverified",
-                    error_message=message,
-                    fields={"session_id": broker_session_id},
-                    audit_action={"type": "resume_session", "provider": provider},
-                )
-                self._send_json({
-                    "ok": False,
-                    "error": {
-                        "code": "process_identity_unverified",
-                        "message": message,
-                    },
-                    "session_id": broker_session_id,
-                    "receipt": receipt,
-                }, status=409)
-                return
-            response = {
-                "ok": True,
-                "provider": provider,
-                "native_id": native_id,
-                "session_id": broker_session_id,
-                "send_scope_id": broker_session_id,
-                "project": project,
-                "tty": _broker_slave_tty(existing),
-                "pid": _broker_pid(existing),
-                "terminal_log": str(_broker_raw_log_path(existing)) if _broker_raw_log_path(existing) else None,
-                "capture_backend": "pty_broker",
-                "terminal_source": "broker_vt",
-                "broker_id": _broker_session_id(existing),
-                "broker_socket": str(PTY_BROKER_SOCKET),
-                "attach_command": f"pairling attach {broker_session_id}",
-            }
-            response["receipt"] = _finalize_receipted_mutation(
-                receipt_context,
-                state="applied",
-                http_status=200,
-                backend="pty_broker",
-                fields=response,
-                audit_action={"type": "resume_session", "provider": provider},
-            )
-            self._send_json(response)
-            return
-
-        command = (
-            f"exec codex resume "
-            f"-C {shlex.quote(project)} --add-dir {shlex.quote(project)} "
-            f"{shlex.quote(native_id)}"
-        )
-        if prompt:
-            command += f" {shlex.quote(prompt)}"
-        session = None
-        ok = False
-        reason = None
-        outcome_indeterminate = False
-        try:
-            session = PTY_BROKER.spawn(
-                session_id=broker_session_id,
-                provider=provider,
-                native_id=native_id,
-                project=project,
-                command=command,
-                rows=30,
-                columns=120,
-                env={"PAIRLING_PHONE_SESSION": "1",
-                     "PAIRLING_BROKER_SESSION_ID": broker_session_id},
-            )
-            if not _broker_session_matches_spawn_request(
-                session,
-                broker_id=broker_session_id,
-                provider=provider,
-                native_id=native_id,
-            ):
-                raise ProcessIdentityDriftError(
-                    "spawned broker session identity does not match resume action"
-                )
-            ok = True
-        except PTYBrokerOutcomeUnknownError as exc:
-            session = _broker_reconcile_session_after_unknown(
-                broker_session_id,
-                provider=provider,
-                native_id=native_id,
-            )
-            if session is not None:
-                ok = True
-                reason = "resume response lost; reconciled by broker session id"
-            else:
-                outcome_indeterminate = True
-                reason = f"resume outcome unknown: {str(exc)[:180]}"
-        except Exception as e:
-            reason = f"{type(e).__name__}: {e}"
-
-        if ok and session is not None:
-            capture_id = secrets.token_hex(12)
-            session_tty = _broker_slave_tty(session)
-            session_log = _broker_raw_log_path(session)
-            session_pid = _broker_pid(session)
-            if session_tty and session_log:
-                _write_terminal_capture_mapping(
-                    session_tty,
-                    session_log,
-                    provider=provider,
-                    project=project,
-                    capture_id=capture_id,
-                )
-            _agent_registry_upsert(
-                "codex",
-                native_id,
-                project,
-                pid=session_pid,
-                terminal_tty=session_tty,
-                metadata={
-                    "spawned_by": "phone-companion",
-                    "resume_target": native_id,
-                    "terminal_log": str(session_log) if session_log else None,
-                    "capture_backend": "pty_broker",
-                    "capture_id": capture_id,
-                    "terminal_source": "broker_vt",
-                    "broker_id": broker_session_id,
-                    "send_scope_id": broker_session_id,
-                    "broker_socket": str(PTY_BROKER_SOCKET),
-                },
-            )
-            _write_agent_turn_state("codex", native_id, "idle", event="resume")
-
-        try:
-            audit_path = HOME / ".claude" / "audit" / "resume-sessions.jsonl"
-            audit_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(audit_path, "a") as f:
-                f.write(json.dumps({
-                    "ts": _time.time(),
-                    "provider": provider,
-                    "project": project,
-                    "native_id": native_id,
-                    "tty": _broker_slave_tty(session) if session else "",
-                    "pid": _broker_pid(session) if session else 0,
-                    "terminal_log": str(_broker_raw_log_path(session)) if session and _broker_raw_log_path(session) else None,
-                    "capture_backend": "pty_broker",
-                    "terminal_source": "broker_vt",
-                    "broker_id": broker_session_id,
-                    "broker_socket": str(PTY_BROKER_SOCKET),
-                    "ok": ok,
-                    "reason": reason,
-                    "via": "phone-companion",
-                }) + "\n")
-        except Exception:
-            pass
-
-        if not ok or session is None:
-            error_code = "broker_resume_outcome_unknown" if outcome_indeterminate else "broker_resume_failed"
-            receipt = _finalize_receipted_mutation(
-                receipt_context,
-                state="indeterminate" if outcome_indeterminate else "failed",
-                http_status=502,
-                backend="pty_broker",
-                error_code=error_code,
-                error_message=reason or "PTY broker resume failed",
-                fields={
-                    "session_id": broker_session_id,
-                    "outcome_indeterminate": outcome_indeterminate,
-                },
-                audit_action={"type": "resume_session", "provider": provider},
-                pty_written=None if outcome_indeterminate else False,
-            )
-            self._send_json({
-                "ok": False,
-                "error": {
-                    "code": error_code,
-                    "message": reason or "PTY broker resume failed",
-                },
-                "session_id": broker_session_id,
-                "outcome_indeterminate": outcome_indeterminate,
-                "receipt": receipt,
-            }, status=502)
-            return
-
-        response = {
-            "ok": True,
-            "provider": provider,
-            "native_id": native_id,
-            "session_id": broker_session_id,
-            "send_scope_id": broker_session_id,
-            "project": project,
-            "tty": _broker_slave_tty(session),
-            "pid": _broker_pid(session),
-            "terminal_log": str(_broker_raw_log_path(session)) if _broker_raw_log_path(session) else None,
-            "capture_backend": "pty_broker",
-            "terminal_source": "broker_vt",
-            "broker_id": broker_session_id,
-            "broker_socket": str(PTY_BROKER_SOCKET),
-            "attach_command": f"pairling attach {broker_session_id}",
-        }
-        response["receipt"] = _finalize_receipted_mutation(
-            receipt_context,
-            state="applied",
-            http_status=200,
-            backend="pty_broker",
-            fields=response,
-            audit_action={"type": "resume_session", "provider": provider},
-        )
-        self._send_json(response)
-
-    def _handle_resume_session(self, q):
-        """Resume Codex once and bind the new terminal to a durable send scope."""
-        try:
-            payload = json.loads(self._read_body() or b"{}")
-        except json.JSONDecodeError:
-            self.send_error(400, "body must be JSON")
-            return
-        provider = str(payload.get("provider") or "").lower()
-        project = str(payload.get("project") or "").strip()
-        native_id = str(payload.get("session_id") or payload.get("native_id") or "").strip()
-        prompt = str(payload.get("prompt") or "").strip()
-        if not _valid_provider_filter(provider, allow_all=False):
-            _send_unknown_provider(self, provider)
-            return
-        if provider not in _agent_provider_ids():
-            _send_unsupported_provider(self, provider, "resume")
-            return
-        if provider != "codex":
-            self.send_error(400, "Claude resume uses /send-text with /resume <id>")
-            return
-        if not project or not project.startswith("/"):
-            self.send_error(400, "valid absolute project required")
-            return
-        if ".." in project.split("/"):
-            self.send_error(400, "path traversal rejected")
-            return
-        home = str(HOME)
-        if not (project == home or project.startswith(home + "/") or project.startswith("/private/tmp/") or project.startswith("/tmp/")):
-            self.send_error(403, f"project path must be under $HOME or /tmp: {project}")
-            return
-        if not _safe_agent_native_id(native_id):
-            self.send_error(400, "bad Codex session id")
-            return
-        if len(prompt) > 4000:
-            self.send_error(413, "prompt too long")
-            return
-
-        receipt_context = _begin_receipted_mutation(
-            self,
-            receipt_scope=f"resume:{_qualified_session_id(provider, native_id)}",
-            action_kind="resume_session",
-            material={
-                "provider": provider,
-                "project": project,
-                "native_id": native_id,
-                "prompt": prompt,
-            },
-            action_label="session resume",
-        )
-        if receipt_context is None:
-            return
-
-        if not _provider_visible(provider):
-            body = _provider_hidden_payload(provider)
-            receipt = _finalize_receipted_mutation(
-                receipt_context,
-                state="rejected",
-                http_status=409,
-                backend="session_resume",
-                error_code="provider_hidden",
-                error_message=str(body["error"]["message"]),
-                fields={"provider": provider},
-                audit_action={"type": "resume_session", "provider": provider},
-            )
-            body["receipt"] = receipt
-            self._send_json(body, status=409)
-            return
-        if not os.path.isdir(project):
-            message = "The project directory is no longer available."
-            receipt = _finalize_receipted_mutation(
-                receipt_context,
-                state="rejected",
-                http_status=400,
-                backend="session_resume",
-                error_code="project_unavailable",
-                error_message=message,
-                fields={"project": project},
-                audit_action={"type": "resume_session", "provider": provider},
-            )
-            self._send_json({
-                "ok": False,
-                "error": {"code": "project_unavailable", "message": message},
-                "project": project,
-                "receipt": receipt,
-            }, status=400)
-            return
-        if not _resolve_codex_transcript(native_id):
-            message = "No Codex transcript exists for this session."
-            receipt = _finalize_receipted_mutation(
-                receipt_context,
-                state="rejected",
-                http_status=404,
-                backend="session_resume",
-                error_code="transcript_not_found",
-                error_message=message,
-                fields={"session_id": _qualified_session_id(provider, native_id)},
-                audit_action={"type": "resume_session", "provider": provider},
-            )
-            self._send_json({
-                "ok": False,
-                "error": {"code": "transcript_not_found", "message": message},
-                "session_id": _qualified_session_id(provider, native_id),
-                "receipt": receipt,
-            }, status=404)
-            return
-
-        resume_backend = os.environ.get(
-            "PAIRLING_RESUME_BACKEND", "terminal_app"
-        ).lower()
-        if resume_backend != "broker":
-            if not _reserve_visible_resume(
-                receipt_context,
-                provider=provider,
-                canonical_native_id=native_id,
-            ):
-                message = (
-                    "This Codex session is already being resumed on the Mac. "
-                    "Wait for it to appear instead of starting another resume."
-                )
-                receipt = _finalize_receipted_mutation(
-                    receipt_context,
-                    state="rejected",
-                    http_status=409,
-                    backend="terminal_app",
-                    error_code="resume_in_progress",
-                    error_message=message,
-                    fields={
-                        "session_id": _qualified_session_id("codex", native_id),
-                    },
-                    audit_action={"type": "resume_session", "provider": provider},
-                )
-                self._send_json({
-                    "ok": False,
-                    "error": {
-                        "code": "resume_in_progress",
-                        "message": message,
-                    },
-                    "session_id": _qualified_session_id("codex", native_id),
-                    "receipt": receipt,
-                }, status=409)
-                return
-            existing = _agent_registry_get("codex", native_id)
-            if (
-                existing is not None
-                and not existing.get("closed_at")
-                and _session_has_verified_provider_process(existing, "codex")
-            ):
-                existing_send_scope_id = (
-                    _durable_send_scope_id_from_registry_row(
-                        existing,
-                        provider="codex",
-                        native_id=native_id,
-                    )
-                    or _qualified_session_id("codex", native_id)
-                )
-                message = (
-                    "This Codex session is already running on the Mac. "
-                    "Open its existing Pairling session instead of resuming it again."
-                )
-                receipt = _finalize_receipted_mutation(
-                    receipt_context,
-                    state="rejected",
-                    http_status=409,
-                    backend="terminal_app",
-                    error_code="session_already_live",
-                    error_message=message,
-                    fields={
-                        "session_id": _qualified_session_id("codex", native_id),
-                        "send_scope_id": existing_send_scope_id,
-                    },
-                    audit_action={"type": "resume_session", "provider": provider},
-                )
-                self._send_json({
-                    "ok": False,
-                    "error": {
-                        "code": "session_already_live",
-                        "message": message,
-                    },
-                    "session_id": _qualified_session_id("codex", native_id),
-                    "send_scope_id": existing_send_scope_id,
-                    "receipt": receipt,
-                }, status=409)
-                return
-
-        allowed, retry = _inject_rate_check("__resume_session__")
-        if not allowed:
-            message = f"rate limited, retry in {retry}s"
-            receipt = _finalize_receipted_mutation(
-                receipt_context,
-                state="rejected",
-                http_status=429,
-                backend="session_resume",
-                error_code="rate_limited",
-                error_message=message,
-                fields={"retry_after": retry},
-                audit_action={"type": "resume_session", "provider": provider},
-            )
-            self._send_json({
-                "ok": False,
-                "error": {"code": "rate_limited", "message": message},
-                "retry_after": retry,
-                "receipt": receipt,
-            }, status=429)
-            return
-
-        if resume_backend == "broker":
-            self._handle_resume_session_broker(
-                provider=provider,
-                project=project,
-                native_id=native_id,
-                prompt=prompt,
-                receipt_context=receipt_context,
-            )
-            return
-
-        resume_scope_native_id = "pending-" + hashlib.sha256(
-            (
-                f"{receipt_context['device_id']}\0"
-                f"{receipt_context['client_action_id']}\0resume\0{native_id}"
-            ).encode()
-        ).hexdigest()[:16]
-        send_scope_id = _qualified_session_id("codex", resume_scope_native_id)
-        capture_id = secrets.token_hex(12)
-        capture_log_path = TERMINAL_CAPTURE_DIR / f"codex-{capture_id}.log"
-        inner = (
-            f"cd {shlex.quote(project)} && "
-            f"exec codex resume "
-            f"-C {shlex.quote(project)} --add-dir {shlex.quote(project)} "
-            f"{shlex.quote(native_id)}"
-        )
-        if prompt:
-            inner += f" {shlex.quote(prompt)}"
-        shell_cmd = _terminal_script_command(capture_log_path, inner, interactive_shell=True)
-        as_escaped_cmd = _as_escape(shell_cmd)
-        title = f"codex:{os.path.basename(project.rstrip('/')) or 'resume'}"
-        script = f'''
-        tell application "Terminal"
-            activate
-            set newTab to do script "{as_escaped_cmd}"
-            set custom title of newTab to "{_as_escape(title)}"
-            delay 0.5
-            return "ok\t" & (tty of newTab)
-        end tell
-        '''
-        result = _run_osascript(script, mutation_possible=True)
-        tty = ""
-        if result.get("ok"):
-            parts = (result.get("stdout") or "").split("\t")
-            if len(parts) >= 2:
-                tty = parts[1].strip()
-        valid_tty = re.fullmatch(r"/dev/ttys[0-9]{3,}", tty)
-        pid = 0
-        terminal_identity: dict | None = None
-        registry_written = False
-        if result.get("ok") and valid_tty is not None:
-            terminal_identity = _wait_for_provider_terminal_identity(
-                tty, "codex"
-            ) if tty else None
-            pid = int((terminal_identity or {}).get("pid") or 0)
-            if pid <= 0:
-                result = {
-                    "ok": False,
-                    "reason": "Terminal resumed Codex, but its process identity could not be verified.",
-                    "outcome_indeterminate": True,
-                    "pty_written": None,
-                    "write_outcome": "unknown",
-                }
-        if result.get("ok") and valid_tty is not None:
-            if tty:
-                _write_terminal_capture_mapping(
-                    tty,
-                    capture_log_path,
-                    provider="codex",
-                    project=project,
-                    capture_id=capture_id,
-                )
-            registry_written = _agent_registry_upsert(
-                "codex",
-                native_id,
-                project,
-                pid=pid,
-                terminal_tty=tty,
-                metadata={
-                    "spawned_by": "phone-companion",
-                    "resume_target": native_id,
-                    "terminal_title": title,
-                    "terminal_log": str(capture_log_path),
-                    "capture_backend": "script",
-                    "terminal_source": "terminal_app_contents",
-                    "launch_visibility": "visible_terminal",
-                    "capture_id": capture_id,
-                    "send_scope_id": send_scope_id,
-                    "pending_native_id": resume_scope_native_id,
-                    "canonical_native_id": native_id,
-                    "identity_link": "visible_resume_launch",
-                    "resume_action_id": receipt_context["client_action_id"],
-                    **_provider_terminal_identity_metadata(terminal_identity),
-                },
-            )
-            if registry_written:
-                _write_agent_turn_state("codex", native_id, "idle", event="resume")
-        try:
-            audit_path = HOME / ".claude" / "audit" / "resume-sessions.jsonl"
-            audit_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(audit_path, "a") as f:
-                f.write(json.dumps({
-                    "ts": _time.time(),
-                    "provider": provider,
-                    "project": project,
-                    "native_id": native_id,
-                    "send_scope_id": send_scope_id,
-                    "tty": tty,
-                    "pid": pid,
-                    "terminal_log": str(capture_log_path),
-                    "capture_backend": "script",
-                    "registry_written": registry_written,
-                    "ok": result.get("ok", False),
-                    "reason": result.get("reason"),
-                    "via": "phone-companion",
-                }) + "\n")
-        except Exception:
-            pass
-        if not result.get("ok"):
-            outcome_indeterminate = bool(result.get("outcome_indeterminate"))
-            error_code = "resume_outcome_unknown" if outcome_indeterminate else "resume_failed"
-            message = str(result.get("reason") or "Terminal session resume failed.")
-            receipt = _finalize_receipted_mutation(
-                receipt_context,
-                state="indeterminate" if outcome_indeterminate else "failed",
-                http_status=502,
-                backend="terminal_app",
-                error_code=error_code,
-                error_message=message,
-                fields={
-                    "session_id": _qualified_session_id("codex", native_id),
-                    "outcome_indeterminate": outcome_indeterminate,
-                },
-                audit_action={"type": "resume_session", "provider": provider},
-                pty_written=None if outcome_indeterminate else False,
-            )
-            self._send_json({
-                "ok": False,
-                "error": {"code": error_code, "message": message},
-                "outcome_indeterminate": outcome_indeterminate,
-                "receipt": receipt,
-            }, status=502)
-            return
-        if valid_tty is None:
-            message = "Terminal accepted the resume, but Pairling could not identify the new tab."
-            receipt = _finalize_receipted_mutation(
-                receipt_context,
-                state="indeterminate",
-                http_status=502,
-                backend="terminal_app",
-                error_code="resume_outcome_unknown",
-                error_message=message,
-                fields={
-                    "session_id": _qualified_session_id("codex", native_id),
-                    "outcome_indeterminate": True,
-                },
-                audit_action={"type": "resume_session", "provider": provider},
-                pty_written=None,
-            )
-            self._send_json({
-                "ok": False,
-                "error": {"code": "resume_outcome_unknown", "message": message},
-                "outcome_indeterminate": True,
-                "receipt": receipt,
-            }, status=502)
-            return
-        if not registry_written:
-            message = (
-                "Terminal resumed the Codex session, but Pairling could not store "
-                "its control identity. Do not resume it again."
-            )
-            receipt = _finalize_receipted_mutation(
-                receipt_context,
-                state="indeterminate",
-                http_status=502,
-                backend="terminal_app",
-                error_code="resume_registry_unavailable",
-                error_message=message,
-                fields={
-                    "session_id": _qualified_session_id("codex", native_id),
-                    "send_scope_id": send_scope_id,
-                    "outcome_indeterminate": True,
-                },
-                audit_action={"type": "resume_session", "provider": provider},
-                pty_written=None,
-            )
-            self._send_json({
-                "ok": False,
-                "error": {
-                    "code": "resume_registry_unavailable",
-                    "message": message,
-                },
-                "session_id": _qualified_session_id("codex", native_id),
-                "send_scope_id": send_scope_id,
-                "outcome_indeterminate": True,
-                "receipt": receipt,
-            }, status=502)
-            return
-        response = {
-            "ok": True,
-            "provider": "codex",
-            "native_id": native_id,
-            "session_id": _qualified_session_id("codex", native_id),
-            "send_scope_id": send_scope_id,
-            "project": project,
-            "tty": tty,
-            "pid": pid,
-            "terminal_log": str(capture_log_path),
-            "capture_backend": "script",
-            "terminal_source": "terminal_app_contents",
-            "launch_visibility": "visible_terminal",
-            "attach_command": None,
-        }
-        response["receipt"] = _finalize_receipted_mutation(
-            receipt_context,
-            state="applied",
-            http_status=200,
-            backend="terminal_app",
-            fields=response,
-            audit_action={"type": "resume_session", "provider": provider, "tty": tty},
-        )
-        self._send_json(response)
 
     def _finish_send_text_failure(
         self,
@@ -34623,6 +38006,11 @@ Worker instructions:
                     extra={"broker_id": _broker_session_id(session)},
                 )
                 return
+            _mark_send_text_running(
+                receipt_context,
+                provider_id="codex",
+                binding_id=f"pty_broker:{broker_id}",
+            )
             result, source_offset_after, source_offset_reason = _broker_send_text_with_truth(
                 broker_id,
                 text,
@@ -34810,6 +38198,11 @@ Worker instructions:
         end tell
         return "ok" & tab & usedTTY
         '''
+        _mark_send_text_running(
+            receipt_context,
+            provider_id="codex",
+            binding_id=f"terminal_tty:{tty}",
+        )
         result = _run_osascript(script, mutation_possible=True)
         if (not result.get("ok")) and result.get("reason") == "no matching Terminal window":
             if pid and _process_alive(pid):
@@ -34994,6 +38387,28 @@ Worker instructions:
             _send_unsupported_provider(self, provider, "send_text")
             return
 
+        attachment_records: list[dict] = []
+        raw_attachment_records = q.get("attachment", [])
+        if len(raw_attachment_records) > 8:
+            self._send_json({
+                "ok": False,
+                "error": {"code": "too_many_attachments", "message": "At most 8 attachments are allowed."},
+                "error_code": "too_many_attachments",
+            }, status=400)
+            return
+        try:
+            for raw_record in raw_attachment_records:
+                decoded = json.loads(raw_record)
+                if not isinstance(decoded, dict):
+                    raise ValueError("attachment must be an object")
+                attachment_records.append(decoded)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            self._send_json({
+                "ok": False,
+                "error": {"code": "bad_attachment_records", "message": "Attachment metadata is invalid."},
+                "error_code": "bad_attachment_records",
+            }, status=400)
+            return
         raw = self._read_body()
         text = raw.decode("utf-8", errors="replace")
         if not text:
@@ -35031,9 +38446,15 @@ Worker instructions:
             "client_action_id": client_action_id or None,
             "device_id": getattr(getattr(self, "pairling_auth", None), "device_id", None),
             "session_id": receipt_session_id,
+            "receipt_scope": receipt_session_id,
+            "action_kind": "send_text",
             "public_session_id": public_session_id,
             "registry_row": registry_row,
-            "body_hash": _receipt_body_hash({"session_id": receipt_session_id, "text": text}),
+            "body_hash": _receipt_body_hash({
+                "session_id": receipt_session_id,
+                "text": text,
+                "attachments": attachment_records,
+            }),
         }
         deduped_receipt, conflict = _receipt_duplicate_response(
             receipt_context["device_id"],
@@ -35098,6 +38519,47 @@ Worker instructions:
                 "receipt": receipt,
             }, status=429)
             return
+
+        if attachment_records:
+            auth = getattr(self, "pairling_auth", None)
+            try:
+                prepared_attachments = self._pairdrop_store().prepare_attachment_handles(
+                    attachment_records,
+                    session_id=receipt_session_id,
+                    source_device_id=str(getattr(auth, "device_id", "") or ""),
+                    source_install_id=str(getattr(auth, "install_id", "") or ""),
+                    binding_id=f"send-text:{receipt_session_id}:{client_action_id}",
+                    client_action_id=client_action_id,
+                )
+                attachment_lines: list[str] = []
+                for attachment in prepared_attachments:
+                    local_path = attachment.materialize_local_path_for_send()
+                    attachment_lines.append(
+                        "Attached file "
+                        + json.dumps(attachment.display_name or "attachment")
+                        + " is available to this local provider at "
+                        + json.dumps(str(local_path))
+                        + "."
+                    )
+                text += "\n\n" + "\n".join(attachment_lines)
+            except PairDropStoreError as exc:
+                code = str(getattr(exc, "code", "") or "attachment_unavailable")
+                status = 404 if code in {
+                    "attachment_not_found",
+                    "not_found",
+                    "deleted",
+                    "missing_object",
+                } else 409
+                self._finish_send_text_failure(
+                    receipt_context,
+                    text,
+                    status=status,
+                    reason="The attachment is no longer available for this session.",
+                    state="rejected",
+                    validated=False,
+                    error_code=code,
+                )
+                return
 
         confirmation_boundary, boundary_error = self._send_text_confirmation_boundary(
             provider,
@@ -35197,6 +38659,11 @@ Worker instructions:
                     extra={"broker_id": _broker_session_id(broker_session)},
                 )
                 return
+            _mark_send_text_running(
+                receipt_context,
+                provider_id="claude",
+                binding_id=f"pty_broker:{broker_id}",
+            )
             result, source_offset_after, source_offset_reason = _broker_send_text_with_truth(
                 broker_id,
                 text,
@@ -35358,6 +38825,11 @@ Worker instructions:
         end tell
         return "ok"
         '''
+        _mark_send_text_running(
+            receipt_context,
+            provider_id="claude",
+            binding_id=f"terminal_tty:{tty}",
+        )
         result = _run_osascript(script, mutation_possible=True)
 
         # If no Terminal tab matches the recorded tty, the session is a zombie:
@@ -35455,6 +38927,12 @@ Worker instructions:
         if not session_id:
             return
         _claude_sessions_backend().tombstone_sessions([session_id])
+        try:
+            self._pairdrop_store().revoke_attachments_for_session(
+                _qualified_session_id("claude", session_id)
+            )
+        except Exception:
+            pass
 
     # ----- /sigint: send SIGINT to the session's claude process (cancel turn) -----
     def _handle_sigint(self, q):
@@ -35552,6 +39030,37 @@ Worker instructions:
             self._send_json(replay, status=replay_status)
             return
 
+        mutation = {
+            "device_id": device_id,
+            "receipt_scope": receipt_session_id,
+            "client_action_id": client_action_id,
+            "body_hash": body_hash,
+            "action_kind": signal_action_kind,
+            "execution_state": "queued",
+        }
+        signal_running = False
+
+        def mark_signal_running() -> None:
+            nonlocal signal_running
+            if signal_running:
+                raise RuntimeError("signal action entered its execution boundary twice")
+            _mark_receipted_mutation_running(
+                mutation,
+                provider_id=provider,
+                provider_version="terminal-surface-v2",
+                provider_channel="terminal",
+                operation_id=signal_action_kind,
+                binding_id=(
+                    f"{provider}:terminal-signal:{receipt_session_id}"
+                ),
+                capability_generation=1,
+                recovery_correlation={
+                    "provider_operation_id": client_action_id,
+                    "provider_cursor": None,
+                },
+            )
+            signal_running = True
+
         def send_signal_result(
             ok: bool,
             pid: int | None,
@@ -35564,6 +39073,8 @@ Worker instructions:
             write_outcome: str | None = None,
             outcome_indeterminate: bool = False,
         ) -> None:
+            if (ok or outcome_indeterminate) and not already_closed and not signal_running:
+                raise RuntimeError("signal outcome recorded before its execution boundary")
             receipt = _make_action_receipt(
                 client_action_id=client_action_id or None,
                 state="applied" if ok else ("indeterminate" if outcome_indeterminate else "failed"),
@@ -35683,6 +39194,7 @@ Worker instructions:
                     )
                     return
                 try:
+                    mark_signal_running()
                     if sig == signal.SIGINT:
                         result = _broker_interrupt_for_draining_runtime(broker_id)
                     else:
@@ -35772,6 +39284,7 @@ Worker instructions:
             err: str | None = None
             error_code: str | None = None
             if sig == signal.SIGTERM:
+                mark_signal_running()
                 termination = _terminate_direct_session_process(reg, "codex", pid)
                 ok = bool(termination.get("ok"))
                 err = termination.get("error")
@@ -35780,6 +39293,7 @@ Worker instructions:
             else:
                 outcome_indeterminate = False
                 try:
+                    mark_signal_running()
                     os.kill(pid, sig)
                 except (ProcessLookupError, PermissionError, OSError) as e:
                     ok = False
@@ -35875,6 +39389,7 @@ Worker instructions:
                 )
                 return
             try:
+                mark_signal_running()
                 if sig == signal.SIGINT:
                     result = _broker_interrupt_for_draining_runtime(broker_id)
                 else:
@@ -35957,6 +39472,7 @@ Worker instructions:
         err: str | None = None
         error_code: str | None = None
         if sig == signal.SIGTERM:
+            mark_signal_running()
             termination = _terminate_direct_session_process(record, "claude", pid)
             ok = bool(termination.get("ok"))
             err = termination.get("error")
@@ -35965,6 +39481,7 @@ Worker instructions:
         else:
             outcome_indeterminate = False
             try:
+                mark_signal_running()
                 os.kill(pid, sig)
             except (ProcessLookupError, PermissionError, OSError) as e:
                 ok = False
@@ -36241,6 +39758,11 @@ Worker instructions:
                     )
                 enriched_results.append(result)
 
+            spawn_contract_by_id = {
+                result.availability.provider_id:
+                    _provider_spawn_contract(result)
+                for result in enriched_results
+            }
             providers: list[dict] = []
             for result in enriched_results:
                 payload = provider_detail_payload(result)
@@ -36248,6 +39770,18 @@ Worker instructions:
                 payload["default_model"] = default_model
                 payload["default_model_is_exact"] = default_model_is_exact
                 payload["default_model_source"] = default_model_source
+                (
+                    spawn_backends,
+                    spawn_profiles,
+                    spawn_setup_diagnostics,
+                ) = spawn_contract_by_id.get(
+                    result.availability.provider_id, ([], [], [])
+                )
+                payload["spawn_backends"] = list(spawn_backends)
+                payload["spawn_profiles"] = list(spawn_profiles)
+                payload["spawn_setup_diagnostics"] = list(
+                    spawn_setup_diagnostics
+                )
                 providers.append(payload)
 
             ts = _time.time()
@@ -36269,6 +39803,16 @@ Worker instructions:
             for row in list(payload["providers"]) + list(payload["snapshot"].get("providers") or []):
                 row_id = str(row.get("provider_id") or row.get("provider") or "")
                 row["included"] = row_id not in excluded_set
+                (
+                    spawn_backends,
+                    spawn_profiles,
+                    spawn_setup_diagnostics,
+                ) = spawn_contract_by_id.get(row_id, ([], [], []))
+                row["spawn_backends"] = list(spawn_backends)
+                row["spawn_profiles"] = list(spawn_profiles)
+                row["spawn_setup_diagnostics"] = list(
+                    spawn_setup_diagnostics
+                )
                 row["adapter_depth"] = depth_by_id.get(row_id, "deep")
             payload["excluded"] = sorted(excluded_set)
             return payload
@@ -36298,6 +39842,1215 @@ Worker instructions:
             "keep_awake": keep_awake,
             "ts": _time.time(),
         })
+
+    # ----- /provider-controls/*: reviewed structured provider controls -----
+    def _provider_control_target(self, raw_session: str) -> dict | None:
+        try:
+            target = _PROVIDER_CONTROL_TARGET_RESOLVER(self, raw_session)
+        except _ProviderControlRouteError as exc:
+            _provider_control_send_error(self, exc)
+            return None
+        if not isinstance(target, dict):
+            _provider_control_send_error(
+                self,
+                _ProviderControlRouteError(
+                    "provider_target_invalid",
+                    "provider session resolution returned invalid truth",
+                    status=503,
+                ),
+            )
+            return None
+        return target
+
+    def _handle_provider_controls_snapshot(self, q) -> None:
+        raw_session = str(q.get("session_id", [""])[0] or "").strip()
+        target = self._provider_control_target(raw_session)
+        if target is None:
+            return
+        try:
+            envelope = _provider_control_snapshot_envelope(target)
+        except _ProviderControlRouteError as exc:
+            _provider_control_send_error(self, exc)
+            return
+        self._send_json(envelope)
+
+    @staticmethod
+    def _provider_control_event_batch(driver, cursor):
+        poll = getattr(driver, "poll_events", None)
+        if not callable(poll):
+            return (), cursor
+        try:
+            raw = poll(cursor)
+        except (TypeError, ValueError):
+            if cursor in (None, "", 0):
+                raise
+            raw = poll(0)
+        next_cursor = cursor
+        if isinstance(raw, dict):
+            events = raw.get("events")
+            next_cursor = raw.get("provider_cursor", cursor)
+        else:
+            events = raw
+        if not isinstance(events, (list, tuple)):
+            return (), cursor
+        return tuple(events[:256]), next_cursor
+
+    @staticmethod
+    def _provider_control_public_event(target: dict, event) -> tuple[dict, str] | None:
+        if not isinstance(event, dict):
+            return None
+        if (
+            event.get("provider_id") not in {None, target["provider_id"]}
+            or event.get("session_id") not in {None, target["session_id"]}
+        ):
+            return None
+        binding_id = event.get("binding_id")
+        expected_binding = target["session_truth"].get("binding_id")
+        if binding_id not in {None, expected_binding}:
+            return None
+        provider_cursor = str(
+            event.get("provider_cursor")
+            or event.get("cursor")
+            or ""
+        ).strip()
+        if not provider_cursor or len(provider_cursor) > 512:
+            return None
+        try:
+            public = _provider_control_public_json(event)
+        except _ProviderControlRouteError:
+            return None
+        if not isinstance(public, dict):
+            return None
+        return public, provider_cursor
+
+    def _handle_provider_controls_stream(self, q) -> None:
+        raw_session = str(q.get("session_id", [""])[0] or "").strip()
+        target = self._provider_control_target(raw_session)
+        if target is None:
+            return
+        try:
+            initial = _provider_control_snapshot_envelope(target)
+        except _ProviderControlRouteError as exc:
+            _provider_control_send_error(self, exc)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self.close_connection = True
+
+        started_at = _time.monotonic()
+        last_keepalive = started_at
+        last_semantic_hash = initial["content_hash"]
+        next_freshness_emission_at = _provider_control_snapshot_renewal_at(initial)
+        provider_cursor = initial["status"].get("provider_cursor")
+        driver = target["driver"]
+        try:
+            if not _sse_write_json_event(
+                self.wfile,
+                "snapshot",
+                initial,
+                max_bytes=SSE_MAX_EVENT_BYTES,
+            ):
+                return
+            while _time.monotonic() - started_at < PROVIDER_CONTROL_STREAM_SECONDS:
+                events, batch_cursor = self._provider_control_event_batch(
+                    driver,
+                    provider_cursor,
+                )
+                for event in events:
+                    normalized = self._provider_control_public_event(target, event)
+                    if normalized is None:
+                        continue
+                    public_event, event_cursor = normalized
+                    provider_cursor = event_cursor
+                    payload = {
+                        "schema_version": PROVIDER_CONTROL_SCHEMA_VERSION,
+                        "session_id": target["session_id"],
+                        "provider_id": target["provider_id"],
+                        "provider_cursor": event_cursor,
+                        "event": public_event,
+                    }
+                    if not _sse_write_json_event(
+                        self.wfile,
+                        "provider_event",
+                        payload,
+                        max_bytes=SSE_MAX_EVENT_BYTES,
+                    ):
+                        return
+                if batch_cursor not in (None, ""):
+                    provider_cursor = str(batch_cursor)
+
+                current = _provider_control_snapshot_envelope(target)
+                semantic_changed = (
+                    current["content_hash"] != last_semantic_hash
+                )
+                freshness_due = (
+                    _time.time() >= next_freshness_emission_at
+                )
+                if semantic_changed or freshness_due:
+                    if not _sse_write_json_event(
+                        self.wfile,
+                        "snapshot",
+                        current,
+                        max_bytes=SSE_MAX_EVENT_BYTES,
+                    ):
+                        return
+                    last_semantic_hash = current["content_hash"]
+                    next_freshness_emission_at = (
+                        _provider_control_snapshot_renewal_at(current)
+                    )
+                    provider_cursor = current["status"].get(
+                        "provider_cursor",
+                        provider_cursor,
+                    )
+                now = _time.monotonic()
+                if now - last_keepalive >= PROVIDER_CONTROL_STREAM_KEEPALIVE_SECONDS:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    last_keepalive = now
+                renewal_delay = max(
+                    0.01,
+                    next_freshness_emission_at - _time.time(),
+                )
+                _time.sleep(
+                    min(
+                        PROVIDER_CONTROL_STREAM_POLL_SECONDS,
+                        renewal_delay,
+                    )
+                )
+        except (BrokenPipeError, ConnectionResetError, ClientDisconnected):
+            return
+        except Exception as exc:
+            error = (
+                _provider_control_contract_error(exc)
+                if isinstance(exc, _ProviderControlContractError)
+                else {
+                    "code": "provider_stream_unavailable",
+                    "message": "provider control stream stopped",
+                }
+            )
+            _sse_write_json_event(
+                self.wfile,
+                "error",
+                {"ok": False, "error": error},
+                max_bytes=SSE_MAX_EVENT_BYTES,
+            )
+        _sse_write_json_event(
+            self.wfile,
+            "done",
+            {"schema_version": PROVIDER_CONTROL_SCHEMA_VERSION},
+            max_bytes=SSE_MAX_EVENT_BYTES,
+        )
+
+    def _provider_control_definition(self, operation_id: str):
+        if _REVIEWED_OPERATION_CATALOG is None:
+            raise _ProviderControlRouteError(
+                "provider_controls_unavailable",
+                "provider operation catalog is unavailable",
+                status=503,
+            )
+        try:
+            return _REVIEWED_OPERATION_CATALOG.require(operation_id)
+        except Exception as exc:
+            raise _ProviderControlRouteError(
+                "unknown_operation",
+                "operation_id is not in the reviewed operation catalog",
+                status=400,
+            ) from exc
+
+    def _provider_control_require_operation_scope(self, definition) -> None:
+        required_scope = str(definition.required_device_scope)
+        granted = frozenset(
+            str(scope)
+            for scope in (
+                getattr(getattr(self, "pairling_auth", None), "scopes", ())
+                or ()
+            )
+        )
+        if required_scope not in granted:
+            raise _ProviderControlRouteError(
+                "missing_operation_scope",
+                f"operation requires {required_scope}",
+                status=403,
+            )
+
+    @staticmethod
+    def _provider_control_normalized_input(definition, request: dict) -> dict:
+        try:
+            return definition.validate_input_payload(request["input"])
+        except Exception as exc:
+            raise _ProviderControlRouteError(
+                "invalid_operation_input",
+                str(exc)[:300] or "operation input is invalid",
+                status=400,
+            ) from exc
+
+
+    @staticmethod
+    def _provider_control_preflight(
+        target: dict,
+        definition,
+        request: dict,
+        normalized_input: dict,
+    ) -> tuple[dict, str | None, dict | None, dict]:
+        envelope = _provider_control_snapshot_envelope(target)
+        status = envelope["status"]
+        if request["binding_id"] != status.get("binding_id"):
+            raise _ProviderControlRouteError(
+                "provider_binding_stale",
+                "provider binding changed; refresh controls before retrying",
+                status=409,
+            )
+        if request["capability_generation"] != status.get("capability_generation"):
+            raise _ProviderControlRouteError(
+                "provider_control_stale",
+                "provider capability generation changed; refresh before retrying",
+                status=409,
+            )
+        blocked_reason = status.get("blocked_reason")
+        if blocked_reason is not None:
+            raise _ProviderControlRouteError(
+                "provider_control_blocked",
+                str(blocked_reason)[:300],
+                status=409,
+            )
+        if request["operation_id"] not in status.get("advertised_operations", ()):
+            raise _ProviderControlRouteError(
+                "operation_not_available",
+                "the live driver did not advertise this operation",
+                status=409,
+            )
+        all_choices = status.get("choices")
+        operation_choices = (
+            all_choices.get(request["operation_id"], {})
+            if isinstance(all_choices, dict)
+            else {}
+        )
+        if not isinstance(operation_choices, dict):
+            operation_choices = {}
+        for descriptor in definition.inputs:
+            input_id = str(descriptor.input_id)
+            if input_id not in normalized_input:
+                if descriptor.required:
+                    raise _ProviderControlRouteError(
+                        "invalid_operation_input",
+                        "operation input is missing a required descriptor",
+                        status=400,
+                    )
+                continue
+            input_type = str(
+                getattr(descriptor.input_type, "value", descriptor.input_type)
+            )
+            rows = operation_choices.get(input_id)
+            if input_type == "choice" and not isinstance(rows, list):
+                raise _ProviderControlRouteError(
+                    "operation_choice_unavailable",
+                    "the live provider did not advertise choices for this input",
+                    status=409,
+                )
+            if isinstance(rows, list):
+                advertised = [
+                    row.get("value")
+                    for row in rows
+                    if isinstance(row, dict) and set(row) == {"value", "label"}
+                ]
+                if advertised.count(normalized_input[input_id]) != 1:
+                    raise _ProviderControlRouteError(
+                        "operation_choice_stale",
+                        "the selected provider value is no longer uniquely advertised",
+                        status=409,
+                    )
+        session_descriptors = [
+            item
+            for item in definition.inputs
+            if str(getattr(item.input_type, "value", item.input_type))
+            == "provider_session"
+        ]
+        if session_descriptors:
+            if len(session_descriptors) != 1:
+                raise _ProviderControlRouteError(
+                    "unsupported_lifecycle",
+                    "operation has an unsupported session identity contract",
+                    status=409,
+                )
+            session_value = normalized_input.get(session_descriptors[0].input_id)
+            expected_session = {
+                "provider_id": target["provider_id"],
+                "session_id": target["session_id"],
+                "binding_id": request["binding_id"],
+                "capability_generation": request["capability_generation"],
+            }
+            if session_value != expected_session:
+                raise _ProviderControlRouteError(
+                    "provider_session_mismatch",
+                    "operation input does not match exact live session truth",
+                    status=409,
+                )
+            execution_session_id = target["session_id"]
+            execution_truth = target["session_truth"]
+        else:
+            execution_session_id = None
+            execution_truth = None
+        proof_kind = str(
+            getattr(
+                definition.resource_proof_kind,
+                "value",
+                definition.resource_proof_kind,
+            )
+        )
+        if proof_kind == "approval_nonce":
+            all_values = status.get("values")
+            live_values = (
+                all_values.get(request["operation_id"], {})
+                if isinstance(all_values, dict)
+                else {}
+            )
+            if not isinstance(live_values, dict):
+                live_values = {}
+            for descriptor in definition.inputs:
+                input_id = str(descriptor.input_id)
+                input_type = str(
+                    getattr(descriptor.input_type, "value", descriptor.input_type)
+                )
+                if input_type == "choice":
+                    continue
+                published_value = input_id in live_values
+                choice_rows = operation_choices.get(input_id)
+                if choice_rows is not None and not isinstance(choice_rows, list):
+                    raise _ProviderControlRouteError(
+                        "approval_proof_stale",
+                        "the provider approval proof is no longer available",
+                        status=409,
+                    )
+                published_choices = isinstance(choice_rows, list)
+                if not published_value and not published_choices:
+                    if descriptor.required:
+                        raise _ProviderControlRouteError(
+                            "approval_proof_stale",
+                            "the provider approval proof is no longer available",
+                            status=409,
+                        )
+                    continue
+                if input_id not in normalized_input:
+                    raise _ProviderControlRouteError(
+                        "approval_proof_mismatch",
+                        "the provider approval proof changed before confirmation",
+                        status=409,
+                    )
+                selected = normalized_input[input_id]
+                if published_value and selected != live_values[input_id]:
+                    raise _ProviderControlRouteError(
+                        "approval_proof_mismatch",
+                        "the provider approval proof changed before confirmation",
+                        status=409,
+                    )
+                if published_choices:
+                    matching_rows = [
+                        row
+                        for row in choice_rows
+                        if (
+                            isinstance(row, dict)
+                            and set(row) == {"value", "label"}
+                            and row.get("value") == selected
+                        )
+                    ]
+                    if len(matching_rows) != 1:
+                        raise _ProviderControlRouteError(
+                            "approval_proof_mismatch",
+                            "the provider approval proof changed before confirmation",
+                            status=409,
+                        )
+        return envelope, execution_session_id, execution_truth, normalized_input
+
+    @staticmethod
+    def _provider_control_result_fields(
+        *,
+        target: dict,
+        operation_id: str,
+        client_action_id: str,
+        result_payload: dict,
+        ok: bool,
+        deduped: bool = False,
+    ) -> dict:
+        return {
+            "ok": bool(ok),
+            "schema_version": PROVIDER_CONTROL_SCHEMA_VERSION,
+            "session_id": target["session_id"],
+            "provider_id": target["provider_id"],
+            "operation_id": operation_id,
+            "result": _provider_control_public_json(result_payload),
+            "receipt": None,
+            "confirmation": None,
+            "deduped": bool(deduped),
+            "client_action_id": client_action_id,
+        }
+
+    @staticmethod
+    def _provider_control_outcome(status) -> tuple[bool, int, str, str | None]:
+        raw = str(getattr(status, "value", status))
+        if raw == "applied":
+            return True, 200, "applied", None
+        if raw == "rejected":
+            return False, 409, "rejected", "provider_operation_rejected"
+        if raw == "in_progress":
+            return True, 202, "indeterminate", None
+        return False, 409, "indeterminate", "action_outcome_unknown"
+
+    def _provider_control_finalize_error(
+        self,
+        context: dict | None,
+        error: dict,
+        *,
+        audit_type: str,
+    ) -> None:
+        if context is None:
+            self._send_json(
+                {"ok": False, "error": {
+                    "code": error["code"],
+                    "message": error["message"],
+                }},
+                status=int(error["status"]),
+            )
+            return
+        running = bool(context.get("running_committed"))
+        state = "indeterminate" if running else "rejected"
+        error_code = (
+            "action_outcome_unknown"
+            if running and error["code"] != "provider_operation_rejected"
+            else error["code"]
+        )
+        receipt = _finalize_receipted_mutation(
+            context,
+            state=state,
+            http_status=int(error["status"]),
+            backend="provider-control",
+            error_code=error_code,
+            error_message=error["message"],
+            audit_action={
+                "type": audit_type,
+                "error_code": error_code,
+            },
+            pty_written=False,
+        )
+        self._send_json(
+            {
+                "ok": False,
+                "receipt": receipt,
+                "error": {
+                    "code": error_code,
+                    "message": error["message"],
+                },
+            },
+            status=int(error["status"]),
+        )
+
+    def _provider_control_recovery(
+        self,
+        *,
+        target: dict,
+        definition,
+        operation_id: str,
+    ):
+        def recover(context: dict):
+            if (
+                _recover_provider_operation is None
+                or _ProviderOperationCorrelation is None
+                or target.get("driver") is None
+            ):
+                return None
+            server_binding = target["driver"].binding
+            if (
+                context.get("provider_id") != server_binding.provider_id
+                or context.get("provider_version") != server_binding.provider_version
+                or context.get("provider_channel") != server_binding.provider_channel
+                or context.get("operation_id") != operation_id
+                or context.get("binding_id") != server_binding.binding_id
+                or context.get("capability_generation")
+                != target["session_truth"].get("capability_generation")
+            ):
+                return None
+            raw_correlation = context.get("recovery_correlation") or {}
+            try:
+                correlation = _ProviderOperationCorrelation(
+                    provider_operation_id=str(
+                        raw_correlation.get("provider_operation_id") or ""
+                    ),
+                    provider_cursor=raw_correlation.get("provider_cursor"),
+                )
+                has_session = any(
+                    str(getattr(item.input_type, "value", item.input_type))
+                    == "provider_session"
+                    for item in definition.inputs
+                )
+                result = _recover_provider_operation(
+                    target["driver"],
+                    operation_id=operation_id,
+                    binding_id=str(context["binding_id"]),
+                    capability_generation=int(context["capability_generation"]),
+                    session_id=target["session_id"] if has_session else None,
+                    client_action_id=str(context["client_action_id"]),
+                    provider_correlation=correlation,
+                    session_truth=target["session_truth"] if has_session else None,
+                )
+            except Exception:
+                return None
+            if result is None:
+                return None
+            ok, http_status, state, error_code = self._provider_control_outcome(
+                result.status
+            )
+            if state == "indeterminate":
+                return None
+            fields = self._provider_control_result_fields(
+                target=target,
+                operation_id=operation_id,
+                client_action_id=str(context["client_action_id"]),
+                result_payload=result.to_payload(),
+                ok=ok,
+            )
+            fields.pop("deduped", None)
+            receipt = _make_action_receipt(
+                client_action_id=str(context["client_action_id"]),
+                state=state,
+                deduped=True,
+                phases=_receipt_phases(
+                    validated=True,
+                    applied=state == "applied",
+                    pty_written=False,
+                ),
+                backend="provider-control",
+            )
+            return _receipt_attach_response(
+                receipt,
+                http_status=http_status,
+                error_code=error_code,
+                error_message=(
+                    "provider rejected the operation" if error_code else None
+                ),
+                fields=fields,
+            )
+
+        return recover
+    def _provider_control_prepare_confirmation_resources(
+        self,
+        *,
+        normalized_input: dict,
+        execution_session_id: str | None,
+        binding_id: str,
+        client_action_id: str,
+    ) -> tuple:
+        records = normalized_input.get("attachments")
+        if not records:
+            return ()
+        if execution_session_id is None:
+            raise _ProviderControlRouteError(
+                "attachment_proof_invalid",
+                "attachment resource proof could not be validated",
+                status=409,
+            )
+        source_device_id, source_install_id = (
+            _provider_control_confirmation_identity(self)
+        )
+        try:
+            return tuple(
+                self._pairdrop_store().prepare_attachment_handles(
+                    records,
+                    session_id=execution_session_id,
+                    source_device_id=source_device_id,
+                    source_install_id=source_install_id,
+                    binding_id=binding_id,
+                    client_action_id=client_action_id,
+                )
+            )
+        except Exception as exc:
+            error = _provider_control_attachment_error(exc)
+            raise _ProviderControlRouteError(
+                error["code"],
+                error["message"],
+                status=error["status"],
+            ) from exc
+
+
+    def _handle_provider_controls_execute(self, q) -> None:
+        del q
+        try:
+            payload = json.loads(self._read_body() or b"{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            self._send_json(
+                {"ok": False, "error": {
+                    "code": "bad_json",
+                    "message": "request body must be one JSON object",
+                }},
+                status=400,
+            )
+            return
+        required_fields = {
+            "session_id",
+            "provider_id",
+            "binding_id",
+            "capability_generation",
+            "operation_id",
+            "input",
+            "client_action_id",
+            "confirmation_challenge",
+        }
+        if not isinstance(payload, dict) or set(payload) != required_fields:
+            self._send_json(
+                {"ok": False, "error": {
+                    "code": "invalid_request",
+                    "message": "provider control request fields are invalid",
+                }},
+                status=400,
+            )
+            return
+        if (
+            not all(
+                isinstance(payload.get(key), str) and bool(payload[key].strip())
+                for key in (
+                    "session_id",
+                    "provider_id",
+                    "binding_id",
+                    "operation_id",
+                    "client_action_id",
+                )
+            )
+            or not isinstance(payload.get("input"), dict)
+            or not isinstance(payload.get("capability_generation"), int)
+            or isinstance(payload.get("capability_generation"), bool)
+            or payload["capability_generation"] <= 0
+            or (
+                payload.get("confirmation_challenge") is not None
+                and (
+                    not isinstance(payload["confirmation_challenge"], str)
+                    or not payload["confirmation_challenge"]
+                )
+            )
+        ):
+            self._send_json(
+                {"ok": False, "error": {
+                    "code": "invalid_request",
+                    "message": "provider control request values are invalid",
+                }},
+                status=400,
+            )
+            return
+        header_action_id = str(
+            self.headers.get("X-Pairling-Action-Id") or ""
+        ).strip()
+        if (
+            not _valid_client_action_id(payload["client_action_id"])
+            or payload["client_action_id"] != header_action_id
+        ):
+            self._send_json(
+                {"ok": False, "error": {
+                    "code": "action_id_mismatch",
+                    "message": (
+                        "client_action_id must equal a valid "
+                        "X-Pairling-Action-Id"
+                    ),
+                }},
+                status=400,
+            )
+            return
+        try:
+            _requested_session, requested_provider, _native_id = (
+                _provider_control_exact_session_id(payload["session_id"])
+            )
+        except _ProviderControlRouteError as exc:
+            _provider_control_send_error(self, exc)
+            return
+        if payload["provider_id"].strip().lower() != requested_provider:
+            self._send_json(
+                {"ok": False, "error": {
+                    "code": "provider_mismatch",
+                    "message": (
+                        "provider_id does not match the provider-qualified "
+                        "session_id"
+                    ),
+                }},
+                status=409,
+            )
+            return
+
+        try:
+            definition = self._provider_control_definition(
+                payload["operation_id"]
+            )
+            self._provider_control_require_operation_scope(definition)
+            normalized_input = self._provider_control_normalized_input(
+                definition,
+                payload,
+            )
+            source_device_id, profile_install_id = (
+                _provider_control_confirmation_identity(self)
+            )
+        except _ProviderControlRouteError as exc:
+            _provider_control_send_error(self, exc)
+            return
+
+        confirmation_requirement = str(
+            getattr(
+                definition.confirmation_requirement,
+                "value",
+                definition.confirmation_requirement,
+            )
+        )
+        confirmation_artifact = payload["confirmation_challenge"]
+        is_mutation = str(
+            getattr(definition.risk, "value", definition.risk)
+        ) != "read"
+        confirmed_mutation = bool(
+            is_mutation
+            and confirmation_requirement != "none"
+            and confirmation_artifact is not None
+        )
+        receipt_scope = (
+            _session_mutation_receipt_scope(self, _requested_session)
+            or _requested_session
+        )
+        receipt_material = {
+            "session_id": receipt_scope,
+            "provider_id": requested_provider,
+            "binding_id": payload["binding_id"],
+            "capability_generation": payload["capability_generation"],
+            "operation_id": payload["operation_id"],
+            "input": normalized_input,
+            "client_action_id": payload["client_action_id"],
+        }
+        if confirmed_mutation:
+            stored_receipt, conflict = _receipt_duplicate_response(
+                source_device_id,
+                receipt_scope,
+                payload["client_action_id"],
+                _receipt_body_hash(receipt_material),
+                action_kind=f"provider_control:{payload['operation_id']}",
+                reserve_missing=False,
+                defer_running=True,
+            )
+            if _send_receipted_mutation_duplicate(
+                self,
+                stored_receipt,
+                conflict,
+            ):
+                return
+
+        target = self._provider_control_target(payload["session_id"])
+        if target is None:
+            return
+        if payload["provider_id"].strip().lower() != target["provider_id"]:
+            self._send_json(
+                {"ok": False, "error": {
+                    "code": "provider_mismatch",
+                    "message": "provider_id does not match daemon session truth",
+                }},
+                status=409,
+            )
+            return
+
+        receipt_scope = target["session_id"]
+        receipt_material = {
+            **receipt_material,
+            "session_id": receipt_scope,
+            "provider_id": target["provider_id"],
+        }
+        recover_uncertain = self._provider_control_recovery(
+            target=target,
+            definition=definition,
+            operation_id=payload["operation_id"],
+        )
+        if confirmed_mutation:
+            stored_receipt, conflict = _receipt_duplicate_response(
+                source_device_id,
+                receipt_scope,
+                payload["client_action_id"],
+                _receipt_body_hash(receipt_material),
+                action_kind=f"provider_control:{payload['operation_id']}",
+                recover_uncertain=recover_uncertain,
+                reserve_missing=False,
+            )
+            if _send_receipted_mutation_duplicate(
+                self,
+                stored_receipt,
+                conflict,
+            ):
+                return
+
+        managed_manager = target.get("manager")
+        if (
+            payload["operation_id"] == "session.fork"
+            and managed_manager is None
+        ):
+            _provider_control_send_error(
+                self,
+                _ProviderControlRouteError(
+                    "unsupported_lifecycle",
+                    "session.fork requires a managed provider session owner",
+                    status=409,
+                ),
+            )
+            return
+
+        try:
+            (
+                envelope,
+                execution_session_id,
+                execution_truth,
+                normalized_input,
+            ) = self._provider_control_preflight(
+                target,
+                definition,
+                payload,
+                normalized_input,
+            )
+            input_hash = _provider_control_canonical_input_hash(normalized_input)
+            fork_parent_session_id = (
+                _provider_control_fork_parent(target, normalized_input)
+                if payload["operation_id"] == "session.fork"
+                else None
+            )
+        except _ProviderControlRouteError as exc:
+            _provider_control_send_error(self, exc)
+            return
+
+        prepared_attachments = None
+        challenge_binding = {
+            "device_id": source_device_id,
+            "profile_install_id": profile_install_id,
+            "provider_id": target["provider_id"],
+            "session_id": target["session_id"],
+            "binding_id": payload["binding_id"],
+            "capability_generation": payload["capability_generation"],
+            "operation_id": payload["operation_id"],
+            "input_hash": input_hash,
+            "client_action_id": payload["client_action_id"],
+        }
+        if confirmation_requirement == "none":
+            if confirmation_artifact is not None:
+                _provider_control_send_error(
+                    self,
+                    _ProviderControlRouteError(
+                        "confirmation_challenge_unexpected",
+                        "this provider operation does not accept confirmation",
+                        status=400,
+                    ),
+                )
+                return
+        elif confirmation_artifact is None:
+            try:
+                resources = self._provider_control_prepare_confirmation_resources(
+                    normalized_input=normalized_input,
+                    execution_session_id=execution_session_id,
+                    binding_id=payload["binding_id"],
+                    client_action_id=payload["client_action_id"],
+                )
+                action = _provider_control_confirmation_action(
+                    target,
+                    definition,
+                    normalized_input,
+                )
+                artifact, expires_at = _provider_control_confirmation_issue(
+                    challenge_binding,
+                    prepared_attachments=resources,
+                )
+            except _ProviderControlRouteError as exc:
+                _provider_control_send_error(self, exc)
+                return
+            self._send_json(
+                {
+                    "ok": True,
+                    "schema_version": PROVIDER_CONTROL_SCHEMA_VERSION,
+                    "session_id": target["session_id"],
+                    "provider_id": target["provider_id"],
+                    "operation_id": payload["operation_id"],
+                    "result": None,
+                    "receipt": None,
+                    "confirmation": {
+                        "artifact": artifact,
+                        "expires_at": expires_at,
+                        "action": action,
+                    },
+                    "deduped": False,
+                    "client_action_id": payload["client_action_id"],
+                },
+                status=200,
+            )
+            return
+        else:
+            try:
+                prepared_attachments = _provider_control_confirmation_consume(
+                    confirmation_artifact,
+                    challenge_binding,
+                )
+            except _ProviderControlRouteError as exc:
+                _provider_control_send_error(self, exc)
+                return
+
+        context = None
+        if is_mutation:
+            context = _begin_receipted_mutation(
+                self,
+                receipt_scope=target["session_id"],
+                action_kind=f"provider_control:{payload['operation_id']}",
+                material=receipt_material,
+                action_label="provider control",
+                recover_uncertain=recover_uncertain,
+            )
+            if context is None:
+                return
+        operation_correlation = None
+        deterministic_operation_id = None
+        if is_mutation:
+            try:
+                correlate = getattr(
+                    target["driver"], "operation_correlation", None
+                )
+                if not callable(correlate) or _ProviderOperationCorrelation is None:
+                    raise RuntimeError(
+                        "provider operation correlation is unavailable"
+                    )
+                operation_correlation = correlate(
+                    operation_id=payload["operation_id"],
+                    client_action_id=payload["client_action_id"],
+                    capability_generation=payload["capability_generation"],
+                    session_id=execution_session_id,
+                    session_truth=execution_truth,
+                )
+                if not isinstance(
+                    operation_correlation, _ProviderOperationCorrelation
+                ):
+                    raise RuntimeError(
+                        "provider operation correlation is invalid"
+                    )
+                deterministic_operation_id = str(
+                    operation_correlation.provider_operation_id
+                )
+                if not deterministic_operation_id:
+                    raise RuntimeError(
+                        "provider operation correlation is empty"
+                    )
+            except Exception:
+                self._provider_control_finalize_error(
+                    context,
+                    {
+                        "code": "provider_operation_correlation_unavailable",
+                        "message": (
+                            "provider cannot reserve an exact operation identity"
+                        ),
+                        "status": 503,
+                    },
+                    audit_type="provider_control_correlation_failed",
+                )
+                return
+        fork_reservation = None
+        if payload["operation_id"] == "session.fork":
+            try:
+                verified_fork_parent = _provider_control_fork_parent(
+                    target,
+                    normalized_input,
+                )
+                if verified_fork_parent != fork_parent_session_id:
+                    raise _ProviderControlRouteError(
+                        "fork_parent_stale",
+                        "the fork parent mapping changed",
+                        status=409,
+                    )
+                fork_reservation = managed_manager.prepare_fork(
+                    verified_fork_parent,
+                    payload["client_action_id"],
+                    provider_operation_id=deterministic_operation_id,
+                    provider_cursor=operation_correlation.provider_cursor,
+                )
+            except Exception:
+                self._provider_control_finalize_error(
+                    context,
+                    {
+                        "code": "fork_registration_unavailable",
+                        "message": "managed fork registration is unavailable",
+                        "status": 503,
+                    },
+                    audit_type="provider_control_fork_prepare_failed",
+                )
+                return
+
+        server_binding = target["driver"].binding
+        before_execute = None
+        if context is not None:
+            before_execute = lambda: _mark_receipted_mutation_running(
+                context,
+                provider_id=server_binding.provider_id,
+                provider_version=server_binding.provider_version,
+                provider_channel=server_binding.provider_channel,
+                operation_id=payload["operation_id"],
+                binding_id=server_binding.binding_id,
+                capability_generation=envelope["status"]["capability_generation"],
+                recovery_correlation={
+                    "provider_operation_id": deterministic_operation_id,
+                    "provider_cursor": operation_correlation.provider_cursor,
+                },
+            )
+        execute_resource_args = (
+            {"prepared_attachments": prepared_attachments}
+            if prepared_attachments is not None
+            else {
+                "attachment_resolver": self._pairdrop_store(),
+                "source_device_id": source_device_id,
+                "source_install_id": profile_install_id,
+            }
+        )
+        try:
+            result = _execute_provider_operation(
+                target["driver"],
+                operation_id=payload["operation_id"],
+                input_payload=normalized_input,
+                binding_id=payload["binding_id"],
+                capability_generation=payload["capability_generation"],
+                session_id=execution_session_id,
+                session_truth=execution_truth,
+                client_action_id=payload["client_action_id"],
+                before_execute=before_execute,
+                provider_correlation=operation_correlation,
+                **execute_resource_args,
+            )
+            if (
+                deterministic_operation_id is not None
+                and str(result.provider_operation_id)
+                != deterministic_operation_id
+            ):
+                raise _ProviderControlContractError(
+                    "provider result changed the reserved action identity"
+                )
+            result_payload = _provider_control_public_json(result.to_payload())
+            result_status = str(
+                getattr(result.status, "value", result.status)
+            )
+            if managed_manager is not None and result_status in {
+                "applied",
+                "in_progress",
+            }:
+                if (
+                    payload["operation_id"] == "session.fork"
+                    and result_status == "applied"
+                ):
+                    child = managed_manager.register_fork(
+                        fork_parent_session_id,
+                        result,
+                        reservation_token=fork_reservation,
+                    )
+                    child_session_id = (
+                        child.get("session_id")
+                        if isinstance(child, dict)
+                        else None
+                    )
+                    if not isinstance(child_session_id, str) or not child_session_id:
+                        raise RuntimeError(
+                            "managed fork registration returned no child session"
+                        )
+                    public_result = result_payload.get("public_result")
+                    if not isinstance(public_result, dict):
+                        public_result = {}
+                        result_payload["public_result"] = public_result
+                    public_result["session_id"] = child_session_id
+                managed_manager.poll(target["session_id"])
+                if (
+                    payload["operation_id"] == "session.terminate"
+                    and result_status == "applied"
+                ):
+                    managed_manager.close(
+                        target["session_id"],
+                        reason="terminated by provider operation",
+                    )
+        except _ProviderControlContractError as exc:
+            error = _provider_control_contract_error(exc)
+            if context is not None and context.get("running_committed"):
+                error = {
+                    "code": "action_outcome_unknown",
+                    "message": "provider execution outcome could not be validated",
+                    "status": 409,
+                }
+            self._provider_control_finalize_error(
+                context,
+                error,
+                audit_type="provider_control_contract_rejected",
+            )
+            return
+        except Exception as exc:
+            error = (
+                _provider_control_attachment_error(exc)
+                if getattr(exc, "code", None)
+                else {
+                    "code": "action_outcome_unknown",
+                    "message": "provider execution outcome is unknown",
+                    "status": 409,
+                }
+            )
+            self._provider_control_finalize_error(
+                context,
+                error,
+                audit_type="provider_control_execution_failed",
+            )
+            return
+
+        ok, http_status, state, error_code = self._provider_control_outcome(
+            result.status
+        )
+        fields = self._provider_control_result_fields(
+            target=target,
+            operation_id=payload["operation_id"],
+            client_action_id=payload["client_action_id"],
+            result_payload=result_payload,
+            ok=ok,
+        )
+        response = dict(fields)
+        if context is not None:
+            receipt_fields = dict(fields)
+            receipt_fields.pop("deduped", None)
+            receipt_fields["provider_operation_id"] = (
+                operation_correlation.provider_operation_id
+            )
+            receipt_fields["provider_cursor"] = (
+                operation_correlation.provider_cursor
+            )
+            receipt = _finalize_receipted_mutation(
+                context,
+                state=state,
+                http_status=http_status,
+                backend="provider-control",
+                error_code=error_code,
+                error_message=(
+                    "provider rejected the operation"
+                    if error_code == "provider_operation_rejected"
+                    else (
+                        "provider execution outcome is unknown"
+                        if error_code
+                        else None
+                    )
+                ),
+                fields=receipt_fields,
+                audit_action={
+                    "type": "provider_control_completed",
+                    "provider_id": target["provider_id"],
+                    "operation_id": payload["operation_id"],
+                    "result_status": str(
+                        getattr(result.status, "value", result.status)
+                    ),
+                },
+                pty_written=False,
+            )
+            response["receipt"] = receipt
+        if error_code:
+            response["error"] = {
+                "code": error_code,
+                "message": (
+                    "provider rejected the operation"
+                    if error_code == "provider_operation_rejected"
+                    else "provider execution outcome is unknown"
+                ),
+            }
+        self._send_json(response, status=http_status)
 
     # ----- /providers/visibility: the only user choice (SPEC-p1 §2.3) -----
     def _providers_visibility_rows(self) -> tuple[list[dict], list[str]]:
@@ -36502,6 +41255,13 @@ Worker instructions:
 
             transcript_path = _resolve_codex_transcript(native_id)
             meta = _codex_rollout_meta(transcript_path) if transcript_path else None
+            last_response_at = (
+                _last_meaningful_transcript_turn_at(
+                    transcript_path, "codex", native_id
+                )
+                if transcript_path
+                else None
+            )
             cwd = (
                 reg.get("project")
                 or (meta or {}).get("cwd")
@@ -36566,6 +41326,7 @@ Worker instructions:
                 "context_pct": 0.0,
                 "cost_usd": None,
                 "working_on": working_on,
+                "last_response_at": last_response_at,
                 "text": status_text,
                 "text_raw": status_text,
                 "permissions_mode": None,
@@ -36644,6 +41405,11 @@ Worker instructions:
         stop_details: dict | None = None
         system_anomaly: dict | None = None
         path = self._resolve_transcript(session_id)
+        last_response_at = (
+            _last_meaningful_transcript_turn_at(path, "claude", session_id)
+            if path
+            else None
+        )
         if path and path.exists():
             try:
                 lines = _tail_lines(path, max_lines=1000, max_bytes=TRANSCRIPT_STATS_MAX_SCAN_BYTES)
@@ -36781,6 +41547,7 @@ Worker instructions:
             "context_pct": context_pct,
             "cost_usd": cost_usd,
             "working_on": working_on,
+            "last_response_at": last_response_at,
             "text": status_text_clean,
             "text_raw": status_text_raw,
             "permissions_mode": perm_mode,
@@ -36795,23 +41562,12 @@ Worker instructions:
         self.end_headers()
         self.wfile.write(body)
 
-    # ----- /pickers/*: native iOS argument-form pickers -----
+    # ----- /pickers/*: native iOS provider diagnostics -----
     #
-    # These power the phone's native UIs that replace Claude Code's in-memory
-    # Ink TUI modals (which never reach the JSONL transcript so the iPhone
-    # can't mirror them). The bridge of choice depends on whether the
-    # underlying command has a CLI argument form:
-    #
-    #   has-arg form (/rename, /resume) → phone sends `/rename "<name>"` via
-    #     /send-text bracketed paste; daemon doesn't need to do anything.
-    #
-    #   no arg form (/permissions, /hooks, /memory, /mcp) → daemon mutates
-    #     the underlying state file directly (settings.json or memory dir).
-    #     Claude Code's settings-watcher picks up the change automatically.
-    #
-    # All endpoints follow the same shape:
-    #   GET  → return current state as JSON
-    #   POST → JSON body, validate, write atomically (.tmp + rename), return updated state
+    # Resume and rename use their reviewed session command paths. Permissions,
+    # hooks, memory, and MCP are provider-qualified read-only diagnostics.
+    # Any supported mutation is advertised and executed through Provider
+    # controls instead of writing provider settings or files here.
 
     def _read_settings_json(self) -> dict:
         """Read ~/.claude/settings.json, returning {} on error or missing.
@@ -36826,25 +41582,6 @@ Worker instructions:
         except (OSError, ValueError, json.JSONDecodeError):
             return {}
 
-    def _write_settings_json(self, settings: dict) -> bool:
-        """Atomic write: stage to .tmp in same dir, fsync, rename. Preserves
-        whatever other keys live in settings.json that we don't touch."""
-        path = HOME / ".claude" / "settings.json"
-        tmp_path = path.with_suffix(".json.tmp")
-        try:
-            tmp_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(tmp_path, "w") as f:
-                json.dump(settings, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, path)
-            return True
-        except OSError:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return False
 
     # ----- /pickers/resume: list resumable sessions for a cwd -----
     def _handle_pickers_resume(self, q):
@@ -36871,59 +41608,62 @@ Worker instructions:
         if provider == "codex":
             self._handle_codex_pickers_resume(cwd)
             return
-        proj_dir = HOME / ".claude" / "projects" / _encode_project_dir(cwd)
-        if not proj_dir.exists():
-            body = json.dumps({"ok": True, "sessions": []}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-
+        proj_dir = CLAUDE_PROJECTS_DIR / _encode_project_dir(cwd)
         items: list[dict] = []
         try:
-            for jsonl in proj_dir.glob("*.jsonl"):
-                try:
-                    stat = jsonl.stat()
-                except OSError:
-                    continue
-                preview = ""
-                turns = 0
-                try:
-                    with open(jsonl, "rb") as f:
-                        for raw in f:
-                            if not raw.strip():
-                                continue
-                            turns += 1
-                            if not preview:
-                                try:
-                                    obj = json.loads(raw)
-                                except (ValueError, json.JSONDecodeError):
+            project_fd = open_directory_fd(proj_dir, root=CLAUDE_PROJECTS_DIR)
+        except (OSError, ValueError):
+            project_fd = -1
+        if project_fd >= 0:
+            try:
+                for name in os.listdir(project_fd):
+                    if not name.endswith(".jsonl"):
+                        continue
+                    try:
+                        file_fd = open_child_regular_file_fd(project_fd, name)
+                    except (OSError, ValueError):
+                        continue
+                    preview = ""
+                    turns = 0
+                    try:
+                        with os.fdopen(file_fd, "rb", closefd=True) as f:
+                            file_fd = -1
+                            opened = os.fstat(f.fileno())
+                            for raw in f:
+                                if not raw.strip():
                                     continue
-                                if obj.get("type") == "user":
-                                    msg = obj.get("message") or {}
-                                    content = msg.get("content")
-                                    if isinstance(content, str):
-                                        preview = content
-                                    elif isinstance(content, list):
-                                        for blk in content:
-                                            if isinstance(blk, dict) and blk.get("type") == "text":
-                                                preview = blk.get("text") or ""
-                                                break
-                                    if preview:
-                                        preview = preview.replace("\n", " ").strip()[:120]
-                except OSError:
-                    pass
-                items.append({
-                    "id": jsonl.stem,
-                    "mtime": stat.st_mtime,
-                    "turns": turns,
-                    "preview": preview,
-                    "bytes": stat.st_size,
-                })
-        except OSError:
-            pass
+                                turns += 1
+                                if not preview:
+                                    try:
+                                        obj = json.loads(raw)
+                                    except (ValueError, json.JSONDecodeError):
+                                        continue
+                                    if obj.get("type") == "user":
+                                        msg = obj.get("message") or {}
+                                        content = msg.get("content")
+                                        if isinstance(content, str):
+                                            preview = content
+                                        elif isinstance(content, list):
+                                            for blk in content:
+                                                if isinstance(blk, dict) and blk.get("type") == "text":
+                                                    preview = blk.get("text") or ""
+                                                    break
+                                        if preview:
+                                            preview = preview.replace("\n", " ").strip()[:120]
+                    except OSError:
+                        continue
+                    finally:
+                        if file_fd >= 0:
+                            os.close(file_fd)
+                    items.append({
+                        "id": Path(name).stem,
+                        "mtime": opened.st_mtime,
+                        "turns": turns,
+                        "preview": preview,
+                        "bytes": opened.st_size,
+                    })
+            finally:
+                os.close(project_fd)
         items.sort(key=lambda x: x["mtime"], reverse=True)
         body = json.dumps({"ok": True, "sessions": items[:80]}).encode()
         self.send_response(200)
@@ -36936,30 +41676,27 @@ Worker instructions:
         items: list[dict] = []
         history = _codex_history_map()
         for path, meta in _codex_selected_rollout_entries():
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
             if meta.get("cwd") != cwd:
                 continue
             sid = meta["id"]
             preview = _codex_first_prompt(path, sid, history) or ""
             turns = 0
             try:
-                with path.open(encoding="utf-8", errors="replace") as f:
+                with _open_session_transcript_file(path) as f:
+                    opened = os.fstat(f.fileno())
                     for raw in f:
                         for row in _normalize_codex_line(raw, sid):
                             msg = row.get("message") or {}
                             if msg.get("role") == "user":
                                 turns += 1
             except OSError:
-                pass
+                continue
             items.append({
                 "id": sid,
-                "mtime": stat.st_mtime,
+                "mtime": opened.st_mtime,
                 "turns": turns,
                 "preview": preview.replace("\n", " ").strip()[:120],
-                "bytes": stat.st_size,
+                "bytes": opened.st_size,
             })
             if len(items) >= 80:
                 break
@@ -37010,7 +41747,9 @@ Worker instructions:
             return
         proj_dir = HOME / ".claude" / "projects" / _encode_project_dir(cwd)
         target = proj_dir / f"{session_id}.jsonl"
-        if not target.exists():
+        try:
+            transcript_handle = _session_transcript_handle(target)
+        except OSError:
             self.send_error(404, "no such session in this project")
             return
 
@@ -37019,7 +41758,7 @@ Worker instructions:
         turns: list[str] = []
         current: list[str] = []
         try:
-            with open(target, "rb") as f:
+            with transcript_handle as f:
                 for raw in f:
                     if not raw.strip():
                         continue
@@ -37087,7 +41826,7 @@ Worker instructions:
         turns: list[str] = []
         current: list[str] = []
         try:
-            with path.open("rb") as f:
+            with _open_session_transcript_file(path) as f:
                 for raw in f:
                     if not raw.strip():
                         continue
@@ -37127,510 +41866,282 @@ Worker instructions:
         self.end_headers()
         self.wfile.write(body)
 
-    # ----- /pickers/permissions: read/write permission rules -----
-    def _handle_pickers_permissions(self, q):
-        """GET: returns current permissions block from settings.json.
-        POST: replaces the permissions block with body, preserving everything
-        else. Body shape: {"allow":[],"deny":[],"ask":[],"additionalDirectories":[],"defaultMode":"..."}
-        """
-        if self.command == "GET":
-            settings = self._read_settings_json()
-            perms = settings.get("permissions") or {}
-            # effortLevel is a sibling top-level key, not nested under
-            # permissions. Returning it inline so the phone can render the
-            # Effort default control on the same screen.
-            body = json.dumps({
-                "ok": True,
-                "permissions": {
-                    "allow": perms.get("allow") or [],
-                    "deny":  perms.get("deny")  or [],
-                    "ask":   perms.get("ask")   or [],
-                    "additionalDirectories": perms.get("additionalDirectories") or [],
-                    "defaultMode": perms.get("defaultMode") or "default",
-                    "effortLevel": settings.get("effortLevel") or "medium",
+    def _picker_diagnostics_provider(self, q, diagnostic: str) -> str | None:
+        provider = q.get("provider", [""])[0].strip().lower()
+        if not provider:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "picker_provider_required",
+                    "message": f"{diagnostic} diagnostics require an exact provider.",
                 },
-            }).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        # POST: write
-        try:
-            raw = self._read_body()
-            new_perms = json.loads(raw or b"{}")
-            if not isinstance(new_perms, dict):
-                self.send_error(400, "body must be a JSON object")
-                return
-        except (ValueError, json.JSONDecodeError):
-            self.send_error(400, "invalid JSON body")
-            return
-        # Whitelist allowed keys + types so a typo can't poison settings.json.
-        sanitized = {}
-        for key in ("allow", "deny", "ask", "additionalDirectories"):
-            v = new_perms.get(key)
-            if isinstance(v, list):
-                sanitized[key] = [str(x) for x in v if isinstance(x, (str, int))]
-        dm = new_perms.get("defaultMode")
-        if isinstance(dm, str) and dm in {"default", "acceptEdits", "plan", "bypassPermissions", "dontAsk"}:
-            sanitized["defaultMode"] = dm
-        settings = self._read_settings_json()
-        settings["permissions"] = sanitized
-        # effortLevel sits at top level, not under permissions — the phone
-        # surfaces it on the same picker for convenience but on disk it's
-        # a sibling key. Persist it whenever the body includes it.
-        el = new_perms.get("effortLevel")
-        if isinstance(el, str) and el in {"low", "medium", "high", "max"}:
-            settings["effortLevel"] = el
-        ok = self._write_settings_json(settings)
-        # Echo the merged shape (permissions block + effortLevel) so the phone
-        # can refresh its UI from the response without a follow-up GET.
-        echo = dict(sanitized)
-        echo["effortLevel"] = settings.get("effortLevel") or "medium"
-        body = json.dumps({"ok": ok, "permissions": echo}).encode()
-        self.send_response(200 if ok else 500)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+            }, status=400)
+            return None
+        if not _valid_provider_filter(provider, allow_all=False):
+            _send_unknown_provider(self, provider)
+            return None
+        if provider != "claude":
+            _send_unsupported_provider(
+                self,
+                provider,
+                f"{diagnostic.lower()}_read",
+                status=501,
+            )
+            return None
+        return provider
 
-    # ----- /pickers/hooks: read/write hook block -----
+    # ----- /pickers/permissions: provider-qualified read-only diagnostics -----
+    def _handle_pickers_permissions(self, q):
+        if (getattr(self, "command", "GET") or "GET").upper() != "GET":
+            self.send_error(405, "GET required")
+            return
+        provider = self._picker_diagnostics_provider(q, "Permissions")
+        if provider is None:
+            return
+        settings = self._read_settings_json()
+        permissions = settings.get("permissions") or {}
+        self._send_json({
+            "ok": True,
+            "provider": provider,
+            "permissions": {
+                "allow": permissions.get("allow") or [],
+                "deny": permissions.get("deny") or [],
+                "ask": permissions.get("ask") or [],
+                "additionalDirectories": permissions.get("additionalDirectories") or [],
+                "defaultMode": permissions.get("defaultMode") or "default",
+                "effortLevel": settings.get("effortLevel") or "medium",
+            },
+        })
+
+    # ----- /pickers/hooks: provider-qualified read-only diagnostics -----
     def _handle_pickers_hooks(self, q):
-        """GET: current hooks block. POST: replace it with the body.
-        Hook event names recognized by Claude Code:
-          PreToolUse, PostToolUse, PreCompact, PostCompact,
-          Stop, Notification, SessionStart, PermissionRequest
-        """
-        valid_events = {
-            "PreToolUse", "PostToolUse", "PreCompact", "PostCompact",
-            "Stop", "Notification", "SessionStart", "PermissionRequest",
-            "UserPromptSubmit",
-        }
-        if self.command == "GET":
-            settings = self._read_settings_json()
-            hooks = settings.get("hooks") or {}
-            body = json.dumps({"ok": True, "hooks": hooks}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        if (getattr(self, "command", "GET") or "GET").upper() != "GET":
+            self.send_error(405, "GET required")
             return
-        try:
-            raw = self._read_body()
-            new_hooks = json.loads(raw or b"{}")
-            if not isinstance(new_hooks, dict):
-                self.send_error(400, "body must be a JSON object")
-                return
-        except (ValueError, json.JSONDecodeError):
-            self.send_error(400, "invalid JSON body")
+        provider = self._picker_diagnostics_provider(q, "Hooks")
+        if provider is None:
             return
-        sanitized = {}
-        for event_name, entries in new_hooks.items():
-            if event_name not in valid_events:
-                continue
-            if not isinstance(entries, list):
-                continue
-            clean_entries = []
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                hooks_list = entry.get("hooks")
-                if not isinstance(hooks_list, list):
-                    continue
-                cleaned_hooks = []
-                for h in hooks_list:
-                    if not isinstance(h, dict):
-                        continue
-                    if not isinstance(h.get("command"), str):
-                        continue
-                    cleaned = {"type": h.get("type", "command"), "command": h["command"]}
-                    if isinstance(h.get("timeout"), (int, float)):
-                        cleaned["timeout"] = int(h["timeout"])
-                    cleaned_hooks.append(cleaned)
-                if not cleaned_hooks:
-                    continue
-                clean_entry = {"hooks": cleaned_hooks}
-                if isinstance(entry.get("matcher"), str):
-                    clean_entry["matcher"] = entry["matcher"]
-                clean_entries.append(clean_entry)
-            if clean_entries:
-                sanitized[event_name] = clean_entries
         settings = self._read_settings_json()
-        settings["hooks"] = sanitized
-        ok = self._write_settings_json(settings)
-        body = json.dumps({"ok": ok, "hooks": sanitized}).encode()
-        self.send_response(200 if ok else 500)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._send_json({
+            "ok": True,
+            "provider": provider,
+            "hooks": settings.get("hooks") or {},
+        })
 
-    # ----- /pickers/memory: master-detail edit of project memory entries -----
+    # ----- /pickers/memory: provider-qualified read-only diagnostics -----
     def _handle_pickers_memory(self, q):
-        """List or create memory entries for a given project cwd.
-
-        Memory layout (Claude Code's auto-memory convention):
-          ~/.claude/projects/<encoded-cwd>/memory/
-            MEMORY.md           index (one bullet per entry)
-            <name>.md           per-entry file with YAML frontmatter
-              ---
-              name: ...
-              description: ...
-              type: user|feedback|project|reference
-              ---
-              <markdown body>
-
-        GET  /pickers/memory?cwd=… → list (lightweight, no body)
-        POST /pickers/memory?cwd=… → create new entry
-        """
+        if (getattr(self, "command", "GET") or "GET").upper() != "GET":
+            self.send_error(405, "GET required")
+            return
+        provider = self._picker_diagnostics_provider(q, "Memory")
+        if provider is None:
+            return
         cwd = q.get("cwd", [""])[0]
         if not cwd:
             self.send_error(400, "cwd required")
             return
         mem_dir = HOME / ".claude" / "projects" / _encode_project_dir(cwd) / "memory"
-
-        if self.command == "GET":
-            entries: list[dict] = []
-            if mem_dir.exists():
-                for md in sorted(mem_dir.glob("*.md")):
-                    if md.name == "MEMORY.md":
-                        continue
-                    try:
-                        text = md.read_text(encoding="utf-8")
-                    except OSError:
-                        continue
-                    fm = _parse_md_frontmatter(text)
-                    entries.append({
-                        "filename": md.name,
-                        "name": fm.get("name") or md.stem,
-                        "description": fm.get("description") or "",
-                        "type": fm.get("type") or "project",
-                    })
-            body = json.dumps({"ok": True, "entries": entries}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-
-        # POST: create new
-        try:
-            payload = json.loads(self._read_body() or b"{}")
-        except (ValueError, json.JSONDecodeError):
-            self.send_error(400, "invalid JSON body")
-            return
-        name = (payload.get("name") or "").strip()
-        if not name or not re.match(r"^[A-Za-z0-9_\- ]{1,80}$", name):
-            self.send_error(400, "name required (alnum/underscore/dash/space, 1-80 chars)")
-            return
-        mem_type = payload.get("type") or "project"
-        if mem_type not in {"user", "feedback", "project", "reference"}:
-            mem_type = "project"
-        description = (payload.get("description") or "").strip()
-        content = payload.get("content") or ""
-        slug = re.sub(r"[^A-Za-z0-9_-]", "_", name.lower()).strip("_") or "memory"
-        target = mem_dir / f"{slug}.md"
-        # Avoid clobbering an existing entry with the same slug.
-        if target.exists():
-            counter = 2
-            while (mem_dir / f"{slug}_{counter}.md").exists():
-                counter += 1
-            target = mem_dir / f"{slug}_{counter}.md"
-        try:
-            mem_dir.mkdir(parents=True, exist_ok=True)
-            frontmatter = (
-                "---\n"
-                f"name: {name}\n"
-                f"description: {description}\n"
-                f"type: {mem_type}\n"
-                "---\n\n"
-            )
-            target.write_text(frontmatter + content, encoding="utf-8")
-            self._update_memory_index(mem_dir, target.name, name, description)
-        except OSError as e:
-            self.send_error(500, f"write failed: {e}")
-            return
-        body = json.dumps({"ok": True, "filename": target.name}).encode()
-        self.send_response(201)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        entries: list[dict] = []
+        if mem_dir.exists():
+            for markdown_path in sorted(mem_dir.glob("*.md")):
+                if markdown_path.name == "MEMORY.md":
+                    continue
+                try:
+                    text = markdown_path.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                frontmatter = _parse_md_frontmatter(text)
+                entries.append({
+                    "filename": markdown_path.name,
+                    "name": frontmatter.get("name") or markdown_path.stem,
+                    "description": frontmatter.get("description") or "",
+                    "type": frontmatter.get("type") or "project",
+                })
+        self._send_json({
+            "ok": True,
+            "provider": provider,
+            "entries": entries,
+        })
 
     def _handle_pickers_memory_one(self, q, filename: str):
-        """GET / POST / DELETE a single memory entry by filename."""
+        if (getattr(self, "command", "GET") or "GET").upper() != "GET":
+            self.send_error(405, "GET required")
+            return
+        provider = self._picker_diagnostics_provider(q, "Memory")
+        if provider is None:
+            return
         cwd = q.get("cwd", [""])[0]
         if not cwd:
             self.send_error(400, "cwd required")
             return
-        # Sanitize: filename must be a single .md without path separators.
-        if "/" in filename or "\\" in filename or not filename.endswith(".md") or filename == "MEMORY.md":
+        if (
+            "/" in filename
+            or "\\" in filename
+            or not filename.endswith(".md")
+            or filename == "MEMORY.md"
+        ):
             self.send_error(400, "invalid filename")
             return
         mem_dir = HOME / ".claude" / "projects" / _encode_project_dir(cwd) / "memory"
         target = mem_dir / filename
-
-        if self.command == "GET":
-            if not target.exists():
-                self.send_error(404, "no such entry")
-                return
-            try:
-                text = target.read_text(encoding="utf-8")
-            except OSError as e:
-                self.send_error(500, f"read failed: {e}")
-                return
-            fm = _parse_md_frontmatter(text)
-            # Body is everything after the closing `---` of frontmatter.
-            body_text = text
-            m = re.match(r"^---\n.*?\n---\n?", text, flags=re.DOTALL)
-            if m:
-                body_text = text[m.end():]
-            body = json.dumps({
-                "ok": True,
-                "filename": filename,
-                "name": fm.get("name") or target.stem,
-                "description": fm.get("description") or "",
-                "type": fm.get("type") or "project",
-                "content": body_text,
-            }).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-
-        if self.command == "DELETE":
-            try:
-                if target.exists():
-                    target.unlink()
-                self._strip_memory_index(mem_dir, filename)
-            except OSError as e:
-                self.send_error(500, f"delete failed: {e}")
-                return
-            body = json.dumps({"ok": True}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-
-        # POST: update existing
-        try:
-            payload = json.loads(self._read_body() or b"{}")
-        except (ValueError, json.JSONDecodeError):
-            self.send_error(400, "invalid JSON body")
-            return
         if not target.exists():
             self.send_error(404, "no such entry")
             return
         try:
-            existing = target.read_text(encoding="utf-8")
-        except OSError as e:
-            self.send_error(500, f"read failed: {e}")
+            text = target.read_text(encoding="utf-8")
+        except OSError as exc:
+            self.send_error(500, f"read failed: {exc}")
             return
-        cur_fm = _parse_md_frontmatter(existing)
-        name = (payload.get("name") or cur_fm.get("name") or target.stem).strip()
-        description = (payload.get("description") or cur_fm.get("description") or "").strip()
-        mem_type = payload.get("type") or cur_fm.get("type") or "project"
-        if mem_type not in {"user", "feedback", "project", "reference"}:
-            mem_type = "project"
-        # Body: incoming `content` if provided, else preserve original body.
-        body_part = payload.get("content")
-        if body_part is None:
-            m = re.match(r"^---\n.*?\n---\n?", existing, flags=re.DOTALL)
-            body_part = existing[m.end():] if m else existing
-        new_text = (
-            "---\n"
-            f"name: {name}\n"
-            f"description: {description}\n"
-            f"type: {mem_type}\n"
-            "---\n\n"
-            + body_part
-        )
-        try:
-            target.write_text(new_text, encoding="utf-8")
-            self._update_memory_index(mem_dir, filename, name, description)
-        except OSError as e:
-            self.send_error(500, f"write failed: {e}")
-            return
-        body = json.dumps({"ok": True, "filename": filename}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        frontmatter = _parse_md_frontmatter(text)
+        body_text = text
+        match = re.match(r"^---\n.*?\n---\n?", text, flags=re.DOTALL)
+        if match:
+            body_text = text[match.end():]
+        self._send_json({
+            "ok": True,
+            "provider": provider,
+            "filename": filename,
+            "name": frontmatter.get("name") or target.stem,
+            "description": frontmatter.get("description") or "",
+            "type": frontmatter.get("type") or "project",
+            "content": body_text,
+        })
 
-    def _update_memory_index(self, mem_dir, filename: str, name: str, description: str) -> None:
-        """Add-or-update one bullet line in MEMORY.md. The convention from
-        the auto-memory rules: `- [Title](file.md) — one-line hook`."""
-        idx = mem_dir / "MEMORY.md"
-        new_line = f"- [{name}]({filename}) — {description}"
-        existing: str
-        try:
-            existing = idx.read_text(encoding="utf-8") if idx.exists() else ""
-        except OSError:
-            existing = ""
-        lines: list[str] = list(existing.splitlines())
-        # Replace any existing line referring to this filename, else append.
-        replaced = False
-        for i, ln in enumerate(lines):
-            if f"]({filename})" in ln:
-                lines[i] = new_line
-                replaced = True
-                break
-        if not replaced:
-            lines.append(new_line)
-        try:
-            idx.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-        except OSError:
-            pass
-
-    def _strip_memory_index(self, mem_dir, filename: str) -> None:
-        idx = mem_dir / "MEMORY.md"
-        if not idx.exists():
-            return
-        try:
-            existing = idx.read_text(encoding="utf-8")
-        except OSError:
-            return
-        lines = [ln for ln in existing.splitlines() if f"]({filename})" not in ln]
-        try:
-            idx.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-        except OSError:
-            pass
-
-    # ----- /pickers/mcp: list MCP servers + restart -----
+    # ----- /pickers/mcp: provider-qualified, read-only diagnostics -----
     def _handle_pickers_mcp(self, q):
-        """Run `claude mcp list` and parse the human-readable output into a
-        structured list. Stdout shape per line:
-          <name>: <command-or-url> - <status-text>
-        Examples:
-          plugin:semgrep:semgrep: semgrep mcp - ✓ Connected
-          phone-tools: python3 /path/to/script.py - ✗ Failed: ...
-        Returns whatever rows we can parse; un-parseable lines are skipped.
-        """
-        # Resolve `claude` binary — launchd-spawned daemon has a stripped PATH
-        # so `which claude` may miss it. Try the known install locations the
-        # user's shell would find via `which -a`.
+        """Return one provider's MCP diagnostics without exposing mutations."""
+        provider = q.get("provider", [""])[0].strip().lower()
+        if not provider:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "mcp_provider_required",
+                    "message": "MCP diagnostics require an exact provider.",
+                },
+            }, status=400)
+            return
+        if not _valid_provider_filter(provider, allow_all=False):
+            _send_unknown_provider(self, provider)
+            return
+        if provider != "claude":
+            _send_unsupported_provider(self, provider, "mcp_read", status=501)
+            return
+
         candidates = [
             HOME / ".local" / "bin" / "claude",
             "/usr/local/bin/claude",
             "/opt/homebrew/bin/claude",
         ]
-        claude_bin: str | None = None
-        for c in candidates:
-            p = str(c)
-            if os.path.exists(p) and os.access(p, os.X_OK):
-                claude_bin = p
-                break
+        claude_bin = next((
+            str(candidate)
+            for candidate in candidates
+            if os.path.exists(str(candidate)) and os.access(str(candidate), os.X_OK)
+        ), None)
         if claude_bin is None:
-            body = json.dumps({"ok": True, "servers": []}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "mcp_diagnostics_unavailable",
+                    "message": "Claude MCP diagnostics are unavailable because the Claude CLI was not found.",
+                    "provider": provider,
+                    "reason": "provider_binary_missing",
+                },
+            }, status=503)
             return
 
-        servers: list[dict] = []
         try:
             proc = subprocess.run(
                 [claude_bin, "mcp", "list"],
-                capture_output=True, text=True, timeout=8,
+                capture_output=True,
+                text=True,
+                timeout=8,
             )
-            if proc.returncode == 0:
-                for raw in proc.stdout.splitlines():
-                    line = raw.strip()
-                    if not line:
-                        continue
-                    if line.startswith("Checking MCP"):
-                        continue
-                    # Pattern: name: cmd-or-url - status
-                    m = re.match(r"^([^:]+):\s+(.*?)\s+-\s+(.*)$", line)
-                    if not m:
-                        continue
-                    name = m.group(1).strip()
-                    target = m.group(2).strip()
-                    status_text = m.group(3).strip()
-                    status: str
-                    if "Connected" in status_text or "✓" in status_text:
-                        status = "connected"
-                    elif "Connecting" in status_text or "Pending" in status_text:
-                        status = "connecting"
-                    elif "Failed" in status_text or "Error" in status_text or "✗" in status_text:
-                        status = "failed"
-                    else:
-                        status = "unknown"
-                    servers.append({
-                        "name": name,
-                        "target": target,
-                        "status": status,
-                        "status_text": status_text,
-                    })
-        except (OSError, subprocess.SubprocessError):
-            pass
-        body = json.dumps({"ok": True, "servers": servers}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        except subprocess.TimeoutExpired:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "mcp_diagnostics_timeout",
+                    "message": "Claude MCP diagnostics did not finish in time.",
+                    "provider": provider,
+                },
+            }, status=504)
+            return
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "mcp_diagnostics_unavailable",
+                    "message": "Claude MCP diagnostics could not be started.",
+                    "provider": provider,
+                    "reason": type(exc).__name__,
+                },
+            }, status=503)
+            return
 
-    def _handle_pickers_mcp_restart(self, q, name: str):
-        """POST /pickers/mcp/<name>/restart — try `claude mcp restart <name>`.
-        Some Claude Code versions don't expose `restart`; if that fails, fall
-        back to remove + re-add (caller has to confirm it's safe). Best-effort,
-        return the captured stderr/stdout so the phone can show what happened.
-        """
-        if self.command != "POST":
-            self.send_error(405, "POST required")
+        if proc.returncode != 0:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "mcp_diagnostics_failed",
+                    "message": f"Claude MCP diagnostics exited with status {proc.returncode}.",
+                    "provider": provider,
+                    "returncode": proc.returncode,
+                },
+            }, status=502)
             return
-        if not re.match(r"^[A-Za-z0-9_\-:.]+$", name):
-            self.send_error(400, "invalid mcp server name")
+
+        servers: list[dict] = []
+        unparsed_lines = 0
+        for raw in proc.stdout.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("Checking MCP"):
+                continue
+            if line.startswith(("No MCP servers configured", "No MCP servers found")):
+                continue
+            try:
+                server_text, status_text = line.rsplit(" - ", 1)
+                name, target = server_text.rsplit(": ", 1)
+            except ValueError:
+                unparsed_lines += 1
+                continue
+            name = name.strip()
+            target = target.strip()
+            status_text = status_text.strip()
+            if not name or not target or not status_text:
+                unparsed_lines += 1
+                continue
+            if "Connected" in status_text or "✓" in status_text:
+                status = "connected"
+            elif "Connecting" in status_text or "Pending" in status_text:
+                status = "connecting"
+            elif "Failed" in status_text or "Error" in status_text or "✗" in status_text:
+                status = "failed"
+            else:
+                status = "unknown"
+            servers.append({
+                "name": name,
+                "target": target,
+                "status": status,
+                "status_text": status_text,
+            })
+
+        if unparsed_lines:
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "mcp_diagnostics_parse_failed",
+                    "message": "Claude MCP diagnostics returned an unsupported output format.",
+                    "provider": provider,
+                    "unparsed_lines": unparsed_lines,
+                },
+            }, status=502)
             return
-        candidates = [
-            HOME / ".local" / "bin" / "claude",
-            "/usr/local/bin/claude",
-            "/opt/homebrew/bin/claude",
-        ]
-        claude_bin: str | None = None
-        for c in candidates:
-            p = str(c)
-            if os.path.exists(p) and os.access(p, os.X_OK):
-                claude_bin = p
-                break
-        if claude_bin is None:
-            self.send_error(500, "claude binary not found")
-            return
-        try:
-            proc = subprocess.run(
-                [claude_bin, "mcp", "restart", name],
-                capture_output=True, text=True, timeout=10,
-            )
-        except (OSError, subprocess.SubprocessError) as e:
-            body = json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}).encode()
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        body = json.dumps({
-            "ok": proc.returncode == 0,
-            "stdout": proc.stdout[:1000],
-            "stderr": proc.stderr[:1000],
-            "returncode": proc.returncode,
-        }).encode()
-        self.send_response(200 if proc.returncode == 0 else 500)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._send_json({
+            "ok": True,
+            "provider": provider,
+            "servers": servers,
+        })
+
 
     # ----- /search: Spotlight-style cross-session text search -----
     def _handle_search(self, q):
@@ -38701,15 +43212,24 @@ Worker instructions:
                 return
             self.send_error(404, "PairDrop route not found")
         except PairDropStoreError as e:
-            self._send_pairdrop_error(
-                e,
-                status=(
-                    404
-                    if getattr(e, "code", "")
-                    in {"not_found", "deleted", "missing_object", "upload_not_found"}
-                    else 400
-                ),
-            )
+            code = str(getattr(e, "code", "") or "")
+            if code in {
+                "not_found",
+                "deleted",
+                "missing_object",
+                "upload_not_found",
+                "attachment_not_found",
+            }:
+                status = 404
+            elif code.startswith("attachment_") or code in {
+                "byte_size_mismatch",
+                "sha256_mismatch",
+                "object_escape",
+            }:
+                status = 409
+            else:
+                status = 400
+            self._send_pairdrop_error(e, status=status)
         except OSError as exc:
             if exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}:
                 self._send_pairdrop_error(
@@ -38731,22 +43251,22 @@ Worker instructions:
 
     def _send_unexpected_pairdrop_error(self, path: str, exc: Exception) -> None:
         correlation_id = "pd_err_" + secrets.token_hex(8)
-        diagnostic = {
+        diagnostic = redact_public_diagnostic({
             "event": "pairdrop.request_failed",
             "correlation_id": correlation_id,
             "route_family": _rate_limit_key_path(path),
             "exception_type": type(exc).__name__,
+            "exception_message": str(exc),
             "device_id": str(
                 getattr(getattr(self, "pairling_auth", None), "device_id", "")
                 or ""
             ),
-        }
+        })
         print(
             "[pairdrop-error] " + json.dumps(diagnostic, sort_keys=True),
             file=sys.stderr,
             flush=True,
         )
-        traceback.print_exc(file=sys.stderr)
         self._send_json({
             "ok": False,
             "error": {
@@ -38792,20 +43312,72 @@ Worker instructions:
 
     def _public_upload_session(self, session: dict) -> dict:
         return {
-            key: value for key, value in session.items()
-            if key not in {"source_device_id", "source_install_id"}
+            key: session.get(key)
+            for key in (
+                "upload_id",
+                "file_id",
+                "display_name",
+                "original_name",
+                "content_type",
+                "total_byte_count",
+                "expected_sha256",
+                "verified_offset",
+                "state",
+                "last_error",
+                "created_at",
+                "updated_at",
+                "expires_at",
+            )
         }
 
     def _public_pairdrop_file(self, item: dict) -> dict:
         return {
-            key: value for key, value in item.items()
-            if key
-            not in {
-                "storage_relpath",
-                "source_device_id",
-                "source_install_id",
-                "session_hint",
-            }
+            key: item.get(key)
+            for key in (
+                "id",
+                "parent_id",
+                "kind",
+                "display_name",
+                "content_type",
+                "byte_size",
+                "sha256",
+                "created_at",
+                "updated_at",
+                "deleted_at",
+                "last_opened_at",
+                "tags",
+            )
+        }
+
+    def _pairdrop_attachment_session(self, raw_session: str) -> str:
+        provider, native_id = _parse_agent_session_ref(raw_session)
+        if (
+            ":" not in raw_session
+            or not native_id
+            or not _valid_provider_filter(provider, allow_all=False)
+            or provider not in _agent_provider_ids()
+        ):
+            raise PairDropStoreError("bad_attachment_session")
+        canonical, registry_row = _session_mutation_receipt_identity(
+            self,
+            _qualified_session_id(provider, native_id),
+        )
+        if not canonical or registry_row is None or registry_row.get("closed_at") is not None:
+            raise PairDropStoreError("attachment_session_unavailable")
+        return canonical
+
+    @staticmethod
+    def _public_attachment_handle(attachment: dict) -> dict:
+        return {
+            "ok": attachment.get("ok") is True,
+            "id": attachment.get("id"),
+            "handle_id": attachment.get("handle_id"),
+            "display_name": attachment.get("display_name"),
+            "mime_type": attachment.get("content_type"),
+            "size_bytes": attachment.get("byte_size"),
+            "sha256": attachment.get("sha256"),
+            "expires_at": attachment.get("expires_at"),
+            "idempotent": attachment.get("idempotent") is True,
         }
 
     def _handle_pairdrop_upload_session_create(self):
@@ -38934,7 +43506,6 @@ Worker instructions:
         self._send_json({
             "ok": True,
             "schema_version": 2,
-            "mac_location": str(self._pairdrop_store().root),
             "files": files,
             "page": {
                 "limit": page["limit"],
@@ -38952,19 +43523,23 @@ Worker instructions:
         self._send_json({"ok": True, "file": item})
 
     def _handle_pairdrop_download(self, file_id: str):
-        descriptor = self._pairdrop_store().download_descriptor(file_id)
-        item = descriptor["item"]
-        path = descriptor["path"]
-        display_name = str(item.get("display_name") or "pairdrop-file")
-        content_type = _pairdrop_safe_content_type(str(item.get("content_type") or "application/octet-stream"))
-        byte_size = int(item.get("byte_size") or path.stat().st_size)
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(byte_size))
-        self.send_header("Content-Disposition", _pairdrop_content_disposition(display_name))
-        self.send_header("X-PairDrop-File-ID", str(item.get("id") or file_id))
-        self.end_headers()
-        with path.open("rb") as handle:
+        with self._pairdrop_store().open_download(file_id) as descriptor:
+            item = descriptor["item"]
+            handle = descriptor["handle"]
+            display_name = str(item.get("display_name") or "pairdrop-file")
+            content_type = _pairdrop_safe_content_type(
+                str(item.get("content_type") or "application/octet-stream")
+            )
+            byte_size = int(descriptor["stat"].st_size)
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(byte_size))
+            self.send_header(
+                "Content-Disposition",
+                _pairdrop_content_disposition(display_name),
+            )
+            self.send_header("X-PairDrop-File-ID", str(item.get("id") or file_id))
+            self.end_headers()
             while True:
                 chunk = handle.read(1024 * 256)
                 if not chunk:
@@ -38972,48 +43547,55 @@ Worker instructions:
                 self.wfile.write(chunk)
 
     def _handle_pairdrop_content(self, file_id: str):
-        descriptor = self._pairdrop_store().download_descriptor(file_id)
-        item = descriptor["item"]
-        path = descriptor["path"]
-        total = int(item.get("byte_size") or path.stat().st_size)
-        digest = str(item.get("sha256") or "")
-        if not digest:
-            raise PairDropStoreError("missing_sha256")
+        with self._pairdrop_store().open_download(file_id) as descriptor:
+            item = descriptor["item"]
+            handle = descriptor["handle"]
+            total = int(descriptor["stat"].st_size)
+            digest = str(item.get("sha256") or "")
+            if not digest:
+                raise PairDropStoreError("missing_sha256")
 
-        range_header = str(self.headers.get("Range") or "").strip()
-        if_range = str(self.headers.get("If-Range") or "").strip()
-        if if_range and if_range != f'"{digest}"':
-            range_header = ""
+            range_header = str(self.headers.get("Range") or "").strip()
+            if_range = str(self.headers.get("If-Range") or "").strip()
+            if if_range and if_range != f'"{digest}"':
+                range_header = ""
 
-        try:
-            start, end, partial = _parse_single_byte_range(range_header, total)
-        except PairDropStoreError as exc:
-            if exc.code == "range_not_satisfiable":
-                body = b'{"ok":false,"error":{"code":"range_not_satisfiable","message":"range not satisfiable"}}'
-                self.send_response(416)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Range", f"bytes */{total}")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            raise
+            try:
+                start, end, partial = _parse_single_byte_range(range_header, total)
+            except PairDropStoreError as exc:
+                if exc.code == "range_not_satisfiable":
+                    body = (
+                        b'{"ok":false,"error":{"code":"range_not_satisfiable",'
+                        b'"message":"range not satisfiable"}}'
+                    )
+                    self.send_response(416)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Range", f"bytes */{total}")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                raise
 
-        display_name = str(item.get("display_name") or "pairdrop-file")
-        content_type = _pairdrop_safe_content_type(str(item.get("content_type") or "application/octet-stream"))
-        length = end - start + 1
-        self.send_response(206 if partial else 200)
-        self.send_header("Accept-Ranges", "bytes")
-        self.send_header("ETag", f'"{digest}"')
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(length))
-        self.send_header("Content-Disposition", _pairdrop_content_disposition(display_name))
-        self.send_header("X-PairDrop-File-ID", str(item.get("id") or file_id))
-        self.send_header("X-PairDrop-SHA256", digest)
-        if partial:
-            self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
-        self.end_headers()
-        with path.open("rb") as handle:
+            display_name = str(item.get("display_name") or "pairdrop-file")
+            content_type = _pairdrop_safe_content_type(
+                str(item.get("content_type") or "application/octet-stream")
+            )
+            length = end - start + 1
+            self.send_response(206 if partial else 200)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("ETag", f'"{digest}"')
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(length))
+            self.send_header(
+                "Content-Disposition",
+                _pairdrop_content_disposition(display_name),
+            )
+            self.send_header("X-PairDrop-File-ID", str(item.get("id") or file_id))
+            self.send_header("X-PairDrop-SHA256", digest)
+            if partial:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+            self.end_headers()
             handle.seek(start)
             remaining = length
             while remaining > 0:
@@ -39027,8 +43609,24 @@ Worker instructions:
         self._send_json(self._pairdrop_store().delete_file(file_id))
 
     def _handle_pairdrop_attach(self, file_id: str, q):
-        session_id = q.get("session", [""])[0].strip()
-        self._send_json(self._pairdrop_store().attach_descriptor(file_id, session_id=session_id))
+        raw_session = q.get("session", [""])[0].strip()
+        session_id = self._pairdrop_attachment_session(raw_session)
+        payload = self._read_pairdrop_json_object()
+        idempotency_key = str(
+            payload.get("client_action_id")
+            or self.headers.get("Idempotency-Key")
+            or self.headers.get("X-Pairling-Action-Id")
+            or ""
+        ).strip()
+        device_id, install_id = self._pairdrop_source()
+        attachment = self._pairdrop_store().create_attachment_handle(
+            file_id,
+            session_id=session_id,
+            source_device_id=device_id,
+            source_install_id=install_id,
+            idempotency_key=idempotency_key,
+        )
+        self._send_json(self._public_attachment_handle(attachment))
 
     def _handle_pairdrop_events(self, q):
         try:
@@ -39044,83 +43642,50 @@ Worker instructions:
             older = 3600
         self._send_json(self._pairdrop_store().cleanup_partials(older_than_seconds=older))
 
-    # ----- /upload: save a file under ~/Pairling/uploads/<bucket>/ -----
+    # ----- /upload: compatibility upload into PairDrop's opaque capability store -----
     def _handle_upload(self, q):
-        """Accept a raw POST body plus `?filename=<name>&session=<id>` query
-        params. Save to ~/Pairling/uploads/<bucket>/<8-hex>-<name>
-        where <bucket> is derived from the session's project path:
-
-          - regular project (e.g. /Users/example/projects/proofforge)
-            → bucket = "proofforge"
-          - sentinel session (e.g. /Users/example/.claude/state/sentinel/projects/proofforge-079c4a/terminals/orange_team)
-            → bucket = "proofforge"  (regex strips -<6hex> suffix)
-          - fallback when session unknown
-            → bucket = "misc"
-
-        Returns the absolute path so the phone can append it to a prompt.
-        Body capped at 100MB.
-        """
         filename = q.get("filename", [""])[0].strip()
         if not filename:
             self.send_error(400, "filename required")
             return
-        session_id = q.get("session", [""])[0].strip()
-
-        # Defang: strip path components, keep only safe chars.
-        base = os.path.basename(filename)
-        safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', base) or "upload.bin"
-        if len(safe_name) > 80:
-            stem, dot, ext = safe_name.rpartition(".")
-            if dot and len(ext) <= 8:
-                safe_name = stem[: 80 - len(ext) - 1] + "." + ext
-            else:
-                safe_name = safe_name[:80]
-
+        session_id = self._pairdrop_attachment_session(
+            q.get("session", [""])[0].strip()
+        )
         body = self._read_body()
         if len(body) > MAX_UPLOAD_BODY_BYTES:
-            self.send_error(413, "file too large (max 100MB)")
+            self.send_error(413, "file too large")
             return
         if not body:
             self.send_error(400, "empty body")
             return
-
-        # Derive bucket folder from session's project (if session known).
-        bucket = "misc"
-        provider, native_id = _parse_agent_session_ref(session_id)
-        if native_id:
-            if provider == "codex":
-                project = _codex_project_for_session(native_id)
-            else:
-                project = self._lookup_project(native_id)
-            if project:
-                bucket = _derive_bucket_folder(project)
-
-        uploads_dir = HOME / "Pairling" / "uploads" / bucket
-        try:
-            uploads_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            self.send_error(500, f"can't create uploads dir: {e}")
-            return
-
-        target = uploads_dir / f"{secrets.token_hex(4)}-{safe_name}"
-        try:
-            target.write_bytes(body)
-        except OSError as e:
-            self.send_error(500, f"write failed: {e}")
-            return
-
-        resp = json.dumps({
-            "ok": True,
-            "path": str(target),
-            "size": len(body),
-            "filename": safe_name,
-            "bucket": bucket,
-        }).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(resp)))
-        self.end_headers()
-        self.wfile.write(resp)
+        idempotency_key = str(
+            self.headers.get("Idempotency-Key")
+            or self.headers.get("X-Pairling-Action-Id")
+            or ""
+        ).strip()
+        if not idempotency_key:
+            raise PairDropStoreError("bad_attachment_idempotency_key")
+        device_id, install_id = self._pairdrop_source()
+        store = self._pairdrop_store()
+        item = store.upload_bytes(
+            filename=filename,
+            content_type=(
+                self.headers.get("Content-Type")
+                or "application/octet-stream"
+            ),
+            data=body,
+            source_device_id=device_id,
+            source_install_id=install_id,
+            session_hint=session_id,
+        )
+        attachment = store.create_attachment_handle(
+            str(item["id"]),
+            session_id=session_id,
+            source_device_id=device_id,
+            source_install_id=install_id,
+            idempotency_key=idempotency_key,
+        )
+        self._send_json(self._public_attachment_handle(attachment))
 
     def _lookup_project(self, session_id: str) -> str:
         session_id = _claude_native_session_id(session_id)
@@ -39798,6 +44363,148 @@ class _PairlingThreadingHTTPServer(ThreadingHTTPServer):
             return
         super().handle_error(request, client_address)
 
+def _peer_uid_for_socket(connection: socket.socket) -> int | None:
+    try:
+        if sys.platform == "darwin":
+            uid = ctypes.c_uint()
+            gid = ctypes.c_uint()
+            getpeereid = ctypes.CDLL(None, use_errno=True).getpeereid
+            getpeereid.argtypes = [
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_uint),
+                ctypes.POINTER(ctypes.c_uint),
+            ]
+            getpeereid.restype = ctypes.c_int
+            if getpeereid(connection.fileno(), ctypes.byref(uid), ctypes.byref(gid)) != 0:
+                return None
+            return int(uid.value)
+        if hasattr(socket, "SO_PEERCRED"):
+            raw = connection.getsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_PEERCRED,
+                struct.calcsize("3i"),
+            )
+            _pid, uid, _gid = struct.unpack("3i", raw)
+            return int(uid)
+    except (AttributeError, OSError, ValueError, ctypes.ArgumentError, struct.error):
+        return None
+    return None
+
+
+def _prepare_local_control_socket_path(path: Path) -> None:
+    if not path.is_absolute():
+        raise OSError(errno.EINVAL, "local control socket path must be absolute", str(path))
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    parent_stat = parent.lstat()
+    if not stat.S_ISDIR(parent_stat.st_mode) or stat.S_ISLNK(parent_stat.st_mode):
+        raise OSError(errno.ENOTDIR, "local control socket parent must be a directory", str(parent))
+    if int(parent_stat.st_uid) != os.getuid():
+        raise PermissionError(errno.EACCES, "local control socket parent must be owned by this uid", str(parent))
+    os.chmod(parent, 0o700)
+
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(existing.st_mode):
+        raise OSError(errno.EEXIST, "refusing to replace a non-socket local control path", str(path))
+    if int(existing.st_uid) != os.getuid():
+        raise PermissionError(errno.EACCES, "refusing to replace a socket owned by another uid", str(path))
+
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(0.2)
+    try:
+        probe.connect(str(path))
+    except OSError as exc:
+        if exc.errno not in {errno.ECONNREFUSED, errno.ENOENT}:
+            raise
+    else:
+        raise OSError(errno.EADDRINUSE, "local control socket is already active", str(path))
+    finally:
+        probe.close()
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+class _PairlingLocalControlHTTPServer(_PairlingThreadingHTTPServer):
+    address_family = socket.AF_UNIX
+    pairling_local_control = True
+
+    def __init__(self, socket_path: str | os.PathLike[str], handler_class):
+        self.control_socket_path = Path(socket_path).expanduser()
+        self._control_socket_identity: tuple[int, int] | None = None
+        _prepare_local_control_socket_path(self.control_socket_path)
+        super().__init__(
+            str(self.control_socket_path),
+            handler_class,
+            bind_and_activate=False,
+        )
+        try:
+            self.server_bind()
+            bound = self.control_socket_path.lstat()
+            if not stat.S_ISSOCK(bound.st_mode) or int(bound.st_uid) != os.getuid():
+                raise PermissionError(
+                    errno.EACCES,
+                    "local control socket ownership could not be established",
+                    str(self.control_socket_path),
+                )
+            self._control_socket_identity = (int(bound.st_dev), int(bound.st_ino))
+            os.chmod(self.control_socket_path, 0o600)
+            secured = self.control_socket_path.lstat()
+            if (
+                not stat.S_ISSOCK(secured.st_mode)
+                or int(secured.st_uid) != os.getuid()
+                or (int(secured.st_dev), int(secured.st_ino)) != self._control_socket_identity
+                or stat.S_IMODE(secured.st_mode) != 0o600
+            ):
+                raise PermissionError(
+                    errno.EACCES,
+                    "local control socket permissions could not be established",
+                    str(self.control_socket_path),
+                )
+            self.server_activate()
+        except Exception:
+            super().server_close()
+            self._unlink_owned_control_socket()
+            raise
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = 0
+
+    def verify_request(self, request, client_address):
+        return _peer_uid_for_socket(request) == os.getuid()
+
+    def _unlink_owned_control_socket(self) -> None:
+        identity = self._control_socket_identity
+        if identity is None:
+            return
+        try:
+            current = self.control_socket_path.lstat()
+        except FileNotFoundError:
+            self._control_socket_identity = None
+            return
+        if (
+            stat.S_ISSOCK(current.st_mode)
+            and int(current.st_uid) == os.getuid()
+            and (int(current.st_dev), int(current.st_ino)) == identity
+        ):
+            try:
+                self.control_socket_path.unlink()
+            except FileNotFoundError:
+                pass
+        self._control_socket_identity = None
+
+    def server_close(self):
+        try:
+            super().server_close()
+        finally:
+            self._unlink_owned_control_socket()
+
 
 def _maybe_backfill_claude_registry_from_pg() -> None:
     """One-time best-effort import of live PG session rows into the SQLite
@@ -39869,6 +44576,7 @@ def _maybe_backfill_claude_registry_from_pg() -> None:
 
 
 def _reconcile_broker_sessions_on_boot() -> None:
+    _recover_orphaned_approval_decisions_on_startup()
     if PTY_BROKER is None:
         return
     survivors: dict[str, dict] = {}
@@ -39962,19 +44670,40 @@ if __name__ == "__main__":
     _sessions_provider_inventory_bundle(
         set(_visible_agent_provider_ids()) & set(_SESSION_MEMBERSHIP_PROVIDERS)
     )
-    # Name the inputs that produced this bind. On 2026-07-08 a daemon boot
-    # served 0.0.0.0 while the plist said loopback and nothing on disk could
-    # say why; a non-loopback bind is a security posture change, so the boot
-    # line must carry its own provenance.
-    _bind_mode_env = os.environ.get("PAIRLING_BIND_MODE") or "<unset>"
-    _webhook_host_env = "set" if os.environ.get("PAIRLING_WEBHOOK_HOST") else "unset"
-    print(
-        f"pairlingd listening on {host}:{PORT} "
-        f"(bind_mode={_bind_mode_env}, webhook_host={_webhook_host_env}, ppid={os.getppid()})",
-        file=sys.stderr,
-        flush=True,
+    try:
+        control_server = _PairlingLocalControlHTTPServer(CONTROL_SOCKET_PATH, Handler)
+    except Exception:
+        server.server_close()
+        raise
+    control_thread = threading.Thread(
+        target=control_server.serve_forever,
+        name="pairling-local-control",
+        daemon=True,
     )
     try:
+        control_thread.start()
+    except Exception:
+        server.server_close()
+        control_server.server_close()
+        raise
+    try:
+        # Name the inputs that produced this bind. On 2026-07-08 a daemon boot
+        # served 0.0.0.0 while the plist said loopback and nothing on disk could
+        # say why; a non-loopback bind is a security posture change, so the boot
+        # line must carry its own provenance.
+        _bind_mode_env = os.environ.get("PAIRLING_BIND_MODE") or "<unset>"
+        _webhook_host_env = "set" if os.environ.get("PAIRLING_WEBHOOK_HOST") else "unset"
+        print(
+            f"pairlingd listening on {host}:{PORT} and unix:{CONTROL_SOCKET_PATH} "
+            f"(bind_mode={_bind_mode_env}, webhook_host={_webhook_host_env}, ppid={os.getppid()})",
+            file=sys.stderr,
+            flush=True,
+        )
         server.serve_forever()
     except KeyboardInterrupt:
-        server.shutdown()
+        pass
+    finally:
+        server.server_close()
+        control_server.shutdown()
+        control_server.server_close()
+        control_thread.join(timeout=5)

@@ -129,6 +129,11 @@ PACKAGED_SOURCE_PATHS=(
   "mac/packaging/vendor-cpython.sh"
   "npm"
   "relay/app_attest_validator.py"
+  "thoughts/shared/specs/coding-agent-remote-control-capability-map.json"
+  "project.yml"
+  "Pairling.xcodeproj/project.pbxproj"
+  "Pairling.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+  "Pairling/Frameworks/PairlingTailnet.xcframework"
 )
 SOURCE_DIRTY="false"
 if git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 && \
@@ -268,6 +273,102 @@ require_release_artifact_evidence() {
     || fail "release evidence changed during build setup"
 }
 
+require_package_source_inputs() {
+  python3 - "$REPO_ROOT" <<'PY' || fail "compile/package source inputs are incomplete or unreviewed"
+import hashlib
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+errors = []
+verifier_path = root / "mac/install/verify-payload-manifest.py"
+spec = importlib.util.spec_from_file_location("_pairling_package_source_gate", verifier_path)
+if spec is None or spec.loader is None:
+    raise SystemExit("payload verifier cannot be loaded")
+verifier = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(verifier)
+for relative in verifier.CANONICAL_DAEMON_SOURCE_PATHS:
+    path = root / relative
+    if path.is_symlink() or not path.is_file():
+        errors.append(f"canonical daemon module missing: {relative}")
+provider_root = root / "mac/companiond/providers"
+for name, digest in verifier.PROVIDER_RUNTIME_ASSET_DIGESTS.items():
+    path = provider_root / name
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or hashlib.sha256(path.read_bytes()).hexdigest() != digest
+    ):
+        errors.append(f"native provider runtime asset missing or unreviewed: {name}")
+
+required_inputs = (
+    "relay/app_attest_validator.py",
+    "Pairling/Frameworks/PairlingTailnet.xcframework/Info.plist",
+    "Pairling/Frameworks/PairlingTailnet.xcframework/ios-arm64/PairlingTailnet.framework/Info.plist",
+    "Pairling/Frameworks/PairlingTailnet.xcframework/ios-arm64/PairlingTailnet.framework/PairlingTailnet",
+    "Pairling/Frameworks/PairlingTailnet.xcframework/ios-arm64/PairlingTailnet.framework/Modules/module.modulemap",
+    "Pairling/Frameworks/PairlingTailnet.xcframework/ios-arm64/PairlingTailnet.framework/Headers/PairlingTailnet.h",
+    "Pairling/Frameworks/PairlingTailnet.xcframework/ios-arm64_x86_64-simulator/PairlingTailnet.framework/Info.plist",
+    "Pairling/Frameworks/PairlingTailnet.xcframework/ios-arm64_x86_64-simulator/PairlingTailnet.framework/PairlingTailnet",
+    "Pairling/Frameworks/PairlingTailnet.xcframework/ios-arm64_x86_64-simulator/PairlingTailnet.framework/Modules/module.modulemap",
+    "Pairling/Frameworks/PairlingTailnet.xcframework/ios-arm64_x86_64-simulator/PairlingTailnet.framework/Headers/PairlingTailnet.h",
+)
+for relative in required_inputs:
+    path = root / relative
+    if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
+        errors.append(f"relay/framework input missing or unsafe: {relative}")
+
+try:
+    project_yml = (root / "project.yml").read_text(encoding="utf-8")
+    project_file = (root / "Pairling.xcodeproj/project.pbxproj").read_text(
+        encoding="utf-8"
+    )
+    resolved = json.loads(
+        (
+            root
+            / "Pairling.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+        ).read_text(encoding="utf-8")
+    )
+except Exception as exc:
+    errors.append(f"Swift Package release inputs are unreadable: {exc}")
+else:
+    products = {
+        "MarkdownUI",
+        "Splash",
+        "NIOSSH",
+        "NIOCore",
+        "NIOHTTP1",
+        "NIOPosix",
+        "NIOEmbedded",
+    }
+    for product in products:
+        if (
+            f"product: {product}" not in project_yml
+            and f"- package: {product}" not in project_yml
+        ):
+            errors.append(f"project.yml Swift Package product missing: {product}")
+        if f"productName = {product};" not in project_file:
+            errors.append(f"Xcode Swift Package product missing: {product}")
+    resolved_ids = {
+        str(row.get("identity") or "")
+        for row in resolved.get("pins", [])
+        if isinstance(row, dict)
+    }
+    for identity in {"swift-markdown-ui", "splash", "swift-nio-ssh", "swift-nio"}:
+        if identity not in resolved_ids:
+            errors.append(f"resolved Swift Package dependency missing: {identity}")
+if errors:
+    print("\n".join(errors), file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+
+require_package_source_inputs
+
+
 if [[ "$RELEASE_MODE" == "1" ]]; then
   [[ "$ALLOW_DIRTY" != "1" ]] || fail "--allow-dirty is only for non-release builds."
   require_release_version_unpublished
@@ -347,9 +448,6 @@ printf '%s\n' "$BRANCH" > "$MACPAY/SOURCE_BRANCH"
 printf '%s\n' "$SOURCE_DIRTY" > "$MACPAY/SOURCE_DIRTY"
 cp "$SOURCE_ROOT/mac/companiond/"*.py "$MACPAY/companiond/"
 APP_ATTEST_VALIDATOR="$SOURCE_ROOT/relay/app_attest_validator.py"
-if [[ ! -f "$APP_ATTEST_VALIDATOR" ]]; then
-  APP_ATTEST_VALIDATOR="$SOURCE_ROOT/mac/companiond/app_attest_validator.py"
-fi
 if [[ ! -f "$APP_ATTEST_VALIDATOR" || \
       ! -f "$SOURCE_ROOT/mac/companiond/apple-app-attest-root-ca.pem" || \
       ! -f "$SOURCE_ROOT/mac/companiond/relay-claim-2026-07-v1.pem" ]]; then
@@ -361,6 +459,36 @@ cp "$SOURCE_ROOT/mac/companiond/apple-app-attest-root-ca.pem" "$MACPAY/companion
 cp "$SOURCE_ROOT/mac/companiond/relay-claim-2026-07-v1.pem" "$MACPAY/companiond/"
 cp "$SOURCE_ROOT/mac/companiond/providers/"*.py "$MACPAY/companiond/providers/"
 cp "$SOURCE_ROOT/mac/companiond/providers/"*.json "$MACPAY/companiond/providers/"
+python3 "$SOURCE_ROOT/mac/install/verify-runtime-package-manifest.py" \
+  --stage-provider-runtime-assets "$SOURCE_ROOT/mac/companiond/providers" \
+  "$MACPAY/companiond/providers" \
+  || fail "could not stage the reviewed provider runtime asset inventory"
+cp "$SOURCE_ROOT/thoughts/shared/specs/coding-agent-remote-control-capability-map.json" \
+  "$MACPAY/companiond/providers/provider-control-capability-map.json"
+python3 - "$SOURCE_ROOT/mac/companiond/providers/operations.py" \
+  "$MACPAY/companiond/providers/reviewed-operation-manifest.json" \
+  "$SOURCE_ROOT" "$REVISION" <<'PY'
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+output = Path(sys.argv[2])
+source_root = Path(sys.argv[3])
+source_revision = sys.argv[4]
+spec = importlib.util.spec_from_file_location("_pairling_packaged_operations", source)
+if spec is None or spec.loader is None:
+    raise SystemExit("cannot load reviewed provider operation module")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+payload = module.release_operation_manifest_payload(
+    source_revision=source_revision,
+    source_root=source_root,
+)
+output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
 cp "$SOURCE_ROOT/mac/companiond/integrations/__init__.py" "$MACPAY/companiond/integrations/"
 cp "$SOURCE_ROOT/mac/companiond/integrations/aperture_cli/"*.py "$MACPAY/companiond/integrations/aperture_cli/"
 cp "$SOURCE_ROOT/mac/mcp/"*.py "$MACPAY/mcp/"
@@ -626,6 +754,53 @@ release_evidence_field() {
   esac
 }
 
+stage_provider_sdks() {
+  local arch="$1" runtime_dir="$2"
+  local source="$SOURCE_ROOT/npm/provider-sdks"
+  local install_root="$WORK/provider-sdks-$arch"
+  local dest="$runtime_dir/provider-sdks"
+  if [[ -L "$source" || ! -d "$source" || \
+        -L "$source/package.json" || ! -f "$source/package.json" || \
+        -L "$source/package-lock.json" || ! -f "$source/package-lock.json" ]]; then
+    fail "reviewed provider SDK lock/config is missing or linked"
+  fi
+  mkdir -m 700 "$install_root"
+  cp "$source/package.json" "$source/package-lock.json" "$install_root/"
+  python3 "$SOURCE_ROOT/mac/install/verify-runtime-package-manifest.py" \
+    --provider-sdk-lock "$install_root" \
+    || fail "provider SDK dependency lock/config is not the reviewed contract"
+  (
+    cd "$install_root"
+    npm_config_ignore_scripts=true \
+      npm_config_audit=false \
+      npm_config_fund=false \
+      npm_config_update_notifier=false \
+      npm_config_cache="$WORK/npm-cache" \
+      npm ci \
+        --ignore-scripts \
+        --omit=peer \
+        --omit=dev \
+        --no-audit \
+        --no-fund \
+        --no-bin-links \
+        --os=darwin \
+        --cpu="$arch"
+  ) || fail "could not materialize the reviewed inert provider SDK closure for $arch"
+  python3 "$SOURCE_ROOT/mac/install/verify-runtime-package-manifest.py" \
+    --sanitize-provider-sdks "$install_root/node_modules" "$arch" \
+    || fail "provider SDK lifecycle script inventory is not the reviewed inert contract for $arch"
+
+  mkdir -p "$dest/packages"
+  cp "$source/package.json" "$dest/package.json"
+  cp "$source/package-lock.json" "$dest/npm-shrinkwrap.json"
+  /bin/cp -R "$install_root/node_modules/." "$dest/packages/"
+  rm -f "$dest/packages/.package-lock.json"
+  python3 "$SOURCE_ROOT/mac/install/verify-runtime-package-manifest.py" \
+    --provider-sdks "$dest" "$arch" \
+    || fail "provider SDK payload failed the reviewed package/integrity/architecture contract for $arch"
+}
+
+
 stage_runtime() {
   local arch="$1" binary="$2" prebuilt_python="$3"
   local dir="$STAGE/runtime-darwin-$arch"
@@ -634,6 +809,7 @@ stage_runtime() {
   cp "$SOURCE_ROOT/npm/runtime-darwin-$arch/README.md" "$dir/README.md"
   cp "$binary" "$dir/bin/pairling-connectd"
   chmod 755 "$dir/bin/pairling-connectd"
+  stage_provider_sdks "$arch" "$dir"
 
   # P3 CPython. Custody rule (same as connectd): the Developer ID signing only
   # happens on the release Mac. A prebuilt python tarball (already signed +
@@ -716,7 +892,7 @@ def sha_file(path):
 
 files = []
 directories = []
-tops = [root / "bin"]
+tops = [root / "bin", root / "provider-sdks"]
 if (root / "python").exists():
     tops.append(root / "python")
 for top in tops:
