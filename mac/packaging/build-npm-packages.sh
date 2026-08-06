@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 # Builds the three Pairling npm packages:
 #   pairling                        (CLI shim + source payload + integrity manifest)
@@ -270,7 +271,7 @@ require_release_artifact_evidence() {
 }
 
 require_package_source_inputs() {
-  PYTHONDONTWRITEBYTECODE=1 python3 - "$REPO_ROOT" <<'PY' || fail "compile/package source inputs are incomplete or unreviewed"
+  python3 - "$REPO_ROOT" <<'PY' || fail "compile/package source inputs are incomplete or unreviewed"
 import hashlib
 import importlib.util
 import sys
