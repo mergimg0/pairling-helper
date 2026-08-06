@@ -130,10 +130,6 @@ PACKAGED_SOURCE_PATHS=(
   "npm"
   "relay/app_attest_validator.py"
   "thoughts/shared/specs/coding-agent-remote-control-capability-map.json"
-  "project.yml"
-  "Pairling.xcodeproj/project.pbxproj"
-  "Pairling.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
-  "Pairling/Frameworks/PairlingTailnet.xcframework"
 )
 SOURCE_DIRTY="false"
 if git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 && \
@@ -277,7 +273,6 @@ require_package_source_inputs() {
   python3 - "$REPO_ROOT" <<'PY' || fail "compile/package source inputs are incomplete or unreviewed"
 import hashlib
 import importlib.util
-import json
 import sys
 from pathlib import Path
 
@@ -303,62 +298,11 @@ for name, digest in verifier.PROVIDER_RUNTIME_ASSET_DIGESTS.items():
     ):
         errors.append(f"native provider runtime asset missing or unreviewed: {name}")
 
-required_inputs = (
-    "relay/app_attest_validator.py",
-    "Pairling/Frameworks/PairlingTailnet.xcframework/Info.plist",
-    "Pairling/Frameworks/PairlingTailnet.xcframework/ios-arm64/PairlingTailnet.framework/Info.plist",
-    "Pairling/Frameworks/PairlingTailnet.xcframework/ios-arm64/PairlingTailnet.framework/PairlingTailnet",
-    "Pairling/Frameworks/PairlingTailnet.xcframework/ios-arm64/PairlingTailnet.framework/Modules/module.modulemap",
-    "Pairling/Frameworks/PairlingTailnet.xcframework/ios-arm64/PairlingTailnet.framework/Headers/PairlingTailnet.h",
-    "Pairling/Frameworks/PairlingTailnet.xcframework/ios-arm64_x86_64-simulator/PairlingTailnet.framework/Info.plist",
-    "Pairling/Frameworks/PairlingTailnet.xcframework/ios-arm64_x86_64-simulator/PairlingTailnet.framework/PairlingTailnet",
-    "Pairling/Frameworks/PairlingTailnet.xcframework/ios-arm64_x86_64-simulator/PairlingTailnet.framework/Modules/module.modulemap",
-    "Pairling/Frameworks/PairlingTailnet.xcframework/ios-arm64_x86_64-simulator/PairlingTailnet.framework/Headers/PairlingTailnet.h",
-)
+required_inputs = ("relay/app_attest_validator.py",)
 for relative in required_inputs:
     path = root / relative
     if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
-        errors.append(f"relay/framework input missing or unsafe: {relative}")
-
-try:
-    project_yml = (root / "project.yml").read_text(encoding="utf-8")
-    project_file = (root / "Pairling.xcodeproj/project.pbxproj").read_text(
-        encoding="utf-8"
-    )
-    resolved = json.loads(
-        (
-            root
-            / "Pairling.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
-        ).read_text(encoding="utf-8")
-    )
-except Exception as exc:
-    errors.append(f"Swift Package release inputs are unreadable: {exc}")
-else:
-    products = {
-        "MarkdownUI",
-        "Splash",
-        "NIOSSH",
-        "NIOCore",
-        "NIOHTTP1",
-        "NIOPosix",
-        "NIOEmbedded",
-    }
-    for product in products:
-        if (
-            f"product: {product}" not in project_yml
-            and f"- package: {product}" not in project_yml
-        ):
-            errors.append(f"project.yml Swift Package product missing: {product}")
-        if f"productName = {product};" not in project_file:
-            errors.append(f"Xcode Swift Package product missing: {product}")
-    resolved_ids = {
-        str(row.get("identity") or "")
-        for row in resolved.get("pins", [])
-        if isinstance(row, dict)
-    }
-    for identity in {"swift-markdown-ui", "splash", "swift-nio-ssh", "swift-nio"}:
-        if identity not in resolved_ids:
-            errors.append(f"resolved Swift Package dependency missing: {identity}")
+        errors.append(f"package source input missing or unsafe: {relative}")
 if errors:
     print("\n".join(errors), file=sys.stderr)
     raise SystemExit(1)
