@@ -163,6 +163,10 @@ jobs:
             echo "publishing $pkg@$VERSION --tag $CHANNEL"
             npm publish "$tarball" --provenance --access public --tag "$CHANNEL"
           }
+          publish_new "@pairling/runtime-claude-darwin-arm64" "dist/npm/pairling-runtime-claude-darwin-arm64-$VERSION.tgz"
+          publish_new "@pairling/runtime-claude-darwin-x64" "dist/npm/pairling-runtime-claude-darwin-x64-$VERSION.tgz"
+          publish_new "@pairling/runtime-copilot-darwin-arm64" "dist/npm/pairling-runtime-copilot-darwin-arm64-$VERSION.tgz"
+          publish_new "@pairling/runtime-copilot-darwin-x64" "dist/npm/pairling-runtime-copilot-darwin-x64-$VERSION.tgz"
           publish_new "@pairling/runtime-darwin-arm64" "dist/npm/pairling-runtime-darwin-arm64-$VERSION.tgz"
           publish_new "@pairling/runtime-darwin-x64" "dist/npm/pairling-runtime-darwin-x64-$VERSION.tgz"
           publish_new "pairling" "dist/npm/pairling-$VERSION.tgz"

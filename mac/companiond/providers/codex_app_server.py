@@ -38,6 +38,8 @@ _MAX_TEXT_FIELD_BYTES = 64 * 1024
 _MAX_EVENTS = 512
 _MAX_RAW_DIAGNOSTIC_EVENTS = 8
 _MAX_PENDING_REQUESTS = 32
+_MAX_INTERACTIVE_REQUESTS_PER_WINDOW = 32
+_INTERACTIVE_REQUEST_WINDOW_SECONDS = 10.0
 
 # Every outbound app-server method is named here. There is intentionally no
 # public dynamic-RPC entry point and no auth, command/exec, filesystem, config
@@ -444,6 +446,7 @@ class _CodexAppServerProcess:
         self._pending: dict[str, _PendingRequest] = {}
         self._approvals: dict[str | int, _ApprovalRequest] = {}
         self._questions: dict[str | int, _QuestionRequest] = {}
+        self._interactive_request_times: deque[float] = deque()
         self._events: deque[dict[str, Any]] = deque(maxlen=_MAX_EVENTS)
         self._raw_events: deque[dict[str, Any]] = deque(
             maxlen=_MAX_RAW_DIAGNOSTIC_EVENTS
@@ -525,6 +528,7 @@ class _CodexAppServerProcess:
                 self._provider_version = None
                 self._approvals.clear()
                 self._questions.clear()
+                self._interactive_request_times.clear()
                 self._current_turn_id = None
                 self._current_item_id = None
                 self._turn_active = False
@@ -837,12 +841,42 @@ class _CodexAppServerProcess:
         else:
             self._handle_notification(method, params, message)
 
+    def _admit_interactive_request(self) -> bool:
+        now = time.monotonic()
+        cutoff = now - _INTERACTIVE_REQUEST_WINDOW_SECONDS
+        with self._state_lock:
+            while (
+                self._interactive_request_times
+                and self._interactive_request_times[0] <= cutoff
+            ):
+                self._interactive_request_times.popleft()
+            if (
+                len(self._interactive_request_times)
+                >= _MAX_INTERACTIVE_REQUESTS_PER_WINDOW
+                or len(self._approvals) + len(self._questions)
+                >= _MAX_INTERACTIVE_REQUESTS_PER_WINDOW
+            ):
+                return False
+            self._interactive_request_times.append(now)
+            return True
+
+
     def _handle_server_request(
         self,
         method: str,
         request_id: str | int,
         params: Mapping[str, Any],
     ) -> None:
+        if method in _QUESTION_METHODS or method in _APPROVAL_METHODS:
+            if not self._admit_interactive_request():
+                self._write_message({
+                    "id": request_id,
+                    "error": {
+                        "code": -32000,
+                        "message": "Provider interactive request rate limit reached",
+                    },
+                })
+                return
         if method in _QUESTION_METHODS:
             self._handle_question_request(request_id, params)
             return

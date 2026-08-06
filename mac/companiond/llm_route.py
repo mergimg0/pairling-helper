@@ -7,6 +7,7 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from providers.base import managed_child_environment
 
 
 HOME = Path.home()
@@ -98,6 +99,7 @@ def run_local_llm(
             text=True,
             timeout=timeout_seconds,
             cwd="/tmp",
+            env=managed_child_environment(),
         )
     except subprocess.TimeoutExpired as exc:
         raise LLMRouteError(f"{family}_cli_timeout", f"{family} CLI timeout", 504) from exc

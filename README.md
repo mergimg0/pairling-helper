@@ -20,10 +20,14 @@ npm/                      Sources of the published packages
   pairling/               CLI shim + payload (the package users install)
   runtime-darwin-arm64/   @pairling/runtime-darwin-arm64 (signed binaries)
   runtime-darwin-x64/     @pairling/runtime-darwin-x64
+  runtime-claude-darwin-arm64/  Claude Agent SDK native component
+  runtime-claude-darwin-x64/    Claude Agent SDK native component
+  runtime-copilot-darwin-arm64/ Copilot CLI native component
+  runtime-copilot-darwin-x64/   Copilot CLI native component
   pairling-helper/        Brand-protection redirect package
   pairlingd/              Brand-protection redirect package
 mac/                      The runtime payload sources (daemon, installer, CLI)
-mac/packaging/build-npm-packages.sh   Assembles and packs the three packages
+mac/packaging/build-npm-packages.sh   Assembles and packs the seven packages
 .github/workflows/release-npm.yml     OIDC publish with provenance
 RELEASE-BINARIES.json     Schema 5 evidence for the source revision, exact
                           mirror source tree, code identity, asset digests, and

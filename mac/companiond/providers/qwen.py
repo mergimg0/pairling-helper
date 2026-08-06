@@ -198,7 +198,15 @@ def _find_package_root(entry: Path, package_name: str) -> Path | None:
 
 def _run_version(command: list[str], code: str) -> str:
     try:
-        proc = subprocess.run(command, capture_output=True, text=True, timeout=4, check=False)
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=4,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env=managed_child_environment(),
+        )
     except Exception as exc:
         raise QwenUnavailableError(code) from exc
     if proc.returncode != 0:

@@ -2,14 +2,15 @@
 """Render Pairling launchd plists with absolute runtime paths."""
 
 from __future__ import annotations
+import argparse
+import hashlib
+import hmac
 import json
 import os
+import plistlib
 import re
 import stat
 import subprocess
-
-import argparse
-import plistlib
 from pathlib import Path
 
 PAIRLING_DAEMON_LABEL = "dev.pairling.companiond"
@@ -173,10 +174,13 @@ def verified_copilot_paths() -> tuple[Path, Path] | None:
     return sdk_root, cli_binary
 
 
-def verified_node_binary() -> Path | None:
+def verified_node_binary() -> tuple[Path, str] | None:
     raw = os.environ.get("PAIRLING_NODE_BIN")
-    if not raw:
+    expected_digest = os.environ.get("PAIRLING_NODE_SHA256", "").lower()
+    if not raw and not expected_digest:
         return None
+    if not raw or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None:
+        raise ValueError("Pairling Node path and SHA256 must be configured together")
     binary = Path(raw).expanduser()
     if (
         not binary.is_absolute()
@@ -185,7 +189,17 @@ def verified_node_binary() -> Path | None:
         or not os.access(binary, os.X_OK)
     ):
         raise ValueError("Pairling Node binary must be an absolute executable real file")
-    return binary.resolve(strict=True)
+    metadata = binary.stat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid not in {0, os.getuid()}
+        or metadata.st_mode & 0o022
+    ):
+        raise ValueError("Pairling Node binary permissions are unsafe")
+    actual_digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    if not hmac.compare_digest(actual_digest, expected_digest):
+        raise ValueError("Pairling Node binary does not match its pinned SHA256")
+    return binary.resolve(strict=True), expected_digest
 
 
 
@@ -227,9 +241,11 @@ def daemon_plist(
         copilot_sdk_root, copilot_binary = copilot_paths
         env["PAIRLING_COPILOT_SDK_ROOT"] = str(copilot_sdk_root)
         env["PAIRLING_COPILOT_BIN"] = str(copilot_binary)
-    node_binary = verified_node_binary()
-    if node_binary is not None:
+    node_identity = verified_node_binary()
+    if node_identity is not None:
+        node_binary, node_sha256 = node_identity
         env["PAIRLING_NODE_BIN"] = str(node_binary)
+        env["PAIRLING_NODE_SHA256"] = node_sha256
     return {
         "Label": PAIRLING_DAEMON_LABEL,
         "ProgramArguments": [

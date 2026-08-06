@@ -21,9 +21,10 @@ from .base import (
     ProviderDescriptor,
     ProviderDiagnostics,
     ProviderProbeResult,
-    managed_child_environment,
     cli_version,
+    managed_child_environment,
     resolve_executable,
+    resolve_pinned_executable,
 )
 from ._sidecar_process import close_owned_process
 from .controls import (
@@ -51,6 +52,8 @@ _MAX_ATTACHMENT_COUNT = 8
 _MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024
 _MAX_ATTACHMENTS_BYTES = 8 * 1024 * 1024
 _MAX_TEXT_BYTES = 64 * 1024
+_MAX_INTERACTIVE_REQUESTS_PER_WINDOW = 32
+_INTERACTIVE_REQUEST_WINDOW_SECONDS = 10.0
 
 _ALLOWED_SIDECAR_OPERATIONS = frozenset(
     {
@@ -298,6 +301,7 @@ class _CopilotSDKSidecarProcess:
         handshake_timeout: float = 10.0,
         expected_cli_version: str = _SUPPORTED_CLI_VERSION,
         max_line_bytes: int = _MAX_LINE_BYTES,
+        require_pinned_node: bool = False,
     ):
         if not argv or any(not isinstance(part, str) or not part for part in argv):
             raise ValueError("Copilot SDK sidecar argv must contain non-empty strings")
@@ -313,6 +317,7 @@ class _CopilotSDKSidecarProcess:
         self._request_timeout = request_timeout
         self._handshake_timeout = handshake_timeout
         self._expected_cli_version = expected_cli_version
+        self._require_pinned_node = require_pinned_node
         self._max_line_bytes = max_line_bytes
         self._state_lock = threading.RLock()
         self._write_lock = threading.Lock()
@@ -322,6 +327,7 @@ class _CopilotSDKSidecarProcess:
         self._pending: dict[str, _PendingResponse] = {}
         self._approvals: dict[str, _PendingApproval] = {}
         self._events: deque[dict[str, Any]] = deque(maxlen=_MAX_EVENT_COUNT)
+        self._interactive_request_times: deque[float] = deque()
         self._next_request_id = 0
         self._generation = 0
         self._cursor = 0
@@ -349,6 +355,19 @@ class _CopilotSDKSidecarProcess:
                     return
                 if self._process is not None:
                     raise CopilotSDKUnavailable("Copilot SDK sidecar is still starting")
+                if self._require_pinned_node:
+                    pinned_node = resolve_pinned_executable(
+                        "node",
+                        path_env_var="PAIRLING_NODE_BIN",
+                        sha256_env_var="PAIRLING_NODE_SHA256",
+                    )
+                    if (
+                        pinned_node is None
+                        or pinned_node.path != Path(self._argv[0])
+                    ):
+                        raise CopilotSDKUnavailable(
+                            "Pairling's pinned Node runtime failed integrity verification"
+                        )
                 try:
                     process = subprocess.Popen(
                         self._argv,
@@ -365,6 +384,7 @@ class _CopilotSDKSidecarProcess:
                     raise CopilotSDKUnavailable("Copilot SDK sidecar did not expose stdio")
                 self._process = process
                 self._generation += 1
+                self._interactive_request_times.clear()
                 reader = threading.Thread(
                     target=self._reader_loop,
                     args=(process,),
@@ -622,6 +642,24 @@ class _CopilotSDKSidecarProcess:
             pending.error = CopilotSidecarRPCError(code, detail)
         pending.completed.set()
 
+    def _admit_interactive_request(self) -> bool:
+        now = time.monotonic()
+        cutoff = now - _INTERACTIVE_REQUEST_WINDOW_SECONDS
+        with self._state_lock:
+            while (
+                self._interactive_request_times
+                and self._interactive_request_times[0] <= cutoff
+            ):
+                self._interactive_request_times.popleft()
+            if (
+                len(self._interactive_request_times)
+                >= _MAX_INTERACTIVE_REQUESTS_PER_WINDOW
+                or len(self._approvals) >= _MAX_INTERACTIVE_REQUESTS_PER_WINDOW
+            ):
+                return False
+            self._interactive_request_times.append(now)
+            return True
+
     def _handle_event(self, event: Any) -> None:
         if not isinstance(event, Mapping):
             raise CopilotSidecarProtocolError("Copilot SDK event is not an object")
@@ -631,6 +669,10 @@ class _CopilotSDKSidecarProcess:
         payload = event.get("payload", {})
         if event_id is None or session_id is None or kind is None or not isinstance(payload, Mapping):
             raise CopilotSidecarProtocolError("Copilot SDK event lacks a safe identity")
+        if kind == "permission.requested" and not self._admit_interactive_request():
+            raise CopilotSidecarProtocolError(
+                "Copilot provider interactive request rate limit reached"
+            )
         safe_payload = _safe_public_result(payload)
         with self._state_lock:
             self._cursor += 1
@@ -684,6 +726,7 @@ class _CopilotSDKSidecarProcess:
             self._handshake = None
             self._generation += 1
             self._approvals.clear()
+            self._interactive_request_times.clear()
             pending = tuple(self._pending.values())
             self._pending.clear()
         for waiter in pending:
@@ -1800,7 +1843,11 @@ class CopilotProviderAdapter(ProviderAdapter):
         version_output = cli_version(resolved.path) if resolved else None
         installed = resolved is not None
         compatible_cli = is_compatible_copilot_cli_version(version_output)
-        node = resolve_executable("node", self.node_candidates, env_var="PAIRLING_NODE_BIN")
+        node = resolve_pinned_executable(
+            "node",
+            path_env_var="PAIRLING_NODE_BIN",
+            sha256_env_var="PAIRLING_NODE_SHA256",
+        )
         notes: list[str] = []
         setup_actions: list[str] = []
         if not installed:
@@ -1867,7 +1914,11 @@ class CopilotProviderAdapter(ProviderAdapter):
             return None
         env_var = _ENTRY.env_override if _ENTRY is not None else "PAIRLING_COPILOT_BIN"
         cli = resolve_executable("copilot", self.candidates, env_var=env_var)
-        node = resolve_executable("node", self.node_candidates, env_var="PAIRLING_NODE_BIN")
+        node = resolve_pinned_executable(
+            "node",
+            path_env_var="PAIRLING_NODE_BIN",
+            sha256_env_var="PAIRLING_NODE_SHA256",
+        )
         if cli is None or node is None or not is_compatible_copilot_cli_version(cli_version(cli.path)):
             return None
         try:
@@ -1892,6 +1943,7 @@ class CopilotProviderAdapter(ProviderAdapter):
             str(self.home / ".copilot"),
         )
         process = _CopilotSDKSidecarProcess(
+            require_pinned_node=True,
             argv=argv,
             expected_cli_version=binding.provider_version,
         )

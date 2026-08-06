@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
+import stat
 import subprocess
-import time
 import threading
+import time
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -342,6 +345,52 @@ def resolve_executable(name: str, known: Iterable[Path | str], env_var: str | No
         if candidate.exists() and os.access(candidate, os.X_OK):
             return ResolvedExecutable(candidate, source)
     return None
+def resolve_pinned_executable(
+    name: str,
+    *,
+    path_env_var: str,
+    sha256_env_var: str,
+) -> ResolvedExecutable | None:
+    raw_path = os.environ.get(path_env_var, "").strip()
+    expected_digest = os.environ.get(sha256_env_var, "").strip().lower()
+    if (
+        not raw_path
+        or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+    ):
+        return None
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        return None
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            candidate,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid not in {0, os.getuid()}
+            or metadata.st_mode & 0o022
+            or not os.access(candidate, os.X_OK)
+        ):
+            return None
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not hmac.compare_digest(digest.hexdigest(), expected_digest):
+        return None
+    return ResolvedExecutable(candidate, f"pinned:{path_env_var}")
+
+
 
 
 def cli_version(
@@ -378,6 +427,8 @@ def cli_version(
             capture_output=True,
             text=True,
             timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            env=managed_child_environment(),
         )
     except Exception:
         value = None
@@ -417,7 +468,14 @@ def command_line_count(bin_path: Path | str | None, args: list[str], timeout: in
     if not bin_path:
         return None
     try:
-        proc = subprocess.run([str(bin_path), *args], capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(
+            [str(bin_path), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            env=managed_child_environment(),
+        )
     except Exception:
         return None
     text = (proc.stdout or proc.stderr or "").strip()

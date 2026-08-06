@@ -71,6 +71,19 @@ function stagedRuntimeVersion() {
   }
 }
 
+function resolvePackageRoot(name) {
+  try {
+    const require = createRequire(import.meta.url);
+    return dirname(require.resolve(`${name}/package.json`));
+  } catch {
+    return null;
+  }
+}
+
+function runtimeArchitecture() {
+  return process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "x64" : null;
+}
+
 function runtimePackageDir() {
   // Test/dev hook only. The installer independently re-verifies the binary's
   // Developer ID signature and TeamID before staging, so this override cannot
@@ -79,17 +92,46 @@ function runtimePackageDir() {
   if (override) {
     return existsSync(override) ? override : null;
   }
-  const arch = process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "x64" : null;
-  if (!arch) {
-    return null;
+  const architecture = runtimeArchitecture();
+  return architecture
+    ? resolvePackageRoot(`@pairling/runtime-darwin-${architecture}`)
+    : null;
+}
+
+function runtimeComponentPackageDirs() {
+  const architecture = runtimeArchitecture();
+  if (!architecture) {
+    return [];
   }
-  try {
-    const require = createRequire(import.meta.url);
-    const manifest = require.resolve(`@pairling/runtime-darwin-${arch}/package.json`);
-    return dirname(manifest);
-  } catch {
-    return null;
+  const definitions = [
+    {
+      provider: "claude",
+      label: "Claude runtime component",
+      override: "PAIRLING_RUNTIME_CLAUDE_PACKAGE_DIR",
+      packageName: `@pairling/runtime-claude-darwin-${architecture}`,
+      targetPrefix: `provider-sdks/packages/@anthropic-ai/claude-agent-sdk-darwin-${architecture}`,
+    },
+    {
+      provider: "copilot",
+      label: "Copilot runtime component",
+      override: "PAIRLING_RUNTIME_COPILOT_PACKAGE_DIR",
+      packageName: `@pairling/runtime-copilot-darwin-${architecture}`,
+      targetPrefix: `provider-sdks/packages/@github/copilot-darwin-${architecture}`,
+    },
+  ];
+  const hasExplicitComponent = definitions.some(({ override }) => process.env[override]);
+  if (process.env.PAIRLING_RUNTIME_PACKAGE_DIR && !hasExplicitComponent) {
+    return [];
   }
+  return definitions.map((definition) => {
+    const override = process.env[definition.override];
+    return {
+      ...definition,
+      root: override
+        ? (existsSync(override) ? override : null)
+        : resolvePackageRoot(definition.packageName),
+    };
+  });
 }
 
 
@@ -345,6 +387,41 @@ function requireExactInventory(expected, actual, label, { packageModePolicy = fa
   }
 }
 
+function manifestEntriesMatch(left, right) {
+  return (
+    left?.kind === right?.kind &&
+    left?.target === right?.target &&
+    left?.sha256 === right?.sha256 &&
+    left?.mode === right?.mode
+  );
+}
+
+function verifyRuntimeSources(integrity) {
+  if (sha256(readFileSync(join(integrity.runtimeRoot, "manifest.json"))) !== integrity.runtimeDocument.digest) {
+    throw new Error("runtime package manifest changed after verification");
+  }
+  const coreActual = inventory(integrity.runtimeRoot, integrity.runtimePrefixes, {
+    rejectBytecode: true,
+  });
+  rejectExtendedAcls(integrity.runtimeRoot, "runtime package");
+  requireExactInventory(integrity.runtimeCoreEntries, coreActual, "runtime package", {
+    packageModePolicy: true,
+  });
+  for (const component of integrity.runtimeComponents) {
+    if (
+      sha256(readFileSync(join(component.root, "component-manifest.json"))) !==
+      component.document.digest
+    ) {
+      throw new Error(`${component.label} manifest changed after verification`);
+    }
+    const actual = inventory(component.root, ["payload"], { rejectBytecode: true });
+    rejectExtendedAcls(join(component.root, "payload"), component.label);
+    requireExactInventory(component.sourceEntries, actual, component.label, {
+      packageModePolicy: true,
+    });
+  }
+}
+
 function verifyPackageIntegrity(env) {
   const packageVersion = readPackageVersion();
   const payloadDocument = readJsonDocument(
@@ -404,7 +481,7 @@ function verifyPackageIntegrity(env) {
     "runtime package manifest",
   );
   const runtimeManifest = runtimeDocument.parsed;
-  const architecture = process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "x64" : null;
+  const architecture = runtimeArchitecture();
   const platformKey = architecture ? `darwin-${architecture}` : null;
   if (
     runtimeManifest.schema_version !== 2 ||
@@ -426,6 +503,66 @@ function verifyPackageIntegrity(env) {
     allowedPrefixes: ["bin", "python", "provider-sdks"],
   });
   const runtimeEntries = mergeExpected(runtimeExpected, runtimeDirectories);
+  const runtimeCoreEntries = new Map(runtimeEntries);
+  const runtimeComponents = [];
+  for (const definition of env.runtimeComponents) {
+    const componentDocument = readJsonDocument(
+      join(definition.root, "component-manifest.json"),
+      `${definition.label} manifest`,
+    );
+    const componentManifest = componentDocument.parsed;
+    if (
+      componentManifest.schema_version !== 1 ||
+      componentManifest.package !== definition.packageName ||
+      componentManifest.package_version !== packageVersion ||
+      componentManifest.source_revision !== payloadManifest.source_revision ||
+      componentManifest.architecture !== architecture ||
+      componentManifest.provider !== definition.provider ||
+      componentManifest.runtime_manifest_sha256 !== runtimeDocument.digest ||
+      componentManifest.target_prefix !== definition.targetPrefix
+    ) {
+      throw new Error(`${definition.label} identity does not match the Pairling runtime`);
+    }
+    const sourceFiles = expectedEntries(componentManifest.files, {
+      requiredPrefix: "payload",
+      rejectBytecode: true,
+      requireMode: true,
+    });
+    const sourceDirectories = expectedDirectories(componentManifest.directories, {
+      requiredPrefix: "payload",
+    });
+    const sourceEntries = mergeExpected(sourceFiles, sourceDirectories);
+    const targetEntries = new Map();
+    for (const [sourcePath, sourceEntry] of sourceEntries) {
+      const suffix = sourcePath === "payload" ? "" : sourcePath.slice("payload/".length);
+      const targetPath = suffix
+        ? `${definition.targetPrefix}/${suffix}`
+        : definition.targetPrefix;
+      const runtimeEntry = runtimeCoreEntries.get(targetPath);
+      if (!runtimeEntry || !manifestEntriesMatch(sourceEntry, runtimeEntry)) {
+        throw new Error(
+          `${definition.label} entry is not bound to the runtime manifest: ${targetPath}`,
+        );
+      }
+      targetEntries.set(targetPath, { ...runtimeEntry, sourcePath });
+      runtimeCoreEntries.delete(targetPath);
+    }
+    const component = {
+      ...definition,
+      document: componentDocument,
+      manifest: componentManifest,
+      sourceEntries,
+      targetEntries,
+    };
+    const componentActual = inventory(definition.root, ["payload"], {
+      rejectBytecode: true,
+    });
+    rejectExtendedAcls(join(definition.root, "payload"), definition.label);
+    requireExactInventory(sourceEntries, componentActual, definition.label, {
+      packageModePolicy: true,
+    });
+    runtimeComponents.push(component);
+  }
   const prefixes = ["bin", "provider-sdks"];
   if (existsSync(join(env.runtimePackageDir, "python"))) {
     prefixes.push("python");
@@ -434,7 +571,7 @@ function verifyPackageIntegrity(env) {
     rejectBytecode: true,
   });
   rejectExtendedAcls(env.runtimePackageDir, "runtime package");
-  requireExactInventory(runtimeEntries, runtimeActual, "runtime package", {
+  requireExactInventory(runtimeCoreEntries, runtimeActual, "runtime package", {
     packageModePolicy: true,
   });
 
@@ -474,11 +611,13 @@ function verifyPackageIntegrity(env) {
     throw new Error("runtime Python archive identity exists without vendored Python");
   }
 
-  return {
+  const integrity = {
     architecture,
     payloadDocument,
     payloadEntries,
     payloadManifest,
+    runtimeComponents,
+    runtimeCoreEntries,
     runtimeDocument,
     runtimeEntries,
     runtimeManifest,
@@ -487,6 +626,8 @@ function verifyPackageIntegrity(env) {
     runtimeConnectd,
     runtimePython,
   };
+  verifyRuntimeSources(integrity);
+  return integrity;
 }
 
 function commandResult(command, args, label) {
@@ -595,7 +736,8 @@ function copyManifestEntries(sourceRoot, destinationRoot, entries) {
       leftPath.localeCompare(rightPath);
   });
   for (const [path, entry] of sorted) {
-    const source = join(sourceRoot, ...path.split("/"));
+    const sourcePath = entry.sourcePath || path;
+    const source = join(sourceRoot, ...sourcePath.split("/"));
     const destination = join(destinationRoot, ...path.split("/"));
     const mode = Number.parseInt(entry.mode, 8);
     if (entry.kind === "directory") {
@@ -683,20 +825,7 @@ function verifySnapshot(snapshotPairling, snapshotRuntime, integrity, mode) {
     });
     rejectExtendedAcls(snapshotRuntime, "private runtime snapshot");
   } else if (mode === SNAPSHOT_MODE_PAYLOAD) {
-    const directRuntimeDocument = readJsonDocument(
-      join(snapshotRuntime, "manifest.json"),
-      "direct runtime package manifest",
-    );
-    if (directRuntimeDocument.digest !== integrity.runtimeDocument.digest) {
-      throw new Error("direct runtime package manifest changed during payload snapshot creation");
-    }
-    const directRuntimeActual = inventory(snapshotRuntime, integrity.runtimePrefixes, {
-      rejectBytecode: true,
-    });
-    requireExactInventory(integrity.runtimeEntries, directRuntimeActual, "direct runtime package", {
-      packageModePolicy: true,
-    });
-    rejectExtendedAcls(snapshotRuntime, "direct runtime package");
+    verifyRuntimeSources(integrity);
   } else {
     throw new Error(`unknown private package snapshot mode: ${mode}`);
   }
@@ -725,7 +854,18 @@ function createPrivatePackageSnapshot(integrity, mode) {
       { mode: 0o600 },
     );
     if (mode === SNAPSHOT_MODE_FULL) {
-      copyManifestEntries(integrity.runtimeRoot, snapshotRuntime, integrity.runtimeEntries);
+      copyManifestEntries(
+        integrity.runtimeRoot,
+        snapshotRuntime,
+        integrity.runtimeCoreEntries,
+      );
+      for (const component of integrity.runtimeComponents) {
+        copyManifestEntries(
+          component.root,
+          snapshotRuntime,
+          component.targetEntries,
+        );
+      }
       writeFileSync(
         join(snapshotRuntime, "manifest.json"),
         integrity.runtimeDocument.raw,
@@ -761,12 +901,14 @@ function shimEnv() {
   const runtimeDir = runtimePackageDir();
   const connectd = runtimeDir ? join(runtimeDir, "bin", "pairling-connectd") : null;
   const vendoredPython = runtimeDir ? join(runtimeDir, "python", "bin", "python3") : null;
+  const runtimeComponents = runtimeComponentPackageDirs();
   return {
     packageRoot,
     packageVersion: readPackageVersion(),
     payloadPresent: existsSync(payloadCli),
     payloadRoot,
     runtimePackageDir: runtimeDir,
+    runtimeComponents,
     connectdPath: connectd && existsSync(connectd) ? connectd : null,
     vendoredPython: vendoredPython && existsSync(vendoredPython) ? vendoredPython : null,
     stagedCli: stagedCliPath(),
@@ -815,6 +957,7 @@ function verifiedPackageEnvironment(pairlingRoot, runtimeRoot, integrity, snapsh
     PAIRLING_RUNTIME_PACKAGE_ROOT: runtimeRoot,
     PAIRLING_CLAUDE_AGENT_SDK_ROOT: "",
     PAIRLING_NODE_BIN: process.execPath,
+    PAIRLING_NODE_SHA256: sha256(readFileSync(process.execPath)),
     PAIRLING_SOURCE_REVISION: integrity.payloadManifest.source_revision,
     PAIRLING_SOURCE_DIRTY: integrity.payloadManifest.source_dirty ? "true" : "false",
     PAIRLING_CONNECTD_TEAM_ID: team,
@@ -876,16 +1019,19 @@ function main() {
 
   if (existsSync(payloadCli)) {
     const env = shimEnv();
+    const missingComponent = env.runtimeComponents.find((component) => !component.root);
     if (
       !env.runtimePackageDir ||
       !env.connectdPath ||
-      !env.vendoredPython
+      !env.vendoredPython ||
+      missingComponent
     ) {
       process.stderr.write(
         [
           "pairling: the platform runtime package is missing or incomplete.",
           "",
-          `Expected: @pairling/runtime-darwin-${process.arch === "arm64" ? "arm64" : "x64"}`,
+          `Expected: @pairling/runtime-darwin-${runtimeArchitecture()}` +
+            (missingComponent ? ` and ${missingComponent.packageName}` : ""),
           "",
           "This usually means npm skipped optional dependencies (network hiccup",
           "or --no-optional / --omit=optional). Fix with:",

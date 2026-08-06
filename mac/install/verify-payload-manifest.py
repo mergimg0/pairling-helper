@@ -573,6 +573,10 @@ def verify_package_json(path: Path, manifest: dict[str, object]) -> str | None:
         return f"cannot read package.json: {exc}"
     version = manifest.get("package_version")
     expected_optional = {
+        "@pairling/runtime-claude-darwin-arm64": version,
+        "@pairling/runtime-claude-darwin-x64": version,
+        "@pairling/runtime-copilot-darwin-arm64": version,
+        "@pairling/runtime-copilot-darwin-x64": version,
         "@pairling/runtime-darwin-arm64": version,
         "@pairling/runtime-darwin-x64": version,
     }

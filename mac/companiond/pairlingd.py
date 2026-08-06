@@ -436,6 +436,7 @@ except Exception:
 try:
     from providers.base import (
         TerminalLaunchProfile as _TerminalLaunchProfile,
+        managed_child_environment as _managed_child_environment,
         provider_detail_payload,
         provider_snapshot_payload,
     )
@@ -461,6 +462,7 @@ except Exception:
     provider_detail_payload = None
     provider_snapshot_payload = None
     _TerminalLaunchProfile = None
+    _managed_child_environment = None
     _provider_known_ids = None
     _provider_registry_descriptors = None
     _provider_registry_ids = None
@@ -473,6 +475,17 @@ except Exception:
     _catalog_annotate_first_seen = None
     _pending_review_collect = None
     _KeepAwakeManager = None
+
+
+def _provider_child_environment() -> dict[str, str]:
+    if _managed_child_environment is not None:
+        return _managed_child_environment(source=os.environ, home=str(HOME))
+    return {
+        "HOME": str(HOME),
+        "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
+        "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+    }
 
 try:
     from providers.controls import (
@@ -1129,6 +1142,7 @@ def _managed_session_rows(
     live_only: bool = False,
     active_within_min: int | None = None,
     limit: int = 500,
+    poll_live: bool = True,
 ) -> list[dict]:
     manager = _ensure_managed_provider_session_manager()
     if manager is None:
@@ -1139,7 +1153,7 @@ def _managed_session_rows(
             live_only=live_only,
             active_within_min=active_within_min,
             limit=limit,
-            poll_live=True,
+            poll_live=poll_live,
         )
     except Exception:
         return []
@@ -3946,10 +3960,14 @@ def _bearer_token(headers) -> str | None:
     return None
 
 
+def _client_address_host(client_address) -> str:
+    if isinstance(client_address, (tuple, list)) and client_address:
+        return str(client_address[0])
+    return str(client_address or "")
+
+
 def _loopback_client_address(client_address) -> bool:
-    if not client_address:
-        return False
-    return str(client_address[0]) in ("127.0.0.1", "::1")
+    return _client_address_host(client_address) in ("127.0.0.1", "::1")
 
 
 def _internal_route_probe_request(path: str, headers, client_address) -> bool:
@@ -4454,7 +4472,7 @@ def _reauth_rate_check(device_id: str, headers, client_address) -> tuple[bool, i
     if _pairdrop_gateway_provenance_ok(headers, client_address):
         origin = _connectd_peer_node_id(headers)
     if not origin:
-        origin = str(client_address[0] if client_address else "unknown")
+        origin = _client_address_host(client_address) or "unknown"
     origin_key = hashlib.sha256(origin.encode("utf-8")).hexdigest()
     target_key = hashlib.sha256(str(device_id or "").encode("utf-8")).hexdigest()
     allowed, retry_after = _request_rate_check(
@@ -10521,7 +10539,12 @@ _claude_terminal_scan_cache: dict[str, object] = {
 }
 _claude_terminal_scan_lock = threading.Lock()
 _sessions_membership_snapshot_lock = threading.Lock()
-_SESSION_MEMBERSHIP_PROVIDERS = frozenset({"claude", "codex"})
+_AMBIENT_SESSION_MEMBERSHIP_PROVIDERS = frozenset({"claude", "codex"})
+
+
+def _session_membership_provider_ids() -> set[str]:
+    """Providers whose complete live membership Pairling can materialize."""
+    return set(_agent_provider_ids())
 _SESSION_INVENTORY_FRESH_SECONDS = 5.0
 _SESSION_INVENTORY_REFRESH_WAIT_SECONDS = 4.0
 _sessions_inventory_bundle_lock = threading.Lock()
@@ -10555,10 +10578,11 @@ def _invalidate_sessions_provider_inventory(provider: str | None = None) -> None
     provider = str(provider or "").strip().lower()
     with _sessions_inventory_bundle_lock:
         stored = _sessions_inventory_bundle.get("inventories") or {}
+        membership_providers = _session_membership_provider_ids()
         targets = (
             {provider}
-            if provider in _SESSION_MEMBERSHIP_PROVIDERS
-            else set(_SESSION_MEMBERSHIP_PROVIDERS)
+            if provider in membership_providers
+            else membership_providers
         )
         for target in targets:
             inventory = stored.get(target)
@@ -11163,16 +11187,8 @@ def _claude_live_terminal_rows_locked(
 
 
 def _capture_sessions_provider_inventory(provider: str) -> dict:
-    """Capture one provider scan and its proof while holding one scan lock."""
-    if provider == "codex":
-        lock = _codex_terminal_scan_lock
-        cache = _codex_terminal_scan_cache
-        loader = _codex_live_terminal_rows_locked
-    elif provider == "claude":
-        lock = _claude_terminal_scan_lock
-        cache = _claude_terminal_scan_cache
-        loader = _claude_live_terminal_rows_locked
-    else:
+    """Capture one exact ambient and/or Pairling-owned provider generation."""
+    if provider not in _session_membership_provider_ids():
         return {
             "provider": provider,
             "rows": [],
@@ -11181,11 +11197,87 @@ def _capture_sessions_provider_inventory(provider: str) -> dict:
             "checked_at": _time.time(),
         }
 
-    with lock:
-        rows = loader(force_refresh=True)
+    managed_rows: list[dict] = []
+    manager = _ensure_managed_provider_session_manager()
+    if manager is None:
         return {
             "provider": provider,
-            "rows": copy.deepcopy(rows),
+            "rows": [],
+            "probe_state": "failed",
+            "probe_reason": "managed_session_inventory_unavailable",
+            "membership_complete": False,
+            "checked_at": _time.time(),
+        }
+    try:
+        managed_rows = manager.list_rows(
+            provider=provider,
+            live_only=True,
+            active_within_min=None,
+            limit=201,
+            poll_live=True,
+        )
+    except Exception as error:
+        return {
+            "provider": provider,
+            "rows": [],
+            "probe_state": "failed",
+            "probe_reason": (
+                "managed_session_inventory_failed:"
+                f"{type(error).__name__}"
+            ),
+            "membership_complete": False,
+            "checked_at": _time.time(),
+        }
+    if len(managed_rows) >= 201:
+        return {
+            "provider": provider,
+            "rows": copy.deepcopy(managed_rows),
+            "probe_state": "incomplete",
+            "probe_reason": "managed_session_inventory_truncated",
+            "membership_complete": False,
+            "checked_at": _time.time(),
+        }
+    if any(
+        not isinstance(row, dict)
+        or not bool(row.get("managed"))
+        or str(row.get("provider") or "").strip().lower() != provider
+        or row.get("closed_at") is not None
+        or str(row.get("lifecycle") or "")
+        not in {"launching", "running", "waiting", "blocked", "closing"}
+        for row in managed_rows
+    ):
+        return {
+            "provider": provider,
+            "rows": [],
+            "probe_state": "failed",
+            "probe_reason": "managed_session_inventory_invalid",
+            "membership_complete": False,
+            "checked_at": _time.time(),
+        }
+
+    if provider not in _AMBIENT_SESSION_MEMBERSHIP_PROVIDERS:
+        return {
+            "provider": provider,
+            "rows": copy.deepcopy(managed_rows),
+            "probe_state": "exact",
+            "membership_complete": True,
+            "checked_at": _time.time(),
+        }
+
+    if provider == "codex":
+        lock = _codex_terminal_scan_lock
+        cache = _codex_terminal_scan_cache
+        loader = _codex_live_terminal_rows_locked
+    else:
+        lock = _claude_terminal_scan_lock
+        cache = _claude_terminal_scan_cache
+        loader = _claude_live_terminal_rows_locked
+
+    with lock:
+        ambient_rows = loader(force_refresh=True)
+        return {
+            "provider": provider,
+            "rows": copy.deepcopy(ambient_rows) + copy.deepcopy(managed_rows),
             "probe_state": str(cache.get("probe_state") or "unknown"),
             "membership_complete": bool(cache.get("membership_complete")),
             # The scanner records its cache timestamp before slower process
@@ -11325,7 +11417,7 @@ def _sessions_provider_inventory_bundle(
     *,
     wait_timeout: float = 0.0,
 ) -> tuple[dict[str, dict], str, int, int]:
-    requested = set(requested) & set(_SESSION_MEMBERSHIP_PROVIDERS)
+    requested = set(requested) & _session_membership_provider_ids()
     if not requested:
         with _sessions_inventory_bundle_lock:
             generation = int(_sessions_inventory_bundle.get("generation") or 0)
@@ -11482,6 +11574,18 @@ def _session_inventory_terminal_matches_row(
         return False
     if row.get("closed_at") is not None:
         return False
+    if bool(terminal.get("managed")):
+        terminal_id = str(
+            terminal.get("id") or terminal.get("session_id") or ""
+        )
+        row_id = str(row.get("id") or row.get("session_id") or "")
+        return (
+            bool(row.get("managed"))
+            and bool(terminal_id)
+            and row_id == terminal_id
+            and str(row.get("native_id") or "")
+            == str(terminal.get("native_id") or "")
+        )
     try:
         terminal_pid = int(terminal.get("pid") or 0)
         row_pid = int(row.get("pid") or row.get("claude_pid") or 0)
@@ -12094,6 +12198,7 @@ class _WarmWorker:
                 text=True,
                 bufsize=1,
                 cwd=str(self.session_dir),
+                env=_provider_child_environment(),
             )
             return True
         except Exception:
@@ -21226,7 +21331,12 @@ def _run_osascript(
         cmd = ["osascript", "-e", script]
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            env=_provider_child_environment(),
         )
     except subprocess.TimeoutExpired:
         return {
@@ -22632,7 +22742,7 @@ class Handler(BaseHTTPRequestHandler):
             # Handled entirely outside device auth: a device Bearer never
             # grants access here, and the hook token never grants device
             # endpoints.
-            client_ip = str(self.client_address[0] if self.client_address else "")
+            client_ip = _client_address_host(self.client_address)
             presented = str(self.headers.get("X-Pairling-Internal-Token") or "").strip()
             if (
                 client_ip not in ("127.0.0.1", "::1")
@@ -23954,15 +24064,15 @@ class Handler(BaseHTTPRequestHandler):
                 },
             }, status=503)
             return
-        # Rate-limit pair starts. NOTE: self.client_address[0] is the loopback
-        # peer for any request proxied through connectd (the upstream is
-        # 127.0.0.1), so this is a GLOBAL circuit breaker, not a per-source-IP
-        # defense. /pair/start is loopback-only today (connectd denies it at the
-        # gateway), so only local callers reach it. Real per-client throttling for
-        # the public funnel path is owned by connectd (see the funnel-hardening
-        # plan, Increment 2); do not rely on this key for per-attacker isolation.
+        # Rate-limit pair starts. The loopback peer is shared by requests
+        # proxied through connectd, so this is a global circuit breaker rather
+        # than a per-source-IP defense. Same-UID local-control requests use a
+        # stable private-socket key because AF_UNIX has no IP peer address.
+        peer = _client_address_host(self.client_address)
+        if not peer and getattr(self.server, "pairling_local_control", False):
+            peer = "local-control"
         allowed, retry_after = _request_rate_check(
-            f"pair_start:{self.client_address[0]}", max_per_min=5
+            f"pair_start:{peer or 'unknown'}", max_per_min=5
         )
         if not allowed:
             self.send_response(429)
@@ -24099,7 +24209,7 @@ class Handler(BaseHTTPRequestHandler):
             trusted_gateway = _pairdrop_gateway_provenance_ok(headers, self.client_address)
             rate_keys = [f"pair_psk:pair:{pair_digest}"]
             if not trusted_gateway:
-                rate_keys.insert(0, f"pair_psk:source:{self.client_address[0]}")
+                rate_keys.insert(0, f"pair_psk:source:{_client_address_host(self.client_address) or 'unknown'}")
             for rate_key in rate_keys:
                 allowed, retry_after = _request_rate_check(rate_key, max_per_min=5)
                 if not allowed:
@@ -24234,7 +24344,7 @@ class Handler(BaseHTTPRequestHandler):
             remote_activation = trusted_gateway or not _loopback_client_address(self.client_address)
             rate_keys = [f"pair_psk_activate:pair:{pair_digest}"]
             if not trusted_gateway:
-                rate_keys.insert(0, f"pair_psk_activate:source:{self.client_address[0]}")
+                rate_keys.insert(0, f"pair_psk_activate:source:{_client_address_host(self.client_address) or 'unknown'}")
             for rate_key in rate_keys:
                 allowed, retry_after = _request_rate_check(rate_key, max_per_min=10)
                 if not allowed:
@@ -25164,7 +25274,31 @@ class Handler(BaseHTTPRequestHandler):
             live_only=live_only,
             active_within_min=active_within_min,
             limit=max(limit, 50),
+            poll_live=not authoritative_inventory,
         )
+        if authoritative_inventory and provider_inventory is not None:
+            captured_managed_rows = [
+                copy.deepcopy(row)
+                for inventory_rows in provider_inventory.values()
+                for row in inventory_rows
+                if bool(row.get("managed"))
+            ]
+            captured_managed_providers = {
+                str(row.get("provider") or "")
+                for row in captured_managed_rows
+            }
+            managed_rows = [
+                row
+                for row in managed_rows
+                if not (
+                    str(row.get("provider") or "")
+                    in captured_managed_providers
+                    and row.get("closed_at") is None
+                    and str(row.get("lifecycle") or "")
+                    in {"launching", "running", "waiting", "blocked", "closing"}
+                )
+            ]
+            managed_rows.extend(captured_managed_rows)
         managed_rows = [
             row for row in managed_rows
             if str(row.get("provider") or "") in visible
@@ -25397,7 +25531,9 @@ class Handler(BaseHTTPRequestHandler):
             if provider_filter == "all"
             else ({provider_filter} if provider_filter in visible else set())
         )
-        unsupported = sorted(requested - _SESSION_MEMBERSHIP_PROVIDERS)
+        unsupported = sorted(
+            requested - _session_membership_provider_ids()
+        )
         if unsupported:
             return {
                 "reason": "session_provider_inventory_unsupported",
@@ -25498,16 +25634,17 @@ class Handler(BaseHTTPRequestHandler):
             if provider_filter == "all"
             else ({provider_filter} if provider_filter in visible else set())
         )
+        membership_providers = _session_membership_provider_ids()
         checked_at = [
             float((provider_inventories.get(provider) or {}).get("checked_at") or 0)
-            for provider in sorted(requested & _SESSION_MEMBERSHIP_PROVIDERS)
+            for provider in sorted(requested & membership_providers)
         ]
         proof_times = [value for value in checked_at if value > 0]
         proof_at = min(proof_times) if proof_times else _time.time()
 
         if degraded is not None:
             return False, proof_at, None
-        unsupported = sorted(requested - _SESSION_MEMBERSHIP_PROVIDERS)
+        unsupported = sorted(requested - membership_providers)
         if unsupported:
             return False, proof_at, {
                 "reason": "session_provider_inventory_unsupported",
@@ -26020,7 +26157,7 @@ class Handler(BaseHTTPRequestHandler):
         if live_only:
             if (
                 provider_filter != "all"
-                and provider_filter not in _SESSION_MEMBERSHIP_PROVIDERS
+                and provider_filter not in _session_membership_provider_ids()
             ):
                 _send_unsupported_provider(
                     self,
@@ -26386,7 +26523,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if (
             provider_filter != "all"
-            and provider_filter not in _SESSION_MEMBERSHIP_PROVIDERS
+            and provider_filter not in _session_membership_provider_ids()
         ):
             _send_unsupported_provider(
                 self,
@@ -34038,6 +34175,32 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         status_payload = _aperture_cli_status_payload(home=HOME, env=os.environ)
+        if status_payload.get("binary_trusted") is not True:
+            message = (
+                "Aperture CLI launch is disabled because this build has no "
+                "independently authenticated Aperture release artifact."
+            )
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="rejected",
+                http_status=503,
+                backend="terminal_app",
+                error_code="aperture_cli_launch_untrusted",
+                error_message=message,
+                fields={
+                    "trust_policy": status_payload.get("binary_trust_policy")
+                },
+                audit_action={"type": "aperture_cli_open"},
+            )
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "aperture_cli_launch_untrusted",
+                    "message": message,
+                },
+                "receipt": receipt,
+            }, status=503)
+            return
         binary = str(status_payload.get("binary_path") or "").strip()
         if not binary or not os.path.exists(binary) or not os.access(binary, os.X_OK):
             message = "Aperture CLI binary was not found on this Mac."
@@ -34570,6 +34733,7 @@ class Handler(BaseHTTPRequestHandler):
                 stdout=stdout_f,
                 stderr=stderr_f,
                 start_new_session=True,
+                env=_provider_child_environment(),
             )
             stdin_f.close()
             stdout_f.close()
@@ -44112,6 +44276,7 @@ Worker instructions:
                 text=True,
                 bufsize=1,
                 cwd="/tmp",
+                env=_provider_child_environment(),
             )
             # Send the prompt
             assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
@@ -44668,7 +44833,8 @@ if __name__ == "__main__":
     server = _PairlingThreadingHTTPServer((host, PORT), Handler)
     server.daemon_threads = True
     _sessions_provider_inventory_bundle(
-        set(_visible_agent_provider_ids()) & set(_SESSION_MEMBERSHIP_PROVIDERS)
+        set(_visible_agent_provider_ids())
+        & _session_membership_provider_ids()
     )
     try:
         control_server = _PairlingLocalControlHTTPServer(CONTROL_SOCKET_PATH, Handler)

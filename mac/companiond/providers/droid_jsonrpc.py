@@ -368,7 +368,11 @@ def probe_factory_droid_launch(
     environ: Mapping[str, str] | None = None,
     require_auth: bool = True,
 ) -> FactoryDroidLaunchEvidence:
-    env = dict(os.environ if environ is None else environ)
+    source_environment = os.environ if environ is None else environ
+    env = managed_child_environment(
+        source=source_environment,
+        home=source_environment.get("HOME"),
+    )
     try:
         resolved = Path(executable).expanduser().resolve(strict=True)
     except (OSError, RuntimeError) as exc:

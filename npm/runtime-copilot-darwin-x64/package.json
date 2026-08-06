@@ -1,0 +1,26 @@
+{
+  "name": "@pairling/runtime-copilot-darwin-x64",
+  "version": "0.2.118",
+  "description": "Inert GitHub Copilot native payload for Pairling on Intel Mac",
+  "files": [
+    "payload",
+    "component-manifest.json"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mergimg0/pairling-helper"
+  },
+  "license": "MIT"
+}

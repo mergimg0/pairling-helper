@@ -32,7 +32,7 @@ usage() {
 usage: mac/packaging/build-npm-packages.sh [options]
 
 Options:
-  --version X.Y.Z         npm semver for all three packages.
+  --version X.Y.Z         npm semver for all seven packages.
                           Defaults to mac/VERSION, which must be semver.
   --release               Enforce release invariants: clean source tree,
                           Developer ID signing, semver version. Implies
@@ -197,7 +197,14 @@ PY
 
 require_release_version_unpublished() {
   local pkg out existing
-  for pkg in "pairling" "@pairling/runtime-darwin-arm64" "@pairling/runtime-darwin-x64"; do
+  for pkg in \
+    "@pairling/runtime-claude-darwin-arm64" \
+    "@pairling/runtime-claude-darwin-x64" \
+    "@pairling/runtime-copilot-darwin-arm64" \
+    "@pairling/runtime-copilot-darwin-x64" \
+    "@pairling/runtime-darwin-arm64" \
+    "@pairling/runtime-darwin-x64" \
+    "pairling"; do
     if out="$(npm view "$pkg@$VERSION" version --json 2>&1)"; then
       existing="$(printf '%s' "$out" | tr -d '"[:space:]')"
       [[ "$existing" != "$VERSION" ]] \
@@ -225,6 +232,10 @@ paths = (
     Path("npm/pairling/package.json"),
     Path("npm/runtime-darwin-arm64/package.json"),
     Path("npm/runtime-darwin-x64/package.json"),
+    Path("npm/runtime-claude-darwin-arm64/package.json"),
+    Path("npm/runtime-claude-darwin-x64/package.json"),
+    Path("npm/runtime-copilot-darwin-arm64/package.json"),
+    Path("npm/runtime-copilot-darwin-x64/package.json"),
 )
 errors = []
 for relative in paths:
@@ -311,13 +322,13 @@ PY
 }
 
 
-require_package_source_inputs
 
 
 if [[ "$RELEASE_MODE" == "1" ]]; then
   [[ "$ALLOW_DIRTY" != "1" ]] || fail "--allow-dirty is only for non-release builds."
   require_release_version_unpublished
   require_release_version_sources
+  require_package_source_inputs
   require_release_artifact_evidence
   require_release_source_traceability
   [[ "$SOURCE_DIRTY" == "false" ]] || fail "source tree is dirty; commit first."
@@ -337,6 +348,8 @@ if [[ "$RELEASE_MODE" == "1" ]]; then
       || fail "--release without a Developer ID identity requires --prebuilt-python-arm64 and --prebuilt-python-x64 (CI must not re-vendor/sign python)."
   fi
   BRANCH="main"
+else
+  require_package_source_inputs
 fi
 
 WORK="$(mktemp -d)"
@@ -682,7 +695,7 @@ team_of() {
   printf '%s\n' "$team"
 }
 
-# --- stage the three packages ----------------------------------------------
+# --- stage the seven inert packages -----------------------------------------
 cp "$SOURCE_ROOT/npm/pairling/package.json" "$STAGE/pairling/package.json"
 cp "$SOURCE_ROOT/npm/pairling/README.md" "$STAGE/pairling/README.md"
 mkdir -p "$STAGE/pairling/bin"
@@ -961,11 +974,28 @@ RUNTIME_ARM64_MANIFEST_SHA="$(/usr/bin/shasum -a 256 "$STAGE/runtime-darwin-arm6
 RUNTIME_X64_MANIFEST_SHA="$(/usr/bin/shasum -a 256 "$STAGE/runtime-darwin-x64/manifest.json" | awk '{ print $1 }')"
 
 # Set versions + pin optionalDependencies exactly (never mutates npm/ sources).
+for rel in \
+  runtime-claude-darwin-arm64 \
+  runtime-claude-darwin-x64 \
+  runtime-copilot-darwin-arm64 \
+  runtime-copilot-darwin-x64; do
+  mkdir -p "$STAGE/$rel"
+  cp "$SOURCE_ROOT/npm/$rel/package.json" "$STAGE/$rel/package.json"
+done
+
 python3 - "$STAGE" "$VERSION" <<'PY'
 import json, sys
 from pathlib import Path
 stage, version = Path(sys.argv[1]), sys.argv[2]
-for rel in ("runtime-darwin-arm64", "runtime-darwin-x64"):
+runtime_packages = (
+    "runtime-darwin-arm64",
+    "runtime-darwin-x64",
+    "runtime-claude-darwin-arm64",
+    "runtime-claude-darwin-x64",
+    "runtime-copilot-darwin-arm64",
+    "runtime-copilot-darwin-x64",
+)
+for rel in runtime_packages:
     path = stage / rel / "package.json"
     data = json.loads(path.read_text())
     data["version"] = version
@@ -974,11 +1004,113 @@ path = stage / "pairling" / "package.json"
 data = json.loads(path.read_text())
 data["version"] = version
 data["optionalDependencies"] = {
+    "@pairling/runtime-claude-darwin-arm64": version,
+    "@pairling/runtime-claude-darwin-x64": version,
+    "@pairling/runtime-copilot-darwin-arm64": version,
+    "@pairling/runtime-copilot-darwin-x64": version,
     "@pairling/runtime-darwin-arm64": version,
     "@pairling/runtime-darwin-x64": version,
 }
 path.write_text(json.dumps(data, indent=2) + "\n")
 PY
+
+for arch in arm64 x64; do
+  python3 "$SOURCE_ROOT/mac/install/verify-runtime-package-manifest.py" --archive \
+    "$STAGE/runtime-darwin-$arch" "$VERSION" "$REVISION" \
+    || fail "complete runtime package failed verification before provider payload split: $arch"
+done
+
+stage_runtime_component() {
+  local provider="$1" arch="$2" target_prefix="$3" runtime_manifest_sha="$4"
+  local runtime_dir="$STAGE/runtime-darwin-$arch"
+  local component_dir="$STAGE/runtime-$provider-darwin-$arch"
+  local source="$runtime_dir/$target_prefix"
+  local package_name="@pairling/runtime-$provider-darwin-$arch"
+  [[ ! -L "$source" && -d "$source" ]] \
+    || fail "runtime component source is missing or linked: $target_prefix"
+  mv "$source" "$component_dir/payload"
+  python3 - "$component_dir" "$package_name" "$VERSION" "$REVISION" "$arch" \
+    "$provider" "$runtime_manifest_sha" "$target_prefix" <<'PY'
+import hashlib
+import json
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+package_name, version, revision, architecture, provider, runtime_digest, target_prefix = sys.argv[2:]
+payload = root / "payload"
+
+def sha_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+directories = [{
+    "path": "payload",
+    "mode": f"{stat.S_IMODE(payload.lstat().st_mode):04o}",
+}]
+files = []
+for path in sorted(payload.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+    relative = path.relative_to(root).as_posix()
+    metadata = path.lstat()
+    if path.name == "__pycache__" or path.suffix == ".pyc":
+        raise SystemExit(f"forbidden Python bytecode in runtime component: {relative}")
+    if stat.S_ISLNK(metadata.st_mode):
+        raise SystemExit(f"symlinks are forbidden in runtime components: {relative}")
+    if stat.S_ISDIR(metadata.st_mode):
+        directories.append({
+            "path": relative,
+            "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+        })
+    elif stat.S_ISREG(metadata.st_mode):
+        files.append({
+            "path": relative,
+            "kind": "file",
+            "sha256": sha_file(path),
+            "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+        })
+    else:
+        raise SystemExit(f"unsupported runtime component entry: {relative}")
+if not files:
+    raise SystemExit("runtime component payload is empty")
+manifest = {
+    "schema_version": 1,
+    "package": package_name,
+    "package_version": version,
+    "source_revision": revision,
+    "architecture": architecture,
+    "provider": provider,
+    "runtime_manifest_sha256": runtime_digest,
+    "target_prefix": target_prefix,
+    "directories": directories,
+    "files": files,
+}
+(root / "component-manifest.json").write_text(
+    json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
+}
+
+stage_runtime_component \
+  claude arm64 \
+  "provider-sdks/packages/@anthropic-ai/claude-agent-sdk-darwin-arm64" \
+  "$RUNTIME_ARM64_MANIFEST_SHA"
+stage_runtime_component \
+  claude x64 \
+  "provider-sdks/packages/@anthropic-ai/claude-agent-sdk-darwin-x64" \
+  "$RUNTIME_X64_MANIFEST_SHA"
+stage_runtime_component \
+  copilot arm64 \
+  "provider-sdks/packages/@github/copilot-darwin-arm64" \
+  "$RUNTIME_ARM64_MANIFEST_SHA"
+stage_runtime_component \
+  copilot x64 \
+  "provider-sdks/packages/@github/copilot-darwin-x64" \
+  "$RUNTIME_X64_MANIFEST_SHA"
 
 # --- payload integrity manifest ---------------------------------------------
 python3 - "$STAGE/pairling" "$VERSION" "$REVISION" "$SOURCE_DIRTY" "$EVIDENCE_SHA256" "$(team_of "$CONNECTD_ARM64")" "$CONNECTD_ARM64" "$(team_of "$CONNECTD_X64")" "$CONNECTD_X64" "$PYTHON_ARM64_ARCHIVE_SHA" "$PYTHON_X64_ARCHIVE_SHA" "$RUNTIME_ARM64_MANIFEST_SHA" "$RUNTIME_X64_MANIFEST_SHA" <<'PY'
@@ -986,6 +1118,7 @@ import hashlib, json, stat, sys
 from pathlib import Path
 pkg, version, revision, dirty, evidence_sha256, team_arm, bin_arm, team_x64, bin_x64, python_arm_sha, python_x64_sha, runtime_arm_sha, runtime_x64_sha = sys.argv[1:]
 pkg = Path(pkg)
+
 payload = pkg / "payload"
 files = []
 directories = [{
@@ -1046,17 +1179,195 @@ manifest = {
 }
 (pkg / "payload-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 PY
+verify_runtime_component() {
+  local root="$1" package_name="$2" arch="$3" provider="$4" runtime_manifest_sha="$5" target_prefix="$6"
+  python3 - "$root" "$package_name" "$VERSION" "$REVISION" "$arch" "$provider" \
+    "$runtime_manifest_sha" "$target_prefix" <<'PY'
+import hashlib
+import json
+import re
+import stat
+import sys
+from pathlib import Path, PurePosixPath
+
+root = Path(sys.argv[1])
+package_name, version, revision, architecture, provider, runtime_digest, target_prefix = sys.argv[2:]
+expected_root = {"component-manifest.json", "package.json", "payload"}
+if root.is_symlink() or not root.is_dir() or {path.name for path in root.iterdir()} != expected_root:
+    raise SystemExit("runtime component package root shape is invalid")
+for name in expected_root:
+    path = root / name
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode):
+        raise SystemExit(f"runtime component root entry is linked: {name}")
+    if name == "payload" and not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit("runtime component payload is not a directory")
+    if name != "payload" and not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit(f"runtime component root entry is not a file: {name}")
+
+package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+required_package = {
+    "name": package_name,
+    "version": version,
+    "files": ["payload", "component-manifest.json"],
+    "os": ["darwin"],
+    "cpu": [architecture],
+    "engines": {"node": ">=20"},
+    "publishConfig": {"access": "public"},
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/mergimg0/pairling-helper",
+    },
+}
+for key, expected in required_package.items():
+    if package.get(key) != expected:
+        raise SystemExit(f"runtime component package.json {key} is invalid")
+for key in (
+    "bin", "scripts", "dependencies", "devDependencies", "peerDependencies",
+    "optionalDependencies", "bundledDependencies", "bundleDependencies",
+):
+    if key in package:
+        raise SystemExit(f"runtime component package.json {key} is forbidden")
+
+manifest = json.loads((root / "component-manifest.json").read_text(encoding="utf-8"))
+required_keys = {
+    "schema_version", "package", "package_version", "source_revision",
+    "architecture", "provider", "runtime_manifest_sha256", "target_prefix",
+    "directories", "files",
+}
+if set(manifest) != required_keys:
+    raise SystemExit("runtime component manifest keys are invalid")
+identity = (
+    manifest["schema_version"] == 1
+    and manifest["package"] == package_name
+    and manifest["package_version"] == version
+    and manifest["source_revision"] == revision
+    and manifest["architecture"] == architecture
+    and manifest["provider"] == provider
+    and manifest["runtime_manifest_sha256"] == runtime_digest
+    and manifest["target_prefix"] == target_prefix
+)
+if not identity or not re.fullmatch(r"[0-9a-f]{40}", revision) or not re.fullmatch(r"[0-9a-f]{64}", runtime_digest):
+    raise SystemExit("runtime component manifest identity is invalid")
+
+def safe_relative(value):
+    if not isinstance(value, str):
+        return None
+    path = PurePosixPath(value)
+    if (
+        path.is_absolute()
+        or "\\" in value
+        or not path.parts
+        or path.parts[0] != "payload"
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+    ):
+        return None
+    return path.as_posix()
+
+def parse_mode(value, relative, directory):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-7]{4}", value):
+        raise SystemExit(f"runtime component manifest mode is invalid: {relative}")
+    mode = int(value, 8)
+    if mode & 0o7022 or not mode & stat.S_IRUSR or (directory and not mode & stat.S_IXUSR):
+        raise SystemExit(f"runtime component manifest mode is unsafe: {relative}")
+    return mode
+
+expected = {}
+for directory in manifest["directories"]:
+    if not isinstance(directory, dict):
+        raise SystemExit("runtime component directory entry is invalid")
+    relative = safe_relative(directory.get("path"))
+    if relative is None or relative in expected:
+        raise SystemExit("runtime component directory path is invalid or duplicated")
+    expected[relative] = ("directory", None, parse_mode(directory.get("mode"), relative, True))
+for item in manifest["files"]:
+    if not isinstance(item, dict):
+        raise SystemExit("runtime component file entry is invalid")
+    relative = safe_relative(item.get("path"))
+    digest = item.get("sha256")
+    if (
+        relative is None
+        or relative in expected
+        or item.get("kind") != "file"
+        or not isinstance(digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        or relative.endswith(".pyc")
+        or "__pycache__" in PurePosixPath(relative).parts
+    ):
+        raise SystemExit("runtime component file entry is invalid or duplicated")
+    expected[relative] = ("file", digest, parse_mode(item.get("mode"), relative, False))
+if not manifest["files"]:
+    raise SystemExit("runtime component payload is empty")
+
+actual = {}
+payload = root / "payload"
+for path in [payload, *sorted(payload.rglob("*"))]:
+    relative = path.relative_to(root).as_posix()
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode):
+        raise SystemExit(f"runtime component contains a symlink: {relative}")
+    if stat.S_ISDIR(metadata.st_mode):
+        kind, digest = "directory", None
+    elif stat.S_ISREG(metadata.st_mode):
+        kind = "file"
+        digest_value = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest_value.update(chunk)
+        digest = digest_value.hexdigest()
+    else:
+        raise SystemExit(f"runtime component entry type is unsupported: {relative}")
+    actual[relative] = (kind, digest, stat.S_IMODE(metadata.st_mode))
+if set(actual) != set(expected):
+    raise SystemExit("runtime component inventory does not match its manifest")
+for relative, (kind, digest, expected_mode) in expected.items():
+    actual_kind, actual_digest, actual_mode = actual[relative]
+    directory = kind == "directory"
+    mode_ok = (
+        actual_mode & 0o7022 == 0
+        and actual_mode & ~expected_mode == 0
+        and actual_mode & stat.S_IRUSR
+        and (not directory or actual_mode & stat.S_IXUSR)
+    )
+    if actual_kind != kind or actual_digest != digest or not mode_ok:
+        raise SystemExit(f"runtime component entry does not match its manifest: {relative}")
+PY
+}
+
+verify_runtime_component \
+  "$STAGE/runtime-claude-darwin-arm64" \
+  "@pairling/runtime-claude-darwin-arm64" arm64 claude \
+  "$RUNTIME_ARM64_MANIFEST_SHA" \
+  "provider-sdks/packages/@anthropic-ai/claude-agent-sdk-darwin-arm64"
+verify_runtime_component \
+  "$STAGE/runtime-claude-darwin-x64" \
+  "@pairling/runtime-claude-darwin-x64" x64 claude \
+  "$RUNTIME_X64_MANIFEST_SHA" \
+  "provider-sdks/packages/@anthropic-ai/claude-agent-sdk-darwin-x64"
+verify_runtime_component \
+  "$STAGE/runtime-copilot-darwin-arm64" \
+  "@pairling/runtime-copilot-darwin-arm64" arm64 copilot \
+  "$RUNTIME_ARM64_MANIFEST_SHA" \
+  "provider-sdks/packages/@github/copilot-darwin-arm64"
+verify_runtime_component \
+  "$STAGE/runtime-copilot-darwin-x64" \
+  "@pairling/runtime-copilot-darwin-x64" x64 copilot \
+  "$RUNTIME_X64_MANIFEST_SHA" \
+  "provider-sdks/packages/@github/copilot-darwin-x64"
 
 # --- deterministic pack ------------------------------------------------------
 python3 "$SOURCE_ROOT/mac/install/verify-payload-manifest.py" --archive \
   "$STAGE/pairling/payload" \
   "$STAGE/pairling/payload-manifest.json"
-for arch in arm64 x64; do
-  python3 "$SOURCE_ROOT/mac/install/verify-runtime-package-manifest.py" --archive \
-    "$STAGE/runtime-darwin-$arch" "$VERSION" "$REVISION"
-done
 find "$STAGE" -exec touch -h -t 202001010000 {} +
-for dir in pairling runtime-darwin-arm64 runtime-darwin-x64; do
+for dir in \
+  runtime-claude-darwin-arm64 \
+  runtime-claude-darwin-x64 \
+  runtime-copilot-darwin-arm64 \
+  runtime-copilot-darwin-x64 \
+  runtime-darwin-arm64 \
+  runtime-darwin-x64 \
+  pairling; do
   (cd "$STAGE/$dir" && npm pack --silent --pack-destination "$DIST_DIR" >/dev/null)
 done
 
@@ -1066,9 +1377,11 @@ verify_archive_container() {
 import stat
 import sys
 import tarfile
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 archive = sys.argv[1]
+if Path(archive).stat().st_size >= 250_000_000:
+    raise SystemExit(f"npm archive exceeds the conservative 250 MB publish limit: {archive}")
 seen = set()
 with tarfile.open(archive, "r:gz") as handle:
     members = handle.getmembers()
@@ -1102,9 +1415,13 @@ PY
 }
 
 for archive in \
-  "$DIST_DIR/pairling-$VERSION.tgz" \
+  "$DIST_DIR/pairling-runtime-claude-darwin-arm64-$VERSION.tgz" \
+  "$DIST_DIR/pairling-runtime-claude-darwin-x64-$VERSION.tgz" \
+  "$DIST_DIR/pairling-runtime-copilot-darwin-arm64-$VERSION.tgz" \
+  "$DIST_DIR/pairling-runtime-copilot-darwin-x64-$VERSION.tgz" \
   "$DIST_DIR/pairling-runtime-darwin-arm64-$VERSION.tgz" \
-  "$DIST_DIR/pairling-runtime-darwin-x64-$VERSION.tgz"; do
+  "$DIST_DIR/pairling-runtime-darwin-x64-$VERSION.tgz" \
+  "$DIST_DIR/pairling-$VERSION.tgz"; do
   verify_archive_container "$archive"
 done
 PACK_VERIFY_ROOT="$WORK/pack-verify"
@@ -1113,6 +1430,29 @@ for arch in arm64 x64; do
   extract="$PACK_VERIFY_ROOT/runtime-$arch"
   mkdir -p "$extract"
   tar -xzf "$DIST_DIR/pairling-runtime-darwin-$arch-$VERSION.tgz" -C "$extract"
+  if [[ "$arch" == "arm64" ]]; then
+    runtime_manifest_sha="$RUNTIME_ARM64_MANIFEST_SHA"
+  else
+    runtime_manifest_sha="$RUNTIME_X64_MANIFEST_SHA"
+  fi
+  for provider in claude copilot; do
+    component_extract="$PACK_VERIFY_ROOT/runtime-$provider-$arch"
+    mkdir -p "$component_extract"
+    tar -xzf \
+      "$DIST_DIR/pairling-runtime-$provider-darwin-$arch-$VERSION.tgz" \
+      -C "$component_extract"
+    if [[ "$provider" == "claude" ]]; then
+      target_prefix="provider-sdks/packages/@anthropic-ai/claude-agent-sdk-darwin-$arch"
+    else
+      target_prefix="provider-sdks/packages/@github/copilot-darwin-$arch"
+    fi
+    verify_runtime_component \
+      "$component_extract/package" \
+      "@pairling/runtime-$provider-darwin-$arch" \
+      "$arch" "$provider" "$runtime_manifest_sha" "$target_prefix"
+    mkdir -p "$extract/package/$(dirname "$target_prefix")"
+    mv "$component_extract/package/payload" "$extract/package/$target_prefix"
+  done
   python3 "$SOURCE_ROOT/mac/install/verify-runtime-package-manifest.py" --archive \
     "$extract/package" "$VERSION" "$REVISION"
 done
