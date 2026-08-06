@@ -270,7 +270,7 @@ require_release_artifact_evidence() {
 }
 
 require_package_source_inputs() {
-  python3 - "$REPO_ROOT" <<'PY' || fail "compile/package source inputs are incomplete or unreviewed"
+  PYTHONDONTWRITEBYTECODE=1 python3 - "$REPO_ROOT" <<'PY' || fail "compile/package source inputs are incomplete or unreviewed"
 import hashlib
 import importlib.util
 import sys
