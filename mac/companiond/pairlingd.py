@@ -16460,6 +16460,8 @@ def _terminal_stream_diagnostics_from_truth(truth: dict) -> dict:
                 "available": bool(v2),
                 "source": v2.get("source"),
                 "generation": v2.get("generation"),
+                "screen_hash": v2.get("screen_hash"),
+                "nonce": v2.get("nonce"),
                 "pending_input_state": (
                     _surface_pending_input_state(v2, version="v2")
                     if v2 else "unknown"
@@ -16489,6 +16491,8 @@ def _terminal_stream_diagnostics_from_truth(truth: dict) -> dict:
                 "basis_surface",
                 "schema_version",
                 "generation",
+                "screen_hash",
+                "nonce",
                 "visible_surface_matches_control_basis",
                 "blocked_reason",
                 "supported_actions",
