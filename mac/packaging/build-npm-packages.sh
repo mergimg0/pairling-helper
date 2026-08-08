@@ -458,9 +458,12 @@ cp -R "$SOURCE_ROOT/mac/connectd/internal" "$MACPAY/connectd/"
 cp "$SOURCE_ROOT/mac/packaging/bin/pairling" "$MACPAY/packaging/bin/"
 cp "$SOURCE_ROOT/mac/packaging/pairling_attach.py" "$MACPAY/packaging/"
 
-chmod 755 "$MACPAY/packaging/bin/pairling" "$MACPAY/install/"*.sh "$MACPAY/mcp/phone_tools.py" \
-  "$MACPAY/companiond/pairlingd.py"
-chmod 644 "$MACPAY/companiond/providers/"*.py "$MACPAY/companiond/providers/"*.json
+find "$MACPAY" -type f -exec chmod 644 {} +
+chmod 755 \
+  "$MACPAY/companiond/pairlingd.py" \
+  "$MACPAY/install/install-runtime.sh" \
+  "$MACPAY/mcp/phone_tools.py" \
+  "$MACPAY/packaging/bin/pairling"
 find "$MACPAY" -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
 
 PYCACHE="$(mktemp -d)"
@@ -1356,7 +1359,7 @@ verify_runtime_component \
   "provider-sdks/packages/@github/copilot-darwin-x64"
 
 # --- deterministic pack ------------------------------------------------------
-python3 "$SOURCE_ROOT/mac/install/verify-payload-manifest.py" --archive \
+python3 "$SOURCE_ROOT/mac/install/verify-payload-manifest.py" --release --archive \
   "$STAGE/pairling/payload" \
   "$STAGE/pairling/payload-manifest.json"
 find "$STAGE" -exec touch -h -t 202001010000 {} +
@@ -1458,7 +1461,7 @@ for arch in arm64 x64; do
 done
 mkdir -p "$PACK_VERIFY_ROOT/pairling"
 tar -xzf "$DIST_DIR/pairling-$VERSION.tgz" -C "$PACK_VERIFY_ROOT/pairling"
-python3 "$SOURCE_ROOT/mac/install/verify-payload-manifest.py" --archive \
+python3 "$SOURCE_ROOT/mac/install/verify-payload-manifest.py" --release --archive \
   "$PACK_VERIFY_ROOT/pairling/package/payload" \
   "$PACK_VERIFY_ROOT/pairling/package/payload-manifest.json"
 rm -rf "$PACK_VERIFY_ROOT"

@@ -804,18 +804,25 @@ def verify_payload_package_root(
 
 def main() -> int:
     args = sys.argv[1:]
-    archive_mode = bool(args and args[0] == "--archive")
-    if archive_mode:
+    archive_mode = False
+    release_mode = False
+    while args and args[0] in {"--archive", "--release"}:
+        if args[0] == "--archive":
+            archive_mode = True
+        else:
+            release_mode = True
         args = args[1:]
     if len(args) != 2:
         return fail(
-            "usage: verify-payload-manifest.py [--archive] "
+            "usage: verify-payload-manifest.py [--archive] [--release] "
             "<payload-root> <payload-manifest.json>"
         )
     file_count, directory_count, verification_error = verify_payload_manifest(
         Path(args[0]),
         Path(args[1]),
         archive_mode=archive_mode,
+        require_clean=release_mode,
+        require_release_files=release_mode,
     )
     if verification_error:
         return fail(verification_error)
