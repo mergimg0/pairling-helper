@@ -1,6 +1,6 @@
 {
   "name": "@pairling/runtime-claude-darwin-x64",
-  "version": "0.2.136",
+  "version": "0.2.137",
   "description": "Inert Claude Agent SDK native payload for Pairling on Intel Mac",
   "files": [
     "payload",
