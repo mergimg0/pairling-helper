@@ -2400,8 +2400,23 @@ def _broker_spawn_provider_identity(
                     broker_pid,
                 )
             ]
-            if len(matches) == 1:
-                return matches[0]
+            match_pids = {
+                int(row.get("pid") or 0)
+                for row in matches
+                if int(row.get("pid") or 0) > 0
+            }
+            roots = [
+                row for row in matches
+                if not any(
+                    other_pid != int(row.get("pid") or 0)
+                    and _process_is_descendant_of(
+                        int(row.get("pid") or 0), other_pid
+                    )
+                    for other_pid in match_pids
+                )
+            ]
+            if len(roots) == 1:
+                return roots[0]
         if _time.monotonic() >= deadline:
             return None
         try:
