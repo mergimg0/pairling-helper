@@ -324,6 +324,24 @@ func TestHandlerLogsMetadataWithoutSensitiveBodies(t *testing.T) {
 	}
 }
 
+func TestProxyErrorClassifiesClientCancellationWithoutFailingRouteHealth(t *testing.T) {
+	logger := &recordingLogger{}
+	handler := &Handler{logger: logger}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "http://pairling-connect.local/sessions-visible", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	handler.proxyError(rec, req, context.Canceled)
+
+	if rec.Code != 499 {
+		t.Fatalf("status = %d, want 499", rec.Code)
+	}
+	if event := logger.last(); event.Outcome != "client_cancelled" {
+		t.Fatalf("outcome = %q, want client_cancelled", event.Outcome)
+	}
+}
+
 func TestNewHandlerRejectsNonLocalUpstream(t *testing.T) {
 	cases := []string{
 		"http://example.com:7773",

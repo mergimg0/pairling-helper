@@ -457,6 +457,10 @@ func extractPairID(body []byte) string {
 }
 
 func (h *Handler) proxyError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, context.Canceled) || errors.Is(r.Context().Err(), context.Canceled) {
+		h.reject(w, r, 499, "client_cancelled")
+		return
+	}
 	h.reject(w, r, http.StatusBadGateway, "upstream_error")
 }
 

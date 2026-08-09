@@ -528,7 +528,11 @@ class OmpProviderAdapter(ProviderAdapter):
             diagnostics=ProviderDiagnostics(
                 cli_path=str(resolved.path) if resolved else None,
                 cli_path_source=resolved.source if resolved else None,
-                version=cli_version(resolved.path) if resolved else None,
+                version=(
+                    managed_probe.diagnostics.version
+                    if managed_probe is not None
+                    else (cli_version(resolved.path) if resolved else None)
+                ),
                 config_path=str(config_path),
                 config_exists=config_path.is_file(),
             ),
