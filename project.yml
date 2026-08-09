@@ -78,7 +78,7 @@ targets:
         CFBundleDisplayName: Pairling
         CFBundleIconName: AppIcon
         CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "246"
+        CFBundleVersion: "247"
         UIAppFonts:
           - stack-sans-headline-variable.ttf
         ITSAppUsesNonExemptEncryption: false
@@ -207,7 +207,7 @@ targets:
       properties:
         CFBundleDisplayName: Pairling Widgets
         CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "246"
+        CFBundleVersion: "247"
         UIAppFonts:
           - stack-sans-headline-variable.ttf
         NSExtension:
@@ -244,7 +244,7 @@ targets:
       properties:
         CFBundleDisplayName: Send to Pairling
         CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "246"
+        CFBundleVersion: "247"
         BGTaskSchedulerPermittedIdentifiers:
           - dev.pairling.ios.pairdrop-transfer.*
         NSExtension:
@@ -290,7 +290,7 @@ targets:
         CFBundleDisplayName: Pairling
         CFBundleIconName: AppIcon
         CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "246"
+        CFBundleVersion: "247"
         WKApplication: true
         WKCompanionAppBundleIdentifier: dev.pairling.ios
     entitlements:
@@ -326,7 +326,7 @@ targets:
       properties:
         CFBundleDisplayName: Pairling Watch Widgets
         CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "246"
+        CFBundleVersion: "247"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     entitlements:
@@ -415,7 +415,7 @@ targets:
       properties:
         CFBundleDisplayName: Pairling Tests
         CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "246"
+        CFBundleVersion: "247"
     dependencies:
       - target: Pairling
       - package: SwiftNIOSSH
