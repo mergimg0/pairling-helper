@@ -483,7 +483,10 @@ cp "$SOURCE_ROOT/mac/packaging/pairling_attach.py" "$MACPAY/packaging/"
 find "$MACPAY" -type f -exec chmod 644 {} +
 chmod 755 \
   "$MACPAY/companiond/pairlingd.py" \
+  "$MACPAY/install/bootstrap-first-run.sh" \
+  "$MACPAY/install/doctor.sh" \
   "$MACPAY/install/install-runtime.sh" \
+  "$MACPAY/install/uninstall-runtime.sh" \
   "$MACPAY/mcp/phone_tools.py" \
   "$MACPAY/packaging/bin/pairling"
 find "$MACPAY" -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true

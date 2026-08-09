@@ -489,7 +489,10 @@ def verify_required_release_payload(
     manifest: dict[str, object],
 ) -> str | None:
     executable_paths = {
+        "payload/mac/install/bootstrap-first-run.sh",
+        "payload/mac/install/doctor.sh",
         "payload/mac/install/install-runtime.sh",
+        "payload/mac/install/uninstall-runtime.sh",
         "payload/mac/companiond/pairlingd.py",
         "payload/mac/mcp/phone_tools.py",
         "payload/mac/packaging/bin/pairling",
