@@ -26594,21 +26594,21 @@ class Handler(BaseHTTPRequestHandler):
         authorized = _authorized_user_path(root, allow_tmp=True)
         directory_fd = open_directory_fd(authorized.path, root=authorized.root)
         try:
-            names = os.listdir(directory_fd)
             items = []
-            for name in names:
-                if name in {".", ".."}:
-                    continue
-                try:
-                    child_fd = open_child_directory_fd(directory_fd, name)
-                except (FileNotFoundError, NotADirectoryError, PermissionError, ValueError):
-                    continue
-                else:
-                    os.close(child_fd)
-                items.append({
-                    "name": name,
-                    "path": str(authorized.path / name),
-                })
+            with os.scandir(directory_fd) as entries:
+                for entry in entries:
+                    if entry.name in {".", ".."}:
+                        continue
+                    try:
+                        is_directory = entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if not is_directory:
+                        continue
+                    items.append({
+                        "name": entry.name,
+                        "path": str(authorized.path / entry.name),
+                    })
         finally:
             os.close(directory_fd)
 
