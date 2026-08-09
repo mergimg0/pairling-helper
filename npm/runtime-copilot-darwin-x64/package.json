@@ -1,6 +1,6 @@
 {
   "name": "@pairling/runtime-copilot-darwin-x64",
-  "version": "0.2.130",
+  "version": "0.2.131",
   "description": "Inert GitHub Copilot native payload for Pairling on Intel Mac",
   "files": [
     "payload",
