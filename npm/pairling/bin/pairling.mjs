@@ -34,7 +34,8 @@ const PRODUCT_URL = "https://pairling.dev";
 const START_URL = "https://pairling.dev/start";
 const EXPECTED_TEAM_ID = "965AVD34A3";
 
-const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const shimPath = fileURLToPath(import.meta.url);
+const packageRoot = dirname(dirname(shimPath));
 const payloadRoot = join(packageRoot, "payload");
 const payloadCli = join(payloadRoot, "mac", "packaging", "bin", "pairling");
 
@@ -983,6 +984,7 @@ function verifiedPackageEnvironment(pairlingRoot, runtimeRoot, integrity, snapsh
     PAIRLING_DAEMON_PYTHON: join(runtimeRoot, "python", "bin", "python3"),
     PAIRLING_RUNTIME_PACKAGE_DIR: runtimeRoot,
     PAIRLING_RUNTIME_PACKAGE_ROOT: runtimeRoot,
+    PAIRLING_TRUSTED_SHIM: shimPath,
     PAIRLING_CLAUDE_AGENT_SDK_ROOT: "",
     PAIRLING_NODE_BIN: process.execPath,
     PAIRLING_NODE_SHA256: sha256(readFileSync(process.execPath)),

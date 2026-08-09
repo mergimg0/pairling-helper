@@ -78,6 +78,7 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import socket
 import sqlite3
 import stat
@@ -825,10 +826,20 @@ except Exception as exc:
 
 try:
     pairling_text = USER_PAIRLING.read_text()
+    trusted_shim = ""
+    for line in pairling_text.splitlines():
+        if not line.startswith("TRUSTED_NPM_SHIM="):
+            continue
+        assignment = shlex.split(line)
+        if len(assignment) == 1:
+            trusted_shim = assignment[0].partition("=")[2]
+        break
     add(
         "shell_pairling_wrapper",
         "runtime/current/bin/pairling" in pairling_text
         and "--shim-print-env" in pairling_text
+        and Path(trusted_shim).is_absolute()
+        and Path(trusted_shim).is_file()
         and re.search(r"/Users/[^\\s'\"]+/projects/Pairling", pairling_text) is None,
         "error",
         "User pairling command resolves through Pairling without trapping npm setup on stale runtime/current.",
