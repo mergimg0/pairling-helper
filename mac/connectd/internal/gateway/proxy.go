@@ -96,6 +96,9 @@ type Options struct {
 	// FunnelLimiter, when set, owns identity-independent rate limiting on the
 	// funnel pairing paths. Used instead of RateLimiter for the funnel handler.
 	FunnelLimiter *FunnelLimiter
+	// GatewayToken resolves the secret that authenticates the private loopback
+	// hop to pairlingd. The handler strips client copies before each injection.
+	GatewayToken func() string
 }
 
 // processFunnelBodyAdmission is shared by every Funnel handler so a second
@@ -112,11 +115,11 @@ type Handler struct {
 	rateLimiter      RateLimiter
 	peerNodeResolver PeerNodeResolver
 	funnelMacIDHash  string
+	gatewayToken     func() string
 	funnelLimiter    *FunnelLimiter
 	funnelAdmission  chan struct{}
 	proxy            *httputil.ReverseProxy
 }
-
 
 type RateLimiter interface {
 	Allow(remoteAddr, method, path string) bool
@@ -150,6 +153,7 @@ func NewHandler(opts Options) (*Handler, error) {
 	h := &Handler{
 		upstream:         &upstream,
 		maxBodyBytes:     maxBody,
+		gatewayToken:     opts.GatewayToken,
 		mode:             mode,
 		logger:           opts.Logger,
 		rateLimiter:      opts.RateLimiter,
@@ -165,7 +169,6 @@ func NewHandler(opts Options) (*Handler, error) {
 	}
 	return h, nil
 }
-
 
 // isFunnelSynthesizedPath reports the funnel-mode GET paths connectd answers
 // itself with a minimal body, so the upstream's identity, version, install
@@ -307,6 +310,7 @@ func (h *Handler) rewrite(r *httputil.ProxyRequest) {
 	r.Out.Header.Del(peerNodeHeader)
 	r.Out.Header.Del(peerProvenanceHeader)
 	r.Out.Header.Del(funnelOriginHeader)
+	r.Out.Header.Del("X-Pairling-Connect-Gateway")
 	if h.mode == ExposureModeFunnelBootstrap {
 		r.Out.Header.Set(funnelOriginHeader, "1")
 	}
@@ -324,7 +328,12 @@ func (h *Handler) rewrite(r *httputil.ProxyRequest) {
 			}
 		}
 	}
-	r.Out.Header.Set("X-Pairling-Connect-Gateway", "pairling-connectd")
+	if h.gatewayToken != nil {
+		if token := strings.TrimSpace(h.gatewayToken()); token != "" {
+			r.Out.Header.Set("X-Pairling-Connect-Gateway", "pairling-connectd")
+			r.Out.Header.Set(internalTokenHeader, token)
+		}
+	}
 	r.SetXForwarded()
 }
 
@@ -485,7 +494,6 @@ type statusRecorder struct {
 	captureBody bool
 	body        bytes.Buffer
 }
-
 
 func (r *statusRecorder) WriteHeader(status int) {
 	r.status = status
@@ -878,12 +886,19 @@ var prePairPostPaths = map[string]bool{
 	"/pair/psk-claim-v2": true,
 }
 
+const (
+	memoryRateLimiterMaxKeys          = 512
+	memoryRateLimiterGlobalMultiplier = 16
+)
+
 type MemoryRateLimiter struct {
-	mu     sync.Mutex
-	limit  int
-	window time.Duration
-	hits   map[string][]time.Time
-	now    func() time.Time
+	mu          sync.Mutex
+	limit       int
+	globalLimit int
+	maxKeys     int
+	window      time.Duration
+	hits        map[string][]time.Time
+	now         func() time.Time
 }
 
 func NewMemoryRateLimiter(limit int, window time.Duration) *MemoryRateLimiter {
@@ -893,11 +908,17 @@ func NewMemoryRateLimiter(limit int, window time.Duration) *MemoryRateLimiter {
 	if window <= 0 {
 		window = 5 * time.Minute
 	}
+	globalLimit := limit * memoryRateLimiterGlobalMultiplier
+	if globalLimit < limit {
+		globalLimit = limit
+	}
 	return &MemoryRateLimiter{
-		limit:  limit,
-		window: window,
-		hits:   map[string][]time.Time{},
-		now:    time.Now,
+		limit:       limit,
+		globalLimit: globalLimit,
+		maxKeys:     memoryRateLimiterMaxKeys,
+		window:      window,
+		hits:        map[string][]time.Time{},
+		now:         time.Now,
 	}
 }
 
@@ -909,29 +930,80 @@ func (l *MemoryRateLimiter) Allow(remoteAddr, method, path string) bool {
 	defer l.mu.Unlock()
 	now := l.now()
 	cutoff := now.Add(-l.window)
-	key := rateLimitKey(remoteAddr, method, path)
-	existing := l.hits[key]
-	kept := existing[:0]
-	for _, ts := range existing {
-		if ts.After(cutoff) {
-			kept = append(kept, ts)
+	for key, timestamps := range l.hits {
+		kept := timestamps[:0]
+		for _, ts := range timestamps {
+			if ts.After(cutoff) {
+				kept = append(kept, ts)
+			}
+		}
+		if len(kept) == 0 {
+			delete(l.hits, key)
+		} else {
+			l.hits[key] = kept
 		}
 	}
-	if len(kept) >= l.limit {
-		l.hits[key] = kept
+
+	source := rateLimitSource(remoteAddr)
+	globalKey := source + "|*"
+	routeKey := source + "|" + method + "|" + rateLimitRouteClass(path)
+	if len(l.hits[globalKey]) >= l.globalLimit || len(l.hits[routeKey]) >= l.limit {
 		return false
 	}
-	kept = append(kept, now)
-	l.hits[key] = kept
+	newKeys := 0
+	if _, exists := l.hits[globalKey]; !exists {
+		newKeys++
+	}
+	if _, exists := l.hits[routeKey]; !exists {
+		newKeys++
+	}
+	if len(l.hits)+newKeys > l.maxKeys {
+		return false
+	}
+	l.hits[globalKey] = append(l.hits[globalKey], now)
+	l.hits[routeKey] = append(l.hits[routeKey], now)
 	return true
 }
 
-func rateLimitKey(remoteAddr, method, path string) string {
+func rateLimitSource(remoteAddr string) string {
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil || host == "" {
-		host = remoteAddr
+		return remoteAddr
 	}
-	return host + "|" + method + "|" + path
+	return host
+}
+
+func rateLimitRouteClass(path string) string {
+	switch {
+	case raceFinishPath(path):
+		return "/sessions/race/*/finish"
+	case raceItemPath(path):
+		return "/sessions/race/*"
+	case sessionExportPath(path):
+		return "/sessions/*/export"
+	case pairDropFileContentPath(path):
+		return "/pairdrop/files/*/content"
+	case pairDropAttachPath(path):
+		return "/pairdrop/files/*/attach"
+	case pairDropFileItemPath(path):
+		return "/pairdrop/files/*"
+	case pairDropUploadBytesPath(path):
+		return "/pairdrop/uploads/*/bytes"
+	case pairDropUploadCompletePath(path):
+		return "/pairdrop/uploads/*/complete"
+	case pairDropUploadItemPath(path):
+		return "/pairdrop/uploads/*"
+	case orchestrationStopPath(path):
+		return "/orchestrations/*/stop"
+	case orchestrationStreamPath(path):
+		return "/orchestrations/*/stream"
+	case orchestrationItemPath(path):
+		return "/orchestrations/*"
+	case postureItemPath(path):
+		return "/postures/*"
+	default:
+		return path
+	}
 }
 
 func joinPath(base, path string) string {

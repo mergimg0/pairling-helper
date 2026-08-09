@@ -26,6 +26,7 @@ from pairling_devices import (
     DeviceRegistryError,
     DeviceRegistry,
     PairActivationResult,
+    PendingActivationContext,
     generate_device_id,
     generate_proof_secret,
     generate_token,
@@ -1246,6 +1247,52 @@ class PairingStore:
         if not isinstance(record, dict):
             raise PairingError("pair_corrupt", 500, "pair record is not an object")
         return record, path
+
+    def pairing_purpose(self, pair_id: str) -> str | None:
+        """Read a live invitation's purpose without claiming or consuming it."""
+        record, _ = self._load_record(pair_id)
+        record_install_id = record.get("install_id")
+        if (
+            not isinstance(record_install_id, str)
+            or not record_install_id.strip()
+            or not secrets.compare_digest(record_install_id.strip(), self.install_id)
+        ):
+            raise PairingError(
+                "pair_install_id_mismatch",
+                409,
+                "pair record belongs to a different Pairling install",
+            )
+        expires_value = record.get("expires_at")
+        if isinstance(expires_value, bool) or not isinstance(expires_value, (int, float)):
+            raise PairingError("pair_corrupt", 500, "pair record has an invalid expiry")
+        try:
+            expires_at = float(expires_value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise PairingError(
+                "pair_corrupt",
+                500,
+                "pair record has an invalid expiry",
+            ) from exc
+        if not math.isfinite(expires_at):
+            raise PairingError("pair_corrupt", 500, "pair record has an invalid expiry")
+        if time.time() > expires_at:
+            raise PairingError("pair_expired", 410, "pair record expired")
+        purpose = record.get("purpose")
+        if purpose is not None and not isinstance(purpose, str):
+            raise PairingError("pair_corrupt", 500, "pair record has an invalid purpose")
+        return purpose
+
+    def pending_psk_activation_context(
+        self,
+        *,
+        pair_id: str,
+        device_id: str,
+    ) -> PendingActivationContext | None:
+        return self.registry.pending_pair_activation_context(
+            pair_id=pair_id,
+            device_id=device_id,
+            install_id=self.install_id,
+        )
 
     def _precheck_claim(self, pair_id: str) -> tuple[dict, Path, float]:
         """Shared front-matter for both claim paths (caller holds _claim_lock):

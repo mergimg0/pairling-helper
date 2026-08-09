@@ -517,11 +517,10 @@ func TestPairlingConnectStripsInternalTokenHeader(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	if forwardedHeader != "" {
-		t.Fatalf("internal token header forwarded to upstream: %q", forwardedHeader)
+	if forwardedHeader != testGatewayToken {
+		t.Fatalf("internal token header = %q, want gateway-owned token", forwardedHeader)
 	}
 }
-
 
 func TestPairlingConnectSetsPeerNodeHeaderFromResolver(t *testing.T) {
 	var forwardedHeader string
@@ -765,6 +764,8 @@ func loadEndpointContractForTesting(t *testing.T) endpointContractForTesting {
 	return contract
 }
 
+const testGatewayToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
 func newTestHandler(t *testing.T, upstream string, maxBody int64, logger Logger) http.Handler {
 	return newTestHandlerWithMode(t, upstream, maxBody, logger, ExposureModePostPair, nil)
 }
@@ -781,6 +782,7 @@ func newTestHandlerWithMode(t *testing.T, upstream string, maxBody int64, logger
 		Mode:         mode,
 		Logger:       logger,
 		RateLimiter:  limiter,
+		GatewayToken: func() string { return testGatewayToken },
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -5,17 +5,19 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import platform
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 PRODUCT_REPOSITORY_SHA256 = "59d2705328edc11607151f8602e184148bb2f90dd12a55ace53f96ccaf1da0cf"
 EXPECTED_TEAM_ID = "965AVD34A3"
 ARCHES = ("arm64", "x64")
@@ -106,6 +108,28 @@ def require_keys(value: dict, expected: set[str], label: str) -> None:
 def sha256_file(path: Path) -> str:
     return sha256_regular_file(path, "release asset")
 
+def tree_sha256(path: Path, label: str) -> str:
+    path = Path(path)
+    try:
+        root_metadata = path.lstat()
+    except OSError as exc:
+        raise EvidenceError(f"{label} is unavailable: {path}: {exc}") from exc
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+        raise EvidenceError(f"{label} must be a real directory: {path}")
+    digest = hashlib.sha256()
+    for entry in [path, *sorted(path.rglob("*"), key=lambda item: item.relative_to(path).as_posix())]:
+        metadata = entry.lstat()
+        relative = "." if entry == path else entry.relative_to(path).as_posix()
+        mode = f"{stat.S_IMODE(metadata.st_mode):04o}"
+        if stat.S_ISDIR(metadata.st_mode):
+            record = f"{relative}\0D\0{mode}\n"
+        elif stat.S_ISREG(metadata.st_mode):
+            record = f"{relative}\0F\0{mode}\0{sha256_regular_file(entry, label)}\n"
+        else:
+            raise EvidenceError(f"{label} contains an unsupported entry: {relative}")
+        digest.update(record.encode("utf-8"))
+    return digest.hexdigest()
+
 
 def mirror_source_sha256(root: Path) -> str:
     if root.is_symlink() or not root.is_dir():
@@ -166,6 +190,7 @@ def validate_evidence(value: dict, *, version: str, source_revision: str) -> Non
             "notarization_receipts_sha256",
             "binaries",
             "python",
+            "automation",
         },
         "release evidence",
     )
@@ -186,7 +211,7 @@ def validate_evidence(value: dict, *, version: str, source_revision: str) -> Non
         or not SHA.fullmatch(value["notarization_receipts_sha256"])
     ):
         raise EvidenceError("release evidence notarization receipt digest is invalid")
-    for section in ("binaries", "python"):
+    for section in ("binaries", "python", "automation"):
         rows = value.get(section)
         if not isinstance(rows, dict):
             raise EvidenceError(f"release evidence {section} is not an object")
@@ -196,14 +221,24 @@ def validate_evidence(value: dict, *, version: str, source_revision: str) -> Non
             expected_keys = {"sha256", "team_id", "identifier", "architecture", "notarization"}
             if section == "binaries":
                 expected_keys.add("build_info")
+            elif section == "automation":
+                expected_keys.update({"tree_sha256", "notarization_tree_sha256"})
             if not isinstance(row, dict):
                 raise EvidenceError(f"release evidence {section}.{arch} is not an object")
             require_keys(row, expected_keys, f"release evidence {section}.{arch}")
             if not isinstance(row.get("sha256"), str) or not SHA.fullmatch(row["sha256"]):
                 raise EvidenceError(f"release evidence {section}.{arch} has an invalid sha256")
+            if section == "automation":
+                for field in ("tree_sha256", "notarization_tree_sha256"):
+                    if not isinstance(row.get(field), str) or not SHA.fullmatch(row[field]):
+                        raise EvidenceError(f"release evidence automation.{arch} has an invalid {field}")
             if row.get("architecture") != arch:
                 raise EvidenceError(f"release evidence {section}.{arch} architecture does not match")
-            expected_identifier = "dev.pairling.connectd" if section == "binaries" else "dev.pairling.python"
+            expected_identifier = {
+                "binaries": "dev.pairling.connectd",
+                "python": "dev.pairling.python",
+                "automation": "dev.pairling.automation",
+            }[section]
             if row.get("identifier") != expected_identifier or row.get("team_id") != EXPECTED_TEAM_ID:
                 raise EvidenceError(f"release evidence {section}.{arch} code identity is invalid")
             notarization = row.get("notarization")
@@ -228,6 +263,8 @@ def validate_evidence(value: dict, *, version: str, source_revision: str) -> Non
                 raise EvidenceError(f"release evidence {section}.{arch} notarization is invalid")
             if section == "binaries" and notarization["subject_sha256"] != row["sha256"]:
                 raise EvidenceError(f"release evidence binaries.{arch} notarization does not bind the binary")
+            if section == "automation" and notarization["subject_sha256"] != row["notarization_tree_sha256"]:
+                raise EvidenceError(f"release evidence automation.{arch} notarization does not bind its submitted app tree")
             if section == "binaries":
                 validate_build_info(row.get("build_info"), version=version, revision=source_revision, arch=arch)
 
@@ -328,6 +365,38 @@ def verify_python_archive(path: Path, arch: str, team_id: str, mirror_source_roo
         raise EvidenceError(f"Python {arch} verifier did not return success")
     return result
 
+def automation_helper_lifecycle_module():
+    module_path = Path(__file__).resolve().parents[1] / "install" / "automation_helper_lifecycle.py"
+    spec = importlib.util.spec_from_file_location("pairling_automation_helper_lifecycle", module_path)
+    if spec is None or spec.loader is None:
+        raise EvidenceError("automation helper lifecycle verifier is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise EvidenceError("automation helper lifecycle verifier could not load") from exc
+    return module
+
+
+def verify_automation_archive(path: Path, arch: str) -> dict:
+    archive_sha256 = sha256_file(path)
+    lifecycle = automation_helper_lifecycle_module()
+    expected_arch = "x86_64" if arch == "x64" else arch
+    try:
+        with tempfile.TemporaryDirectory(prefix=f"pairling-evidence-automation-{arch}-") as tmp:
+            app = lifecycle.extract_bundle_archive(
+                path,
+                Path(tmp) / "extracted",
+                expected_sha256=archive_sha256,
+            )
+            lifecycle.verify_signed_bundle(app, architecture=expected_arch)
+            return {
+                "sha256": archive_sha256,
+                "tree_sha256": tree_sha256(app, "automation helper app bundle"),
+            }
+    except Exception as exc:
+        raise EvidenceError(f"automation helper {arch} archive verification failed") from exc
 
 def load_notarization_receipts(path: Path, *, version: str, revision: str) -> tuple[dict, bytes]:
     raw = read_regular_file(path, "notarization receipt set")
@@ -345,10 +414,12 @@ def load_notarization_receipts(path: Path, *, version: str, revision: str) -> tu
         "pairling-connectd-x64",
         "pairling-python-arm64",
         "pairling-python-x64",
+        "pairling-automation-arm64",
+        "pairling-automation-x64",
     }
     assets = value.get("assets")
     if not isinstance(assets, dict) or set(assets) != expected_labels:
-        raise EvidenceError("notarization receipt set does not contain the four exact release assets")
+        raise EvidenceError("notarization receipt set does not contain the six exact release assets")
     for label, row in assets.items():
         if not isinstance(row, dict):
             raise EvidenceError(f"notarization receipt is not an object: {label}")
@@ -367,7 +438,7 @@ def load_notarization_receipts(path: Path, *, version: str, revision: str) -> tu
             or not SHA.fullmatch(row["submitted_sha256"])
         ):
             raise EvidenceError(f"notarization receipt is invalid: {label}")
-        expected_kind = "tree-sha256" if "python" in label else "file-sha256"
+        expected_kind = "file-sha256" if "connectd" in label else "tree-sha256"
         if row.get("subject_kind") != expected_kind:
             raise EvidenceError(f"notarization receipt subject kind is invalid: {label}")
     return assets, raw
@@ -382,6 +453,10 @@ def artifact_paths(args) -> dict[str, dict[str, Path]]:
         "python": {
             "arm64": args.python_arm64,
             "x64": args.python_x64,
+        },
+        "automation": {
+            "arm64": args.automation_arm64,
+            "x64": args.automation_x64,
         },
     }
 
@@ -402,7 +477,11 @@ def verify_command(args) -> dict:
         )
         if hashlib.sha256(receipt_raw).hexdigest() != value["notarization_receipts_sha256"]:
             raise EvidenceError("notarization receipt set sha256 does not match release evidence")
-        for section, label_prefix in (("binaries", "pairling-connectd"), ("python", "pairling-python")):
+        for section, label_prefix in (
+            ("binaries", "pairling-connectd"),
+            ("python", "pairling-python"),
+            ("automation", "pairling-automation"),
+        ):
             for arch in ARCHES:
                 if value[section][arch]["notarization"] != receipt_rows[f"{label_prefix}-{arch}"]:
                     raise EvidenceError(f"{section}.{arch} notarization does not match retained receipts")
@@ -422,7 +501,7 @@ def verify_command(args) -> dict:
         "notarization_receipts_sha256": value["notarization_receipts_sha256"],
         "asset_sha256": {
             section: {arch: value[section][arch]["sha256"] for arch in ARCHES}
-            for section in ("binaries", "python")
+            for section in ("binaries", "python", "automation")
         },
     }
 
@@ -436,7 +515,7 @@ def create_command(args) -> dict:
         raise EvidenceError("release evidence Team ID is not allowlisted")
     paths = artifact_paths(args)
     if any(path is None for rows in paths.values() for path in rows.values()):
-        raise EvidenceError("all four release assets are required to create evidence")
+        raise EvidenceError("all six release assets are required to create evidence")
     receipts, receipt_raw = load_notarization_receipts(
         args.notarization_receipts,
         version=args.version,
@@ -447,11 +526,13 @@ def create_command(args) -> dict:
         for arch in ARCHES
     }
     python_verification = {}
+    automation_verification = {}
     for arch in ARCHES:
         validate_build_info(build_info[arch], version=args.version, revision=args.source_revision, arch=arch)
         python_verification[arch] = verify_python_archive(
             paths["python"][arch], arch, args.team_id, args.mirror_source_root
         )
+        automation_verification[arch] = verify_automation_archive(paths["automation"][arch], arch)
         binary_receipt = receipts[f"pairling-connectd-{arch}"]
         if binary_receipt["subject_sha256"] != sha256_file(paths["binaries"][arch]):
             raise EvidenceError(f"connectd {arch} notarization receipt does not bind the selected binary")
@@ -488,6 +569,18 @@ def create_command(args) -> dict:
             }
             for arch in ARCHES
         },
+        "automation": {
+            arch: {
+                "sha256": automation_verification[arch]["sha256"],
+                "tree_sha256": automation_verification[arch]["tree_sha256"],
+                "notarization_tree_sha256": receipts[f"pairling-automation-{arch}"]["subject_sha256"],
+                "team_id": args.team_id,
+                "identifier": "dev.pairling.automation",
+                "architecture": arch,
+                "notarization": receipts[f"pairling-automation-{arch}"],
+            }
+            for arch in ARCHES
+        },
     }
     validate_evidence(value, version=args.version, source_revision=args.source_revision)
     if args.output.is_symlink():
@@ -505,6 +598,8 @@ def create_command(args) -> dict:
         connectd_x64=paths["binaries"]["x64"],
         python_arm64=paths["python"]["arm64"],
         python_x64=paths["python"]["x64"],
+        automation_arm64=paths["automation"]["arm64"],
+        automation_x64=paths["automation"]["x64"],
         mirror_source_root=args.mirror_source_root,
         notarization_receipts=args.notarization_receipts,
     ))
@@ -515,6 +610,8 @@ def add_artifact_arguments(parser) -> None:
     parser.add_argument("--connectd-x64", type=Path)
     parser.add_argument("--python-arm64", type=Path)
     parser.add_argument("--python-x64", type=Path)
+    parser.add_argument("--automation-arm64", type=Path)
+    parser.add_argument("--automation-x64", type=Path)
 
 
 def add_mirror_source_argument(parser) -> None:

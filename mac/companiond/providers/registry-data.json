@@ -239,7 +239,7 @@
     },
     {
       "id": "omp",
-      "display_name": "Oh My Pi",
+      "display_name": "OMP",
       "kind": "terminal_cli",
       "adapter_depth": "standard",
       "binary_name": "omp",
@@ -249,7 +249,9 @@
         "/usr/local/bin/omp"
       ],
       "env_override": "PAIRLING_OMP_BIN",
-      "config_paths": [],
+      "config_paths": [
+        "~/.omp/agent/config.yml"
+      ],
       "version_command": ["--version"],
       "docs_url": "https://github.com/can1357/oh-my-pi",
       "managed_launch": {

@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -637,6 +638,13 @@ class PendingClaimRecord:
     response_json: str
     state: str
     expires_at: float
+
+
+
+@dataclass(frozen=True)
+class PendingActivationContext:
+    purpose: str | None
+
 
 
 @dataclass(frozen=True)
@@ -1360,6 +1368,60 @@ class DeviceRegistry:
                 "WHERE pair_id = ? AND device_id = ?",
                 (pair_id, device_id),
             )
+
+    def pending_pair_activation_context(
+        self,
+        *,
+        pair_id: str,
+        device_id: str,
+        install_id: str,
+        now: float | None = None,
+    ) -> PendingActivationContext | None:
+        """Return a live pending claim's non-secret purpose, if it still exists."""
+        expected_install_id = normalize_install_id(install_id)
+        if not expected_install_id:
+            return None
+        current = utc_epoch() if now is None else float(now)
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT d.install_id, d.activation_state, d.pending_pair_id,
+                       d.pending_expires_at, d.revoked_at, d.purpose,
+                       c.device_id AS claim_device_id, c.state AS claim_state,
+                       c.expires_at AS claim_expires_at
+                FROM devices AS d
+                LEFT JOIN pending_pair_claims AS c ON c.pair_id = d.pending_pair_id
+                WHERE d.device_id = ?
+                """,
+                (device_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        saved_install_id = normalize_install_id(row["install_id"])
+        if (
+            not saved_install_id
+            or not secrets.compare_digest(saved_install_id, expected_install_id)
+            or str(row["activation_state"] or "") != "pending"
+            or not secrets.compare_digest(str(row["pending_pair_id"] or ""), pair_id)
+            or row["revoked_at"] is not None
+            or not secrets.compare_digest(str(row["claim_device_id"] or ""), device_id)
+            or str(row["claim_state"] or "") != "pending"
+        ):
+            return None
+        try:
+            pending_expires_at = float(row["pending_expires_at"])
+            claim_expires_at = float(row["claim_expires_at"])
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if (
+            not math.isfinite(pending_expires_at)
+            or not math.isfinite(claim_expires_at)
+            or current >= pending_expires_at
+            or current > claim_expires_at
+        ):
+            return None
+        purpose = str(row["purpose"] or "").strip() or None
+        return PendingActivationContext(purpose=purpose)
 
     def activate_pending_claim(
         self,

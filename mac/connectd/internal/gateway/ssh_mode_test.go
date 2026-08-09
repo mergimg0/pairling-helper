@@ -144,8 +144,8 @@ func TestSSHModeScrubsForgedHeadersAndInjectsSSHProvenance(t *testing.T) {
 	if peerNode != "" {
 		t.Fatalf("forged peer node forwarded: %q", peerNode)
 	}
-	if internalToken != "" {
-		t.Fatalf("forged internal token forwarded: %q", internalToken)
+	if internalToken != testGatewayToken {
+		t.Fatalf("internal token = %q, want gateway-owned token", internalToken)
 	}
 	if provenance != "ssh_gateway" {
 		t.Fatalf("provenance = %q, want ssh_gateway (gateway-injected, never client-supplied)", provenance)

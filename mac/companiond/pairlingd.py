@@ -13,8 +13,8 @@ Runtime endpoints use per-device scoped Authorization: Bearer tokens:
   GET  /corpus?since=<unix-ts>                   list transcripts modified after ts
   GET  /session-meta?session=<id>                effort/model/type/sentinel-mode/etc
   GET  /personal-context                         contents of ~/.claude/personal-context.md
-  POST /llm-route?model=sonnet|haiku  body:JSON  one-shot prompt via `claude -p` (subscription)
-  POST /llm-route-stream?model=...    body:JSON  same as /llm-route but streams as SSE
+  POST /llm-route?model=...                    prompt-only route; fails closed without an isolated backend
+  POST /llm-route-stream?model=...             same route streamed as SSE when a safe backend exists
   GET  /worker-stats?since_min=<n>               counts of automated worker sessions
   GET  /push/status                              APNs relay/provider registration state
   POST /push/preferences body:JSON               store per-device push preferences
@@ -43,7 +43,7 @@ Runtime endpoints use per-device scoped Authorization: Bearer tokens:
   GET  /phone-tools/activity?limit=N             durable, privacy-bounded tool history
   POST /phone-tools/availability body:JSON       foreground iPhone tool-listener availability
 
-Listens on PAIRLING_WEBHOOK_HOST, loopback by default unless explicitly configured.
+The credential-bearing runtime is always loopback-only behind pairling-connectd.
 """
 from __future__ import annotations
 
@@ -59,6 +59,7 @@ import ipaddress
 import json
 import math
 import os
+import stat
 import re
 import copy
 import secrets
@@ -88,6 +89,12 @@ from safe_filesystem import (
     open_child_regular_file_fd,
     open_directory_fd,
     open_regular_file_fd,
+)
+from pairling_automation import (
+    AutomationHelperClient,
+    AutomationHelperMutationIndeterminate,
+    AutomationHelperUnavailableError,
+    terminal_permissions_summary,
 )
 
 _DAEMON_SCRIPT_PATH = Path(__file__).resolve()
@@ -274,11 +281,10 @@ except Exception:
     _aperture_cli_validate_launch_context = None
 
 try:
-    from llm_route import LLMRouteError, llm_route_model_family, run_local_llm
+    from llm_route import llm_route_model_family, run_remote_llm
 except Exception:
-    LLMRouteError = None
     llm_route_model_family = None
-    run_local_llm = None
+    run_remote_llm = None
 
 try:
     from pairling_tools import (
@@ -293,7 +299,6 @@ except Exception:
     PHONE_TOOL_WORK_QUEUE = None
     audit_detail_for_tool_run = None
     current_worker_id = None
-    run_pairling_tool = None
 
 try:
     from live_activity_publisher import LiveActivityTurnStatePublisher
@@ -439,13 +444,20 @@ try:
         managed_child_environment as _managed_child_environment,
         provider_detail_payload,
         provider_snapshot_payload,
+        resolve_executable as _provider_resolve_executable,
     )
     from providers.registry import (
         known_provider_ids as _provider_known_ids,
+        get_provider as _provider_get,
         provider_descriptors as _provider_registry_descriptors,
         provider_ids as _provider_registry_ids,
         probe_all as _provider_probe_all,
         session_capable_provider_ids as _provider_session_capable_ids,
+    )
+    from providers.omp import (
+        saved_sessions as _omp_saved_sessions,
+        session_runtime_metadata as _omp_session_runtime_metadata,
+        terminal_session_records as _omp_terminal_session_records,
     )
     from providers.visibility import (
         read_excluded as _provider_visibility_read_excluded,
@@ -463,6 +475,11 @@ except Exception:
     provider_snapshot_payload = None
     _TerminalLaunchProfile = None
     _managed_child_environment = None
+    _provider_get = None
+    _provider_resolve_executable = None
+    _omp_terminal_session_records = None
+    _omp_session_runtime_metadata = None
+    _omp_saved_sessions = None
     _provider_known_ids = None
     _provider_registry_descriptors = None
     _provider_registry_ids = None
@@ -541,8 +558,8 @@ from substrate_status_contract import (
     fetch_substrate_status as _fetch_substrate_status,
 )
 
-# launchd gives subprocesses a minimal PATH; prepend the locations of `docker`,
-# `psql`, `osascript`, `open`, etc. so we can shell out reliably.
+# launchd gives subprocesses a minimal PATH; prepend user tool locations so
+# provider and runtime binaries resolve reliably.
 _USER_HOME = str(Path.home())
 os.environ["PATH"] = (
     f"{_USER_HOME}/.local/bin:{_USER_HOME}/bin:"
@@ -578,6 +595,87 @@ TURN_STATE_DIR = HOME / ".claude" / "turn-state"
 # deepfield blurt target: verbatim voice captures land in the idea
 # observatory's inbox. Fail-closed when the repo is absent (foreign installs).
 DEEPFIELD_INBOX_DIR = HOME / "projects" / "deepfield" / "observations" / "inbox"
+
+
+class _UnsafeDeepfieldPathError(OSError):
+    """The observation destination failed no-follow or ownership validation."""
+
+
+def _deepfield_directory_flags() -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise _UnsafeDeepfieldPathError("no-follow directory opens are unavailable")
+    return os.O_RDONLY | nofollow | directory | getattr(os, "O_CLOEXEC", 0)
+
+
+def _open_owned_deepfield_directory(
+    path: Path | str,
+    *,
+    dir_fd: int | None = None,
+) -> int:
+    try:
+        descriptor = os.open(path, _deepfield_directory_flags(), dir_fd=dir_fd)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise _UnsafeDeepfieldPathError("unsafe Deepfield directory") from exc
+    try:
+        directory_stat = os.fstat(descriptor)
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            raise _UnsafeDeepfieldPathError("Deepfield path is not a directory")
+        if directory_stat.st_uid != os.getuid():
+            raise _UnsafeDeepfieldPathError("Deepfield directory has an unexpected owner")
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _deepfield_repository_root() -> Path:
+    if (
+        not DEEPFIELD_INBOX_DIR.is_absolute()
+        or any(part in {"", ".", ".."} for part in DEEPFIELD_INBOX_DIR.parts)
+        or DEEPFIELD_INBOX_DIR.name != "inbox"
+        or DEEPFIELD_INBOX_DIR.parent.name != "observations"
+    ):
+        raise _UnsafeDeepfieldPathError("invalid Deepfield inbox path")
+    return DEEPFIELD_INBOX_DIR.parent.parent
+
+
+def _open_deepfield_repository_root() -> int:
+    return _open_owned_deepfield_directory(_deepfield_repository_root())
+
+
+def _open_or_create_deepfield_directory(name: str, *, parent_fd: int) -> int:
+    if not name or name in {".", ".."} or "/" in name:
+        raise _UnsafeDeepfieldPathError("invalid Deepfield directory component")
+    try:
+        return _open_owned_deepfield_directory(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        return _open_owned_deepfield_directory(name, dir_fd=parent_fd)
+
+
+def _open_deepfield_inbox_directory() -> int:
+    current_fd = _open_deepfield_repository_root()
+    try:
+        for component in ("observations", "inbox"):
+            next_fd = _open_or_create_deepfield_directory(
+                component,
+                parent_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
 AGENT_REGISTRY_DB = COMPANION_DIR / "agent-sessions.sqlite"
 CONTROL_RECEIPT_DB = COMPANION_DIR / "control-receipts.sqlite"
 TERMINAL_CAPTURE_DIR = COMPANION_DIR / "terminal-capture"
@@ -606,7 +704,6 @@ MANAGED_PROVIDER_SESSION_MANAGER = None
 _MANAGED_PROVIDER_SESSION_STORE = None
 _MANAGED_PROVIDER_SESSION_MANAGER = None
 _MANAGED_PROVIDER_SESSION_LOCK = threading.RLock()
-
 
 def _ensure_session_file_watcher():
     global _SESSION_FILE_WATCHER
@@ -2254,6 +2351,103 @@ def _broker_session_matches_spawn_request(
     )
 
 
+def _broker_spawn_provider_identity(
+    session,
+    *,
+    broker_id: str,
+    provider: str,
+    native_id: str,
+    project: str,
+    timeout: float = 2.0,
+) -> dict | None:
+    """Prove a live provider process before publishing a broker launch."""
+    if not _broker_session_matches_spawn_request(
+        session,
+        broker_id=broker_id,
+        provider=provider,
+        native_id=native_id,
+    ):
+        return None
+    current_session = session
+
+    def current_liveness() -> str:
+        liveness_probe = getattr(current_session, "ownership_liveness", None)
+        if callable(liveness_probe):
+            return str(liveness_probe() or "")
+        liveness = str(_broker_value(current_session, "liveness", "") or "")
+        if liveness:
+            return liveness
+        alive = _broker_value(current_session, "alive", None)
+        return "alive" if alive is True else ("gone" if alive is False else "")
+
+    if current_liveness() != "alive":
+        return None
+    broker_pid = _broker_pid(current_session)
+    broker_tty = _broker_slave_tty(current_session)
+    if broker_pid <= 0 or not broker_tty:
+        return None
+    canonical_project = os.path.realpath(project)
+    deadline = _time.monotonic() + max(0.0, timeout)
+    while True:
+        probe_ok, rows = _scan_provider_process_rows(provider)
+        if probe_ok:
+            matches = [
+                row for row in rows
+                if str(row.get("tty") or "") == broker_tty
+                and os.path.realpath(str(row.get("project") or "")) == canonical_project
+                and _process_is_descendant_of(
+                    int(row.get("pid") or 0),
+                    broker_pid,
+                )
+            ]
+            if len(matches) == 1:
+                return matches[0]
+        if _time.monotonic() >= deadline:
+            return None
+        try:
+            refreshed = (
+                PTY_BROKER.get(broker_id)
+                if PTY_BROKER is not None
+                else None
+            )
+        except Exception:
+            return None
+        if refreshed is None or not _broker_session_matches_spawn_request(
+            refreshed,
+            broker_id=broker_id,
+            provider=provider,
+            native_id=native_id,
+        ):
+            return None
+        current_session = refreshed
+        if current_liveness() != "alive":
+            return None
+        _time.sleep(0.05)
+
+
+def _terminate_fresh_broker_or_raise_unknown(
+    broker_id: str,
+    *,
+    context: str,
+) -> None:
+    """Require confirmed cleanup when a fresh broker launch cannot publish."""
+    try:
+        result = (
+            PTY_BROKER.terminate(broker_id)
+            if PTY_BROKER is not None
+            else None
+        )
+    except Exception as error:
+        raise PTYBrokerOutcomeUnknownError(
+            f"{context}; broker cleanup failed: "
+            f"{type(error).__name__}: {str(error)[:120]}"
+        ) from error
+    if not isinstance(result, dict) or not result.get("ok"):
+        raise PTYBrokerOutcomeUnknownError(
+            f"{context}; broker cleanup could not be confirmed"
+        )
+
+
 def _broker_session_owns_identity(session, provider: str, native_id: str) -> bool:
     """Prove that a broker session is owned by the requested provider session."""
     broker_id = _broker_session_id(session)
@@ -2283,6 +2477,34 @@ def _broker_session_owns_identity(session, provider: str, native_id: str) -> boo
         and durable_broker_id == broker_id
         and session_provider == provider
         and session_native_id in durable_native_ids
+    )
+
+
+def _registry_owned_broker_session(
+    provider: str,
+    native_id: str,
+    row: dict | None = None,
+):
+    """Return the live broker session proven by one durable registry row."""
+    if PTY_BROKER is None:
+        return None
+    row = row or _agent_registry_get(provider, native_id)
+    if row is None or row.get("closed_at") is not None:
+        return None
+    broker_id = str(
+        _registry_metadata_from_row(row).get("broker_id") or ""
+    ).strip()
+    if not broker_id:
+        return None
+    try:
+        session = PTY_BROKER.get(broker_id)
+    except Exception:
+        return None
+    return (
+        session
+        if session is not None
+        and _broker_session_owns_identity(session, provider, native_id)
+        else None
     )
 
 
@@ -2620,30 +2842,7 @@ TERMINAL_CAPTURE_MAP_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _bind_host() -> str:
-    if os.environ.get("PAIRLING_WEBHOOK_HOST"):
-        return os.environ["PAIRLING_WEBHOOK_HOST"]
-    mode = os.environ.get("PAIRLING_BIND_MODE", "loopback").strip().lower()
-    if mode in ("all", "tailnet_lan"):
-        return "0.0.0.0"
-    if mode == "loopback":
-        return "127.0.0.1"
-    if mode == "lan":
-        ok, out, _ = _run_text(["/sbin/ifconfig"], timeout=3)
-        if ok:
-            for match in re.finditer(r"\binet\s+(\d+\.\d+\.\d+\.\d+)\b", out):
-                ip = match.group(1)
-                if not ip.startswith(("127.", "169.254.", "100.")):
-                    return ip
-    try:
-        proc = subprocess.run(
-            ["tailscale", "ip", "-4"],
-            capture_output=True, text=True, timeout=2,
-        )
-        ip = (proc.stdout or "").strip().splitlines()[0]
-        if ip.startswith("100."):
-            return ip
-    except Exception:
-        pass
+    """Keep the credential-bearing runtime behind the local connectd gateway."""
     return "127.0.0.1"
 
 # Simple per-session rate limit for exact terminal mutations.
@@ -2801,6 +3000,13 @@ _inject_rate_state: dict[str, list[float]] = {}  # session_id -> [timestamps]
 _request_rate_lock = threading.Lock()
 _request_rate_state: dict[str, list[float]] = {}
 _REQUEST_RATE_MAX_KEYS = 4096
+_pairing_rate_lock = threading.Lock()
+_pairing_rate_state: dict[str, list[float]] = {}
+_PAIRING_RATE_MAX_KEYS = 1024
+_invalid_proof_rate_lock = threading.Lock()
+_invalid_proof_rate_state: dict[str, list[float]] = {}
+_INVALID_PROOF_RATE_MAX_KEYS = 1024
+_INJECT_RATE_MAX_KEYS = 4096
 PAIRDROP_REQUEST_PROOF_CHUNK_BYTES = 512 * 1024
 REQUEST_PROOF_TRANSFER_FLOOR_BYTES = 4 * 1024 * 1024 * 1024
 REQUEST_PROOF_CACHE_MAX_ENTRIES = 131_072
@@ -2859,9 +3065,9 @@ RUNTIME_MAX_ACTIVE_CONNECTIONS = max(
     ),
     int(os.environ.get("PAIRLING_RUNTIME_MAX_ACTIVE_CONNECTIONS", "28")),
 )
-TERMINAL_TRUTH_OSASCRIPT_TIMEOUT_SECONDS = max(
+TERMINAL_APP_SNAPSHOT_TIMEOUT_SECONDS = max(
     0.5,
-    min(5.0, float(os.environ.get("PAIRLING_TERMINAL_TRUTH_OSASCRIPT_TIMEOUT_SECONDS", "3.0"))),
+    min(5.0, float(os.environ.get("PAIRLING_TERMINAL_APP_SNAPSHOT_TIMEOUT_SECONDS", "3.0"))),
 )
 TERMINAL_SURFACE_V2_NONCE_SALT = os.urandom(16).hex()
 LAST_HUMAN_ACTIVITY_AT = 0.0
@@ -3231,7 +3437,7 @@ class _RuntimeAdmission:
             pass
         self._released = True
 
-PUBLIC_ENDPOINTS = {"/health", "/healthz", "/readyz", "/manifest", "/power-state", "/pair/psk-claim-v2", "/pair/psk-activate", "/pair/reauth-challenge", "/pair/reauth-claim"}
+PUBLIC_ENDPOINTS = {"/health", "/healthz", "/readyz", "/manifest", "/pair/psk-claim-v2", "/pair/psk-activate", "/pair/reauth-challenge", "/pair/reauth-claim"}
 
 LOCAL_CONTROL_PATHS = {
     "/pair/start",
@@ -3254,27 +3460,76 @@ INTERNAL_LOOPBACK_PATHS = {
 INTERNAL_HOOK_TOKEN_FILE = COMPANION_DIR / "internal-hook-token"
 
 
+def _read_internal_hook_token(path: Path) -> str:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        return ""
+    flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return ""
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+            or metadata.st_size < 64
+            or metadata.st_size > 65
+        ):
+            return ""
+        with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as stream:
+            value = stream.read(66).strip()
+    except (OSError, UnicodeError):
+        return ""
+    finally:
+        os.close(descriptor)
+    return value if re.fullmatch(r"[0-9a-f]{64}", value or "") else ""
+
+
 def _ensure_internal_hook_token() -> str:
     """Mint (or read) the loopback hook token. 32-byte hex, mode 600.
     Created at boot so hooks can read it without racing the first request."""
-    try:
-        existing = INTERNAL_HOOK_TOKEN_FILE.read_text(encoding="utf-8").strip()
-        if re.fullmatch(r"[0-9a-f]{64}", existing or ""):
-            return existing
-    except OSError:
-        pass
+    existing = _read_internal_hook_token(INTERNAL_HOOK_TOKEN_FILE)
+    if existing:
+        return existing
     token = secrets.token_hex(32)
+    temporary_path: Path | None = None
     try:
         INTERNAL_HOOK_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = INTERNAL_HOOK_TOKEN_FILE.with_name(INTERNAL_HOOK_TOKEN_FILE.name + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(token)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, INTERNAL_HOOK_TOKEN_FILE)
+        temporary_path = INTERNAL_HOOK_TOKEN_FILE.with_name(
+            f"{INTERNAL_HOOK_TOKEN_FILE.name}.tmp-{secrets.token_hex(8)}"
+        )
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(temporary_path, flags, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", closefd=False) as stream:
+                stream.write(token)
+                stream.flush()
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary_path, INTERNAL_HOOK_TOKEN_FILE)
+        temporary_path = None
+        if _read_internal_hook_token(INTERNAL_HOOK_TOKEN_FILE) != token:
+            return ""
     except OSError:
         return ""
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
     return token
 
 
@@ -3433,6 +3688,16 @@ POST_ONLY_ENDPOINTS = {
     "/pairdrop/uploads",
 }
 
+
+def _is_post_only_endpoint(path: str) -> bool:
+    return (
+        path in POST_ONLY_ENDPOINTS
+        or (
+            path.startswith("/sessions/race/")
+            and path.endswith("/finish")
+        )
+    )
+
 GET_OR_POST_ENDPOINTS = {
     "/onestream-handoff",
     "/sentinel/preferences",
@@ -3457,6 +3722,8 @@ HIGH_RISK_ENDPOINTS = {
     "/safety/request-activation",
     "/safety/open-full-disk-access",
     "/safety/evidence-test",
+    "/safety/ack",
+    "/onestream-handoff",
     "/spawn-session",
     "/mirror/flush",
     "/mirror/resume",
@@ -3503,9 +3770,18 @@ MAX_COMPOSE_SYNC_BODY_BYTES = 2 * 1024 * 1024
 MAX_UPLOAD_BODY_BYTES = 100 * 1024 * 1024
 MAX_PAIRDROP_SMALL_BODY_BYTES = 10 * 1024 * 1024
 MAX_PAIRDROP_UPLOAD_CHUNK_BYTES = 1024 * 1024
-ONESTREAM_HANDOFF_MAX_STORED_BYTES = MAX_REQUEST_BODY_BYTES * 2 + 64 * 1024
-ONESTREAM_HANDOFF_MAX_RESPONSE_BYTES = ONESTREAM_HANDOFF_MAX_STORED_BYTES
-ONESTREAM_HANDOFF_MAX_PENDING = 100
+ONESTREAM_HANDOFF_MAX_TRANSCRIPT_BYTES = 128 * 1024
+ONESTREAM_HANDOFF_MAX_PROMPT_BYTES = 8 * 1024
+ONESTREAM_HANDOFF_MAX_METADATA_BYTES = 256
+ONESTREAM_HANDOFF_MAX_STORED_BYTES = (
+    ONESTREAM_HANDOFF_MAX_TRANSCRIPT_BYTES
+    + ONESTREAM_HANDOFF_MAX_PROMPT_BYTES
+    + 4096
+)
+ONESTREAM_HANDOFF_MAX_RESPONSE_BYTES = 256 * 1024
+ONESTREAM_HANDOFF_MAX_PENDING = 32
+ONESTREAM_HANDOFF_MAX_TOTAL_BYTES = 256 * 1024
+ONESTREAM_HANDOFF_TTL_SECONDS = 7 * 24 * 60 * 60
 ONESTREAM_HANDOFF_MAX_DIRECTORY_SCAN = 1_000
 ONESTREAM_HANDOFF_FILENAME_RE = re.compile(r"onestream-[0-9a-f]{12}\.json")
 
@@ -3524,13 +3800,13 @@ def _onestream_handoff_names(directory_fd: int) -> list[str]:
             if ONESTREAM_HANDOFF_FILENAME_RE.fullmatch(entry.name):
                 names.append(entry.name)
     names.sort()
-    return names[:ONESTREAM_HANDOFF_MAX_PENDING]
+    return names
 
 
 def _read_onestream_handoff_record(
     directory_fd: int,
     filename: str,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any], int, float] | None:
     if ONESTREAM_HANDOFF_FILENAME_RE.fullmatch(filename) is None:
         return None
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -3565,7 +3841,54 @@ def _read_onestream_handoff_record(
         payload = json.loads(body)
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return None
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    expected_id = str(payload.get("handoff_id") or payload.get("handoffId") or "")
+    if expected_id != filename[:-5]:
+        return None
+    return payload, len(body), metadata.st_mtime
+
+
+def _onestream_handoff_records(
+    directory_fd: int,
+    *,
+    cleanup: bool,
+) -> list[tuple[str, dict[str, Any], int, float]]:
+    now = _time.time()
+    records: list[tuple[str, dict[str, Any], int, float]] = []
+    for filename in _onestream_handoff_names(directory_fd):
+        loaded = _read_onestream_handoff_record(directory_fd, filename)
+        if loaded is None:
+            continue
+        record, byte_count, modified_at = loaded
+        raw_created_at = (
+            record.get("received_at")
+            or record.get("created_at")
+            or record.get("createdAt")
+            or modified_at
+        )
+        try:
+            created_at = float(raw_created_at)
+        except (TypeError, ValueError):
+            created_at = modified_at
+        if not math.isfinite(created_at):
+            created_at = modified_at
+        expired = now - created_at > ONESTREAM_HANDOFF_TTL_SECONDS
+        consumed = bool(
+            record.get("consumed")
+            or record.get("consumed_at")
+            or record.get("consumedAt")
+        )
+        if expired or consumed:
+            if cleanup:
+                try:
+                    os.unlink(filename, dir_fd=directory_fd)
+                except OSError:
+                    pass
+            continue
+        records.append((filename, record, byte_count, created_at))
+    records.sort(key=lambda item: item[3])
+    return records[:ONESTREAM_HANDOFF_MAX_PENDING]
 
 
 def _write_onestream_handoff_record(
@@ -3596,8 +3919,14 @@ def _write_onestream_handoff_record(
         if not stat.S_ISREG(lock_metadata.st_mode):
             raise OSError(errno.ELOOP, "unsafe handoff lock")
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        if len(_onestream_handoff_names(directory_fd)) >= ONESTREAM_HANDOFF_MAX_PENDING:
+        records = _onestream_handoff_records(directory_fd, cleanup=True)
+        if len(records) >= ONESTREAM_HANDOFF_MAX_PENDING:
             raise OSError(errno.ENOSPC, "handoff capacity exhausted")
+        if (
+            sum(record[2] for record in records) + len(body)
+            > ONESTREAM_HANDOFF_MAX_TOTAL_BYTES
+        ):
+            raise OSError(errno.ENOSPC, "handoff storage quota exhausted")
 
         flags = (
             os.O_WRONLY
@@ -3637,6 +3966,25 @@ def _write_onestream_handoff_record(
             finally:
                 os.close(lock_fd)
         os.close(directory_fd)
+
+
+
+MAX_SAFETY_ACK_IDS = 100
+MAX_SAFETY_ACK_ID_BYTES = 256
+
+def _bounded_utf8_text(value: object, field: str, maximum_bytes: int, *, required: bool = False) -> str:
+    if value is None:
+        text = ""
+    elif isinstance(value, str):
+        text = value.strip()
+    else:
+        raise ValueError(f"{field} must be a string")
+    byte_count = len(text.encode("utf-8"))
+    if required and not text:
+        raise ValueError(f"{field} is required")
+    if byte_count > maximum_bytes:
+        raise ValueError(f"{field} exceeds {maximum_bytes} UTF-8 bytes")
+    return text
 
 
 
@@ -3739,13 +4087,29 @@ def _requires_pairling_connect_gateway(path: str) -> bool:
 
 
 def _pairdrop_gateway_provenance_ok(headers, client_address=None) -> bool:
-    getter = headers.get if hasattr(headers, "get") else lambda key, default=None: default
-    header_ok = str(getter("X-Pairling-Connect-Gateway", "") or "") == "pairling-connectd"
-    if not header_ok:
+    if not _loopback_client_address(client_address) or not INTERNAL_HOOK_TOKEN:
         return False
-    # The gateway header alone is spoofable. The trusted connectd hop is loopback,
-    # even when connectd received the original request over a tailnet route.
-    return _loopback_client_address(client_address)
+    getter = headers.get if hasattr(headers, "get") else lambda key, default=None: default
+    gateway = str(getter("X-Pairling-Connect-Gateway", "") or "").strip()
+    presented = str(getter("X-Pairling-Internal-Token", "") or "").strip()
+    return (
+        gateway == "pairling-connectd"
+        and bool(presented)
+        and secrets.compare_digest(presented, INTERNAL_HOOK_TOKEN)
+    )
+
+
+def _pairling_connect_gateway_claimed(headers) -> bool:
+    """Treat any claimed gateway hop as remote traffic until it authenticates."""
+    getter = headers.get if hasattr(headers, "get") else lambda key, default=None: default
+    return bool(str(getter("X-Pairling-Connect-Gateway", "") or "").strip())
+
+def _unauthenticated_request_allowed(path: str, headers, client_address=None) -> bool:
+    if path in PUBLIC_ENDPOINTS:
+        return True
+    if path != "/power-state" or not _loopback_client_address(client_address):
+        return False
+    return not _pairling_connect_gateway_claimed(headers)
 
 
 def _pairling_connect_gateway_rejection(path: str, headers, client_address=None) -> dict | None:
@@ -3810,7 +4174,9 @@ def _required_scopes_for_request(path: str, method: str) -> set[str]:
         return {"sessions:read"}
     if path == "/provider-controls/execute":
         return {"provider:control"}
-    if path in {"/health", "/healthz", "/readyz", "/routez", "/health-stream", "/power-state", "/provider-status", "/status", "/aperture-cli/status", "/aperture-cli/providers", "/aperture-cli/launch-contexts"}:
+    if path == "/status":
+        return {"sessions:read", "transcript:read"}
+    if path in {"/health", "/healthz", "/readyz", "/routez", "/health-stream", "/power-state", "/provider-status", "/aperture-cli/status", "/aperture-cli/providers", "/aperture-cli/launch-contexts"}:
         return {"health:read"}
     if path == "/manifest":
         return {"manifest:read"}
@@ -3826,7 +4192,7 @@ def _required_scopes_for_request(path: str, method: str) -> set[str]:
         return {"sessions:read"}
     if path in {"/sessions", "/sessions-visible", "/sessions-stream", "/recent-projects", "/filesystem/directories", "/session-meta", "/activity", "/activity-stream", "/fleet/digest", "/phone-tools/activity"}:
         return {"sessions:read"}
-    if path in {"/transcript", "/transcript-stream", "/session-live-events", "/session-events-v2", "/session-events-v2-raw", "/session-events-v2-content", "/device-events", "/terminal-stream", "/terminal-stream-diagnostics", "/terminal-surface", "/terminal-surface-stream", "/terminal-surface-v2", "/terminal-surface-stream-v2", "/session-runtime-truth", "/session-runtime-truth-stream", "/terminal-workspace", "/terminal-workspace-stream", "/corpus"}:
+    if path in {"/search", "/transcript", "/transcript-stream", "/session-live-events", "/session-events-v2", "/session-events-v2-raw", "/session-events-v2-content", "/device-events", "/terminal-stream", "/terminal-stream-diagnostics", "/terminal-surface", "/terminal-surface-stream", "/terminal-surface-v2", "/terminal-surface-stream-v2", "/session-runtime-truth", "/session-runtime-truth-stream", "/terminal-workspace", "/terminal-workspace-stream", "/corpus"}:
         return {"transcript:read"}
     if path.startswith("/sessions/") and path.endswith("/export"):
         return {"transcript:read"}
@@ -3846,9 +4212,9 @@ def _required_scopes_for_request(path: str, method: str) -> set[str]:
         return {"worker:read"}
     if path in {"/sentinel/snooze", "/sentinel/evaluate-now"}:
         return {"pair:admin"}
-    if path in {"/safety/status", "/safety/events", "/safety/ack"}:
+    if path in {"/safety/status", "/safety/events"}:
         return {"health:read"}
-    if path in {"/safety/request-activation", "/safety/open-full-disk-access", "/safety/evidence-test"}:
+    if path in {"/safety/ack", "/safety/request-activation", "/safety/open-full-disk-access", "/safety/evidence-test"}:
         return {"pair:admin"}
     if path == "/aperture-cli/open":
         return {"pair:admin"}
@@ -3872,7 +4238,9 @@ def _required_scopes_for_request(path: str, method: str) -> set[str]:
         return {"files:upload"}
     if path.startswith("/pair/") or path.startswith("/pickers/") or path.startswith("/mirror/"):
         return {"pair:admin"}
-    if path in {"/commands", "/commands-stream", "/invocations", "/invocations-stream", "/personal-context", "/tokens"}:
+    if path == "/personal-context":
+        return {"files:read", "manifest:read"}
+    if path in {"/commands", "/commands-stream", "/invocations", "/invocations-stream", "/tokens"}:
         return {"manifest:read"}
     if path == "/postures":
         # SPEC-p6 §2.2: reads ride the personal-context posture; the write is
@@ -3947,8 +4315,17 @@ def _pairling_tools_payload_for_auth(auth_result, payload: dict) -> tuple[dict |
     device_id, error = _self_device_target(auth_result, requested)
     if error is not None:
         return None, error
+    strategy = str(payload.get("strategy") or "auto")
+    if strategy == "mac_only":
+        return None, {
+            "status": 403,
+            "code": "remote_mac_fallback_forbidden",
+            "message": "Paired devices cannot send model prompts to the Mac fallback.",
+        }
     scoped_payload = dict(payload)
     scoped_payload["iphone_device_id"] = device_id
+    scoped_payload["strategy"] = "iphone_only"
+    scoped_payload.pop("mac_model", None)
     return scoped_payload, None
 
 
@@ -3977,18 +4354,20 @@ def _internal_route_probe_request(path: str, headers, client_address) -> bool:
     return bool(presented) and secrets.compare_digest(presented, INTERNAL_HOOK_TOKEN)
 
 
+def _local_authorization_request(headers, client_address) -> bool:
+    """Authenticate local CLI-only operations against the per-boot secret."""
+    if not _loopback_client_address(client_address) or not INTERNAL_HOOK_TOKEN:
+        return False
+    presented = str(headers.get("X-Pairling-Internal-Token") or "").strip()
+    return bool(presented) and secrets.compare_digest(presented, INTERNAL_HOOK_TOKEN)
+
+
 def _funnel_origin_request(headers, client_address) -> bool:
-    """True only when a request bears connectd's funnel-origin marker AND arrives
-    over the loopback hop from connectd. The marker alone is spoofable, so the
-    loopback peer is required: the connectd-to-pairlingd hop is loopback and is
-    unreachable from the internet, so an internet client cannot forge the marker.
-    A funnel-enabled install uses this to hard-require App Attest (Increment 5)
-    and to refuse /pair/start for funnel-origin requests (Increment 4)."""
+    """Recognize a restriction-only marker injected by the loopback gateway."""
     if not _loopback_client_address(client_address):
         return False
     getter = headers.get if hasattr(headers, "get") else lambda key, default=None: default
     return str(getter("X-Pairling-Funnel-Origin", "") or "").strip() == "1"
-
 
 def _pair_claim_requires_app_attest(headers, client_address) -> bool:
     return _funnel_origin_request(headers, client_address) or not _loopback_client_address(client_address)
@@ -4438,27 +4817,85 @@ def _pairdrop_safe_content_type(raw: str) -> str:
     return "application/octet-stream"
 
 
-def _request_rate_check(key: str, max_per_min: int = 120) -> tuple[bool, int]:
+def _bounded_rate_check(
+    *,
+    state: dict[str, list[float]],
+    lock: threading.Lock,
+    key: str,
+    max_per_min: int,
+    max_keys: int,
+    evict_oldest: bool,
+) -> tuple[bool, int]:
     now = _time.time()
     window_start = now - 60
-    with _request_rate_lock:
-        if key not in _request_rate_state and len(_request_rate_state) >= _REQUEST_RATE_MAX_KEYS:
-            for existing_key, existing_timestamps in list(_request_rate_state.items()):
+    with lock:
+        if key not in state and len(state) >= max_keys:
+            for existing_key, existing_timestamps in list(state.items()):
                 fresh = [stamp for stamp in existing_timestamps if stamp > window_start]
                 if fresh:
-                    _request_rate_state[existing_key] = fresh
+                    state[existing_key] = fresh
                 else:
-                    _request_rate_state.pop(existing_key, None)
-            if len(_request_rate_state) >= _REQUEST_RATE_MAX_KEYS:
-                return False, 60
-        timestamps = [t for t in _request_rate_state.get(key, []) if t > window_start]
+                    state.pop(existing_key, None)
+            if key not in state and len(state) >= max_keys:
+                if not evict_oldest:
+                    return False, 60
+                oldest_key = min(
+                    state,
+                    key=lambda candidate: max(state[candidate], default=float("-inf")),
+                )
+                state.pop(oldest_key, None)
+        timestamps = [stamp for stamp in state.get(key, []) if stamp > window_start]
         if len(timestamps) >= max_per_min:
             oldest = min(timestamps)
-            _request_rate_state[key] = timestamps
+            state[key] = timestamps
             return False, max(1, math.ceil(60 - (now - oldest)))
         timestamps.append(now)
-        _request_rate_state[key] = timestamps
+        state[key] = timestamps
     return True, 0
+
+
+def _request_rate_check(key: str, max_per_min: int = 120) -> tuple[bool, int]:
+    return _bounded_rate_check(
+        state=_request_rate_state,
+        lock=_request_rate_lock,
+        key=key,
+        max_per_min=max_per_min,
+        max_keys=_REQUEST_RATE_MAX_KEYS,
+        evict_oldest=False,
+    )
+
+
+def _pairing_rate_check(key: str, max_per_min: int = 5) -> tuple[bool, int]:
+    return _bounded_rate_check(
+        state=_pairing_rate_state,
+        lock=_pairing_rate_lock,
+        key=key,
+        max_per_min=max_per_min,
+        max_keys=_PAIRING_RATE_MAX_KEYS,
+        evict_oldest=True,
+    )
+
+
+def _request_origin_key(headers, client_address) -> str:
+    origin = ""
+    if _pairdrop_gateway_provenance_ok(headers, client_address):
+        origin = _connectd_peer_node_id(headers) or "connectd"
+    if not origin:
+        origin = _client_address_host(client_address) or "unknown"
+    return hashlib.sha256(origin.encode("utf-8")).hexdigest()
+
+
+def _invalid_proof_rate_check(token: str, headers, client_address) -> tuple[bool, int]:
+    origin_key = _request_origin_key(headers, client_address)
+    token_key = hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+    return _bounded_rate_check(
+        state=_invalid_proof_rate_state,
+        lock=_invalid_proof_rate_lock,
+        key=f"invalid_proof:{origin_key}:{token_key}",
+        max_per_min=20,
+        max_keys=_INVALID_PROOF_RATE_MAX_KEYS,
+        evict_oldest=True,
+    )
 
 
 def _reauth_rate_check(device_id: str, headers, client_address) -> tuple[bool, int]:
@@ -5551,40 +5988,135 @@ def _first_prompt_surface_is_ready(provider: str, snapshot: dict | None) -> bool
     return False
 
 
+def _automation_helper_client() -> AutomationHelperClient:
+    """Create the only local path permitted to control Apple Terminal."""
+    return AutomationHelperClient()
+
+
+def _terminal_permissions_summary(*, fresh: bool = True) -> dict:
+    """Read the helper's non-prompting Terminal control capability safely."""
+    return terminal_permissions_summary(
+        fresh=fresh,
+        client=_automation_helper_client(),
+    )
+
+
+def _pairing_terminal_permissions_error() -> dict | None:
+    """Return the safe retryable pairing error unless Terminal control is ready."""
+    terminal_permissions = _terminal_permissions_summary(fresh=True)
+    if terminal_permissions.get("terminal_control_ready") is True:
+        return None
+    return {
+        "ok": False,
+        "error": {
+            "code": "mac_permissions_needed",
+            "message": "Finish Pairling setup on the Mac before pairing.",
+        },
+        "terminal_permissions": terminal_permissions,
+    }
+
+
+def _automation_helper_response(response: dict, *, mutation: bool) -> dict:
+    """Translate the helper's typed result into the daemon's safe response shape."""
+    helper = response.get("helper")
+    result = response.get("result")
+    outcome = response.get("mutationOutcome")
+    if response.get("ok") is True:
+        payload = {
+            "ok": True,
+            "helper": helper,
+            "mutation_outcome": outcome,
+        }
+        if isinstance(result, dict):
+            payload.update(result)
+        return payload
+
+    error = response.get("error") if isinstance(response.get("error"), dict) else {}
+    code = str(error.get("code") or "automation_helper_unavailable")
+    safe_message = str(
+        error.get("safeMessage") or "Pairling automation helper is unavailable."
+    )
+    status = 409 if code in {
+        "mac_permissions_needed",
+        "accessibility_not_granted",
+        "automation_not_determined",
+        "automation_denied",
+        "terminal_probe_failed",
+    } else 503
+    return {
+        "ok": False,
+        "reason": safe_message,
+        "status": status,
+        "error_code": code,
+        "helper": helper,
+        "mutation_outcome": outcome,
+        "outcome_indeterminate": mutation and outcome == "outcome_unknown",
+    }
+
+
+def _automation_helper_failure(exc: Exception, *, mutation: bool) -> dict:
+    code = str(getattr(exc, "code", "") or "automation_helper_unavailable")
+    reason = str(getattr(exc, "safe_message", "") or "Pairling automation helper is unavailable.")
+    outcome_indeterminate = mutation and isinstance(exc, AutomationHelperMutationIndeterminate)
+    return {
+        "ok": False,
+        "reason": reason,
+        "status": 409 if code == "mac_permissions_needed" else 503,
+        "error_code": code,
+        "mutation_outcome": "outcome_unknown" if outcome_indeterminate else "failed_before_mutation",
+        "outcome_indeterminate": outcome_indeterminate,
+    }
+
+
 def _send_terminal_app_text_exact(tty: str, text: str) -> dict:
-    """Submit text to one Terminal tab without focus or title matching."""
+    """Submit validated text to one Terminal tab through Pairling.app."""
+    sanitized, sanitize_error = _sanitize_terminal_text_input(
+        text,
+        allow_newline=True,
+        max_chars=4000,
+    )
+    if sanitize_error is not None or sanitized is None:
+        error = sanitize_error or {
+            "code": "invalid_text",
+            "message": "terminal text is invalid",
+            "status": 400,
+        }
+        return {
+            "ok": False,
+            "reason": str(error["message"]),
+            "code": str(error["code"]),
+            "status": int(error["status"]),
+        }
     if not re.match(r"^/dev/ttys[0-9]{3,}$", str(tty or "")):
         return {"ok": False, "reason": "invalid terminal tty", "status": 400}
-    safe_tty = _as_escape(tty)
-    safe_text = _as_escape(text)
-    if _is_direct_slash_invocation_text(text):
-        payload_expr = f'"{safe_text}"'
-    else:
-        payload_expr = f'ESC & "[200~" & "{safe_text}" & ESC & "[201~"'
-    script = f'''
-    tell application "Terminal"
-        set targetTab to missing value
-        repeat with w in windows
-            repeat with t in tabs of w
-                if tty of t is "{safe_tty}" then
-                    set targetTab to t
-                    exit repeat
-                end if
-            end repeat
-            if targetTab is not missing value then exit repeat
-        end repeat
-        if targetTab is missing value then
-            return "no_window"
-        end if
-        set ESC to (ASCII character 27)
-        set wrapped to {payload_expr}
-        do script wrapped in targetTab
-        delay 0.45
-        do script "" in targetTab
-    end tell
-    return "ok"
-    '''
-    return _run_osascript(script, mutation_possible=True)
+    bracketed_paste = not _is_direct_slash_invocation_text(sanitized)
+    try:
+        response = _automation_helper_client().send_text(
+            tty,
+            sanitized,
+            bracketed_paste=bracketed_paste,
+            timeout_ms=3_000,
+        )
+    except (AutomationHelperMutationIndeterminate, AutomationHelperUnavailableError) as exc:
+        return _automation_helper_failure(exc, mutation=True)
+    return _automation_helper_response(response, mutation=True)
+
+def _start_pairling_terminal_session(
+    command: str,
+    ownership_marker: str,
+    *,
+    timeout_ms: int = 15_000,
+) -> dict:
+    """Open one Pairling-owned Terminal tab through the signed helper."""
+    try:
+        response = _automation_helper_client().start_session(
+            command,
+            ownership_marker,
+            timeout_ms=timeout_ms,
+        )
+    except (AutomationHelperMutationIndeterminate, AutomationHelperUnavailableError) as exc:
+        return _automation_helper_failure(exc, mutation=True)
+    return _automation_helper_response(response, mutation=True)
 
 
 def _deliver_first_prompt_now(handler, *, provider: str, native_id: str, text: str) -> dict:
@@ -5884,7 +6416,7 @@ def _schedule_first_prompt_delivery(
                     snapshot = (
                         handler._broker_surface_snapshot(raw_session)
                         or handler._terminal_app_surface_snapshot(
-                            raw_session, osascript_timeout=3.0,
+                            raw_session, automation_timeout=3.0,
                         )
                     )
                 except (FileNotFoundError, RuntimeError, ProcessIdentityDriftError) as exc:
@@ -6472,7 +7004,7 @@ def _agent_registry_upsert(provider: str, native_id: str, project: str, *,
     # started_at is preserved from the original insert.
     now = _time.time()
     stored_metadata = dict(metadata or {})
-    if provider in {"claude", "codex"} and int(pid or 0) > 0:
+    if _provider_supports(provider, "terminal_control") and int(pid or 0) > 0:
         try:
             process_started_at = float(
                 stored_metadata.get("process_started_at") or 0
@@ -9607,15 +10139,6 @@ def _readyz_payload() -> dict:
         "ok": request_proof.get("ok") is True,
         "schema_version": 1,
         "contract_version": RUNTIME_CONTRACT_VERSION,
-        "ts": _time.time(),
-        "daemon": {
-            "name": "pairlingd",
-            "pid": os.getpid(),
-            "uptime_seconds": int(_time.time() - DAEMON_STARTED_AT),
-            "version": DAEMON_VERSION,
-            "threaded": True,
-        },
-        "request_proof": request_proof,
     }
 
 
@@ -10223,6 +10746,10 @@ def _is_codex_cli_entrypoint(value: str) -> bool:
     )
 
 
+def _is_omp_cli_entrypoint(value: str) -> bool:
+    return os.path.basename(value.strip().lower()) == "omp"
+
+
 def _is_claude_cli_entrypoint(value: str) -> bool:
     normalized = value.strip().lower()
     basename = os.path.basename(normalized)
@@ -10250,11 +10777,14 @@ def _lossy_command_may_be_provider_entrypoint(
     tokens = (command or "").strip().split()
     if not tokens:
         return False
-    is_entrypoint = (
-        _is_codex_cli_entrypoint
-        if provider == "codex"
-        else _is_claude_cli_entrypoint
-    )
+    entrypoints = {
+        "claude": _is_claude_cli_entrypoint,
+        "codex": _is_codex_cli_entrypoint,
+        "omp": _is_omp_cli_entrypoint,
+    }
+    is_entrypoint = entrypoints.get(provider)
+    if is_entrypoint is None:
+        return False
     if is_entrypoint(tokens[0]):
         return True
     if os.path.basename(tokens[0]).lower() not in {"node", "nodejs", "bun"}:
@@ -10288,7 +10818,7 @@ def _scan_provider_process_rows(
 ):
     """Read provider processes from one all-process inventory snapshot."""
     empty = (False, [], {}) if include_snapshot else (False, [])
-    if provider not in {"claude", "codex"}:
+    if provider not in {"claude", "codex", "omp"}:
         return empty
     snapshot_ok, snapshot = _scan_process_snapshot()
     if not snapshot_ok:
@@ -10310,11 +10840,12 @@ def _scan_provider_process_rows(
                 # Flattened ps text cannot prove the provider command. A PID
                 # exit or denied argv read invalidates this exact inventory.
                 return empty
-        command_matches = (
-            _is_codex_cli_argv(argv)
-            if provider == "codex"
-            else _is_claude_cli_argv(argv)
-        )
+        classifiers = {
+            "claude": _is_claude_cli_argv,
+            "codex": _is_codex_cli_argv,
+            "omp": _is_omp_cli_argv,
+        }
+        command_matches = classifiers[provider](argv)
         if not command_matches:
             continue
         raw_candidates.append({
@@ -10331,6 +10862,7 @@ def _scan_provider_process_rows(
             "tty": str(process.get("tty") or ""),
             "started_at": float(process.get("started_at") or 0),
             "command": shlex.join(argv),
+            "argv": argv,
             "legacy_fixture_format": bool(
                 process.get("legacy_fixture_format")
             ),
@@ -10406,6 +10938,7 @@ def _scan_provider_process_rows(
             "tty": tty,
             "started_at": float(raw_candidate["started_at"]),
             "command": str(raw_candidate["command"]),
+            "argv": list(raw_candidate.get("argv") or []),
             "control_eligible": control_eligible,
             "ppid_observed": bool(raw_candidate.get("ppid_observed")),
         })
@@ -10417,8 +10950,23 @@ def _scan_provider_process_rows(
         # successful partial list would make a real session disappear or let
         # the registry act on a subset while lsof is temporarily unavailable.
         return empty
+    executable_by_pid: dict[int, str] = {}
+    if provider == "omp":
+        executable_probe_ok, executable_by_pid = _process_executable_paths([
+            int(candidate["pid"]) for candidate in candidates
+        ])
+        if not executable_probe_ok:
+            return empty
     rows = [
-        {**candidate, "project": cwd_by_pid[int(candidate["pid"])]}
+        {
+            **candidate,
+            "project": cwd_by_pid[int(candidate["pid"])],
+            **(
+                {"executable_path": executable_by_pid[int(candidate["pid"])]}
+                if provider == "omp"
+                else {}
+            ),
+        }
         for candidate in candidates
     ]
     if include_snapshot:
@@ -10545,6 +11093,16 @@ _AMBIENT_SESSION_MEMBERSHIP_PROVIDERS = frozenset({"claude", "codex"})
 def _session_membership_provider_ids() -> set[str]:
     """Providers whose complete live membership Pairling can materialize."""
     return set(_agent_provider_ids())
+
+
+def _provider_supports(provider: str, capability: str) -> bool:
+    if _provider_get is None:
+        return False
+    try:
+        adapter = _provider_get(provider)
+        return bool(adapter and adapter.supports(capability))
+    except Exception:
+        return False
 _SESSION_INVENTORY_FRESH_SECONDS = 5.0
 _SESSION_INVENTORY_REFRESH_WAIT_SECONDS = 4.0
 _sessions_inventory_bundle_lock = threading.Lock()
@@ -10601,6 +11159,145 @@ def _invalidate_sessions_provider_inventory(provider: str | None = None) -> None
             "refreshing" if refreshing else "cold"
         )
         _sessions_health["inventory_checked_at"] = 0.0
+
+
+def _process_executable_paths(pids: list[int]) -> tuple[bool, dict[int, str]]:
+    unique_pids = sorted({int(pid) for pid in pids if int(pid or 0) > 0})
+    if not unique_pids:
+        return True, {}
+
+    paths: dict[int, str] = {}
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        proc_pidpath = libproc.proc_pidpath
+        proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        proc_pidpath.restype = ctypes.c_int
+    except (AttributeError, OSError):
+        proc_pidpath = None
+
+    if proc_pidpath is not None:
+        for pid in unique_pids:
+            buffer = ctypes.create_string_buffer(4096)
+            length = int(proc_pidpath(pid, buffer, len(buffer)))
+            if length <= 0:
+                continue
+            try:
+                path = buffer.raw[:length].rstrip(b"\0").decode("utf-8")
+            except UnicodeError:
+                continue
+            if path:
+                paths[pid] = path
+
+    unresolved = [pid for pid in unique_pids if pid not in paths]
+    if unresolved:
+        try:
+            proc = subprocess.run(
+                [
+                    "lsof", "-a", "-p", ",".join(str(pid) for pid in unresolved),
+                    "-d", "txt", "-Fpn",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            return False, {}
+        if proc.returncode != 0:
+            return False, {}
+        current_pid = 0
+        for line in proc.stdout.splitlines():
+            if line.startswith("p") and line[1:].isdigit():
+                current_pid = int(line[1:])
+                continue
+            if current_pid in unresolved and line.startswith("n") and current_pid not in paths:
+                path = line[1:].strip()
+                if path:
+                    paths[current_pid] = path
+
+    if any(pid not in paths for pid in unique_pids):
+        return False, {}
+    return True, paths
+
+
+def _omp_executable_path_matches(observed: str, resolved_binary: Path) -> bool:
+    try:
+        return (
+            Path(observed).expanduser().resolve(strict=True)
+            == resolved_binary.expanduser().resolve(strict=True)
+        )
+    except OSError:
+        return False
+
+
+def _omp_resume_terminal_identity_matches(
+    identity: dict | None,
+    *,
+    terminal_tty: str,
+    canonical_project: str,
+    resolved_binary: Path,
+    record_mtime: float,
+) -> bool:
+    """Prove a resumed OMP UUID is bound to the expected live process."""
+    if not isinstance(identity, dict):
+        return False
+    try:
+        pid = int(identity.get("pid") or 0)
+        process_started_at = float(identity.get("started_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    if (
+        pid <= 0
+        or process_started_at <= 0
+        or str(identity.get("tty") or "") != terminal_tty
+        or record_mtime < process_started_at
+        or not _omp_executable_path_matches(
+            str(identity.get("executable_path") or ""),
+            resolved_binary,
+        )
+    ):
+        return False
+    try:
+        return os.path.realpath(
+            str(identity.get("project") or "")
+        ) == os.path.realpath(canonical_project)
+    except OSError:
+        return str(identity.get("project") or "") == canonical_project
+
+
+def _wait_for_omp_resume_terminal_identity(
+    native_id: str,
+    *,
+    terminal_tty: str,
+    canonical_project: str,
+    resolved_binary: Path,
+    timeout_seconds: float = 5.0,
+) -> dict | None:
+    """Wait briefly for OMP's terminal record and process identity to agree."""
+    deadline = _time.monotonic() + max(0.1, timeout_seconds)
+    while True:
+        scan_ok, process_rows = _scan_provider_process_rows("omp")
+        if scan_ok:
+            inventory = _omp_provider_inventory_from_process_rows(process_rows, home=HOME)
+            matches = [
+                terminal
+                for terminal in inventory.get("terminals") or []
+                if str(terminal.get("native_id") or "") == native_id
+                and str(terminal.get("terminal_tty") or "") == terminal_tty
+                and str(terminal.get("identity_probe_state") or "") == "exact"
+            ]
+            if len(matches) == 1:
+                terminal = matches[0]
+                if _omp_resume_terminal_identity_matches(
+                    terminal,
+                    terminal_tty=terminal_tty,
+                    canonical_project=canonical_project,
+                    resolved_binary=resolved_binary,
+                    record_mtime=float(terminal.get("record_mtime") or 0),
+                ):
+                    return terminal
+        if _time.monotonic() >= deadline:
+            return None
+        _time.sleep(0.25)
 
 
 def _process_cwds(pids: list[int]) -> tuple[bool, dict[int, str]]:
@@ -10932,6 +11629,81 @@ def _is_claude_cli_argv(argv: list[str]) -> bool:
     return True
 
 
+def _is_omp_cli_argv(argv: list[str]) -> bool:
+    if not argv or not _is_omp_cli_entrypoint(argv[0]):
+        return False
+    trailing = argv[1:]
+    non_session_commands = {
+        "agents",
+        "browser-relay",
+        "compact",
+        "config",
+        "doctor",
+        "export",
+        "gateway",
+        "help",
+        "hub",
+        "init",
+        "install",
+        "join",
+        "mcp",
+        "models",
+        "plugins",
+        "remote",
+        "stats",
+        "update",
+        "upgrade",
+        "versions",
+        "whoami",
+    }
+    options_with_values = {
+        "--config-dir",
+        "--cwd",
+        "--extension",
+        "--mode",
+        "--model",
+        "--plan",
+        "--plan-yolo-into",
+        "--plugin-dir",
+        "--prewalk-into",
+        "--provider",
+        "--resume",
+        "--smol",
+    }
+    index = 0
+    while index < len(trailing):
+        argument = trailing[index]
+        lowered = argument.lower()
+        if lowered.startswith("--mode="):
+            if lowered.split("=", 1)[1] == "rpc":
+                return False
+            index += 1
+            continue
+        if argument == "--mode":
+            if index + 1 >= len(trailing):
+                return False
+            if trailing[index + 1].lower() == "rpc":
+                return False
+            index += 2
+            continue
+        if argument == "--":
+            return True
+        if argument.startswith("-"):
+            option = argument.split("=", 1)[0]
+            if "=" not in argument and option in options_with_values:
+                index += 2
+            else:
+                index += 1
+            continue
+        if lowered.startswith("__omp_"):
+            return False
+        return lowered not in non_session_commands
+    return not any(
+        argument.lower() in {"-h", "--help", "-v", "--version"}
+        for argument in trailing
+    )
+
+
 def _is_claude_cli_command(command: str) -> bool:
     try:
         argv = shlex.split(command or "")
@@ -11186,8 +11958,338 @@ def _claude_live_terminal_rows_locked(
     return copy.deepcopy(rows)
 
 
+def _omp_provider_inventory_from_process_rows(
+    process_rows: list[dict],
+    *,
+    home: Path | None = None,
+) -> dict:
+    checked_at = _time.time()
+    if (
+        _provider_get is None
+        or _provider_resolve_executable is None
+        or _omp_terminal_session_records is None
+        or _omp_session_runtime_metadata is None
+    ):
+        return {
+            "provider": "omp",
+            "terminals": [],
+            "rows": [],
+            "checked_at": checked_at,
+            "probe_state": "failed",
+            "probe_reason": "omp_adapter_unavailable",
+            "membership_complete": False,
+        }
+    home = home or Path.home()
+    adapter = _provider_get("omp", home=home)
+    if adapter is None:
+        return {
+            "provider": "omp",
+            "terminals": [],
+            "rows": [],
+            "checked_at": checked_at,
+            "probe_state": "failed",
+            "probe_reason": "omp_adapter_unavailable",
+            "membership_complete": False,
+        }
+    resolved = _provider_resolve_executable(
+        "omp",
+        adapter.candidates,
+        env_var="PAIRLING_OMP_BIN",
+    )
+    if resolved is None:
+        return {
+            "provider": "omp",
+            "terminals": [],
+            "rows": [],
+            "checked_at": checked_at,
+            "probe_state": "exact",
+            "probe_reason": "omp_not_installed",
+            "membership_complete": True,
+        }
+    try:
+        resolved_binary = resolved.path.resolve(strict=True)
+    except OSError:
+        return {
+            "provider": "omp",
+            "terminals": [],
+            "rows": [],
+            "checked_at": checked_at,
+            "probe_state": "failed",
+            "probe_reason": "omp_binary_unavailable",
+            "membership_complete": False,
+        }
+
+    candidates_by_tty: dict[str, list[dict]] = {}
+    for process in process_rows:
+        argv = process.get("argv")
+        if not isinstance(argv, list):
+            try:
+                argv = shlex.split(str(process.get("command") or ""))
+            except ValueError:
+                continue
+        argv = [str(argument) for argument in argv]
+        if not _is_omp_cli_argv(argv):
+            continue
+        executable_path = str(process.get("executable_path") or "")
+        if not executable_path or not _omp_executable_path_matches(
+            executable_path, resolved_binary
+        ):
+            continue
+        tty = str(process.get("tty") or "")
+        pid = int(process.get("pid") or 0)
+        started_at = float(process.get("started_at") or 0)
+        project = str(process.get("project") or "")
+        if not tty or pid <= 0 or started_at <= 0 or not project:
+            continue
+        candidates_by_tty.setdefault(tty, []).append(process)
+
+    terminals: list[dict] = []
+    for record in _omp_terminal_session_records(home=home):
+        if not record.fresh:
+            continue
+        candidates = candidates_by_tty.get(record.terminal_tty) or []
+        if len(candidates) != 1:
+            continue
+        process = candidates[0]
+        process_started_at = float(process.get("started_at") or 0)
+        if process_started_at <= 0 or record.record_mtime < process_started_at:
+            continue
+        try:
+            process_project = os.path.realpath(str(process.get("project") or ""))
+        except OSError:
+            continue
+        if process_project != record.project:
+            continue
+        can_control = False
+        runtime_metadata = _omp_session_runtime_metadata(Path(record.session_path))
+        terminals.append({
+            "provider": "omp",
+            "session_id": record.session_id,
+            "native_id": record.native_id,
+            "project": record.project,
+            "title": record.title,
+            "output_path": record.session_path,
+            "session_path": record.session_path,
+            "terminal_tty": record.terminal_tty,
+            "tty": record.terminal_tty,
+            "executable_path": str(process.get("executable_path") or ""),
+            "pid": int(process.get("pid") or 0),
+            "provider_pid": int(process.get("pid") or 0),
+            "process_started_at": process_started_at,
+            "started_at": process_started_at,
+            "command": str(
+                process.get("command") or shlex.join(process.get("argv") or [])
+            ),
+            "identity_probe_state": "exact",
+            "can_control": can_control,
+            "record_mtime": record.record_mtime,
+            "record_fresh": record.fresh,
+            "identity_probe_reason": "terminal_app_mutation_not_atomic",
+            "source": "omp_terminal_record",
+            "model": runtime_metadata.get("model"),
+            "effort": runtime_metadata.get("effort"),
+        })
+
+    counts: dict[str, int] = {}
+    for terminal in terminals:
+        native_id = str(terminal.get("native_id") or "")
+        counts[native_id] = counts.get(native_id, 0) + 1
+    for terminal in terminals:
+        if counts.get(str(terminal.get("native_id") or ""), 0) > 1:
+            terminal["identity_probe_state"] = "ambiguous"
+            terminal["can_control"] = False
+
+    return {
+        "provider": "omp",
+        "terminals": terminals,
+        "rows": terminals,
+        "checked_at": checked_at,
+        "probe_state": "exact",
+        "probe_reason": None,
+        "membership_complete": True,
+    }
+
+
+def _omp_sessions_from_inventory(inventory: dict) -> list[dict]:
+    checked_at = float(inventory.get("checked_at") or _time.time())
+    rows: list[dict] = []
+    for terminal in inventory.get("terminals") or []:
+        if not isinstance(terminal, dict):
+            continue
+        native_id = str(terminal.get("native_id") or terminal.get("session_id") or "")
+        project = str(terminal.get("project") or "")
+        if not native_id or not project:
+            continue
+        resumable = (
+            str(terminal.get("identity_probe_state") or "") == "exact"
+        )
+        broker_controllable = bool(
+            terminal.get("broker_id") and terminal.get("can_control")
+        )
+        capabilities = ["terminal_output", "terminal_surface"]
+        if resumable:
+            capabilities.insert(0, "resume")
+        if broker_controllable:
+            capabilities.extend([
+                "terminal_control",
+                "send_text",
+                "interrupt",
+                "terminate",
+            ])
+        reason = (
+            None
+            if broker_controllable
+            else (
+                "terminal_requires_pairling_broker"
+                if resumable
+                else str(
+                    terminal.get("identity_probe_reason")
+                    or "process_identity_unverified"
+                )
+            )
+        )
+        started_at = float(terminal.get("process_started_at") or checked_at)
+        rows.append({
+            "id": _qualified_session_id("omp", native_id),
+            "provider": "omp",
+            "native_id": native_id,
+            "project": project,
+            "working_on": str(terminal.get("title") or "OMP session"),
+            "started_at": int(started_at),
+            "last_heartbeat": int(checked_at),
+            "stale_seconds": max(0, int(_time.time() - checked_at)),
+            "source_freshness": "inventory_live",
+            "terminal_tty": str(terminal.get("terminal_tty") or ""),
+            "pid": int(terminal.get("pid") or 0),
+            "terminal_title": terminal.get("title"),
+            "first_prompt": None,
+            "state": "running",
+            "tool": None,
+            "turn_started_at": None,
+            "effort": terminal.get("effort"),
+            "model": terminal.get("model"),
+            "context_pct": None,
+            "capabilities": capabilities,
+            "controllability": {
+                "can_send_text": broker_controllable,
+                "can_interrupt": broker_controllable,
+                "can_terminate": broker_controllable,
+                "can_control": broker_controllable,
+                "reason": reason,
+            },
+        })
+    return rows
+
+
+def _omp_reconcile_provider_inventory(inventory: dict) -> None:
+    if (
+        inventory.get("probe_state") != "exact"
+        or not bool(inventory.get("membership_complete"))
+    ):
+        return
+    live_ids: set[str] = set()
+    for terminal in inventory.get("terminals") or []:
+        if str(terminal.get("identity_probe_state") or "") != "exact":
+            continue
+        native_id = str(terminal.get("native_id") or "")
+        project = str(terminal.get("project") or "")
+        pid = int(terminal.get("pid") or 0)
+        terminal_tty = str(terminal.get("terminal_tty") or "")
+        process_started_at = float(terminal.get("process_started_at") or 0)
+        if (
+            not native_id
+            or not project
+            or pid <= 0
+            or not terminal_tty
+            or process_started_at <= 0
+        ):
+            continue
+        metadata = {
+            "provider_tty": str(terminal.get("tty") or terminal_tty),
+            "process_started_at": process_started_at,
+            "output_path": str(terminal.get("output_path") or ""),
+            "session_path": str(terminal.get("session_path") or ""),
+            "command": str(terminal.get("command") or ""),
+            "identity_probe_state": "exact",
+            "can_control": bool(terminal.get("can_control")),
+            "record_mtime": float(terminal.get("record_mtime") or 0),
+            "source": "omp_terminal_record",
+        }
+        existing = _agent_registry_get("omp", native_id)
+        broker_session = _registry_owned_broker_session(
+            "omp", native_id, existing
+        )
+        if (
+            broker_session is not None
+            and os.path.realpath(str((existing or {}).get("project") or ""))
+            == os.path.realpath(project)
+            and _broker_pid(broker_session) == pid
+            and _broker_slave_tty(broker_session) == terminal_tty
+        ):
+            broker_relation = _broker_runtime_relation()
+            current_atomic_control = (
+                broker_relation == "current"
+                and _broker_supports_current_atomic_control(broker_relation)
+            )
+            durable_metadata = _registry_metadata_from_row(existing)
+            metadata = {**durable_metadata, **metadata}
+            metadata["terminal_source"] = "broker_vt"
+            terminal.update({
+                "broker_id": _broker_session_id(broker_session),
+                "terminal_source": "broker_vt",
+                "can_control": current_atomic_control,
+                "control_profile": (
+                    "current_atomic_v2"
+                    if current_atomic_control
+                    else "read_only"
+                ),
+            })
+        if _agent_registry_upsert(
+            "omp",
+            native_id,
+            project,
+            pid=pid,
+            terminal_tty=terminal_tty,
+            state="running",
+            metadata=metadata,
+            working_on=str(terminal.get("title") or ""),
+        ):
+            live_ids.add(native_id)
+
+    for row in _agent_registry_live("omp", limit=1000):
+        native_id = str(row.get("native_id") or "")
+        if not native_id or native_id in live_ids:
+            continue
+        if _registry_owned_broker_session("omp", native_id, row) is not None:
+            continue
+        _agent_registry_mark_closed("omp", native_id)
+
+
 def _capture_sessions_provider_inventory(provider: str) -> dict:
     """Capture one exact ambient and/or Pairling-owned provider generation."""
+    if provider == "omp":
+        if provider not in _session_membership_provider_ids():
+            return {
+                "provider": provider,
+                "rows": [],
+                "probe_state": "unsupported",
+                "membership_complete": False,
+                "checked_at": _time.time(),
+            }
+        process_scan_ok, process_rows = _scan_provider_process_rows("omp")
+        if not process_scan_ok:
+            return {
+                "provider": "omp",
+                "rows": [],
+                "terminals": [],
+                "checked_at": _time.time(),
+                "probe_state": "failed",
+                "probe_reason": "process_scan_failed",
+                "membership_complete": False,
+            }
+        inventory = _omp_provider_inventory_from_process_rows(process_rows)
+        _omp_reconcile_provider_inventory(inventory)
+        return inventory
     if provider not in _session_membership_provider_ids():
         return {
             "provider": provider,
@@ -11621,7 +12723,7 @@ def _session_inventory_terminal_matches_row(
         )
 
     terminal_native_id = str(terminal.get("native_id") or "")
-    if provider == "codex" and terminal_native_id:
+    if provider in {"codex", "omp"} and terminal_native_id:
         return str(row.get("native_id") or "") == terminal_native_id
     return True
 
@@ -11788,21 +12890,31 @@ def _session_has_verified_provider_process(
     inventory_rows: list[dict] | None = None,
 ) -> bool:
     provider = str(provider or row.get("provider") or "").strip().lower()
-    if provider not in {"claude", "codex"}:
+    if provider not in {"claude", "codex", "omp"}:
         return False
     pid = int(row.get("pid") or row.get("claude_pid") or 0)
     tty = str(row.get("terminal_tty") or "")
     project = str(row.get("project") or "")
     native_id = str(row.get("native_id") or "")
-    if provider in {"claude", "codex"} and not _registry_process_birth_matches(row, pid):
+    if provider in {"claude", "codex", "omp"} and not _registry_process_birth_matches(row, pid):
         return False
 
     candidates = inventory_rows
     if candidates is None:
-        candidates = (
-            _codex_live_terminal_rows() if provider == "codex"
-            else _claude_live_terminal_rows()
-        )
+        if provider == "omp":
+            inventory = _capture_sessions_provider_inventory("omp")
+            if (
+                inventory.get("probe_state") != "exact"
+                or not bool(inventory.get("membership_complete"))
+            ):
+                return False
+            candidates = list(inventory.get("terminals") or [])
+        else:
+            candidates = (
+                _codex_live_terminal_rows()
+                if provider == "codex"
+                else _claude_live_terminal_rows()
+            )
 
     def project_matches(candidate_project: str) -> bool:
         if not project:
@@ -11822,7 +12934,7 @@ def _session_has_verified_provider_process(
         if int(candidate.get("pid") or 0) != pid:
             continue
         if (
-            provider == "codex"
+            provider in {"codex", "omp"}
             and native_id
             and not native_id.startswith(("pending-", "terminal-"))
             and str(candidate.get("native_id") or "") != native_id
@@ -11946,6 +13058,73 @@ def _codex_inventory_registry_process_matches(
             ):
                 continue
         return True
+    return False
+
+
+def _omp_inventory_registry_process_matches(
+    reg: dict | None,
+    live_terminal_rows: list[dict] | None = None,
+    *,
+    require_direct_control: bool = True,
+) -> bool:
+    """Bind one OMP UUID to one exact terminal record and process birth."""
+    if not isinstance(reg, dict) or reg.get("closed_at") is not None:
+        return False
+    if str(reg.get("provider") or "omp").strip().lower() != "omp":
+        return False
+    native_id = str(reg.get("native_id") or "")
+    project = str(reg.get("project") or "")
+    terminal_tty = str(reg.get("terminal_tty") or "")
+    pid = int(reg.get("pid") or 0)
+    metadata = _registry_metadata_from_row(reg)
+    try:
+        expected_started_at = float(metadata.get("process_started_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    if (
+        not native_id
+        or not project
+        or pid <= 0
+        or expected_started_at <= 0
+        or re.fullmatch(r"/dev/ttys[0-9]{3,}", terminal_tty) is None
+    ):
+        return False
+    candidates = live_terminal_rows
+    if candidates is None:
+        inventory = _capture_sessions_provider_inventory("omp")
+        if (
+            inventory.get("probe_state") != "exact"
+            or not bool(inventory.get("membership_complete"))
+        ):
+            return False
+        candidates = list(inventory.get("terminals") or [])
+    for candidate in candidates:
+        if str(candidate.get("identity_probe_state") or "") != "exact":
+            continue
+        if require_direct_control and not bool(candidate.get("can_control")):
+            continue
+        if str(candidate.get("native_id") or "") != native_id:
+            continue
+        if int(candidate.get("pid") or 0) != pid:
+            continue
+        if str(candidate.get("terminal_tty") or candidate.get("tty") or "") != terminal_tty:
+            continue
+        try:
+            actual_started_at = float(
+                candidate.get("process_started_at") or candidate.get("started_at") or 0
+            )
+        except (TypeError, ValueError):
+            continue
+        if actual_started_at <= 0 or abs(actual_started_at - expected_started_at) > 2:
+            continue
+        try:
+            projects_match = os.path.realpath(
+                str(candidate.get("project") or "")
+            ) == os.path.realpath(project)
+        except OSError:
+            projects_match = str(candidate.get("project") or "") == project
+        if projects_match:
+            return True
     return False
 
 
@@ -12078,6 +13257,8 @@ def _verified_session_signal_target(
         row = _agent_registry_get("codex", native_id)
     elif provider == "claude":
         row = _claude_sessions_backend().session_record(native_id)
+    elif provider == "omp":
+        row = _agent_registry_get("omp", native_id)
     else:
         return None, 0, "unsupported_provider"
     if not row or row.get("closed_at") is not None:
@@ -12256,16 +13437,33 @@ _warm_pool = _WarmPool()
 
 
 def _inject_rate_check(session_id: str, max_per_min: int = 30) -> tuple[bool, int]:
-    """Returns (allowed, retry_after_seconds). Drops timestamps older than 60s."""
+    """Return one bounded per-session mutation rate decision."""
     now = _time.time()
     with _inject_rate_lock:
+        for key in list(_inject_rate_state):
+            recent = [
+                timestamp
+                for timestamp in _inject_rate_state[key]
+                if now - timestamp < 60
+            ]
+            if recent:
+                _inject_rate_state[key] = recent
+            else:
+                _inject_rate_state.pop(key, None)
+        if (
+            session_id not in _inject_rate_state
+            and len(_inject_rate_state) >= _INJECT_RATE_MAX_KEYS
+        ):
+            oldest_key = min(
+                _inject_rate_state,
+                key=lambda key: max(_inject_rate_state[key]),
+            )
+            _inject_rate_state.pop(oldest_key, None)
         timestamps = _inject_rate_state.get(session_id, [])
-        timestamps = [t for t in timestamps if now - t < 60]
         if len(timestamps) >= max_per_min:
             oldest = min(timestamps)
             retry = max(1, int(60 - (now - oldest)))
             return False, retry
-        # Also enforce a 1-second cooldown between consecutive injects
         if timestamps and now - max(timestamps) < 1.0:
             return False, 1
         timestamps.append(now)
@@ -12580,6 +13778,97 @@ _INVOCATION_MAX_TOTAL_BYTES = 32 * 1024 * 1024
 _INVOCATION_MAX_TRAVERSAL_DEPTH = 8
 
 
+_INVOCATION_MAX_SCAN_ENTRIES = 10_000
+
+
+def _bounded_invocation_scan(
+    root: Path,
+    *,
+    file_name: str | None = None,
+    suffix: str | None = None,
+    directory_name: str | None = None,
+    max_depth: int = _INVOCATION_MAX_TRAVERSAL_DEPTH,
+    max_results: int = _INVOCATION_MAX_SKILL_FILES,
+) -> list[Path]:
+    """Enumerate invocation metadata without following links or unbounded trees."""
+    try:
+        root_resolved = root.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return []
+    results: list[Path] = []
+    pending: list[tuple[Path, int]] = [(root_resolved, 0)]
+    entries_seen = 0
+    while pending and entries_seen < _INVOCATION_MAX_SCAN_ENTRIES:
+        directory, depth = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    entries_seen += 1
+                    if entries_seen > _INVOCATION_MAX_SCAN_ENTRIES:
+                        break
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            if directory_name is not None and entry.name == directory_name:
+                                results.append(Path(entry.path))
+                                if len(results) >= max_results:
+                                    return sorted(results, key=lambda path: str(path))
+                            if depth < max_depth:
+                                pending.append((Path(entry.path), depth + 1))
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    if file_name is not None and entry.name != file_name:
+                        continue
+                    if suffix is not None and not entry.name.endswith(suffix):
+                        continue
+                    results.append(Path(entry.path))
+                    if len(results) >= max_results:
+                        return sorted(results, key=lambda path: str(path))
+        except OSError:
+            continue
+    return sorted(results, key=lambda path: str(path))
+
+
+def _read_invocation_file_nofollow(
+    root: Path,
+    path: Path,
+) -> tuple[str, os.stat_result]:
+    """Read one scanner result through no-follow directory descriptors."""
+    root_resolved = root.resolve(strict=True)
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        relative = path.relative_to(root_resolved)
+    if not relative.parts:
+        raise OSError(errno.EINVAL, "invocation path is empty")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(root_resolved, directory_flags)
+    try:
+        for component in relative.parts[:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(relative.parts[-1], file_flags, dir_fd=directory_fd)
+        try:
+            stat_result = os.fstat(file_fd)
+            if not stat.S_ISREG(stat_result.st_mode):
+                raise OSError(errno.EINVAL, "invocation path is not a regular file")
+            with os.fdopen(file_fd, "r", errors="replace", closefd=False) as stream:
+                text = stream.read(_INVOCATION_MAX_SKILL_FILE_SIZE + 1)
+            if len(text.encode("utf-8", errors="replace")) > _INVOCATION_MAX_SKILL_FILE_SIZE:
+                raise OSError(errno.EFBIG, "invocation file exceeds size limit")
+            return text, stat_result
+        finally:
+            os.close(file_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _title_from_invocation_name(name: str) -> str:
     parts = re.split(r"[-_\s]+", name.strip())
     return " ".join(p[:1].upper() + p[1:] for p in parts if p) or name
@@ -12715,23 +14004,26 @@ def _first_prose_line(text: str) -> str:
 def _scan_md_dir_invocations(dir_path: Path, *, source_label: str, namespace: str,
                              provider: str, trigger: str = "/", kind: str = "command") -> list:
     items: list = []
-    if not dir_path.is_dir():
-        return items
-    try:
-        files = sorted(dir_path.glob("*.md"))
-    except OSError:
-        return items
-    for p in files:
+    total_bytes = 0
+    for path in _bounded_invocation_scan(
+        dir_path,
+        suffix=".md",
+        max_depth=0,
+    ):
         try:
-            resolved = p.resolve()
-            text = p.read_text(errors="replace")
+            text, stat_result = _read_invocation_file_nofollow(dir_path, path)
+            if stat_result.st_size > _INVOCATION_MAX_SKILL_FILE_SIZE:
+                continue
+            if total_bytes + stat_result.st_size > _INVOCATION_MAX_TOTAL_BYTES:
+                break
         except OSError:
             continue
+        total_bytes += stat_result.st_size
         fm = _parse_md_frontmatter(text)
         if not _bool_frontmatter(fm.get("user-invocable"), True):
             continue
         desc = fm.get("description") or _first_prose_line(text)
-        name = fm.get("name") or p.stem
+        name = fm.get("name") or path.stem
         items.append(_make_invocation(
             provider=provider,
             trigger=trigger,
@@ -12742,7 +14034,52 @@ def _scan_md_dir_invocations(dir_path: Path, *, source_label: str, namespace: st
             namespace=namespace,
             args=fm.get("args"),
             insert_text=f"{trigger}{name.lstrip('/$')}",
-            source_path=resolved,
+            source_path=path,
+            trust={"local": True, "allowlisted_root": True, "signed": False},
+            visibility={"user_invocable": True, "hidden": False},
+        ))
+    return items
+
+
+def _scan_omp_skill_root(
+    skills_dir: Path,
+    *,
+    source: str,
+    namespace: str,
+) -> list:
+    items: list = []
+    total_bytes = 0
+    for skill_md in _bounded_invocation_scan(
+        skills_dir,
+        file_name="SKILL.md",
+        max_depth=1,
+    ):
+        try:
+            if skill_md.parent.parent != skills_dir.resolve():
+                continue
+            text, stat_result = _read_invocation_file_nofollow(skills_dir, skill_md)
+            if stat_result.st_size > _INVOCATION_MAX_SKILL_FILE_SIZE:
+                continue
+            if total_bytes + stat_result.st_size > _INVOCATION_MAX_TOTAL_BYTES:
+                break
+        except OSError:
+            continue
+        total_bytes += stat_result.st_size
+        frontmatter = _parse_md_frontmatter(text)
+        if not _bool_frontmatter(frontmatter.get("user-invocable"), True):
+            continue
+        name = frontmatter.get("name") or skill_md.parent.name
+        items.append(_make_invocation(
+            provider="omp",
+            trigger="/",
+            name=name,
+            description=frontmatter.get("description") or _first_prose_line(text),
+            source=source,
+            kind="skill",
+            namespace=namespace,
+            args=frontmatter.get("args"),
+            insert_text=f"/{name.lstrip('/')}",
+            source_path=skill_md,
             trust={"local": True, "allowlisted_root": True, "signed": False},
             visibility={"user_invocable": True, "hidden": False},
         ))
@@ -12751,25 +14088,28 @@ def _scan_md_dir_invocations(dir_path: Path, *, source_label: str, namespace: st
 
 def _scan_claude_skill_invocations() -> list:
     items: list = []
+    total_bytes = 0
     skills_dir = HOME / ".claude" / "skills"
-    if not skills_dir.is_dir():
-        return items
-    try:
-        skill_dirs = sorted(d for d in skills_dir.iterdir() if d.is_dir() and not d.name.startswith("."))
-    except OSError:
-        return items
-    for d in skill_dirs:
-        skill_md = d / "SKILL.md"
-        if not skill_md.is_file():
+    for skill_md in _bounded_invocation_scan(
+        skills_dir,
+        file_name="SKILL.md",
+        max_depth=1,
+    ):
+        if skill_md.parent.parent != skills_dir.resolve():
             continue
         try:
-            text = skill_md.read_text(errors="replace")
+            text, stat_result = _read_invocation_file_nofollow(skills_dir, skill_md)
+            if stat_result.st_size > _INVOCATION_MAX_SKILL_FILE_SIZE:
+                continue
+            if total_bytes + stat_result.st_size > _INVOCATION_MAX_TOTAL_BYTES:
+                break
         except OSError:
             continue
+        total_bytes += stat_result.st_size
         fm = _parse_md_frontmatter(text)
         if not _bool_frontmatter(fm.get("user-invocable"), True):
             continue
-        name = fm.get("name") or d.name
+        name = fm.get("name") or skill_md.parent.name
         items.append(_make_invocation(
             provider="claude",
             trigger="/",
@@ -12789,45 +14129,46 @@ def _scan_claude_skill_invocations() -> list:
 
 def _scan_claude_plugin_invocations() -> list:
     items: list = []
+    total_bytes = 0
     plugins_dir = HOME / ".claude" / "plugins"
-    if not plugins_dir.is_dir():
-        return items
-    try:
-        all_md = list(plugins_dir.glob("**/commands/*.md"))
-    except OSError:
-        return items
-    for p in all_md:
+    for path in _bounded_invocation_scan(plugins_dir, suffix=".md"):
+        if path.parent.name != "commands":
+            continue
         try:
-            parts = p.parts
-            idx = parts.index("plugins")
-            plugin_name = parts[idx + 1]
+            relative_parts = path.relative_to(plugins_dir.resolve()).parts
+            plugin_name = relative_parts[0]
         except (ValueError, IndexError):
             continue
-        if plugin_name in ("cache",):
+        if plugin_name == "cache":
             continue
         if plugin_name == "marketplaces":
-            try:
-                plugin_name = parts[idx + 2]
-            except IndexError:
+            if len(relative_parts) < 3:
                 continue
+            plugin_name = relative_parts[1]
         try:
-            text = p.read_text(errors="replace")
+            text, stat_result = _read_invocation_file_nofollow(plugins_dir, path)
+            if stat_result.st_size > _INVOCATION_MAX_SKILL_FILE_SIZE:
+                continue
+            if total_bytes + stat_result.st_size > _INVOCATION_MAX_TOTAL_BYTES:
+                break
         except OSError:
             continue
+        total_bytes += stat_result.st_size
         fm = _parse_md_frontmatter(text)
         if not _bool_frontmatter(fm.get("user-invocable"), True):
             continue
+        name = fm.get("name") or path.stem
         items.append(_make_invocation(
             provider="claude",
             trigger="/",
-            name=fm.get("name") or p.stem,
+            name=name,
             description=fm.get("description") or _first_prose_line(text),
             source=f"plugin:{plugin_name}",
             kind="plugin",
             namespace=plugin_name,
             args=fm.get("args"),
-            insert_text=f"/{(fm.get('name') or p.stem).lstrip('/')}",
-            source_path=p,
+            insert_text=f"/{name.lstrip('/')}",
+            source_path=path,
             trust={"local": True, "allowlisted_root": True, "signed": False},
             visibility={"user_invocable": True, "hidden": False},
         ))
@@ -12880,23 +14221,20 @@ def _revalidate_canonical_user_directory(path: str, *, allow_tmp: bool) -> str:
     return resolved
 
 
+
+
 def _codex_skill_roots() -> list[Path]:
     roots = [
         HOME / ".codex" / "skills" / ".system",
         HOME / ".agents" / "skills",
     ]
     cache_root = HOME / ".codex" / "plugins" / "cache"
-    if cache_root.is_dir():
-        try:
-            for p in sorted(cache_root.rglob("skills")):
-                try:
-                    rel_depth = len(p.resolve().relative_to(cache_root.resolve()).parts)
-                except Exception:
-                    continue
-                if p.is_dir() and rel_depth <= _INVOCATION_MAX_TRAVERSAL_DEPTH:
-                    roots.append(p)
-        except OSError:
-            pass
+    roots.extend(
+        _bounded_invocation_scan(
+            cache_root,
+            directory_name="skills",
+        )
+    )
     out: list[Path] = []
     seen: set[str] = set()
     for root in roots:
@@ -12942,7 +14280,7 @@ def _scan_codex_dollar_skill_invocations() -> list:
             continue
         try:
             root_resolved = root.resolve()
-            candidates = sorted(root.rglob("SKILL.md"))
+            candidates = _bounded_invocation_scan(root, file_name="SKILL.md")
         except OSError:
             continue
         for skill_md in candidates:
@@ -12955,12 +14293,11 @@ def _scan_codex_dollar_skill_invocations() -> list:
                 rel_depth = len(resolved.relative_to(root_resolved).parts)
                 if rel_depth > _INVOCATION_MAX_TRAVERSAL_DEPTH:
                     continue
-                st = resolved.stat()
+                text, st = _read_invocation_file_nofollow(root_resolved, skill_md)
                 if st.st_size > _INVOCATION_MAX_SKILL_FILE_SIZE:
                     continue
                 if total_bytes + st.st_size > _INVOCATION_MAX_TOTAL_BYTES:
                     return items
-                text = resolved.read_text(errors="replace")
             except OSError:
                 continue
             files_seen += 1
@@ -12992,12 +14329,15 @@ def _scan_codex_dollar_skill_invocations() -> list:
 def _build_invocation_catalog(cwd: str = "", provider: str = "claude",
                               trigger: str | None = None) -> list:
     provider = (provider or "claude").strip().lower()
-    if provider not in _agent_provider_ids():
+    if not _provider_supports(provider, "commands"):
         return []
     items: list = []
     if trigger in (None, "/"):
         items.extend(_builtin_invocations(provider))
-        user_root = HOME / (".codex" if provider == "codex" else ".claude") / "commands"
+        if provider == "omp":
+            user_root = HOME / ".omp" / "agent" / "commands"
+        else:
+            user_root = HOME / (".codex" if provider == "codex" else ".claude") / "commands"
         items.extend(_scan_md_dir_invocations(
             user_root,
             source_label="user",
@@ -13007,7 +14347,10 @@ def _build_invocation_catalog(cwd: str = "", provider: str = "claude",
             kind="command",
         ))
         if cwd and os.path.isdir(cwd):
-            project_root = Path(cwd) / (".codex" if provider == "codex" else ".claude") / "commands"
+            if provider == "omp":
+                project_root = Path(cwd) / ".omp" / "commands"
+            else:
+                project_root = Path(cwd) / (".codex" if provider == "codex" else ".claude") / "commands"
             items.extend(_scan_md_dir_invocations(
                 project_root,
                 source_label="project",
@@ -13019,6 +14362,23 @@ def _build_invocation_catalog(cwd: str = "", provider: str = "claude",
         if provider == "claude":
             items.extend(_scan_claude_plugin_invocations())
             items.extend(_scan_claude_skill_invocations())
+        elif provider == "omp":
+            items.extend(_scan_omp_skill_root(
+                HOME / ".omp" / "agent" / "skills",
+                source="skill",
+                namespace="skill",
+            ))
+            items.extend(_scan_omp_skill_root(
+                HOME / ".omp" / "agent" / "managed-skills",
+                source="managed-skill",
+                namespace="managed-skill",
+            ))
+            if cwd and os.path.isdir(cwd):
+                items.extend(_scan_omp_skill_root(
+                    Path(cwd) / ".omp" / "skills",
+                    source="project-skill",
+                    namespace="project-skill",
+                ))
     if provider == "codex" and trigger in (None, "$"):
         items.extend(_scan_codex_dollar_skill_invocations())
     return _dedupe_invocations(items)
@@ -13027,20 +14387,32 @@ def _build_invocation_catalog(cwd: str = "", provider: str = "claude",
 def _invocations_signature(cwd: str = "", provider: str = "claude",
                            trigger: str | None = None) -> str:
     provider = (provider or "claude").strip().lower()
-    if provider not in _agent_provider_ids():
+    if not _provider_supports(provider, "commands"):
         return f"unsupported:{provider}:{trigger or ''}"
     h = hashlib.sha256()
     h.update(f"epoch:{_CATALOG_EPOCH}\n".encode())
     h.update(json.dumps(_builtin_catalog_meta_for(provider), sort_keys=True).encode())
     roots: list[Path] = []
     if trigger in (None, "/"):
-        roots.extend([
-            HOME / (".codex" if provider == "codex" else ".claude") / "commands",
-        ])
+        if provider == "omp":
+            roots.append(HOME / ".omp" / "agent" / "commands")
+        else:
+            roots.append(HOME / (".codex" if provider == "codex" else ".claude") / "commands")
         if provider == "claude":
             roots.extend([HOME / ".claude" / "skills", HOME / ".claude" / "plugins"])
+        elif provider == "omp":
+            roots.extend([
+                HOME / ".omp" / "agent" / "skills",
+                HOME / ".omp" / "agent" / "managed-skills",
+            ])
         if cwd and os.path.isdir(cwd):
-            roots.append(Path(cwd) / (".codex" if provider == "codex" else ".claude") / "commands")
+            if provider == "omp":
+                roots.extend([
+                    Path(cwd) / ".omp" / "commands",
+                    Path(cwd) / ".omp" / "skills",
+                ])
+            else:
+                roots.append(Path(cwd) / (".codex" if provider == "codex" else ".claude") / "commands")
     if provider == "codex" and trigger in (None, "$"):
         roots.extend(_codex_skill_roots())
     for root in roots:
@@ -13193,7 +14565,7 @@ def _commands_signature(cwd: str = "", provider: str = "claude") -> str:
     Cheap: ~1000 stat calls on local fs across 5 dirs is sub-millisecond.
     """
     provider = (provider or "claude").strip().lower()
-    if provider not in _agent_provider_ids():
+    if not _provider_supports(provider, "mcp"):
         return f"unsupported:{provider}"
     h = hashlib.sha256()
     h.update(f"epoch:{_CATALOG_EPOCH}\n".encode())
@@ -15286,7 +16658,7 @@ def _direct_terminal_action_profile(
         "can_terminate": False,
         "control_profile": "read_only",
     }
-    if not allowed or provider not in {"claude", "codex"} or not isinstance(registry_row, dict):
+    if not allowed or provider not in {"claude", "codex", "omp"} or not isinstance(registry_row, dict):
         return read_only
     if registry_row.get("closed_at") is not None:
         return read_only
@@ -15295,10 +16667,17 @@ def _direct_terminal_action_profile(
     pid = int(registry_row.get("pid") or registry_row.get("claude_pid") or 0)
     if pid <= 0:
         return read_only
-    if inventory_live_terminal_rows is not None and provider == "codex":
-        if not _codex_inventory_registry_process_matches(
-            registry_row, inventory_live_terminal_rows
-        ):
+    if inventory_live_terminal_rows is not None and provider in {"codex", "omp"}:
+        matches_inventory = (
+            _codex_inventory_registry_process_matches(
+                registry_row, inventory_live_terminal_rows
+            )
+            if provider == "codex"
+            else _omp_inventory_registry_process_matches(
+                registry_row, inventory_live_terminal_rows
+            )
+        )
+        if not matches_inventory:
             return read_only
         return {
             "can_control": False,
@@ -15339,7 +16718,7 @@ def _terminal_surface_source(
         return {"available": False, "source": "unavailable", "reason": "bad_session"}
     if not re.fullmatch(r"[a-z0-9_]{1,48}", provider or ""):
         return {"available": False, "source": "unavailable", "reason": "bad_session"}
-    if provider not in _agent_provider_ids():
+    if not _provider_supports(provider, "terminal_surface"):
         return {"available": False, "source": "unavailable", "reason": "unsupported_provider"}
 
     broker_error = ""
@@ -15448,6 +16827,90 @@ def _terminal_surface_source(
             "tty": tty,
             "pid": int(reg.get("pid") or 0),
             **direct_actions,
+        }
+
+    if provider == "omp":
+        reg = _agent_registry_get("omp", native_id) or {}
+        metadata = _registry_metadata_from_row(reg)
+        broker_id = str(metadata.get("broker_id") or "").strip()
+        broker_session = _registry_owned_broker_session(
+            "omp", native_id, reg
+        )
+        if broker_session is not None:
+            try:
+                PTY_BROKER.register_alias(
+                    qualified, _broker_session_id(broker_session)
+                )
+            except Exception:
+                pass
+            broker_relation = _broker_runtime_relation()
+            current_atomic_control = (
+                broker_relation == "current"
+                and _broker_supports_current_atomic_control(broker_relation)
+            )
+            return {
+                "available": True,
+                "source": "broker_vt",
+                "reason": "broker_vt",
+                "broker_id": _broker_session_id(broker_session),
+                "tty": _broker_slave_tty(broker_session),
+                "pid": _broker_pid(broker_session),
+                "can_control": current_atomic_control,
+                "can_send_text": current_atomic_control,
+                "can_interrupt": current_atomic_control,
+                "can_terminate": current_atomic_control,
+                "control_profile": (
+                    "current_atomic_v2"
+                    if current_atomic_control
+                    else "read_only"
+                ),
+            }
+        tty = str(reg.get("terminal_tty") or "")
+        if not re.match(r"^/dev/ttys[0-9]{3,}$", tty):
+            return {
+                "available": False,
+                "source": "unavailable",
+                "reason": "invalid_tty" if tty else "no_terminal_tty",
+                "tty": tty,
+            }
+        live_terminal_rows = inventory_live_terminal_rows
+        if live_terminal_rows is None:
+            inventory = _capture_sessions_provider_inventory("omp")
+            if (
+                inventory.get("probe_state") == "exact"
+                and bool(inventory.get("membership_complete"))
+            ):
+                live_terminal_rows = list(inventory.get("terminals") or [])
+            else:
+                live_terminal_rows = []
+        if not _omp_inventory_registry_process_matches(
+            reg,
+            live_terminal_rows,
+            require_direct_control=False,
+        ):
+            return {
+                "available": False,
+                "source": "unavailable",
+                "reason": "process_identity_unverified",
+                "tty": tty,
+                "pid": int(reg.get("pid") or 0),
+                "can_control": False,
+                "can_send_text": False,
+                "can_interrupt": False,
+                "can_terminate": False,
+                "control_profile": "read_only",
+            }
+        return {
+            "available": True,
+            "source": "terminal_app_contents",
+            "reason": "terminal_app_contents",
+            "tty": tty,
+            "pid": int(reg.get("pid") or 0),
+            "can_control": False,
+            "can_send_text": False,
+            "can_interrupt": False,
+            "can_terminate": False,
+            "control_profile": "read_only",
         }
 
     if provider == "claude":
@@ -16571,14 +18034,6 @@ TERMINAL_CONTROL_ALLOWED_KEYS = {
     "tab",
     "ctrl_c",
 }
-TERMINAL_CONTROL_KEY_CODES = {
-    "enter": 36,
-    "escape": 53,
-    "up": 126,
-    "down": 125,
-    "left": 123,
-    "right": 124,
-}
 TERMINAL_CONTROL_TEXT_MAX_CHARS = TERMINAL_TEXT_SUBMIT_MAX_CHARS
 _RECEIPT_EXECUTION_STATES = frozenset({
     "queued",
@@ -16667,6 +18122,8 @@ def _receipt_key(device_id: str | None, session_id: str, client_action_id: str) 
     if not normalized_device_id:
         raise ValueError("authenticated device_id is required for mutation receipts")
     return "|".join([normalized_device_id, session_id, client_action_id])
+
+
 
 
 
@@ -17543,6 +19000,34 @@ def _receipt_duplicate_response(
                     "WHERE device_id=? AND session_id=? AND client_action_id=?",
                     (normalized_device_id, session_id, client_action_id),
                 ).fetchone()
+                if (
+                    reserve_missing
+                    and existing is not None
+                    and existing["execution_state"] == "queued"
+                    and existing["body_hash"] == body_hash
+                    and existing["action_kind"] == action_kind
+                    and existing["owner_instance"]
+                    != _CONTROL_RECEIPT_INSTANCE_ID
+                ):
+                    reclaimed = conn.execute(
+                        "UPDATE control_action_receipts "
+                        "SET owner_instance=?, receipt_json=?, updated_at=? "
+                        "WHERE device_id=? AND session_id=? "
+                        "AND client_action_id=? AND execution_state='queued' "
+                        "AND owner_instance IS ?",
+                        (
+                            _CONTROL_RECEIPT_INSTANCE_ID,
+                            queued_receipt_json,
+                            now,
+                            normalized_device_id,
+                            session_id,
+                            client_action_id,
+                            existing["owner_instance"],
+                        ),
+                    )
+                    if reclaimed.rowcount == 1:
+                        inserted_reservation = True
+                        existing = None
     except (OSError, sqlite3.Error) as exc:
         receipt = _make_action_receipt(
             client_action_id=client_action_id,
@@ -18447,7 +19932,11 @@ def _write_agent_turn_state(provider: str, native_id: str, state: str, *,
     except Exception:
         prior = {}
     payload = {
-        "session_id": _qualified_session_id(provider, native_id) if provider == "codex" else native_id,
+        "session_id": (
+            native_id
+            if provider == "claude"
+            else _qualified_session_id(provider, native_id)
+        ),
         "state": state,
         "tool": tool,
         "started_at": float(started_at or prior.get("started_at") or now),
@@ -19274,6 +20763,31 @@ def _codex_turn_state_payload(native_id: str, *, apply_boundary: bool = True) ->
     if apply_boundary:
         return _apply_codex_task_boundary(native_id, payload, path)
     return payload
+
+def _managed_turn_state_payload(
+    provider: str,
+    native_id: str,
+    *,
+    apply_boundary: bool = True,
+) -> dict | None:
+    if provider == "codex":
+        return _codex_turn_state_payload(native_id, apply_boundary=apply_boundary)
+    if provider != "omp" or not _safe_agent_native_id(native_id):
+        return None
+    native_id = _agent_registry_resolve_native_alias(provider, native_id)
+    if not _safe_agent_native_id(native_id):
+        return None
+    path = _turn_state_path(provider, native_id)
+    try:
+        obj = json.loads(path.read_text())
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    obj["session_id"] = _qualified_session_id(provider, native_id)
+    obj["provider"] = provider
+    obj["native_id"] = native_id
+    return obj
 
 
 def _codex_first_prompt(path: Path, session_id: str, history: dict[str, dict]) -> str | None:
@@ -20280,6 +21794,14 @@ def _session_record_is_active(provider: str, native_id: str, record: dict) -> bo
     pid = int(record.get("pid") or record.get("claude_pid") or 0)
     if pid > 0 and _session_has_verified_provider_process(record, provider):
         return True
+    # Inventory failure must not turn a still-live, birth-matched process into
+    # permission to delete its transcript.
+    if (
+        pid > 0
+        and _registry_process_birth_matches(record, pid)
+        and _process_alive(pid)
+    ):
+        return True
     qualified = _qualified_session_id(provider, native_id)
     if PTY_BROKER is not None:
         try:
@@ -21275,9 +22797,6 @@ def _clean_transcript_export_text(text: str) -> str:
     return text
 
 
-def _as_escape(s: str) -> str:
-    """Escape a Python string for embedding in an AppleScript double-quoted literal."""
-    return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
 _ABSOLUTE_PATH_ROOT_TOKENS = {
@@ -21300,12 +22819,7 @@ _ABSOLUTE_PATH_ROOT_TOKENS = {
 
 
 def _is_direct_slash_invocation_text(text: str) -> bool:
-    """Return true only for slash commands that need typed input semantics.
-
-    Absolute file paths also begin with "/", and uploaded-file feedback often
-    starts with /Users/... . Those must stay on the bracketed-paste path so the
-    agent receives a normal prompt instead of entering slash-command UI state.
-    """
+    """Identify slash commands that need keystroke rather than paste semantics."""
     if "\n" in text or not text.startswith("/") or text.startswith("//"):
         return False
     token = text.split(maxsplit=1)[0]
@@ -21314,85 +22828,9 @@ def _is_direct_slash_invocation_text(text: str) -> bool:
     command = token[1:]
     if not command or command in _ABSOLUTE_PATH_ROOT_TOKENS:
         return False
-    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*(?::[A-Za-z][A-Za-z0-9_-]*)*", command))
-
-
-CLAUDE_INJECTOR = HOME / "Applications" / "ClaudeInjector.app" / "Contents" / "MacOS" / "ClaudeInjector"
-
-
-def _run_osascript(
-    script: str,
-    *,
-    timeout: float = 15.0,
-    mutation_possible: bool = False,
-) -> dict:
-    """Run AppleScript via ClaudeInjector.app wrapper if present (so macOS
-    Accessibility can be granted to a normal .app instead of the hardened
-    python3.13 runtime). Falls back to direct osascript."""
-    if CLAUDE_INJECTOR.exists():
-        cmd = [str(CLAUDE_INJECTOR), "-e", script]
-    else:
-        cmd = ["osascript", "-e", script]
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            stdin=subprocess.DEVNULL,
-            env=_provider_child_environment(),
-        )
-    except subprocess.TimeoutExpired:
-        return {
-            "ok": False,
-            "reason": "applescript timeout",
-            "outcome_indeterminate": bool(mutation_possible),
-            **(
-                {"pty_written": None, "write_outcome": "unknown"}
-                if mutation_possible
-                else {}
-            ),
-        }
-    except OSError as exc:
-        return {
-            "ok": False,
-            "reason": f"applescript launch failed: {type(exc).__name__}",
-            "outcome_indeterminate": False,
-        }
-    out = proc.stdout.strip()
-    err = proc.stderr.strip()
-    if proc.returncode != 0:
-        # -1743 means Apple Events permission was refused before Terminal could
-        # receive the script. Other errors may happen after a `do script`
-        # mutation, so mutating callers must treat the outcome as unknown.
-        permission_refused = "-1743" in err
-        indeterminate = bool(mutation_possible and not permission_refused)
-        return {
-            "ok": False,
-            "reason": f"applescript err: {err[:200]}",
-            "outcome_indeterminate": indeterminate,
-            **(
-                {"pty_written": None, "write_outcome": "unknown"}
-                if indeterminate
-                else {}
-            ),
-        }
-    if out == "no_window":
-        return {"ok": False, "reason": "no matching Terminal window"}
-    if out == "ok":
-        return {"ok": True}
-    if out.startswith("ok\t"):
-        return {"ok": True, "stdout": out}
-    return {
-        "ok": False,
-        "reason": f"unexpected: {out[:120]}",
-        "outcome_indeterminate": bool(mutation_possible),
-        **(
-            {"pty_written": None, "write_outcome": "unknown"}
-            if mutation_possible
-            else {}
-        ),
-    }
+    return bool(
+        re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*(?::[A-Za-z][A-Za-z0-9_-]*)*", command)
+    )
 
 
 def _peek_cwd_from_transcript(path: Path) -> str:
@@ -22539,7 +23977,77 @@ def _provider_control_send_error(handler, error) -> None:
         status=int(error.status),
     )
 
+class _RevalidatingStreamWriter:
+    """Fail an SSE write after its remote bearer authority changes."""
+
+    def __init__(self, handler, raw, *, interval_seconds: float = 1.0):
+        self._handler = handler
+        self._raw = raw
+        self._interval_seconds = max(0.0, float(interval_seconds))
+        self._next_check = 0.0
+
+    def reset(self) -> None:
+        self._next_check = 0.0
+
+    def write(self, data):
+        now = _time.monotonic()
+        if now >= self._next_check:
+            self._next_check = now + self._interval_seconds
+            if not self._handler._stream_authorization_is_current():
+                self._handler.close_connection = True
+                raise BrokenPipeError("stream authorization is no longer current")
+        return self._raw.write(data)
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
+
 class Handler(BaseHTTPRequestHandler):
+    def _stream_authorization_is_current(self) -> bool:
+        """Revalidate remote bearer authority for an already-open stream."""
+        snapshot = getattr(self, "_pairling_stream_authorization", None)
+        if snapshot is None:
+            return True
+        token, required_scopes, path, device_id, install_id = snapshot
+        if DEVICE_REGISTRY is None:
+            return False
+        try:
+            current = DEVICE_REGISTRY.authenticate(
+                token,
+                required_scopes=required_scopes,
+                path=path,
+            )
+            current = _bind_auth_result_to_local_install(current)
+        except Exception:
+            return False
+        if current is None or not getattr(current, "ok", False):
+            return False
+        return (
+            secrets.compare_digest(
+                str(getattr(current, "device_id", "") or ""),
+                device_id,
+            )
+            and secrets.compare_digest(
+                str(getattr(current, "install_id", "") or ""),
+                install_id,
+            )
+        )
+
+    def send_header(self, keyword, value):
+        if str(keyword).lower() == "content-type" and str(value).lower() == "text/event-stream":
+            self._pairling_sse_response = True
+        return super().send_header(keyword, value)
+
+    def end_headers(self):
+        super().end_headers()
+        if not getattr(self, "_pairling_sse_response", False):
+            return
+        if isinstance(self.wfile, _RevalidatingStreamWriter):
+            self.wfile.reset()
+        else:
+            self.wfile = _RevalidatingStreamWriter(self, self.wfile)
+
     def send_error(self, code, message=None, explain=None):
         safe_message = (
             None if message is None else redact_public_text(str(message))
@@ -22604,6 +24112,7 @@ class Handler(BaseHTTPRequestHandler):
         return body
 
     def _dispatch(self):
+        self._pairling_sse_response = False
         u = urlparse(self.path)
         q = parse_qs(u.query)
         self._cached_body = None
@@ -22658,6 +24167,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self.pairling_auth = None
+        self._pairling_stream_authorization = None
 
         if getattr(self.server, "pairling_local_control", False):
             try:
@@ -22836,7 +24346,16 @@ class Handler(BaseHTTPRequestHandler):
                 }, status=auth_result.status)
                 return
             self.pairling_auth = auth_result
-        elif u.path not in PUBLIC_ENDPOINTS and not internal_route_probe:
+            self._pairling_stream_authorization = (
+                token,
+                frozenset(required_scopes),
+                u.path,
+                str(getattr(auth_result, "device_id", "") or ""),
+                str(getattr(auth_result, "install_id", "") or ""),
+            )
+        elif not _unauthenticated_request_allowed(
+            u.path, self.headers, self.client_address
+        ) and not internal_route_probe:
             admission.release()
             self._send_json({
                 "ok": False,
@@ -22867,7 +24386,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(405, "GET required")
             return
 
-        if u.path in POST_ONLY_ENDPOINTS and self.command != "POST":
+        if _is_post_only_endpoint(u.path) and self.command != "POST":
             admission.release()
             self.send_error(405, "POST required")
             return
@@ -22876,24 +24395,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(405, "GET or POST required")
             return
 
-        if self.pairling_auth is not None and _is_high_risk_endpoint(u.path) and DEVICE_REGISTRY is not None:
-            max_per_min = _rate_limit_for_high_risk_endpoint(u.path)
-            rate_path = _rate_limit_key_path(u.path)
-            allowed, retry = _request_rate_check(
-                f"{self.pairling_auth.device_id}:{rate_path}",
-                max_per_min=max_per_min,
-            )
-            if not allowed:
-                admission.release()
-                self._send_json({
-                    "ok": False,
-                    "error": {
-                        "code": "rate_limited",
-                        "message": "too many mutating requests",
-                    },
-                    "retry_after": retry,
-                }, status=429, headers={"Retry-After": str(retry)})
-                return
 
         proof_verified = False
         if (
@@ -22933,16 +24434,49 @@ class Handler(BaseHTTPRequestHandler):
                 }, status=503)
                 return
             if not proof_result.ok:
+                proof_rate_allowed, proof_retry = _invalid_proof_rate_check(
+                    token or "",
+                    self.headers,
+                    self.client_address,
+                )
+                admission.release()
+                if not proof_rate_allowed:
+                    self._send_json({
+                        "ok": False,
+                        "error": {
+                            "code": "invalid_proof_rate_limited",
+                            "message": "too many invalid request proofs",
+                        },
+                        "retry_after": proof_retry,
+                    }, status=429, headers={"Retry-After": str(proof_retry)})
+                else:
+                    self._send_json({
+                        "ok": False,
+                        "error": {
+                            "code": proof_result.code,
+                            "message": proof_result.message,
+                        },
+                    }, status=proof_result.status)
+                return
+            proof_verified = True
+        if self.pairling_auth is not None and _is_high_risk_endpoint(u.path) and DEVICE_REGISTRY is not None:
+            max_per_min = _rate_limit_for_high_risk_endpoint(u.path)
+            rate_path = _rate_limit_key_path(u.path)
+            allowed, retry = _request_rate_check(
+                f"{self.pairling_auth.device_id}:{rate_path}",
+                max_per_min=max_per_min,
+            )
+            if not allowed:
                 admission.release()
                 self._send_json({
                     "ok": False,
                     "error": {
-                        "code": proof_result.code,
-                        "message": proof_result.message,
+                        "code": "rate_limited",
+                        "message": "too many mutating requests",
                     },
-                }, status=proof_result.status)
+                    "retry_after": retry,
+                }, status=429, headers={"Retry-After": str(retry)})
                 return
-            proof_verified = True
 
         if self.pairling_auth is not None:
             _maybe_persist_tailnet_node_id(
@@ -22989,12 +24523,11 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == "/manifest":
                 self._handle_manifest(q)
             elif u.path == "/pair/start":
-                if not _loopback_client_address(self.client_address):
-                    self._send_json({"ok": False, "error": {"code": "pair_start_loopback_required", "message": "pair start is only available from loopback"}}, status=403)
+                if self.command != "POST":
+                    self._send_json({"ok": False, "error": {"code": "method_not_allowed", "message": "pair start requires POST"}}, status=405)
+                elif not _local_authorization_request(self.headers, self.client_address):
+                    self._send_json({"ok": False, "error": {"code": "pair_start_local_authorization_required", "message": "pair start requires local CLI authorization"}}, status=403)
                 elif _funnel_origin_request(self.headers, self.client_address):
-                    # Belt-and-suspenders: /pair/start returns the 192-bit secret
-                    # in plaintext and must never be served to a funnel-origin
-                    # request, even if connectd's allowlist ever drifted.
                     self._send_json({"ok": False, "error": {"code": "funnel_forbidden", "message": "pair start is not available over funnel"}}, status=403)
                 else:
                     self._handle_pair_start(q)
@@ -23119,7 +24652,10 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == "/sessions/race/prepare":
                 self._handle_race_prepare(q)
             elif u.path.startswith("/sessions/race/") and u.path.endswith("/finish"):
-                self._handle_race_finish(q, u.path.split("/")[3])
+                if self.command != "POST":
+                    self._send_json({"ok": False, "error": {"code": "method_not_allowed", "message": "race finish requires POST"}}, status=405)
+                else:
+                    self._handle_race_finish(q, u.path.split("/")[3])
             elif u.path == "/push/live-activity-token":
                 self._handle_push_live_activity_token(q)
             elif u.path == "/push/live-activity-test":
@@ -24112,6 +25648,11 @@ class Handler(BaseHTTPRequestHandler):
                         payload.get("lease_ttl_seconds") or DEFAULT_SMOKE_LEASE_TTL_SECONDS
                     ),
                 })
+            if purpose != "runtime_truth_smoke":
+                permission_error = _pairing_terminal_permissions_error()
+                if permission_error is not None:
+                    self._send_json(permission_error, status=409)
+                    return
             started = PAIRING_STORE.start_pair(**start_kwargs)
             bonjour = {
                 "ok": False,
@@ -24151,7 +25692,7 @@ class Handler(BaseHTTPRequestHandler):
                 "routes": pairling_connect_routes,
             },
             "claim": {
-                "url": "pairling://pair",
+                "url": "https://pairling.dev/pair/",
                 "pair_id": started.pair_id,
                 "secret": started.secret,
                 "attest_challenge": started.attest_challenge,
@@ -24210,12 +25751,13 @@ class Handler(BaseHTTPRequestHandler):
             pair_id = str(payload.get("pair_id") or "")
             pair_digest = hashlib.sha256(pair_id.encode("utf-8")).hexdigest()[:24]
             headers = getattr(self, "headers", {})
-            trusted_gateway = _pairdrop_gateway_provenance_ok(headers, self.client_address)
-            rate_keys = [f"pair_psk:pair:{pair_digest}"]
-            if not trusted_gateway:
-                rate_keys.insert(0, f"pair_psk:source:{_client_address_host(self.client_address) or 'unknown'}")
+            origin_digest = _request_origin_key(headers, self.client_address)
+            rate_keys = [
+                f"pair_psk:source:{origin_digest}",
+                f"pair_psk:pair:{pair_digest}",
+            ]
             for rate_key in rate_keys:
-                allowed, retry_after = _request_rate_check(rate_key, max_per_min=5)
+                allowed, retry_after = _pairing_rate_check(rate_key, max_per_min=5)
                 if not allowed:
                     self._send_json(
                         {
@@ -24228,6 +25770,12 @@ class Handler(BaseHTTPRequestHandler):
                         status=429,
                         headers={"Retry-After": str(retry_after)},
                     )
+                    return
+            purpose = PAIRING_STORE.pairing_purpose(pair_id)
+            if purpose != "runtime_truth_smoke":
+                permission_error = _pairing_terminal_permissions_error()
+                if permission_error is not None:
+                    self._send_json(permission_error, status=409)
                     return
             host_chain = self._pairing_host_chain()
             runtime_routes = self._pairing_runtime_routes(list(host_chain))
@@ -24346,11 +25894,13 @@ class Handler(BaseHTTPRequestHandler):
             headers = getattr(self, "headers", {})
             trusted_gateway = _pairdrop_gateway_provenance_ok(headers, self.client_address)
             remote_activation = trusted_gateway or not _loopback_client_address(self.client_address)
-            rate_keys = [f"pair_psk_activate:pair:{pair_digest}"]
-            if not trusted_gateway:
-                rate_keys.insert(0, f"pair_psk_activate:source:{_client_address_host(self.client_address) or 'unknown'}")
+            origin_digest = _request_origin_key(headers, self.client_address)
+            rate_keys = [
+                f"pair_psk_activate:source:{origin_digest}",
+                f"pair_psk_activate:pair:{pair_digest}",
+            ]
             for rate_key in rate_keys:
-                allowed, retry_after = _request_rate_check(rate_key, max_per_min=10)
+                allowed, retry_after = _pairing_rate_check(rate_key, max_per_min=10)
                 if not allowed:
                     self._send_json(
                         {
@@ -24363,6 +25913,18 @@ class Handler(BaseHTTPRequestHandler):
                         status=429,
                         headers={"Retry-After": str(retry_after)},
                     )
+                    return
+            pending_activation = PAIRING_STORE.pending_psk_activation_context(
+                pair_id=pair_id,
+                device_id=device_id,
+            )
+            if (
+                pending_activation is not None
+                and pending_activation.purpose != "runtime_truth_smoke"
+            ):
+                permission_error = _pairing_terminal_permissions_error()
+                if permission_error is not None:
+                    self._send_json(permission_error, status=409)
                     return
             if PUSH_DISPATCHER is not None:
                 try:
@@ -24839,6 +26401,8 @@ class Handler(BaseHTTPRequestHandler):
         last_keepalive = 0.0
         deadline = _time.time() + 600
         while _time.time() < deadline:
+            if not self._stream_authorization_is_current():
+                return
             payload = _cached_health_payload(
                 authenticated=self.pairling_auth is not None,
                 auth_result=self.pairling_auth,
@@ -24994,6 +26558,8 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as error:
             self.send_error(400, str(error))
             return
+        home = str(HOME.resolve())
+        tmp = str(Path("/tmp").resolve())
 
         try:
             payload = _cached_runtime_snapshot(
@@ -25308,6 +26874,16 @@ class Handler(BaseHTTPRequestHandler):
             if str(row.get("provider") or "") in visible
         ]
         rows = _merge_managed_session_rows(rows, managed_rows)
+
+        if (
+            provider_filter in ("all", "omp")
+            and "omp" in visible
+            and provider_inventory is not None
+        ):
+            rows.extend(_omp_sessions_from_inventory({
+                "checked_at": _time.time(),
+                "terminals": provider_inventory.get("omp", []),
+            }))
 
         rows = _filter_tombstoned_session_rows(rows)
         rows = _collapse_live_session_rows_by_terminal(rows)
@@ -25891,6 +27467,12 @@ class Handler(BaseHTTPRequestHandler):
         pid = int(row.get("pid") or row.get("claude_pid") or 0)
         tty = str(row.get("terminal_tty") or "")
         has_real_tty = bool(re.match(r"^/dev/ttys[0-9]{3,}$", tty))
+        if row.get("provider") == "omp":
+            return bool(
+                row.get("source_freshness") == "inventory_live"
+                and pid > 0
+                and has_real_tty
+            )
         if (
             row.get("provider") == "codex"
             and row.get("source_freshness") == "identity_probe_degraded"
@@ -26055,18 +27637,24 @@ class Handler(BaseHTTPRequestHandler):
         age = max(0, now - last) if last else 0
 
         controllability = dict(row.get("controllability") or {})
+        capabilities = set(row.get("capabilities") or [])
         can_control = bool(
             not closed_at
             and (
                 controllability.get("can_send_text")
                 or controllability.get("can_interrupt")
                 or controllability.get("can_terminate")
+                or (
+                    controllability.get("can_control")
+                    and "terminal_control" in capabilities
+                )
             )
         )
         has_verified_process = can_control
         if not closed_at and not has_verified_process:
             try:
-                if str(row.get("provider") or "claude") == "codex":
+                provider = str(row.get("provider") or "claude")
+                if provider == "codex":
                     registry_row = _codex_registry_row_for_strict_live_display(
                         row
                     )
@@ -26082,24 +27670,24 @@ class Handler(BaseHTTPRequestHandler):
                         )
                     )
                 else:
-                    claude_inventory = (
-                        provider_inventory.get("claude", [])
+                    live_inventory = (
+                        provider_inventory.get(provider, [])
                         if provider_inventory is not None
                         else None
                     )
-                    if claude_inventory is not None:
+                    if live_inventory is not None:
                         has_verified_process = any(
                             _session_inventory_terminal_matches_row(
-                                "claude",
+                                provider,
                                 terminal,
                                 row,
                             )
-                            for terminal in claude_inventory
+                            for terminal in live_inventory
                         )
                     else:
                         has_verified_process = _session_has_verified_provider_process(
                             row,
-                            "claude",
+                            provider,
                         )
             except Exception:
                 has_verified_process = False
@@ -26119,7 +27707,18 @@ class Handler(BaseHTTPRequestHandler):
             control_state = "controllable"
             control_reason = None
         else:
-            control_state = "read_only" if readable_state == "closed" or "transcript" in set(row.get("capabilities") or []) else "unavailable"
+            read_capabilities = set(row.get("capabilities") or [])
+            control_state = (
+                "read_only"
+                if readable_state == "closed"
+                or bool(read_capabilities & {
+                    "transcript",
+                    "resume",
+                    "terminal_output",
+                    "terminal_surface",
+                })
+                else "unavailable"
+            )
             if readable_state == "closed":
                 control_reason = "Session is closed; transcript remains readable."
             elif readable_state in {"stale", "offline"}:
@@ -26132,7 +27731,14 @@ class Handler(BaseHTTPRequestHandler):
                 "can_terminate": False,
                 "reason": control_reason,
             }
-            row["capabilities"] = [cap for cap in (row.get("capabilities") or []) if cap in {"transcript", "export", "live_state"}]
+            allowed_read_only = {"transcript", "export", "live_state"}
+            if readable_state == "live":
+                allowed_read_only.update({"resume", "terminal_output", "terminal_surface"})
+            row["capabilities"] = [
+                capability
+                for capability in (row.get("capabilities") or [])
+                if capability in allowed_read_only
+            ]
 
         row["readable_state"] = readable_state
         row["control_state"] = control_state
@@ -26262,6 +27868,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+
+        # OMP exposes live terminal inventory only. It has no transcript-backed
+        # history surface, so a non-live filter must never reach Claude.
+        if provider_filter == "omp":
+            self._send_json({"count": 0, "items": []})
             return
 
         # Live filter semantics (live_only): keep sessions with either a fresh
@@ -26624,6 +28236,8 @@ class Handler(BaseHTTPRequestHandler):
 
             last_scan = _time.time()
             while _time.time() < deadline:
+                if not self._stream_authorization_is_current():
+                    return
                 woke = pending_wake
                 pending_wake = False
                 if sessions_wakes is not None:
@@ -26837,7 +28451,11 @@ class Handler(BaseHTTPRequestHandler):
             else None
         )
         try:
+            if not self._stream_authorization_is_current():
+                return
             while _time.time() < deadline:
+                if not self._stream_authorization_is_current():
+                    return
                 data, next_since, total = _managed_transcript_ndjson(
                     session_id,
                     since=cursor,
@@ -27071,10 +28689,14 @@ class Handler(BaseHTTPRequestHandler):
             # Initial snapshot — emit anything from `since` to current EOF
             # (through the last \n) so the client has a baseline even if
             # no new writes happen for a while.
+            if not self._stream_authorization_is_current():
+                return
             if not _emit_complete_lines():
                 return
 
             while _time.time() < deadline:
+                if not self._stream_authorization_is_current():
+                    return
                 if transcript_wakes is not None:
                     wake = transcript_wakes.get(timeout=1.0)
                     while wake is not None:
@@ -27477,6 +29099,8 @@ class Handler(BaseHTTPRequestHandler):
             return ok
 
         try:
+            if not self._stream_authorization_is_current():
+                return
             if not emit("hello", {
                 "session_id": session_id,
                 "since_terminal": 0,
@@ -27487,6 +29111,8 @@ class Handler(BaseHTTPRequestHandler):
             }, source="managed-provider-sessions"):
                 return
             while _time.time() < deadline:
+                if not self._stream_authorization_is_current():
+                    return
                 truth = _managed_session_runtime_truth(session_id)
                 if truth is None:
                     emit("error", {
@@ -27613,10 +29239,9 @@ class Handler(BaseHTTPRequestHandler):
         terminal_line_buffer = ""
         deadline = _time.time() + 600.0
 
-        # Runtime truth can block for seconds (terminal-surface probing runs
-        # AppleScript against Terminal.app). Computing it inline starved the
-        # transcript/terminal tails, which is exactly the "live view feels
-        # delayed" failure. The probe runs in a worker SHARED across every
+        # Runtime truth can block for seconds while the native helper probes
+        # Terminal.app. Computing it inline starved transcript/terminal tails.
+        # The probe runs in a worker shared across every stream on this session;
         # stream on this session (refcounted); the writer loop only ever
         # reads the latest result, so tail latency stays decoupled from
         # probe latency and extra viewers add no probe cost.
@@ -27651,6 +29276,8 @@ class Handler(BaseHTTPRequestHandler):
         merged_events = None
         transcript_watch = None
         try:
+            if not self._stream_authorization_is_current():
+                return
             if not emit("hello", {
                 "session_id": session_id,
                 "since_terminal": max(0, terminal_offset),
@@ -27716,6 +29343,8 @@ class Handler(BaseHTTPRequestHandler):
                         })
 
             while _time.time() < deadline:
+                if not self._stream_authorization_is_current():
+                    return
                 want_terminal = want_transcript = want_receipts = want_approval = False
                 if merged_events is not None:
                     wake = merged_events.get(
@@ -28100,6 +29729,8 @@ class Handler(BaseHTTPRequestHandler):
                 }, stats_key="v2_backlog_gap"):
                     return
             while _time.time() < deadline:
+                if not self._stream_authorization_is_current():
+                    return
                 page = _managed_session_events_v2_page(
                     session_key,
                     since_seq=cursor,
@@ -28367,6 +29998,8 @@ class Handler(BaseHTTPRequestHandler):
                 }, stats_key="v2_backlog_gap"):
                     return
             while _time.time() < deadline:
+                if not self._stream_authorization_is_current():
+                    return
                 if getattr(self.wfile, "closed", False):
                     return
                 now = _time.time()
@@ -28776,6 +30409,8 @@ class Handler(BaseHTTPRequestHandler):
                     if current_error is not None and not emit_device_ingest_state(current_error):
                         return
             while _time.time() < deadline:
+                if not self._stream_authorization_is_current():
+                    return
                 if getattr(self.wfile, "closed", False):
                     return
                 emitted = False
@@ -28906,6 +30541,8 @@ class Handler(BaseHTTPRequestHandler):
             }, stats_key="summary_snapshot"):
                 return
             while _time.time() < deadline:
+                if not self._stream_authorization_is_current():
+                    return
                 if getattr(self.wfile, "closed", False):
                     return
                 wake = subscription.get(timeout=1.0)
@@ -29106,8 +30743,13 @@ class Handler(BaseHTTPRequestHandler):
         observed_heartbeat = original_heartbeat
         state = row.get("state")
         closed_at = row.get("closed_at")
+        has_live_control = self._registry_row_has_verified_control(
+            row,
+            provider=provider,
+            native_id=native_id,
+        )
 
-        if provider == "codex" and not closed_at:
+        if provider == "codex" and not closed_at and has_live_control:
             try:
                 turn = _codex_turn_state_payload(native_id, apply_boundary=False) or {}
             except Exception:
@@ -29118,7 +30760,7 @@ class Handler(BaseHTTPRequestHandler):
                 observed_heartbeat,
                 float(turn.get("last_update") or turn.get("turn_state_updated_at") or 0),
             )
-        elif provider == "claude" and not closed_at:
+        elif provider == "claude" and not closed_at and has_live_control:
             claude_uuid = str(row.get("claude_uuid") or "")
             try:
                 turn = self._turn_state_summary(claude_uuid) if claude_uuid else {}
@@ -29144,16 +30786,12 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 stat = transcript_path.stat()
                 transcript_available = transcript_path.is_file()
-                observed_heartbeat = max(observed_heartbeat, float(stat.st_mtime))
+                if has_live_control:
+                    observed_heartbeat = max(observed_heartbeat, float(stat.st_mtime))
             except OSError:
                 transcript_available = False
 
         stale_seconds = max(0, int(now - observed_heartbeat)) if observed_heartbeat else 0
-        has_live_control = self._registry_row_has_verified_control(
-            row,
-            provider=provider,
-            native_id=native_id,
-        )
 
         if closed_at:
             readable_state = "closed"
@@ -29222,8 +30860,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _turn_truth_for_session(self, provider: str, native_id: str) -> dict:
         try:
-            native_id = _agent_registry_resolve_native_alias(provider, native_id)
-            payload = _codex_turn_state_payload(native_id, apply_boundary=False) if provider == "codex" else {}
+            payload = (
+                _managed_turn_state_payload(
+                    provider,
+                    native_id,
+                    apply_boundary=False,
+                )
+                if provider in {"codex", "omp"}
+                else {}
+            )
             if not payload and provider == "claude":
                 payload = self._turn_state_summary(_lookup_claude_uuid_for_session(native_id))
             return {
@@ -29392,7 +31037,7 @@ class Handler(BaseHTTPRequestHandler):
         )
         if managed_truth is not None:
             return managed_truth
-        if provider not in _agent_provider_ids():
+        if not _provider_supports(provider, "terminal_surface"):
             raise ValueError(f"unsupported provider: {provider}")
 
         try:
@@ -29433,7 +31078,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 v1 = self._terminal_app_surface_snapshot(
                     session_id,
-                    osascript_timeout=TERMINAL_TRUTH_OSASCRIPT_TIMEOUT_SECONDS,
+                    automation_timeout=TERMINAL_APP_SNAPSHOT_TIMEOUT_SECONDS,
                 )
                 v2 = _terminal_surface_v2_from_text_snapshot(v1, provider=provider, native_id=native_id)
             except Exception as e:
@@ -29494,6 +31139,8 @@ class Handler(BaseHTTPRequestHandler):
         last_keepalive = _time.time()
         deadline = _time.time() + 600
         while _time.time() < deadline:
+            if not self._stream_authorization_is_current():
+                return
             try:
                 truth = self._session_runtime_truth(raw_session, expected_source_revision=expected_source_revision)
                 slim = _session_runtime_truth_stream_payload(truth)
@@ -29573,6 +31220,8 @@ class Handler(BaseHTTPRequestHandler):
         last_keepalive = _time.time()
         deadline = _time.time() + 600
         while _time.time() < deadline:
+            if not self._stream_authorization_is_current():
+                return
             try:
                 truth = self._session_runtime_truth(raw_session, expected_source_revision=expected_source_revision)
                 workspace = _terminal_workspace_from_truth(truth)
@@ -29679,7 +31328,11 @@ class Handler(BaseHTTPRequestHandler):
                     f"terminal:{_qualified_session_id(provider, native_id)}"
                 )
             try:
+                if not self._stream_authorization_is_current():
+                    return
                 while _time.time() < deadline and PTY_BROKER:
+                    if not self._stream_authorization_is_current():
+                        return
                     tail = PTY_BROKER.raw_tail(broker_id, since=last_offset)
                     if tail is None:
                         break
@@ -29802,6 +31455,8 @@ class Handler(BaseHTTPRequestHandler):
 
         f = None
         try:
+            if not self._stream_authorization_is_current():
+                return
             f = open(log_path, "rb")
             opened_stat = os.fstat(f.fileno())
             size = opened_stat.st_size
@@ -29822,6 +31477,8 @@ class Handler(BaseHTTPRequestHandler):
                     f.seek(last_emitted_offset)
 
             while _time.time() < deadline:
+                if not self._stream_authorization_is_current():
+                    return
                 _time.sleep(POLL_INTERVAL)
                 try:
                     current_stat = log_path.stat()
@@ -30015,7 +31672,7 @@ class Handler(BaseHTTPRequestHandler):
         provider, native_id = _parse_agent_session_ref(raw_session)
         if not native_id:
             return provider, "", ""
-        if provider in {"claude", "codex"}:
+        if provider in {"claude", "codex", "omp"}:
             session_id = (
                 _claude_native_session_id(raw_session)
                 if provider == "claude"
@@ -30039,54 +31696,44 @@ class Handler(BaseHTTPRequestHandler):
             return provider, session_id, tty
         return provider, native_id, ""
 
-    def _terminal_app_surface_snapshot(self, raw_session: str, *, osascript_timeout: float = 15.0) -> dict:
+    def _terminal_app_surface_snapshot(
+        self,
+        raw_session: str,
+        *,
+        automation_timeout: float = 15.0,
+    ) -> dict:
         provider, native_id, tty = self._terminal_surface_tty(raw_session)
         if not native_id:
             raise ValueError("session required")
         if not tty:
             raise FileNotFoundError("no terminal_tty for session")
-        if not re.match(r'^/dev/ttys[0-9]{3,}$', tty):
+        if not re.match(r"^/dev/ttys[0-9]{3,}$", tty):
             raise PermissionError("invalid terminal_tty")
 
-        safe_tty = _as_escape(tty)
-        # `contents of <tab>` broke on macOS 26 — the specifier resolves to
-        # the ttab object itself and the text coercion fails with -1700
-        # ("Can't make «class ttab» … into type text"). `history of <tab>`
-        # still returns the scrollback text; the snapshot builder tails it
-        # to the visible row count.
-        script = f'''
-        tell application "Terminal"
-            repeat with w in windows
-                repeat with t in tabs of w
-                    if tty of t is "{safe_tty}" then
-                        return "ok\t" & ((number of rows of t) as text) & "\t" & ((number of columns of t) as text) & "\t" & ((history of t) as text)
-                    end if
-                end repeat
-            end repeat
-        end tell
-        return "no_window"
-        '''
-        result = _run_osascript(script, timeout=osascript_timeout)
+        timeout_milliseconds = max(250, min(15_000, round(automation_timeout * 1_000)))
+        try:
+            raw_result = _automation_helper_client().read_tab(
+                tty,
+                timeout_ms=timeout_milliseconds,
+            )
+        except AutomationHelperUnavailableError as exc:
+            raise RuntimeError(str(exc) or "terminal contents unavailable") from exc
+        result = _automation_helper_response(raw_result, mutation=False)
         if not result.get("ok"):
-            if result.get("reason") == "no matching Terminal window":
+            if result.get("error_code") == "terminal_tab_not_found":
                 raise FileNotFoundError("matching Terminal tab not found")
+            if result.get("error_code") == "mac_permissions_needed":
+                raise PermissionError("Pairling needs Mac permission before it can read Terminal.")
             raise RuntimeError(result.get("reason") or "terminal contents unavailable")
-        stdout = str(result.get("stdout") or "")
-        if not stdout.startswith("ok\t"):
-            raise RuntimeError("terminal contents unavailable")
-        parts = stdout.split("\t", 3)
-        if len(parts) != 4:
+
+        text = result.get("history")
+        if not isinstance(text, str):
             raise RuntimeError("malformed terminal contents response")
         try:
-            rows = int(parts[1])
-            columns = int(parts[2])
-        except ValueError:
+            rows = int(result.get("rows"))
+            columns = int(result.get("columns"))
+        except (TypeError, ValueError):
             rows, columns = 24, 80
-        # History is the full scrollback; keep only a generous tail so a
-        # megabyte buffer never rides through the snapshot pipeline.
-        text = parts[3]
-        if len(text) > 256 * 1024:
-            text = text[-256 * 1024:]
         return _terminal_surface_snapshot_from_text(
             session_id=_qualified_session_id(provider, native_id),
             source="terminal_app_contents",
@@ -30118,17 +31765,17 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _terminal_surface_v2_snapshot(self, raw_session: str, *, osascript_timeout: float = 15.0) -> dict:
+    def _terminal_surface_v2_snapshot(self, raw_session: str, *, automation_timeout: float = 15.0) -> dict:
         provider, native_id = _parse_agent_session_ref(raw_session)
         if not native_id:
             raise ValueError("session required")
-        if provider not in _agent_provider_ids():
+        if not _provider_supports(provider, "terminal_surface"):
             raise ValueError(f"unsupported provider: {provider}")
         broker_payload = self._broker_surface_v2_snapshot(raw_session)
         if broker_payload is not None:
             return broker_payload
         try:
-            v1 = self._terminal_app_surface_snapshot(raw_session, osascript_timeout=osascript_timeout)
+            v1 = self._terminal_app_surface_snapshot(raw_session, automation_timeout=automation_timeout)
         except (FileNotFoundError, RuntimeError) as e:
             return _terminal_surface_v2_unavailable(provider=provider, native_id=native_id, reason=str(e))
         return _terminal_surface_v2_from_text_snapshot(v1, provider=provider, native_id=native_id)
@@ -30221,6 +31868,8 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             while _time.time() < deadline:
+                if not self._stream_authorization_is_current():
+                    return
                 try:
                     if not first and since_generation:
                         kind, payload = self._terminal_surface_v2_delta(
@@ -30334,6 +31983,8 @@ class Handler(BaseHTTPRequestHandler):
             return _sse_write_json_event(self.wfile, event, payload, max_bytes=SSE_MAX_EVENT_BYTES)
 
         while _time.time() < deadline:
+            if not self._stream_authorization_is_current():
+                return
             try:
                 snap = self._broker_surface_snapshot(raw_session) or self._terminal_app_surface_snapshot(raw_session)
             except ValueError as e:
@@ -30415,6 +32066,14 @@ class Handler(BaseHTTPRequestHandler):
                 "pid": self._lookup_claude_pid(session_id) or 0,
             }
 
+        if provider == "omp":
+            raise PermissionError(
+                "OMP terminal control requires a Pairling-owned PTY broker session"
+            )
+
+        if provider != "codex":
+            raise ValueError(f"unsupported provider: {provider}")
+
         reg = _agent_registry_get("codex", native_id)
         if not reg:
             raise FileNotFoundError("no Codex control registry row for session")
@@ -30488,83 +32147,46 @@ class Handler(BaseHTTPRequestHandler):
         return {"ok": True, "pid": pid, "signal": sig_name}
 
     def _terminal_control_run_in_terminal(self, target: dict, action: dict) -> dict:
-        tty_candidates = target.get("tty_candidates") or [target.get("tty")]
-        safe_ttys = "{" + ", ".join(f'"{_as_escape(candidate)}"' for candidate in tty_candidates if candidate) + "}"
-        if action["type"] == "choice":
-            safe_text = _as_escape(str(action["choice_id"]))
-            payload_expr = f'"{safe_text}"'
-        elif action["type"] == "text":
-            safe_text = _as_escape(str(action["text"]))
-            payload_expr = f'"{safe_text}"'
-        elif action["type"] == "key":
-            key_code = TERMINAL_CONTROL_KEY_CODES.get(action["key"])
-            if key_code is None:
-                return {"ok": False, "reason": "key requires signal path", "status": 400}
-            script = f'''
-            tell application "Terminal"
-                set targetTab to missing value
-                set targetWindow to missing value
-                set usedTTY to ""
-                set candidateTTYs to {safe_ttys}
-                repeat with w in windows
-                    repeat with t in tabs of w
-                        set tabTTY to tty of t
-                        repeat with candidateTTY in candidateTTYs
-                            if tabTTY is (candidateTTY as text) then
-                                set targetTab to t
-                                set targetWindow to w
-                                set usedTTY to (candidateTTY as text)
-                                exit repeat
-                            end if
-                        end repeat
-                        if targetTab is not missing value then exit repeat
-                    end repeat
-                    if targetTab is not missing value then exit repeat
-                end repeat
-                if targetTab is missing value then
-                    return "no_window"
-                end if
-                set selected tab of targetWindow to targetTab
-                set index of targetWindow to 1
-                activate
-                delay 0.05
-            end tell
-            tell application "System Events"
-                key code {key_code}
-            end tell
-            return "ok" & tab & usedTTY
-            '''
-            return _run_osascript(script, mutation_possible=True)
-        else:
-            return {"ok": False, "reason": "unsupported action", "status": 400}
-
-        script = f'''
-        tell application "Terminal"
-            set targetTab to missing value
-            set usedTTY to ""
-            set candidateTTYs to {safe_ttys}
-            repeat with w in windows
-                repeat with t in tabs of w
-                    set tabTTY to tty of t
-                    repeat with candidateTTY in candidateTTYs
-                        if tabTTY is (candidateTTY as text) then
-                            set targetTab to t
-                            set usedTTY to (candidateTTY as text)
-                            exit repeat
-                        end if
-                    end repeat
-                    if targetTab is not missing value then exit repeat
-                end repeat
-                if targetTab is not missing value then exit repeat
-            end repeat
-            if targetTab is missing value then
-                return "no_window"
-            end if
-            do script {payload_expr} in targetTab
-        end tell
-        return "ok" & tab & usedTTY
-        '''
-        return _run_osascript(script, mutation_possible=True)
+        tty = str(target.get("tty") or "")
+        if not re.fullmatch(r"/dev/ttys[0-9]{3,}", tty):
+            return {
+                "ok": False,
+                "reason": "invalid terminal tty",
+                "error_code": "invalid_tty",
+                "status": 400,
+                "mutation_outcome": "failed_before_mutation",
+                "outcome_indeterminate": False,
+            }
+        try:
+            helper = _automation_helper_client()
+            if action["type"] == "choice":
+                raw_result = _send_terminal_app_text_exact(
+                    tty,
+                    str(action["choice_id"]),
+                )
+            elif action["type"] == "text":
+                raw_result = _send_terminal_app_text_exact(
+                    tty,
+                    str(action["text"]),
+                )
+            elif action["type"] == "key":
+                raw_result = helper.send_special_key(
+                    tty,
+                    str(action["key"]),
+                    timeout_ms=3_000,
+                )
+            else:
+                return {
+                    "ok": False,
+                    "reason": "unsupported action",
+                    "error_code": "unsupported_action",
+                    "status": 400,
+                    "mutation_outcome": "failed_before_mutation",
+                    "outcome_indeterminate": False,
+                }
+        except (AutomationHelperMutationIndeterminate, AutomationHelperUnavailableError) as exc:
+            return _automation_helper_failure(exc, mutation=True)
+        return _automation_helper_response(raw_result, mutation=True)
 
     # ----- /terminal-input: type mode (SPEC-p4 §2.2) -----
     # Keystrokes stream to the broker PTY without steer's per-action
@@ -30698,7 +32320,7 @@ class Handler(BaseHTTPRequestHandler):
         if not native_id or not _valid_provider_filter(provider, allow_all=False):
             reject("bad_session", "session_id must be provider-qualified", 400)
             return
-        if provider not in _agent_provider_ids():
+        if not _provider_supports(provider, "terminal_control"):
             reject(
                 "unsupported_provider",
                 f"{provider or 'unknown'} does not support terminal input",
@@ -31383,7 +33005,6 @@ class Handler(BaseHTTPRequestHandler):
             reject_reserved_action(payload_error[0], payload_error[1], 400)
             return
         raw_session, session_err = _terminal_control_session_id(payload, q)
-        audit["session_id"] = raw_session or body_session or query_session
         if session_err:
             reject_reserved_action(
                 str(session_err["error"]["code"]),
@@ -31402,14 +33023,18 @@ class Handler(BaseHTTPRequestHandler):
         provider, native_id = _parse_agent_session_ref(raw_session)
         audit["provider"] = provider
         audit["native_id"] = native_id
-        if not native_id or not _valid_provider_filter(provider, allow_all=False):
+        if (
+            not native_id
+            or not _valid_provider_filter(provider, allow_all=False)
+            or not _safe_agent_native_id(native_id)
+        ):
             reject_reserved_action(
                 "bad_session",
                 "session_id must be provider-qualified",
                 400,
             )
             return
-        if provider not in _agent_provider_ids():
+        if not _provider_supports(provider, "terminal_control"):
             reject_reserved_action(
                 "unsupported_provider",
                 f"{provider} does not support terminal control",
@@ -31454,37 +33079,38 @@ class Handler(BaseHTTPRequestHandler):
             audit["tty"] = target.get("tty")
             audit["terminal_source"] = target.get("source")
             audit["broker_id"] = target.get("broker_id")
-            if target.get("source") != "broker_vt" or not target.get("broker_id"):
+            if target.get("source") == "broker_vt" and target.get("broker_id"):
+                if surface_schema_version != 2:
+                    reject_reserved_action(
+                        "surface_schema_version_required",
+                        "Broker terminal control requires a current version 2 screen proof.",
+                        409,
+                    )
+                    return
+                try:
+                    pair = self._broker_surface_pair_snapshot(raw_session)
+                except Exception:
+                    pair = None
+                context = _broker_atomic_control_context(
+                    pair,
+                    broker_id=str(target.get("broker_id") or ""),
+                )
+                if context is None:
+                    reject_reserved_action(
+                        "surface_not_controllable",
+                        "Atomic terminal control proof is unavailable; refresh the helper before sending input.",
+                        409,
+                    )
+                    return
+                snapshot = context["v2"]
+                broker_control_proof = context["control_proof"]
+            else:
                 reject_reserved_action(
                     "surface_not_controllable",
                     "Terminal control requires a Pairling-owned version 2 broker surface.",
                     409,
                 )
                 return
-            if surface_schema_version != 2:
-                reject_reserved_action(
-                    "surface_schema_version_required",
-                    "Broker terminal control requires a current version 2 screen proof.",
-                    409,
-                )
-                return
-            try:
-                pair = self._broker_surface_pair_snapshot(raw_session)
-            except Exception:
-                pair = None
-            context = _broker_atomic_control_context(
-                pair,
-                broker_id=str(target.get("broker_id") or ""),
-            )
-            if context is None:
-                reject_reserved_action(
-                    "surface_not_controllable",
-                    "Atomic terminal control proof is unavailable; refresh the helper before sending input.",
-                    409,
-                )
-                return
-            snapshot = context["v2"]
-            broker_control_proof = context["control_proof"]
             audit["surface_source"] = snapshot.get("source")
             audit["surface_backend"] = snapshot.get("backend")
             audit["screen_hash"] = snapshot.get("screen_hash")
@@ -31506,7 +33132,7 @@ class Handler(BaseHTTPRequestHandler):
             reject_reserved_action("surface_unavailable", str(e)[:200], 502)
             return
 
-        stale = _terminal_control_v2_availability_error(snapshot) if surface_schema_version == 2 else None
+        stale = _terminal_control_v2_availability_error(snapshot)
         if stale is None:
             stale = _terminal_control_validate_screen(payload, snapshot, action)
         if stale:
@@ -31958,15 +33584,23 @@ class Handler(BaseHTTPRequestHandler):
                 }
             self._send_json(body, status=status)
 
-        deepfield_root = DEEPFIELD_INBOX_DIR.parent.parent
         try:
+            deepfield_root = _deepfield_repository_root()
             project_fd = open_directory_fd(deepfield_root, root=HOME)
-        except (FileNotFoundError, NotADirectoryError, PermissionError, OSError, ValueError):
+        except FileNotFoundError:
             finish(
                 state="rejected",
                 status=404,
                 error_code="no_observatory",
                 error_message="deepfield is not present on this Mac",
+            )
+            return
+        except (OSError, ValueError):
+            finish(
+                state="rejected",
+                status=409,
+                error_code="unsafe_observatory_path",
+                error_message="deepfield repository path is unsafe",
             )
             return
         else:
@@ -31996,6 +33630,23 @@ class Handler(BaseHTTPRequestHandler):
                 root=deepfield_root,
                 mode=0o700,
             )
+        except FileNotFoundError:
+            finish(
+                state="rejected",
+                status=404,
+                error_code="no_observatory",
+                error_message="deepfield is not present on this Mac",
+            )
+            return
+        except (OSError, ValueError):
+            finish(
+                state="rejected",
+                status=409,
+                error_code="unsafe_observatory_path",
+                error_message="deepfield repository path is unsafe",
+            )
+            return
+        try:
             stamp = _time.strftime("%Y-%m-%d-%H%M%S")
             header = f"<!-- caught {_time.strftime('%Y-%m-%d %H:%M:%S %Z')} via pairling-blurt, unprocessed -->\n\n".encode()
             payload = header + raw + (b"" if raw.endswith(b"\n") else b"\n")
@@ -32010,6 +33661,9 @@ class Handler(BaseHTTPRequestHandler):
             )
             fd = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
             try:
+                file_stat = os.fstat(fd)
+                if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_uid != os.getuid():
+                    raise _UnsafeDeepfieldPathError("unsafe observation temporary file")
                 view = memoryview(payload)
                 written = 0
                 while written < len(view):
@@ -32021,9 +33675,9 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 os.close(fd)
 
-            # A hard link publishes the already-complete file without replacing
-            # an existing observation. Readers can therefore see either no
-            # destination or the whole payload, never a zero-byte reservation.
+            # Publish the complete file relative to the already-validated inbox
+            # descriptor. Neither source nor destination resolution can escape
+            # through a replaced or symlinked pathname component.
             suffix = 1
             while True:
                 name = f"{stamp}.md" if suffix == 1 else f"{stamp}-{suffix}.md"
@@ -32417,17 +34071,10 @@ class Handler(BaseHTTPRequestHandler):
             return llm_route_model_family(model)
         return None
 
-    @staticmethod
-    def _find_executable(candidates: list[Path | str]) -> Path | None:
-        for candidate in candidates:
-            path = Path(candidate)
-            if path.exists() and os.access(path, os.X_OK):
-                return path
-        return None
 
-    # ----- /llm-route: subscription-routed Claude/Codex one-shot -----
+    # ----- /llm-route: filesystem-isolated one-shot prompt routing -----
     def _handle_llm_route(self, q):
-        """Forward a prompt through the user's local Claude or Codex CLI.
+        """Route an in-memory prompt without exposing a local agent process.
 
         Body: JSON {prompt, system?, max_chars?}
         Query: ?model=sonnet|haiku|opus|gpt-5.5|gpt-5.4|gpt-5.4-mini|gpt-5.3-codex
@@ -32453,12 +34100,12 @@ class Handler(BaseHTTPRequestHandler):
         if len(prompt) > max_chars:
             prompt = prompt[:max_chars]
 
-        if run_local_llm is None:
-            self.send_error(503, "local LLM route helper unavailable")
+        if run_remote_llm is None:
+            self.send_error(503, "remote LLM route helper unavailable")
             return
 
         try:
-            content = run_local_llm(model=model, prompt=prompt, system=system, timeout_seconds=120)
+            content = run_remote_llm(model=model, prompt=prompt, system=system, timeout_seconds=120)
         except Exception as exc:
             status = int(getattr(exc, "status", 502) or 502)
             message = str(getattr(exc, "message", str(exc)) or str(exc))
@@ -33459,6 +35106,8 @@ class Handler(BaseHTTPRequestHandler):
         deadline = _time.time() + 10 * 60
         last_hash = None
         while _time.time() < deadline:
+            if not self._stream_authorization_is_current():
+                return
             items = self._activity_items(since_min=since_min, limit=120)
             digest = hashlib.sha256(json.dumps(items, sort_keys=True).encode()).hexdigest()
             if digest != last_hash:
@@ -34025,24 +35674,79 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_safety_ack(self, q):
         if SAFETY_MONITOR is None:
-            self._send_json({
-                "ok": False,
-                "error": {
-                    "code": "safety_unavailable",
-                    "message": "Safety monitor bridge is unavailable",
-                },
-            }, status=503)
+            self._send_json(
+                {"ok": False, "error": {"code": "safety_unavailable", "message": "Safety Monitor is unavailable."}},
+                status=503,
+            )
             return
         try:
-            payload = json.loads(self._read_body() or b"{}")
-        except json.JSONDecodeError:
-            self.send_error(400, "invalid JSON")
+            payload = self._read_json_object()
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            self._send_json(
+                {"ok": False, "error": {"code": "bad_request", "message": str(exc)}},
+                status=400,
+            )
             return
-        ids = payload.get("ids") if isinstance(payload, dict) else None
-        if ids is not None and not isinstance(ids, list):
-            self.send_error(400, "ids must be a list")
+        ids = payload.get("ids")
+        if not isinstance(ids, list) or not ids:
+            self._send_json(
+                {"ok": False, "error": {"code": "bad_request", "message": "ids must be a non-empty list."}},
+                status=400,
+            )
             return
-        self._send_json(SAFETY_MONITOR.ack(ids=ids))
+        if len(ids) > MAX_SAFETY_ACK_IDS:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "too_many_ids",
+                        "message": f"At most {MAX_SAFETY_ACK_IDS} safety event IDs may be acknowledged at once.",
+                    },
+                },
+                status=400,
+            )
+            return
+        normalized: list[str] = []
+        for value in ids:
+            if not isinstance(value, str):
+                self._send_json(
+                    {"ok": False, "error": {"code": "bad_request", "message": "Every safety event ID must be a string."}},
+                    status=400,
+                )
+                return
+            event_id = value.strip()
+            if not event_id or len(event_id.encode("utf-8")) > MAX_SAFETY_ACK_ID_BYTES:
+                self._send_json(
+                    {"ok": False, "error": {"code": "bad_request", "message": "A safety event ID is empty or too large."}},
+                    status=400,
+                )
+                return
+            normalized.append(event_id)
+        if len(set(normalized)) != len(normalized):
+            self._send_json(
+                {"ok": False, "error": {"code": "duplicate_ids", "message": "Safety event IDs must be unique."}},
+                status=400,
+            )
+            return
+        visible_ids = {
+            str(event.get("id") or "")
+            for event in SAFETY_MONITOR.events(limit=MAX_SAFETY_ACK_IDS * 3)
+            if isinstance(event, dict) and event.get("id")
+        }
+        if any(event_id not in visible_ids for event_id in normalized):
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "unknown_safety_event",
+                        "message": "One or more safety events are no longer visible.",
+                    },
+                },
+                status=409,
+            )
+            return
+        result = SAFETY_MONITOR.ack(normalized)
+        self._send_json(result, status=200 if result.get("ok") else 400)
 
     def _handle_safety_request_activation(self, q):
         if SAFETY_MONITOR is None:
@@ -34228,18 +35932,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         shell_cmd = f"cd {shlex.quote(str(HOME))} && exec {shlex.quote(binary)}"
-        as_escaped_cmd = _as_escape(shell_cmd)
-        as_escaped_title = _as_escape("Aperture CLI")
-        script = f'''
-        tell application "Terminal"
-            activate
-            set newTab to do script "{as_escaped_cmd}"
-            set custom title of newTab to "{as_escaped_title}"
-            delay 0.5
-            return "ok\t" & (tty of newTab)
-        end tell
-        '''
-        result = _run_osascript(script, mutation_possible=True)
+        result = _start_pairling_terminal_session(shell_cmd, "Aperture CLI")
         if not result.get("ok"):
             outcome_indeterminate = bool(result.get("outcome_indeterminate"))
             message = str(result.get("reason") or "Terminal could not open Aperture CLI.")
@@ -34250,7 +35943,8 @@ class Handler(BaseHTTPRequestHandler):
                 backend="terminal_app",
                 error_code=(
                     "aperture_cli_launch_outcome_unknown"
-                    if outcome_indeterminate else "terminal_open_failed"
+                    if outcome_indeterminate
+                    else "terminal_open_failed"
                 ),
                 error_message=message,
                 fields={"outcome_indeterminate": outcome_indeterminate},
@@ -34262,7 +35956,8 @@ class Handler(BaseHTTPRequestHandler):
                 "error": {
                     "code": (
                         "aperture_cli_launch_outcome_unknown"
-                        if outcome_indeterminate else "terminal_open_failed"
+                        if outcome_indeterminate
+                        else "terminal_open_failed"
                     ),
                     "message": message,
                 },
@@ -34271,9 +35966,7 @@ class Handler(BaseHTTPRequestHandler):
             }, status=502)
             return
 
-        stdout = result.get("stdout") or ""
-        parts = stdout.split("\t")
-        tty = parts[1].strip() if len(parts) >= 2 else ""
+        tty = str(result.get("tty") or "").strip()
         if re.fullmatch(r"/dev/ttys[0-9]{3,}", tty) is None:
             message = "Terminal accepted the launch, but Pairling could not identify the new tab."
             receipt = _finalize_receipted_mutation(
@@ -34637,21 +36330,8 @@ class Handler(BaseHTTPRequestHandler):
         shell_cmd = (
             f"/bin/zsh {self._orchestration_shell_quote(str(launch_script))}"
         )
-        script = f'''
-        tell application "Terminal"
-            activate
-            set newTab to do script "{_as_escape(shell_cmd)}"
-            set custom title of newTab to "{_as_escape(title)}"
-            delay 0.5
-            return "ok\t" & (tty of newTab)
-        end tell
-        '''
-        result = _run_osascript(script, mutation_possible=True)
-        tty = ""
-        if result.get("ok"):
-            parts = (result.get("stdout") or "").split("\t")
-            if len(parts) >= 2:
-                tty = parts[1].strip()
+        result = _start_pairling_terminal_session(shell_cmd, title)
+        tty = str(result.get("tty") or "").strip() if result.get("ok") else ""
         pid = self._orchestration_wait_for_provider_pid(tty, "claude") if tty else 0
         outcome_indeterminate = bool(result.get("outcome_indeterminate"))
         launch_confirmed = bool(result.get("ok") and tty and pid)
@@ -35285,7 +36965,7 @@ Worker instructions:
             return
         if provider_mode == "all":
             provider = None
-        elif provider_mode in _agent_provider_ids():
+        elif _provider_supports(provider_mode, "orchestration_launch"):
             provider = provider_mode
         else:
             error = _unsupported_provider_payload(provider_mode, "orchestration_launch")["error"]
@@ -35537,6 +37217,8 @@ Worker instructions:
         last_hash = None
         deadline = _time.time() + 10 * 60
         while _time.time() < deadline:
+            if not self._stream_authorization_is_current():
+                return
             run = self._orchestration_read(orchestration_id)
             if not run:
                 break
@@ -36600,6 +38282,7 @@ Worker instructions:
         reason = None
         outcome_indeterminate = False
         session = None
+        provider_identity = None
         reconciled_existing = False
         try:
             session = PTY_BROKER.get(broker_session_id)
@@ -36645,6 +38328,7 @@ Worker instructions:
                 native_id=native_id,
             )
             if session is not None:
+                reconciled_existing = True
                 ok = True
                 reason = "spawn response lost; reconciled by broker session id"
             else:
@@ -36654,17 +38338,33 @@ Worker instructions:
             reason = f"{type(e).__name__}: {e}"
 
         if ok and session is not None:
+            provider_identity = _broker_spawn_provider_identity(
+                session,
+                broker_id=broker_session_id,
+                provider=provider,
+                native_id=native_id,
+                project=project,
+            )
+            if provider_identity is None:
+                ok = False
+                reason = "broker launch did not produce one live exact provider process"
+                if not reconciled_existing:
+                    try:
+                        cleanup = PTY_BROKER.terminate(broker_session_id)
+                        if not isinstance(cleanup, dict) or not cleanup.get("ok"):
+                            outcome_indeterminate = True
+                            reason += "; broker cleanup could not be confirmed"
+                    except Exception as error:
+                        outcome_indeterminate = True
+                        reason += (
+                            "; broker cleanup failed: "
+                            + f"{type(error).__name__}: {str(error)[:120]}"
+                        )
+
+        if ok and session is not None:
             session_tty = _broker_slave_tty(session)
             session_log = _broker_raw_log_path(session)
-            session_pid = _broker_pid(session)
-            if session_tty and session_log:
-                _write_terminal_capture_mapping(
-                    session_tty,
-                    session_log,
-                    provider=provider,
-                    project=project,
-                    capture_id=capture_id,
-                )
+            session_pid = int(provider_identity.get("pid") or 0)
             if launch_context is not None:
                 launch_meta = {
                     "spawned_by": "pairling",
@@ -36687,7 +38387,7 @@ Worker instructions:
                     "launch_strategy": "direct_pairling",
                     "danger_mode": True,
                 }
-            _agent_registry_upsert(
+            registry_ok = _agent_registry_upsert(
                 provider,
                 native_id,
                 project,
@@ -36703,10 +38403,40 @@ Worker instructions:
                     "spawn_action_id": spawn_action_id or None,
                     "spawn_body_hash": spawn_body_hash or None,
                     **launch_meta,
+                    "broker_owner_pid": _broker_pid(session),
                 },
             )
-            if provider == "codex":
-                _write_agent_turn_state("codex", native_id, "idle", event="spawn")
+            if not registry_ok:
+                ok = False
+                reason = "Spawned broker ownership could not be stored durably."
+                if not reconciled_existing:
+                    try:
+                        cleanup = PTY_BROKER.terminate(broker_session_id)
+                        if not isinstance(cleanup, dict) or not cleanup.get("ok"):
+                            outcome_indeterminate = True
+                            reason += "; broker cleanup could not be confirmed"
+                    except Exception as error:
+                        outcome_indeterminate = True
+                        reason += (
+                            "; broker cleanup failed: "
+                            + f"{type(error).__name__}: {str(error)[:120]}"
+                        )
+            else:
+                if session_tty and session_log:
+                    _write_terminal_capture_mapping(
+                        session_tty,
+                        session_log,
+                        provider=provider,
+                        project=project,
+                        capture_id=capture_id,
+                    )
+                if provider == "codex":
+                    _write_agent_turn_state(
+                        "codex",
+                        native_id,
+                        "idle",
+                        event="spawn",
+                    )
 
         try:
             audit_path = HOME / ".claude" / "audit" / "spawn-sessions.jsonl"
@@ -36718,7 +38448,7 @@ Worker instructions:
                     "provider": provider,
                     "native_id": native_id,
                     "tty": _broker_slave_tty(session) if session else "",
-                    "pid": _broker_pid(session) if session else 0,
+                    "pid": int(provider_identity.get("pid") or 0) if provider_identity else 0,
                     "terminal_log": str(_broker_raw_log_path(session)) if session and _broker_raw_log_path(session) else None,
                     "capture_backend": "pty_broker",
                     "broker_id": broker_session_id,
@@ -36800,7 +38530,7 @@ Worker instructions:
             "structured_fallback_reason": structured_fallback_reason,
             "terminal_backed": True,
             "tty": _broker_slave_tty(session),
-            "pid": _broker_pid(session),
+            "pid": int(provider_identity.get("pid") or 0),
             "terminal_log": str(_broker_raw_log_path(session)) if _broker_raw_log_path(session) else None,
             "capture_backend": "pty_broker",
             "terminal_source": "broker_vt",
@@ -36855,51 +38585,53 @@ Worker instructions:
                     "Unsupported or missing handoff schemaVersion",
                 )
                 return
-
-            source = payload.get("source", "OneStream")
-            suggested_prompt = payload.get("suggestedPrompt", "")
-            transcript_text = payload.get("transcriptText", "")
-            workflow_hint = payload.get("workflowHint")
-            generated_at = payload.get("generatedAt")
-            segments = payload.get("segments", [])
-            if not isinstance(source, str):
-                self._send_error(400, "invalid_source", "source must be a string")
-                return
-            if not isinstance(suggested_prompt, str):
-                self._send_error(
-                    400,
-                    "invalid_suggested_prompt",
-                    "suggestedPrompt must be a string",
-                )
-                return
-            if not isinstance(transcript_text, str):
+            transcript_value = payload.get("transcriptText")
+            if transcript_value is not None and not isinstance(transcript_value, str):
                 self._send_error(
                     400,
                     "invalid_transcript",
                     "transcriptText must be a string",
                 )
                 return
-            if workflow_hint is not None and not isinstance(workflow_hint, str):
+
+            try:
+                source = _bounded_utf8_text(
+                    payload.get("source") or "OneStream",
+                    "source",
+                    ONESTREAM_HANDOFF_MAX_METADATA_BYTES,
+                    required=True,
+                )
+                suggested_prompt = _bounded_utf8_text(
+                    payload.get("suggestedPrompt"),
+                    "suggestedPrompt",
+                    ONESTREAM_HANDOFF_MAX_PROMPT_BYTES,
+                )
+                transcript_text = _bounded_utf8_text(
+                    payload.get("transcriptText"),
+                    "transcriptText",
+                    ONESTREAM_HANDOFF_MAX_TRANSCRIPT_BYTES,
+                )
+                workflow_hint = _bounded_utf8_text(
+                    payload.get("workflowHint"),
+                    "workflowHint",
+                    ONESTREAM_HANDOFF_MAX_METADATA_BYTES,
+                ) or None
+                generated_at = _bounded_utf8_text(
+                    payload.get("generatedAt"),
+                    "generatedAt",
+                    ONESTREAM_HANDOFF_MAX_METADATA_BYTES,
+                ) or None
+            except (TypeError, ValueError, UnicodeError) as exc:
                 self._send_error(
                     400,
-                    "invalid_workflow_hint",
-                    "workflowHint must be a string or null",
+                    "invalid_handoff_fields",
+                    str(exc)[:300] or "Handoff contains invalid field values",
                 )
                 return
-            if generated_at is not None and not isinstance(generated_at, str):
-                self._send_error(
-                    400,
-                    "invalid_generated_at",
-                    "generatedAt must be a string or null",
-                )
-                return
+            segments = payload.get("segments", [])
             if not isinstance(segments, list):
                 self._send_error(400, "invalid_segments", "segments must be an array")
                 return
-
-            source = source.strip() or "OneStream"
-            suggested_prompt = suggested_prompt.strip()
-            transcript_text = transcript_text.strip()
             if not suggested_prompt and not transcript_text:
                 self._send_error(
                     400,
@@ -36916,14 +38648,12 @@ Worker instructions:
             handoff_id = f"onestream-{secrets.token_hex(6)}"
             record = {
                 "handoff_id": handoff_id,
-                "schema_version": 1,
+                "schemaVersion": 1,
                 "source": source,
-                "generated_at": generated_at,
-                "workflow_hint": workflow_hint,
-                "suggested_prompt": suggested_prompt,
-                "transcript_text": transcript_text,
-                "compose_draft": compose_draft,
-                "segments": segments,
+                "generatedAt": generated_at,
+                "workflowHint": workflow_hint,
+                "suggestedPrompt": suggested_prompt,
+                "transcriptText": transcript_text,
                 "received_at": int(_time.time()),
                 "consumed": False,
             }
@@ -36946,18 +38676,25 @@ Worker instructions:
                 return
             try:
                 _write_onestream_handoff_record(f"{handoff_id}.json", record_body)
-            except OSError:
-                self._send_error(
-                    503,
-                    "handoff_storage_unavailable",
-                    "Handoff storage is unavailable",
-                )
+            except OSError as exc:
+                if exc.errno == errno.ENOSPC:
+                    self._send_error(
+                        507,
+                        "handoff_quota_exceeded",
+                        "Pending OneStream handoffs exceed their storage quota",
+                    )
+                else:
+                    self._send_error(
+                        503,
+                        "handoff_storage_unavailable",
+                        "Handoff storage is unavailable",
+                    )
                 return
             self._send_json(
                 {
                     "ok": True,
                     "handoff_id": handoff_id,
-                    "compose_draft": compose_draft,
+                    "composeDraft": compose_draft,
                 },
                 status=200,
             )
@@ -36973,13 +38710,25 @@ Worker instructions:
             )
             return
         try:
-            names = _onestream_handoff_names(directory_fd)
+            records = _onestream_handoff_records(directory_fd, cleanup=False)
             items = []
             response_size = len(json.dumps({"ok": True, "handoffs": []}).encode())
-            for filename in names:
-                record = _read_onestream_handoff_record(directory_fd, filename)
-                if not isinstance(record, dict) or record.get("consumed"):
-                    continue
+            for filename, record, _byte_count, _created_at in records:
+                suggested = record.get(
+                    "suggestedPrompt",
+                    record.get("suggested_prompt", ""),
+                )
+                if not isinstance(suggested, str):
+                    suggested = ""
+                transcript = record.get(
+                    "transcriptText",
+                    record.get("transcript_text", ""),
+                )
+                if not isinstance(transcript, str):
+                    transcript = ""
+                compose_draft = "\n\n---\n\n".join(
+                    part for part in (suggested, transcript) if part
+                )
                 item = {
                     "handoff_id": filename[:-5],
                     "source": (
@@ -36987,31 +38736,25 @@ Worker instructions:
                         if isinstance(record.get("source"), str)
                         else "OneStream"
                     ),
-                    "generated_at": (
-                        record.get("generated_at")
-                        if isinstance(record.get("generated_at"), str)
+                    "generatedAt": (
+                        record.get("generatedAt", record.get("generated_at"))
+                        if isinstance(
+                            record.get("generatedAt", record.get("generated_at")),
+                            str,
+                        )
                         else None
                     ),
-                    "workflow_hint": (
-                        record.get("workflow_hint")
-                        if isinstance(record.get("workflow_hint"), str)
+                    "workflowHint": (
+                        record.get("workflowHint", record.get("workflow_hint"))
+                        if isinstance(
+                            record.get("workflowHint", record.get("workflow_hint")),
+                            str,
+                        )
                         else None
                     ),
-                    "suggested_prompt": (
-                        record.get("suggested_prompt")
-                        if isinstance(record.get("suggested_prompt"), str)
-                        else ""
-                    ),
-                    "transcript_text": (
-                        record.get("transcript_text")
-                        if isinstance(record.get("transcript_text"), str)
-                        else ""
-                    ),
-                    "compose_draft": (
-                        record.get("compose_draft")
-                        if isinstance(record.get("compose_draft"), str)
-                        else ""
-                    ),
+                    "suggestedPrompt": suggested,
+                    "transcriptText": transcript,
+                    "composeDraft": compose_draft,
                     "received_at": (
                         record.get("received_at")
                         if (
@@ -37035,9 +38778,8 @@ Worker instructions:
         self._send_json({"ok": True, "handoffs": items})
 
     def _handle_spawn_session(self, q):
-        """Spawn a new Claude/Codex session. User-facing direct spawns open a
-        visible Terminal.app tab. The broker remains for aperture_cli launches
-        and PAIRLING_SPAWN_BACKEND=broker rollback/debugging.
+        """Spawn a new Claude/Codex session. User-facing terminal sessions use
+        the Pairling-owned PTY broker. Terminal.app automation is retired.
 
         Security:
         - Project path must be absolute and exist on disk.
@@ -37273,7 +39015,7 @@ Worker instructions:
                 fields={"error": error},
             )
             return
-        if provider not in _agent_provider_ids():
+        if not _provider_supports(provider, "spawn"):
             error = _unsupported_provider_payload(provider, "spawn")["error"]
             reject_spawn(
                 400,
@@ -37333,7 +39075,7 @@ Worker instructions:
             return
 
         try:
-            project = _canonical_user_directory(project, allow_tmp=True)
+            canonical_project = _canonical_user_directory(project, allow_tmp=True)
         except ValueError:
             reject_spawn(400, "invalid_project", "project path is invalid")
             return
@@ -37349,6 +39091,7 @@ Worker instructions:
                 f"project path must be a real directory under $HOME or /tmp: {project}",
             )
             return
+        project = canonical_project
 
         deterministic_native_id = requested_native_id or (
             "pending-"
@@ -37648,6 +39391,7 @@ Worker instructions:
             )
             return
 
+
         # A real new launch changes the composer catalogs. The durable action
         # reservation above must exist before this global epoch mutation.
         _bump_catalog_epoch()
@@ -37676,61 +39420,18 @@ Worker instructions:
         capture_log_path: Path | None = (
             TERMINAL_CAPTURE_DIR / f"{provider}-{capture_id}.log"
         )
-        spawn_marker_path: Path | None = None
         shell_cmd = _terminal_script_command(
             capture_log_path,
             reviewed_terminal_command,
             interactive_shell=reviewed_terminal_interactive_shell,
         )
-        spawn_marker_path = TERMINAL_CAPTURE_DIR / f"spawn-{capture_id}.tty"
-        try:
-            spawn_marker_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        as_escaped_cmd = _as_escape(shell_cmd)
 
-        # Set a useful Terminal title for the person at the Mac. Mutations use
-        # the exact recorded tty and never use this title as session identity.
+        # The title is the helper's Pairling-owned session marker. Session
+        # identity itself remains the exact TTY and verified provider process.
         basename = os.path.basename(project.rstrip("/")) or provider
         title = f"{provider}:{basename}" if provider == "codex" else basename
-        as_escaped_title = _as_escape(title)
-        as_escaped_marker_path = _as_escape(str(spawn_marker_path))
-
-        script = f'''
-        tell application "Terminal"
-            activate
-            set newTab to do script "{as_escaped_cmd}"
-            set custom title of newTab to "{as_escaped_title}"
-            set markerTTY to tty of newTab
-            set markerPath to "{as_escaped_marker_path}"
-            do shell script ("/usr/bin/printf '%s' " & quoted form of markerTTY & " > " & quoted form of markerPath)
-            delay 0.5
-            return "ok\t" & markerTTY
-        end tell
-        '''
-        result = _run_osascript(script, mutation_possible=True)
-        tty = ""
-        if result.get("ok"):
-            stdout = result.get("stdout") or ""
-            parts = stdout.split("\t")
-            if len(parts) >= 2:
-                tty = parts[1].strip()
-        elif result.get("outcome_indeterminate") and spawn_marker_path is not None:
-            for _attempt in range(20):
-                try:
-                    marker_tty = spawn_marker_path.read_text().strip()
-                except OSError:
-                    marker_tty = ""
-                if re.fullmatch(r"/dev/ttys[0-9]{3,}", marker_tty):
-                    tty = marker_tty
-                    result = {
-                        "ok": True,
-                        "stdout": f"ok\t{tty}",
-                        "reconciled_after_unknown": True,
-                        "reason": "Terminal spawn reconciled from its durable action marker.",
-                    }
-                    break
-                _time.sleep(0.1)
+        result = _start_pairling_terminal_session(shell_cmd, title)
+        tty = str(result.get("tty") or "").strip() if result.get("ok") else ""
         pid = 0
         terminal_identity: dict | None = None
         registry_written = False
@@ -37954,115 +39655,742 @@ Worker instructions:
             "transcript_path": str(path),
         }
 
-    def _launch_provider_prompt(self, provider: str, project: str, prompt_path: Path,
-                                title_suffix: str, metadata: dict) -> dict:
-        shell_safe_path = project.replace("'", "'\\''")
-        shell_safe_prompt = str(prompt_path).replace("'", "'\\''")
-        if provider == "codex":
-            shell_cmd = (
-                f"cd '{shell_safe_path}' && "
-                f"codex -C '{shell_safe_path}' --add-dir '{shell_safe_path}' \"$(cat '{shell_safe_prompt}')\""
+
+
+
+    def _handle_resume_session_broker(
+        self,
+        *,
+        provider: str,
+        project: str,
+        native_id: str,
+        prompt: str,
+        receipt_context: dict,
+    ) -> None:
+        if PTY_BROKER is None:
+            message = "PTY broker unavailable"
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="failed",
+                http_status=503,
+                backend="pty_broker",
+                error_code="broker_unavailable",
+                error_message=message,
+                audit_action={"type": "resume_session", "provider": provider},
+            )
+            self._send_json({
+                "ok": False,
+                "error": {"code": "broker_unavailable", "message": message},
+                "receipt": receipt,
+            }, status=503)
+            return
+        if not _broker_is_current_runtime():
+            message = "Resume requires the current terminal broker. A session still owned by the previous runtime remains read-only until it finishes."
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="rejected",
+                http_status=409,
+                backend="pty_broker",
+                error_code="broker_requires_current_runtime",
+                error_message=message,
+                audit_action={"type": "resume_session", "provider": provider},
+            )
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": "broker_requires_current_runtime",
+                    "message": message,
+                },
+                "receipt": receipt,
+            }, status=409)
+            return
+        broker_session_id = _qualified_session_id(provider, native_id)
+        resume_running = False
+
+        def mark_resume_running() -> None:
+            nonlocal resume_running
+            if resume_running:
+                raise RuntimeError(
+                    "resume action entered its execution boundary twice"
+                )
+            _mark_receipted_mutation_running(
+                receipt_context,
+                provider_id=provider,
+                provider_version="terminal-surface-v2",
+                provider_channel="pty_broker",
+                operation_id="session.resume",
+                binding_id=f"pty-broker:{broker_session_id}",
+                capability_generation=1,
+                recovery_correlation={
+                    "provider_operation_id": str(
+                        receipt_context["client_action_id"]
+                    ),
+                    "provider_cursor": broker_session_id,
+                },
+            )
+            resume_running = True
+        omp_path = ""
+        omp_resolved_binary: Path | None = None
+        if provider == "omp":
+            adapter = _provider_get("omp") if _provider_get is not None else None
+            omp_path = str(adapter.probe().diagnostics.cli_path or "") if adapter else ""
+            try:
+                omp_resolved_binary = Path(omp_path).resolve(strict=True) if omp_path else None
+            except OSError:
+                omp_resolved_binary = None
+        existing = PTY_BROKER.get(broker_session_id)
+        if existing is not None:
+            if not _broker_session_owns_identity(existing, provider, native_id):
+                message = "Existing broker session identity does not match the requested resume."
+                receipt = _finalize_receipted_mutation(
+                    receipt_context,
+                    state="rejected",
+                    http_status=409,
+                    backend="pty_broker",
+                    error_code="process_identity_unverified",
+                    error_message=message,
+                    fields={"session_id": broker_session_id},
+                    audit_action={"type": "resume_session", "provider": provider},
+                )
+                self._send_json({
+                    "ok": False,
+                    "error": {
+                        "code": "process_identity_unverified",
+                        "message": message,
+                    },
+                    "session_id": broker_session_id,
+                    "receipt": receipt,
+                }, status=409)
+                return
+            if provider == "omp":
+                identity = (
+                    _wait_for_omp_resume_terminal_identity(
+                        native_id,
+                        terminal_tty=_broker_slave_tty(existing),
+                        canonical_project=project,
+                        resolved_binary=omp_resolved_binary,
+                    )
+                    if omp_resolved_binary is not None
+                    else None
+                )
+            else:
+                identity = _broker_spawn_provider_identity(
+                    existing,
+                    broker_id=broker_session_id,
+                    provider=provider,
+                    native_id=native_id,
+                    project=project,
+                )
+            if identity is None:
+                message = (
+                    f"Existing {provider} broker session has no exact "
+                    "provider process identity proof."
+                )
+                receipt = _finalize_receipted_mutation(
+                    receipt_context,
+                    state="rejected",
+                    http_status=409,
+                    backend="pty_broker",
+                    error_code="process_identity_unverified",
+                    error_message=message,
+                    fields={"session_id": broker_session_id},
+                    audit_action={"type": "resume_session", "provider": provider},
+                )
+                self._send_json({
+                    "ok": False,
+                    "error": {
+                        "code": "process_identity_unverified",
+                        "message": message,
+                    },
+                    "session_id": broker_session_id,
+                    "receipt": receipt,
+                }, status=409)
+                return
+            mark_resume_running()
+            existing_tty = _broker_slave_tty(existing)
+            existing_log = _broker_raw_log_path(existing)
+            existing_pid = int(identity.get("pid") or 0)
+            capture_id = secrets.token_hex(12)
+            registry_ok = _agent_registry_upsert(
+                provider,
+                native_id,
+                project,
+                pid=existing_pid,
+                terminal_tty=existing_tty,
+                metadata={
+                    "spawned_by": "phone-companion",
+                    "resume_target": native_id,
+                    "terminal_log": (
+                        str(existing_log) if existing_log else None
+                    ),
+                    "capture_backend": "pty_broker",
+                    "capture_id": capture_id,
+                    "terminal_source": "broker_vt",
+                    "broker_id": broker_session_id,
+                    "send_scope_id": broker_session_id,
+                    "broker_socket": str(PTY_BROKER_SOCKET),
+                    "resume_identity_verified": True,
+                    "broker_owner_pid": _broker_pid(existing),
+                },
+            )
+            if not registry_ok:
+                message = (
+                    "Existing broker ownership could not be stored durably."
+                )
+                receipt = _finalize_receipted_mutation(
+                    receipt_context,
+                    state="failed",
+                    http_status=502,
+                    backend="pty_broker",
+                    error_code="broker_resume_registry_failed",
+                    error_message=message,
+                    fields={
+                        "session_id": broker_session_id,
+                        "outcome_indeterminate": False,
+                    },
+                    audit_action={
+                        "type": "resume_session",
+                        "provider": provider,
+                    },
+                    pty_written=False,
+                )
+                self._send_json({
+                    "ok": False,
+                    "error": {
+                        "code": "broker_resume_registry_failed",
+                        "message": message,
+                    },
+                    "session_id": broker_session_id,
+                    "outcome_indeterminate": False,
+                    "receipt": receipt,
+                }, status=502)
+                return
+            if existing_tty and existing_log:
+                _write_terminal_capture_mapping(
+                    existing_tty,
+                    existing_log,
+                    provider=provider,
+                    project=project,
+                    capture_id=capture_id,
+                )
+            response = {
+                "ok": True,
+                "provider": provider,
+                "native_id": native_id,
+                "session_id": broker_session_id,
+                "send_scope_id": broker_session_id,
+                "project": project,
+                "tty": existing_tty,
+                "pid": existing_pid,
+                "terminal_log": (
+                    str(existing_log) if existing_log else None
+                ),
+                "capture_backend": "pty_broker",
+                "terminal_source": "broker_vt",
+                "broker_id": _broker_session_id(existing),
+                "broker_socket": str(PTY_BROKER_SOCKET),
+                "attach_command": f"pairling attach {broker_session_id}",
+            }
+            response["receipt"] = _finalize_receipted_mutation(
+                receipt_context,
+                state="applied",
+                http_status=200,
+                backend="pty_broker",
+                fields=response,
+                audit_action={"type": "resume_session", "provider": provider},
+            )
+            self._send_json(response)
+            return
+
+        if provider == "omp":
+            command = (
+                f"exec {shlex.quote(omp_path)} "
+                f"--cwd {shlex.quote(project)} --resume {shlex.quote(native_id)}"
             )
         else:
-            shell_cmd = (
-                f"cd '{shell_safe_path}' && "
-                f"{_claude_interactive_exec_prefix()} "
-                f"claude \"$(cat '{shell_safe_prompt}')\""
+            command = (
+                f"exec codex resume "
+                f"-C {shlex.quote(project)} --add-dir {shlex.quote(project)} "
+                f"{shlex.quote(native_id)}"
             )
-        script = f'''
-        tell application "Terminal"
-            activate
-            set newTab to do script "{_as_escape(shell_cmd)}"
-            set custom title of newTab to "{_as_escape(provider + ':' + title_suffix)}"
-            delay 0.5
-            return "ok\t" & (tty of newTab)
-        end tell
-        '''
-        result = _run_osascript(script, mutation_possible=True)
-        tty = ""
-        if result.get("ok"):
-            parts = (result.get("stdout") or "").split("\t")
-            if len(parts) >= 2:
-                tty = parts[1].strip()
-        launch_ok = bool(
-            result.get("ok")
-            and re.fullmatch(r"/dev/ttys[0-9]{3,}", tty) is not None
-        )
-        outcome_indeterminate = bool(
-            result.get("outcome_indeterminate")
-            or (result.get("ok") and not launch_ok)
-        )
-        pid = 0
-        native_id = None
-        send_scope_id = None
-        registry_unavailable = False
-        if provider == "codex" and launch_ok:
-            native_id = "pending-" + secrets.token_hex(8)
-            send_scope_id = _qualified_session_id("codex", native_id)
-            terminal_identity = _wait_for_provider_terminal_identity(tty, "codex")
-            pid = int((terminal_identity or {}).get("pid") or 0)
-            if pid <= 0:
-                launch_ok = False
+            if prompt:
+                command += f" {shlex.quote(prompt)}"
+        session = None
+        ok = False
+        reason = None
+        outcome_indeterminate = False
+        reconciled_after_unknown = False
+        mark_resume_running()
+        try:
+            session = PTY_BROKER.spawn(
+                session_id=broker_session_id,
+                provider=provider,
+                native_id=native_id,
+                project=project,
+                command=command,
+                rows=30,
+                columns=120,
+                env={"PAIRLING_PHONE_SESSION": "1",
+                     "PAIRLING_BROKER_SESSION_ID": broker_session_id},
+            )
+            if not _broker_session_matches_spawn_request(
+                session,
+                broker_id=broker_session_id,
+                provider=provider,
+                native_id=native_id,
+            ):
+                raise ProcessIdentityDriftError(
+                    "spawned broker session identity does not match resume action"
+                )
+            ok = True
+        except PTYBrokerOutcomeUnknownError as exc:
+            session = _broker_reconcile_session_after_unknown(
+                broker_session_id,
+                provider=provider,
+                native_id=native_id,
+            )
+            if session is not None:
+                reconciled_after_unknown = True
+                ok = True
+                reason = "resume response lost; reconciled by broker session id"
+            else:
                 outcome_indeterminate = True
-            reg_meta = dict(metadata)
-            reg_meta.update({
-                "spawned_by": "phone-companion",
-                "prompt_path": str(prompt_path),
-                "terminal_title": f"{provider}:{title_suffix}",
-                "capture_backend": "script",
-                "terminal_source": "terminal_app_contents",
-                "launch_strategy": "direct_pairling",
-                "send_scope_id": send_scope_id,
-                **_provider_terminal_identity_metadata(terminal_identity),
-            })
-            if launch_ok:
-                registry_written = _agent_registry_upsert(
-                    "codex",
+                reason = f"resume outcome unknown: {str(exc)[:180]}"
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}"
+
+        if ok and session is not None:
+            capture_id = secrets.token_hex(12)
+            session_tty = _broker_slave_tty(session)
+            session_log = _broker_raw_log_path(session)
+            identity = (
+                _wait_for_omp_resume_terminal_identity(
+                    native_id,
+                    terminal_tty=session_tty,
+                    canonical_project=project,
+                    resolved_binary=omp_resolved_binary,
+                )
+                if provider == "omp"
+                and omp_resolved_binary is not None
+                and session_tty
+                else _broker_spawn_provider_identity(
+                    session,
+                    broker_id=broker_session_id,
+                    provider=provider,
+                    native_id=native_id,
+                    project=project,
+                )
+                if provider != "omp"
+                else None
+            )
+            session_pid = int(identity.get("pid") or 0) if identity else 0
+            if identity is None:
+                ok = False
+                reason = (
+                    f"{provider} resume could not prove one live exact "
+                    "provider process identity."
+                )
+                outcome_indeterminate = reconciled_after_unknown
+            if ok:
+                registry_ok = _agent_registry_upsert(
+                    provider,
                     native_id,
                     project,
-                    pid=pid,
-                    terminal_tty=tty,
-                    metadata=reg_meta,
+                    pid=session_pid,
+                    terminal_tty=session_tty,
+                    metadata={
+                        "spawned_by": "phone-companion",
+                        "resume_target": native_id,
+                        "terminal_log": str(session_log) if session_log else None,
+                        "capture_backend": "pty_broker",
+                        "capture_id": capture_id,
+                        "terminal_source": "broker_vt",
+                        "broker_id": broker_session_id,
+                        "send_scope_id": broker_session_id,
+                        "broker_socket": str(PTY_BROKER_SOCKET),
+                        "resume_identity_verified": True,
+                    },
                 )
-                if registry_written:
-                    _write_agent_turn_state(
-                        "codex", native_id, "thinking", event="cross_provider"
+                if not registry_ok:
+                    ok = False
+                    reason = (
+                        "Resumed broker ownership could not be stored durably."
                     )
-                else:
-                    launch_ok = False
-                    outcome_indeterminate = True
-                    registry_unavailable = True
-        return {
-            "provider": provider,
-            "ok": launch_ok,
-            "native_id": native_id,
-            "session_id": _qualified_session_id(provider, native_id) if native_id else None,
-            "send_scope_id": send_scope_id,
-            "tty": tty,
-            "pid": pid,
-            "error_code": (
-                "cross_provider_registry_unavailable"
-                if registry_unavailable
-                else None
-            ),
-            "error": (
-                None
-                if launch_ok
-                else (
-                    "Terminal launched the provider, but Pairling could not "
-                    "store its control identity. Do not launch it again."
-                    if registry_unavailable
-                    else
-                    "Terminal launch identity could not be confirmed"
-                    if result.get("ok")
-                    else result.get("reason", "unknown")
+                    outcome_indeterminate = reconciled_after_unknown
+
+            if not ok:
+                if not reconciled_after_unknown:
+                    try:
+                        termination = PTY_BROKER.terminate(
+                            broker_session_id,
+                            signal.SIGTERM,
+                        )
+                        if termination.get("outcome_indeterminate"):
+                            outcome_indeterminate = True
+                            reason = str(
+                                termination.get("error")
+                                or termination.get("reason")
+                                or reason
+                                or "resume cleanup outcome unknown"
+                            )
+                    except PTYBrokerOutcomeUnknownError as exc:
+                        outcome_indeterminate = True
+                        reason = (
+                            "resume cleanup outcome unknown: "
+                            f"{str(exc)[:180]}"
+                        )
+                    except Exception as exc:
+                        outcome_indeterminate = True
+                        reason = (
+                            f"{reason or 'resume verification failed'}; cleanup "
+                            f"failed: {type(exc).__name__}: {exc}"
+                        )
+            else:
+                if session_tty and session_log:
+                    _write_terminal_capture_mapping(
+                        session_tty,
+                        session_log,
+                        provider=provider,
+                        project=project,
+                        capture_id=capture_id,
+                    )
+                _write_agent_turn_state(
+                    provider,
+                    native_id,
+                    "idle",
+                    event="resume",
                 )
-            ),
-            "outcome_indeterminate": outcome_indeterminate,
+
+        try:
+            audit_path = HOME / ".claude" / "audit" / "resume-sessions.jsonl"
+            audit_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(audit_path, "a") as f:
+                f.write(json.dumps({
+                    "ts": _time.time(),
+                    "provider": provider,
+                    "project": project,
+                    "native_id": native_id,
+                    "tty": _broker_slave_tty(session) if session else "",
+                    "pid": _broker_pid(session) if session else 0,
+                    "terminal_log": str(_broker_raw_log_path(session)) if session and _broker_raw_log_path(session) else None,
+                    "capture_backend": "pty_broker",
+                    "terminal_source": "broker_vt",
+                    "broker_id": broker_session_id,
+                    "broker_socket": str(PTY_BROKER_SOCKET),
+                    "ok": ok,
+                    "reason": reason,
+                    "via": "phone-companion",
+                }) + "\n")
+        except Exception:
+            pass
+
+        if not ok or session is None:
+            error_code = "broker_resume_outcome_unknown" if outcome_indeterminate else "broker_resume_failed"
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="indeterminate" if outcome_indeterminate else "failed",
+                http_status=502,
+                backend="pty_broker",
+                error_code=error_code,
+                error_message=reason or "PTY broker resume failed",
+                fields={
+                    "session_id": broker_session_id,
+                    "outcome_indeterminate": outcome_indeterminate,
+                },
+                audit_action={"type": "resume_session", "provider": provider},
+                pty_written=None if outcome_indeterminate else False,
+            )
+            self._send_json({
+                "ok": False,
+                "error": {
+                    "code": error_code,
+                    "message": reason or "PTY broker resume failed",
+                },
+                "session_id": broker_session_id,
+                "outcome_indeterminate": outcome_indeterminate,
+                "receipt": receipt,
+            }, status=502)
+            return
+
+        response = {
+            "ok": True,
+            "provider": provider,
+            "native_id": native_id,
+            "session_id": broker_session_id,
+            "send_scope_id": broker_session_id,
+            "project": project,
+            "tty": _broker_slave_tty(session),
+            "pid": _broker_pid(session),
+            "terminal_log": str(_broker_raw_log_path(session)) if _broker_raw_log_path(session) else None,
+            "capture_backend": "pty_broker",
+            "terminal_source": "broker_vt",
+            "broker_id": broker_session_id,
+            "broker_socket": str(PTY_BROKER_SOCKET),
+            "attach_command": f"pairling attach {broker_session_id}",
         }
+        response["receipt"] = _finalize_receipted_mutation(
+            receipt_context,
+            state="applied",
+            http_status=200,
+            backend="pty_broker",
+            fields=response,
+            audit_action={"type": "resume_session", "provider": provider},
+        )
+        self._send_json(response)
+
+    def _handle_resume_omp(
+        self,
+        *,
+        project: str,
+        native_id: str,
+        prompt: str,
+    ) -> None:
+        """Resume one saved OMP UUID through the owned PTY broker."""
+        try:
+            canonical_project = _canonical_user_directory(project, allow_tmp=True)
+        except ValueError as exc:
+            self.send_error(400, str(exc))
+            return
+        except (FileNotFoundError, NotADirectoryError):
+            self.send_error(404, f"directory not found: {project}")
+            return
+        except PermissionError as exc:
+            self.send_error(403, str(exc))
+            return
+        except OSError as exc:
+            self.send_error(400, str(exc))
+            return
+        if not _safe_agent_native_id(native_id):
+            self.send_error(400, "bad OMP session id")
+            return
+        if prompt:
+            _send_unsupported_provider(self, "omp", "send_text")
+            return
+        source_record = next(
+            (
+                record
+                for record in (
+                    _omp_saved_sessions(
+                        project=canonical_project,
+                        limit=200,
+                    )
+                    if _omp_saved_sessions is not None
+                    else []
+                )
+                if record.session_id == native_id
+            ),
+            None,
+        )
+        if source_record is None:
+            self.send_error(404, "No OMP session exists for this project")
+            return
+        if not _provider_visible("omp"):
+            self.send_error(409, "OMP is hidden in Pairling settings.")
+            return
+        if not str(_provider_get("omp").probe().diagnostics.cli_path or ""):
+            _send_unsupported_provider(self, "omp", "resume")
+            return
+        receipt_context = _begin_receipted_mutation(
+            self,
+            receipt_scope=f"resume:{_qualified_session_id('omp', native_id)}",
+            action_kind="resume_session",
+            material={
+                "provider": "omp",
+                "project": canonical_project,
+                "native_id": native_id,
+                "prompt": "",
+            },
+            action_label="OMP session resume",
+        )
+        if receipt_context is None:
+            return
+        self._handle_resume_session_broker(
+            provider="omp",
+            project=canonical_project,
+            native_id=native_id,
+            prompt="",
+            receipt_context=receipt_context,
+        )
 
 
+    def _handle_resume_session(self, q):
+        """Resume Codex once and bind the new terminal to a durable send scope."""
+        try:
+            payload = json.loads(self._read_body() or b"{}")
+        except json.JSONDecodeError:
+            self.send_error(400, "body must be JSON")
+            return
+        provider = str(payload.get("provider") or "").lower()
+        project = str(payload.get("project") or "").strip()
+        native_id = str(payload.get("session_id") or payload.get("native_id") or "").strip()
+        prompt = str(payload.get("prompt") or "").strip()
+        if not _valid_provider_filter(provider, allow_all=False):
+            _send_unknown_provider(self, provider)
+            return
+        if not _provider_supports(provider, "resume"):
+            _send_unsupported_provider(self, provider, "resume")
+            return
+        if provider == "omp":
+            self._handle_resume_omp(
+                project=project,
+                native_id=native_id,
+                prompt=prompt,
+            )
+            return
+        if provider != "codex":
+            self.send_error(400, "Claude resume uses /send-text with /resume <id>")
+            return
+        try:
+            project = _canonical_user_directory(project, allow_tmp=True)
+        except ValueError as exc:
+            self.send_error(400, str(exc))
+            return
+        except (FileNotFoundError, NotADirectoryError):
+            self.send_error(404, f"directory not found: {project}")
+            return
+        except PermissionError as exc:
+            self.send_error(403, str(exc))
+            return
+        except OSError as exc:
+            self.send_error(400, str(exc))
+            return
+        if not _safe_agent_native_id(native_id):
+            self.send_error(400, "bad Codex session id")
+            return
+        if len(prompt) > 4000:
+            self.send_error(413, "prompt too long")
+            return
 
+        receipt_context = _begin_receipted_mutation(
+            self,
+            receipt_scope=f"resume:{_qualified_session_id(provider, native_id)}",
+            action_kind="resume_session",
+            material={
+                "provider": provider,
+                "project": project,
+                "native_id": native_id,
+                "prompt": prompt,
+            },
+            action_label="session resume",
+        )
+        if receipt_context is None:
+            return
+
+        if not _provider_visible(provider):
+            body = _provider_hidden_payload(provider)
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="rejected",
+                http_status=409,
+                backend="session_resume",
+                error_code="provider_hidden",
+                error_message=str(body["error"]["message"]),
+                fields={"provider": provider},
+                audit_action={"type": "resume_session", "provider": provider},
+            )
+            body["receipt"] = receipt
+            self._send_json(body, status=409)
+            return
+        if not os.path.isdir(project):
+            message = "The project directory is no longer available."
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="rejected",
+                http_status=400,
+                backend="session_resume",
+                error_code="project_unavailable",
+                error_message=message,
+                fields={"project": project},
+                audit_action={"type": "resume_session", "provider": provider},
+            )
+            self._send_json({
+                "ok": False,
+                "error": {"code": "project_unavailable", "message": message},
+                "project": project,
+                "receipt": receipt,
+            }, status=400)
+            return
+        transcript_path = _resolve_codex_transcript(native_id)
+        if not transcript_path:
+            message = "No Codex transcript exists for this session."
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="rejected",
+                http_status=404,
+                backend="session_resume",
+                error_code="transcript_not_found",
+                error_message=message,
+                fields={"session_id": _qualified_session_id(provider, native_id)},
+                audit_action={"type": "resume_session", "provider": provider},
+            )
+            self._send_json({
+                "ok": False,
+                "error": {"code": "transcript_not_found", "message": message},
+                "session_id": _qualified_session_id(provider, native_id),
+                "receipt": receipt,
+            }, status=404)
+            return
+        transcript_metadata = _codex_rollout_meta(transcript_path) or {}
+        recorded_project = str(transcript_metadata.get("cwd") or "").strip()
+        if (
+            not recorded_project
+            or os.path.realpath(recorded_project) != os.path.realpath(project)
+        ):
+            message = (
+                "The requested project does not match this Codex session's "
+                "recorded workspace."
+            )
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="rejected",
+                http_status=409,
+                backend="session_resume",
+                error_code="project_mismatch",
+                error_message=message,
+                fields={
+                    "session_id": _qualified_session_id(provider, native_id),
+                    "project": project,
+                },
+                audit_action={"type": "resume_session", "provider": provider},
+            )
+            self._send_json({
+                "ok": False,
+                "error": {"code": "project_mismatch", "message": message},
+                "session_id": _qualified_session_id(provider, native_id),
+                "project": project,
+                "receipt": receipt,
+            }, status=409)
+            return
+
+
+        allowed, retry = _inject_rate_check("__resume_session__")
+        if not allowed:
+            message = f"rate limited, retry in {retry}s"
+            receipt = _finalize_receipted_mutation(
+                receipt_context,
+                state="rejected",
+                http_status=429,
+                backend="session_resume",
+                error_code="rate_limited",
+                error_message=message,
+                fields={"retry_after": retry},
+                audit_action={"type": "resume_session", "provider": provider},
+            )
+            self._send_json({
+                "ok": False,
+                "error": {"code": "rate_limited", "message": message},
+                "retry_after": retry,
+                "receipt": receipt,
+            }, status=429)
+            return
+
+        self._handle_resume_session_broker(
+            provider=provider,
+            project=project,
+            native_id=native_id,
+            prompt=prompt,
+            receipt_context=receipt_context,
+        )
 
     def _finish_send_text_failure(
         self,
@@ -38331,48 +40659,29 @@ Worker instructions:
                 error_code="process_identity_unverified",
             )
             return
-        safe_ttys = "{" + ", ".join(f'"{_as_escape(candidate)}"' for candidate in tty_candidates) + "}"
-        safe_text = _as_escape(text)
-        is_slash = _is_direct_slash_invocation_text(text)
-        if is_slash:
-            payload_expr = f'"{safe_text}"'
-        else:
-            payload_expr = f'ESC & "[200~" & "{safe_text}" & ESC & "[201~"'
-        script = f'''
-        tell application "Terminal"
-            set targetTab to missing value
-            set usedTTY to ""
-            set candidateTTYs to {safe_ttys}
-            repeat with w in windows
-                repeat with t in tabs of w
-                    set tabTTY to tty of t
-                    repeat with candidateTTY in candidateTTYs
-                        if tabTTY is (candidateTTY as text) then
-                            set targetTab to t
-                            set usedTTY to (candidateTTY as text)
-                            exit repeat
-                        end if
-                    end repeat
-                    if targetTab is not missing value then exit repeat
-                end repeat
-                if targetTab is not missing value then exit repeat
-            end repeat
-            if targetTab is missing value then
-                return "no_window"
-            end if
-            set ESC to (ASCII character 27)
-            set wrapped to {payload_expr}
-            do script wrapped in targetTab
-        end tell
-        return "ok" & tab & usedTTY
-        '''
         _mark_send_text_running(
             receipt_context,
             provider_id="codex",
             binding_id=f"terminal_tty:{tty}",
         )
-        result = _run_osascript(script, mutation_possible=True)
-        if (not result.get("ok")) and result.get("reason") == "no matching Terminal window":
+        # The registry binding is re-proved above. A helper request names one
+        # exact Terminal TTY; retrying is safe only when the helper confirms
+        # that a candidate tab did not exist before any mutation.
+        result: dict = {
+            "ok": False,
+            "reason": "Terminal tab not found.",
+            "error_code": "terminal_tab_not_found",
+            "mutation_outcome": "failed_before_mutation",
+            "outcome_indeterminate": False,
+        }
+        for candidate_tty in tty_candidates:
+            result = _send_terminal_app_text_exact(candidate_tty, text)
+            if result.get("ok"):
+                tty = candidate_tty
+                break
+            if result.get("error_code") != "terminal_tab_not_found":
+                break
+        if (not result.get("ok")) and result.get("error_code") == "terminal_tab_not_found":
             if pid and _process_alive(pid):
                 self._finish_send_text_failure(
                     receipt_context,
@@ -38482,6 +40791,194 @@ Worker instructions:
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_text_to_omp_registry(
+        self,
+        native_id: str,
+        text: str,
+        receipt_context: dict | None = None,
+    ) -> None:
+        """Send text only through the currently owned OMP PTY broker session."""
+        receipt_context = receipt_context or {}
+        reg = _agent_registry_get("omp", native_id)
+        if not reg:
+            self._finish_send_text_failure(
+                receipt_context,
+                text,
+                status=404,
+                reason="No OMP control record exists for this session.",
+                error_code="session_not_found",
+            )
+            return
+        if reg.get("closed_at") is not None:
+            self._finish_send_text_failure(
+                receipt_context,
+                text,
+                status=409,
+                reason="OMP session is closed and cannot receive text.",
+                backend="pty_broker",
+                error_code="process_identity_unverified",
+            )
+            return
+
+        public_session_id = str(
+            receipt_context.get("public_session_id")
+            or _qualified_session_id("omp", native_id)
+        )
+        durable_broker_id = _durable_broker_id_from_registry_row(
+            reg,
+            provider="omp",
+            native_id=native_id,
+        )
+        broker_session = _registry_owned_broker_session("omp", native_id, reg)
+        if broker_session is None:
+            if durable_broker_id:
+                self._finish_send_text_failure(
+                    receipt_context,
+                    text,
+                    status=503,
+                    reason="OMP terminal broker is temporarily unavailable. No text was sent.",
+                    state="failed",
+                    validated=True,
+                    backend="pty_broker",
+                    tty=str(reg.get("terminal_tty") or "") or None,
+                    pid=int(reg.get("pid") or 0) or None,
+                    error_code="broker_unavailable",
+                    extra={"broker_id": durable_broker_id},
+                )
+            else:
+                self._finish_send_text_failure(
+                    receipt_context,
+                    text,
+                    status=409,
+                    reason="OMP control requires a currently owned terminal broker.",
+                    backend="pty_broker",
+                    tty=str(reg.get("terminal_tty") or "") or None,
+                    pid=int(reg.get("pid") or 0) or None,
+                    error_code="broker_ownership_unverified",
+                )
+            return
+
+        broker_id = _broker_session_id(broker_session)
+        if _broker_runtime_relation() != "current":
+            self._finish_send_text_failure(
+                receipt_context,
+                text,
+                status=409,
+                reason="OMP control requires the current terminal broker.",
+                backend="pty_broker",
+                tty=_broker_slave_tty(broker_session) or None,
+                pid=_broker_pid(broker_session) or None,
+                error_code="broker_requires_current_runtime",
+                extra={"broker_id": broker_id},
+            )
+            return
+
+        _mark_send_text_running(
+            receipt_context,
+            provider_id="omp",
+            binding_id=f"pty_broker:{broker_id}",
+        )
+        result, source_offset_after, source_offset_reason = _broker_send_text_with_truth(
+            broker_id,
+            text,
+            public_session_id=public_session_id,
+        )
+        if result.get("ok"):
+            _agent_registry_update_control(
+                "omp",
+                native_id,
+                pid=_broker_pid(broker_session),
+                terminal_tty=_broker_slave_tty(broker_session),
+                state="running",
+                reopen=True,
+            )
+            _write_agent_turn_state(
+                "omp",
+                native_id,
+                "thinking",
+                started_at=_time.time(),
+                event="send_text",
+            )
+
+        outcome_indeterminate = bool(result.get("outcome_indeterminate"))
+        pty_written = (
+            result.get("pty_written")
+            if "pty_written" in result
+            else (None if outcome_indeterminate else bool(result.get("ok")))
+        )
+        receipt = _make_send_text_receipt(
+            receipt_context,
+            client_action_id=receipt_context.get("client_action_id"),
+            state=(
+                "applied"
+                if result.get("ok")
+                else ("indeterminate" if outcome_indeterminate else "failed")
+            ),
+            phases=_receipt_phases(
+                validated=True,
+                applied=bool(result.get("ok")),
+                pty_written=pty_written,
+            ),
+            backend="pty_broker",
+            tty=_broker_slave_tty(broker_session),
+            pid=_broker_pid(broker_session),
+            source_offset_after=source_offset_after,
+            source_offset_reason=source_offset_reason,
+        )
+        if result.get("write_outcome"):
+            receipt["phases"]["pty_write_state"] = str(result["write_outcome"])
+        if not result.get("ok"):
+            _receipt_attach_response(
+                receipt,
+                http_status=int(result.get("status") or 502),
+                error_code=str(
+                    result.get("error_code")
+                    or result.get("reason")
+                    or "send_text_failed"
+                ),
+                error_message=str(
+                    result.get("error")
+                    or result.get("reason")
+                    or "Send failed."
+                ),
+                fields={
+                    "reason": result.get("reason"),
+                    "bytes_written": result.get("bytes_written"),
+                    "bytes_expected": result.get("bytes_expected"),
+                    "write_outcome": result.get("write_outcome"),
+                    "outcome_indeterminate": outcome_indeterminate,
+                },
+            )
+        _store_action_receipt(
+            receipt_context.get("device_id"),
+            str(
+                receipt_context.get("session_id")
+                or _qualified_session_id("omp", native_id)
+            ),
+            receipt_context.get("client_action_id"),
+            str(receipt_context.get("body_hash") or _receipt_body_hash(text)),
+            receipt,
+            action_kind="send_text",
+            audit_action={"type": "send_text", "chars": len(text)},
+        )
+        self._send_json(
+            {
+                "ok": bool(result.get("ok")),
+                "session_id": public_session_id,
+                "tty": _broker_slave_tty(broker_session),
+                "pid": _broker_pid(broker_session),
+                "broker_id": broker_id,
+                "reason": result.get("reason"),
+                "error_code": result.get("error_code"),
+                "bytes_written": result.get("bytes_written"),
+                "bytes_expected": result.get("bytes_expected"),
+                "write_outcome": result.get("write_outcome"),
+                "outcome_indeterminate": outcome_indeterminate,
+                "receipt": receipt,
+            },
+            status=200 if result.get("ok") else int(result.get("status") or 502),
+        )
+
     def _send_text_confirmation_boundary(
         self,
         provider: str,
@@ -38551,7 +41048,7 @@ Worker instructions:
                 "error_code": "bad_session",
             }, status=400)
             return
-        if provider not in _agent_provider_ids():
+        if not _provider_supports(provider, "send_text"):
             _send_unsupported_provider(self, provider, "send_text")
             return
 
@@ -38754,6 +41251,12 @@ Worker instructions:
         if provider == "codex":
             self._send_text_to_codex_registry(native_id, text, receipt_context)
             return
+        if provider == "omp":
+            self._send_text_to_omp_registry(native_id, text, receipt_context)
+            return
+        if provider != "claude":
+            _send_unsupported_provider(self, provider, "send_text")
+            return
 
         session_id = _claude_native_session_id(raw_session)
         if not session_id:
@@ -38942,68 +41445,17 @@ Worker instructions:
             return
         receipt_context["registry_row"] = direct_registry_row
 
-        safe_tty = _as_escape(tty)
-        safe_text = _as_escape(text)
-        # Slash commands (single-line, leading "/") bypass bracketed paste:
-        # Claude Code's prompt-toolkit treats anything inside the paste markers
-        # as literal input data and does NOT fire its slash-command handler, so
-        # /model arrives as text in the buffer and Enter submits it as a plain
-        # message rather than executing the command. Sending without the markers
-        # makes the TUI treat each character as a typed keystroke, which is
-        # what the slash dispatcher hooks into.
-        #
-        # Multi-line / non-slash text still gets bracketed paste so embedded
-        # newlines stay together as a single paste event, not N submissions.
-        is_slash = _is_direct_slash_invocation_text(text)
-        if is_slash:
-            payload_expr = f'"{safe_text}"'
-        else:
-            # Bracketed paste mode: ESC[200~ ... ESC[201~ around the payload.
-            # Trailing newline auto-appended by `do script` lands AFTER the
-            # paste-end marker and acts as a normal Enter, submitting the
-            # prompt. ESC byte (0x1B) materialized via `(ASCII character 27)`
-            # so we don't embed raw bytes in the f-string.
-            payload_expr = f'ESC & "[200~" & "{safe_text}" & ESC & "[201~"'
-        script = f'''
-        tell application "Terminal"
-            set targetTab to missing value
-            repeat with w in windows
-                repeat with t in tabs of w
-                    if tty of t is "{safe_tty}" then
-                        set targetTab to t
-                        exit repeat
-                    end if
-                end repeat
-                if targetTab is not missing value then exit repeat
-            end repeat
-            if targetTab is missing value then
-                return "no_window"
-            end if
-            set ESC to (ASCII character 27)
-            set wrapped to {payload_expr}
-            do script wrapped in targetTab
-            -- Double-tap return: when the paste lands while the TUI is busy
-            -- re-rendering (mid-turn churn), the trailing newline from
-            -- `do script` can be consumed without submitting — the text sits
-            -- in the input box unsent. A delayed bare return is a no-op when
-            -- the first submit landed (empty prompt) and a catch when it was
-            -- eaten.
-            delay 0.45
-            do script "" in targetTab
-        end tell
-        return "ok"
-        '''
         _mark_send_text_running(
             receipt_context,
             provider_id="claude",
             binding_id=f"terminal_tty:{tty}",
         )
-        result = _run_osascript(script, mutation_possible=True)
+        result = _send_terminal_app_text_exact(tty, text)
 
         # If no Terminal tab matches the recorded tty, the session is a zombie:
         # the user closed that tab. Auto-tombstone and tell the iPhone with a
         # 410 Gone so the bucket disappears on next /sessions?live=true poll.
-        if (not result.get("ok")) and result.get("reason") == "no matching Terminal window":
+        if (not result.get("ok")) and result.get("error_code") == "terminal_tab_not_found":
             self._mark_session_closed(session_id)
             self._finish_send_text_failure(
                 receipt_context,
@@ -39053,14 +41505,16 @@ Worker instructions:
         if result.get("write_outcome"):
             receipt["phases"]["pty_write_state"] = str(result["write_outcome"])
         if not result.get("ok"):
+            error_code = (
+                "terminal_write_outcome_unknown"
+                if outcome_indeterminate
+                else str(result.get("error_code") or "send_text_failed")
+            )
+            status = int(result.get("status") or 502)
             _receipt_attach_response(
                 receipt,
-                http_status=502,
-                error_code=(
-                    "terminal_write_outcome_unknown"
-                    if outcome_indeterminate
-                    else "send_text_failed"
-                ),
+                http_status=status,
+                error_code=error_code,
                 error_message=str(result.get("reason") or "Send failed."),
                 fields={
                     "reason": result.get("reason"),
@@ -39069,20 +41523,22 @@ Worker instructions:
                 },
             )
         _store_action_receipt(receipt_context["device_id"], receipt_session_id, receipt_context["client_action_id"], receipt_context["body_hash"], receipt, action_kind="send_text", audit_action={"type": "send_text", "chars": len(text)})
+        error_code = (
+            "terminal_write_outcome_unknown"
+            if outcome_indeterminate
+            else (str(result.get("error_code") or "send_text_failed") if not result.get("ok") else None)
+        )
+        status = int(result.get("status") or 502)
         body = json.dumps({
             "ok": result.get("ok", False),
             "tty": tty,
             "reason": result.get("reason"),
-            "error_code": (
-                "terminal_write_outcome_unknown"
-                if outcome_indeterminate
-                else ("send_text_failed" if not result.get("ok") else None)
-            ),
+            "error_code": error_code,
             "write_outcome": result.get("write_outcome"),
             "outcome_indeterminate": outcome_indeterminate,
             "receipt": receipt,
         }).encode()
-        self.send_response(200 if result.get("ok") else 502)
+        self.send_response(200 if result.get("ok") else status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -39135,8 +41591,9 @@ Worker instructions:
                 "error_code": "bad_session",
             }, status=400)
             return
-        if provider not in _agent_provider_ids():
-            _send_unsupported_provider(self, provider, sig_name.lower())
+        capability = "terminate" if sig == signal.SIGTERM else "interrupt"
+        if not _provider_supports(provider, capability):
+            _send_unsupported_provider(self, provider, capability)
             return
         public_session_id = _qualified_session_id(provider, native_id)
         receipt_session_id = _session_mutation_receipt_scope(self, public_session_id)
@@ -39247,7 +41704,7 @@ Worker instructions:
                 client_action_id=client_action_id or None,
                 state="applied" if ok else ("indeterminate" if outcome_indeterminate else "failed"),
                 phases=_receipt_phases(validated=True, applied=ok, pty_written=pty_written),
-                backend="pty_broker" if broker_id else "process_signal",
+                backend="pty_broker" if broker_id or provider == "omp" else "process_signal",
                 pid=pid,
             )
             if write_outcome:
@@ -39479,6 +41936,137 @@ Worker instructions:
                 error_code=error_code,
                 outcome_indeterminate=outcome_indeterminate,
             )
+            return
+
+        if provider == "omp":
+            native_id = control_native_id
+            reg = _agent_registry_get("omp", native_id)
+            if reg and reg.get("closed_at") is not None:
+                if sig == signal.SIGTERM:
+                    send_signal_result(True, None, None, 200, already_closed=True)
+                else:
+                    send_signal_result(
+                        False,
+                        None,
+                        "OMP session is closed and cannot be interrupted.",
+                        409,
+                        error_code="process_identity_unverified",
+                    )
+                return
+            if not reg:
+                send_signal_result(
+                    False,
+                    None,
+                    "No OMP control record exists for this session.",
+                    404,
+                    error_code="session_not_found",
+                )
+                return
+
+            durable_broker_id = _durable_broker_id_from_registry_row(
+                reg,
+                provider="omp",
+                native_id=native_id,
+            )
+            broker_session = _registry_owned_broker_session("omp", native_id, reg)
+            if broker_session is None:
+                if durable_broker_id:
+                    send_signal_result(
+                        False,
+                        int(reg.get("pid") or 0) or None,
+                        "OMP terminal broker is temporarily unavailable.",
+                        503,
+                        broker_id=durable_broker_id,
+                        error_code="broker_unavailable",
+                        pty_written=False,
+                        write_outcome="none",
+                    )
+                else:
+                    send_signal_result(
+                        False,
+                        int(reg.get("pid") or 0) or None,
+                        "OMP control requires a currently owned terminal broker.",
+                        409,
+                        error_code="broker_ownership_unverified",
+                        pty_written=False,
+                        write_outcome="none",
+                    )
+                return
+
+            broker_id = _broker_session_id(broker_session)
+            if _broker_runtime_relation() != "current":
+                send_signal_result(
+                    False,
+                    _broker_pid(broker_session) or None,
+                    "OMP control requires the current terminal broker.",
+                    409,
+                    broker_id=broker_id,
+                    error_code="broker_requires_current_runtime",
+                    pty_written=False,
+                    write_outcome="none",
+                )
+                return
+            try:
+                mark_signal_running()
+                if sig == signal.SIGINT:
+                    result = _broker_interrupt_for_draining_runtime(broker_id)
+                else:
+                    result = PTY_BROKER.terminate(broker_id, sig)
+            except PTYBrokerOutcomeUnknownError as exc:
+                send_signal_result(
+                    False,
+                    _broker_pid(broker_session) or None,
+                    str(exc)[:200],
+                    502,
+                    broker_id=broker_id,
+                    error_code="broker_signal_outcome_unknown",
+                    pty_written=None,
+                    write_outcome="unknown",
+                    outcome_indeterminate=True,
+                )
+                return
+            except Exception as exc:
+                send_signal_result(
+                    False,
+                    _broker_pid(broker_session) or None,
+                    str(exc)[:200],
+                    503,
+                    broker_id=broker_id,
+                    error_code="broker_unavailable",
+                    pty_written=False,
+                    write_outcome="none",
+                )
+                return
+
+            ok = bool(result.get("ok"))
+            if ok:
+                _write_agent_turn_state(
+                    "omp",
+                    native_id,
+                    "idle",
+                    event=sig_name.lower(),
+                )
+            if ok and sig == signal.SIGTERM:
+                _agent_registry_mark_closed("omp", native_id)
+            send_signal_result(
+                ok,
+                result.get("pid") or _broker_pid(broker_session),
+                result.get("error") or result.get("reason"),
+                200 if ok else int(result.get("status") or 502),
+                broker_id=broker_id,
+                error_code=result.get("error_code"),
+                pty_written=(
+                    bool(result.get("pty_written"))
+                    if "pty_written" in result
+                    else bool(ok and sig == signal.SIGINT)
+                ),
+                write_outcome=result.get("write_outcome"),
+                outcome_indeterminate=bool(result.get("outcome_indeterminate")),
+            )
+            return
+
+        if provider != "claude":
+            _send_unsupported_provider(self, provider, sig_name.lower())
             return
 
         session_id = control_native_id
@@ -40125,6 +42713,8 @@ Worker instructions:
             ):
                 return
             while _time.monotonic() - started_at < PROVIDER_CONTROL_STREAM_SECONDS:
+                if not self._stream_authorization_is_current():
+                    return
                 events, batch_cursor = self._provider_control_event_batch(
                     driver,
                     provider_cursor,
@@ -41767,14 +44357,18 @@ Worker instructions:
         if not _valid_provider_filter(provider, allow_all=False):
             _send_unknown_provider(self, provider)
             return
-        if provider not in _agent_provider_ids():
-            self._send_json({"ok": True, "sessions": [], "provider": provider})
+        required_capability = "saved_sessions" if provider == "omp" else "read_transcript"
+        if not _provider_supports(provider, required_capability):
+            _send_unsupported_provider(self, provider, required_capability)
             return
         if not cwd:
             self.send_error(400, "cwd required")
             return
         if provider == "codex":
             self._handle_codex_pickers_resume(cwd)
+            return
+        if provider == "omp":
+            self._handle_omp_pickers_resume(cwd)
             return
         proj_dir = CLAUDE_PROJECTS_DIR / _encode_project_dir(cwd)
         items: list[dict] = []
@@ -41876,6 +44470,27 @@ Worker instructions:
         self.end_headers()
         self.wfile.write(body)
 
+    def _handle_omp_pickers_resume(self, cwd: str):
+        sessions = (
+            _omp_saved_sessions(project=cwd, limit=80)
+            if _omp_saved_sessions is not None
+            else []
+        )
+        items: list[dict] = []
+        for session in sessions:
+            try:
+                metadata = Path(session.session_path).stat()
+            except OSError:
+                continue
+            items.append({
+                "id": session.session_id,
+                "mtime": session.modified_at,
+                "turns": 0,
+                "preview": (session.title or "OMP session")[:120],
+                "bytes": metadata.st_size,
+            })
+        self._send_json({"ok": True, "provider": "omp", "sessions": items})
+
     # ----- /pickers/resume/preview: last-N assistant outputs from a session -----
     def _handle_pickers_resume_preview(self, q):
         """Return the last N (default 2) full assistant text outputs from a
@@ -41902,11 +44517,15 @@ Worker instructions:
         if not _valid_provider_filter(provider, allow_all=False):
             _send_unknown_provider(self, provider)
             return
-        if provider not in _agent_provider_ids():
-            self._send_json({"ok": True, "session": None, "provider": provider, "preview": []})
+        required_capability = "saved_sessions" if provider == "omp" else "read_transcript"
+        if not _provider_supports(provider, required_capability):
+            _send_unsupported_provider(self, provider, required_capability)
             return
         if provider == "codex":
             self._handle_codex_pickers_resume_preview(cwd, session_id, n)
+            return
+        if provider == "omp":
+            self._handle_omp_pickers_resume_preview(cwd, session_id, n)
             return
         # session_id arrives as the JSONL filename stem (a UUID); guard
         # against path traversal.
@@ -42033,6 +44652,103 @@ Worker instructions:
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _handle_omp_pickers_resume_preview(self, cwd: str, session_id: str, n: int):
+        if not _safe_agent_native_id(session_id):
+            self.send_error(400, "invalid id")
+            return
+        target = next(
+            (
+                session
+                for session in (
+                    _omp_saved_sessions(project=cwd, limit=200)
+                    if _omp_saved_sessions is not None
+                    else []
+                )
+                if session.session_id == session_id
+            ),
+            None,
+        )
+        if target is None:
+            self.send_error(404, "no such OMP session in this project")
+            return
+
+        descriptor = -1
+        turns: list[str] = []
+        current: list[str] = []
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(target.session_path, flags)
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OSError("OMP session is not a regular file")
+            maximum_bytes = 2 * 1024 * 1024
+            maximum_line_bytes = 256 * 1024
+            offset = max(0, metadata.st_size - maximum_bytes)
+            remaining = metadata.st_size - offset
+            os.lseek(descriptor, offset, os.SEEK_SET)
+            with os.fdopen(descriptor, "rb", closefd=True) as handle:
+                descriptor = -1
+                if offset:
+                    skipped = handle.readline(min(remaining, maximum_line_bytes) + 1)
+                    if len(skipped) > remaining or len(skipped) > maximum_line_bytes:
+                        remaining = 0
+                    else:
+                        remaining -= len(skipped)
+                for _line_count in range(10_000):
+                    if remaining <= 0:
+                        break
+                    raw = handle.readline(min(remaining, maximum_line_bytes) + 1)
+                    if not raw:
+                        break
+                    if len(raw) > remaining or len(raw) > maximum_line_bytes:
+                        break
+                    remaining -= len(raw)
+                    if not raw.strip():
+                        continue
+                    try:
+                        event = json.loads(raw)
+                    except (ValueError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(event, dict) or event.get("type") != "message":
+                        continue
+                    message = event.get("message") or {}
+                    if not isinstance(message, dict):
+                        continue
+                    role = message.get("role")
+                    if role == "user":
+                        if current:
+                            turns.append("\n\n".join(current))
+                            current = []
+                        continue
+                    if role != "assistant":
+                        continue
+                    content = message.get("content") or []
+                    if not isinstance(content, list):
+                        continue
+                    chunks = [
+                        str(block.get("text") or "")
+                        for block in content
+                        if isinstance(block, dict)
+                        and block.get("type") == "text"
+                        and str(block.get("text") or "").strip()
+                    ]
+                    if chunks:
+                        current.append("\n\n".join(chunks))
+                if current:
+                    turns.append("\n\n".join(current))
+        except OSError as exc:
+            self.send_error(500, f"read failed: {exc}")
+            return
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+        capped = [
+            turn if len(turn) <= 2000 else turn[:1000] + "\n\n…[truncated]…\n\n" + turn[-1000:]
+            for turn in turns[-n:]
+        ]
+        self._send_json({"ok": True, "provider": "omp", "turns": capped})
 
     def _picker_diagnostics_provider(self, q, diagnostic: str) -> str | None:
         provider = q.get("provider", [""])[0].strip().lower()
@@ -43054,6 +45770,8 @@ Worker instructions:
 
         try:
             while _time.time() < deadline:
+                if not self._stream_authorization_is_current():
+                    return
                 _time.sleep(5)
 
                 # Re-sign + re-emit only if it changed.
@@ -43142,6 +45860,8 @@ Worker instructions:
 
         try:
             while _time.time() < deadline:
+                if not self._stream_authorization_is_current():
+                    return
                 _time.sleep(5)
                 try:
                     sig = _invocations_signature(cwd=cwd, provider=provider, trigger=trigger)
@@ -43816,9 +46536,12 @@ Worker instructions:
         if not filename:
             self.send_error(400, "filename required")
             return
-        session_id = self._pairdrop_attachment_session(
-            q.get("session", [""])[0].strip()
-        )
+        raw_session = q.get("session", [""])[0].strip()
+        provider, native_id = _parse_agent_session_ref(raw_session)
+        if native_id and not _provider_supports(provider, "upload"):
+            _send_unsupported_provider(self, provider, "upload")
+            return
+        session_id = self._pairdrop_attachment_session(raw_session)
         body = self._read_body()
         if len(body) > MAX_UPLOAD_BODY_BYTES:
             self.send_error(413, "file too large")
@@ -43882,10 +46605,9 @@ Worker instructions:
             self.send_error(400, "session required")
             return
 
-        if provider == "codex":
-            self._handle_codex_turn_state_stream(session_id)
+        if provider in {"codex", "omp"}:
+            self._handle_managed_turn_state_stream(provider, session_id)
             return
-
         session_id = _claude_native_session_id(raw_session)
         if not session_id:
             self.send_error(400, "session required")
@@ -43947,6 +46669,8 @@ Worker instructions:
         turn_wakes = SESSION_EVENT_HUB.subscribe(f"turn:claude:{uuid}") if SESSION_EVENT_HUB is not None else None
         try:
             while _time.time() < deadline:
+                if not self._stream_authorization_is_current():
+                    return
                 if turn_wakes is not None:
                     wake = turn_wakes.get(timeout=1.0)
                     while wake is not None:
@@ -43985,9 +46709,17 @@ Worker instructions:
             if turn_wakes is not None:
                 turn_wakes.close()
 
-    def _handle_codex_turn_state_stream(self, native_id: str):
+    def _handle_managed_turn_state_stream(
+        self,
+        provider: str,
+        native_id: str,
+    ):
+        if provider not in {"codex", "omp"} or not _safe_agent_native_id(native_id):
+            self.send_error(400, "bad managed provider session id")
+            return
+        native_id = _agent_registry_resolve_native_alias(provider, native_id)
         if not _safe_agent_native_id(native_id):
-            self.send_error(400, "bad Codex session id")
+            self.send_error(400, "bad managed provider session id")
             return
 
         self.send_response(200)
@@ -44002,7 +46734,7 @@ Worker instructions:
         deadline = _time.time() + 600
 
         def payload_bytes() -> bytes | None:
-            obj = _codex_turn_state_payload(native_id)
+            obj = _managed_turn_state_payload(provider, native_id)
             if not obj:
                 return None
             return json.dumps(obj, sort_keys=True).encode()
@@ -44018,9 +46750,21 @@ Worker instructions:
         except Exception:
             pass
 
+        turn_wakes = (
+            SESSION_EVENT_HUB.subscribe(f"turn:{provider}:{native_id}")
+            if SESSION_EVENT_HUB is not None
+            else None
+        )
         try:
             while _time.time() < deadline:
-                _time.sleep(0.25)
+                if not self._stream_authorization_is_current():
+                    return
+                if turn_wakes is not None:
+                    wake = turn_wakes.get(timeout=1.0)
+                    while wake is not None:
+                        wake = turn_wakes.get(timeout=0)
+                else:
+                    _time.sleep(0.25)
                 try:
                     payload = payload_bytes()
                     if payload and payload != last_payload:
@@ -44047,6 +46791,9 @@ Worker instructions:
                 pass
         except (BrokenPipeError, ConnectionResetError):
             return
+        finally:
+            if turn_wakes is not None:
+                turn_wakes.close()
 
     def _lookup_claude_uuid(self, session_id: str) -> str:
         return _lookup_claude_uuid_for_session(session_id)
@@ -44227,25 +46974,21 @@ Worker instructions:
         if len(prompt) > max_chars:
             prompt = prompt[:max_chars]
 
-        claude_bin = HOME / ".local" / "bin" / "claude"
-        if not claude_bin.exists():
-            for candidate in ("/opt/homebrew/bin/claude", "/usr/local/bin/claude"):
-                p = Path(candidate)
-                if p.exists():
-                    claude_bin = p
-                    break
-        if not claude_bin.exists():
-            self.send_error(502, "claude CLI not found")
+        if run_remote_llm is None:
+            self.send_error(503, "remote LLM route helper unavailable")
             return
-
-        cmd = [
-            str(claude_bin), "-p",
-            "--output-format", "text",
-            "--model", model,
-            "--tools", "",
-        ]
-        if system:
-            cmd.extend(["--append-system-prompt", system])
+        try:
+            content = run_remote_llm(
+                model=model,
+                prompt=prompt,
+                system=system,
+                timeout_seconds=120,
+            )
+        except Exception as exc:
+            status = int(getattr(exc, "status", 502) or 502)
+            message = str(getattr(exc, "message", str(exc)) or str(exc))
+            self.send_error(status, message)
+            return
 
         # SSE response headers
         self.send_response(200)
@@ -44266,11 +47009,6 @@ Worker instructions:
                 # Client disconnected; bail out
                 raise
 
-        # Initialize so Pyright sees `proc` as bound in the TimeoutExpired
-        # branch even if Popen raises before assignment. None-check on every
-        # pipe access — subprocess.Popen with PIPE returns non-None pipes,
-        # but the type stub annotates them Optional[IO[str]].
-        proc: subprocess.Popen | None = None
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -44318,62 +47056,6 @@ Worker instructions:
                 write_sse("error", json.dumps({"message": f"{type(e).__name__}: {e}"}))
             except Exception:
                 pass
-
-    # ----- AppleScript helpers -----
-    def _applescript_inject(self, window_match: str, text: str):
-        safe_match = _as_escape(window_match)
-        # Newlines submit prematurely in Claude's prompt — collapse to spaces.
-        single_line = text.replace("\r", " ").replace("\n", " ").strip()
-        safe_text = _as_escape(single_line)
-        script = f'''
-        tell application "Terminal"
-          set targetWindow to missing value
-          repeat with w in windows
-            if name of w contains "{safe_match}" then
-              set targetWindow to w
-              exit repeat
-            end if
-          end repeat
-          if targetWindow is missing value then
-            return "no_window"
-          end if
-          activate
-          set index of targetWindow to 1
-          delay 0.25
-        end tell
-        tell application "System Events"
-          keystroke "{safe_text}"
-          delay 0.1
-          keystroke return
-        end tell
-        return "ok"
-        '''
-        return _run_osascript(script, mutation_possible=True)
-
-    def _applescript_send_esc(self, window_match: str):
-        safe_match = _as_escape(window_match)
-        script = f'''
-        tell application "Terminal"
-          set targetWindow to missing value
-          repeat with w in windows
-            if name of w contains "{safe_match}" then
-              set targetWindow to w
-              exit repeat
-            end if
-          end repeat
-          if targetWindow is missing value then
-            return "no_window"
-          end if
-          activate
-          set index of targetWindow to 1
-          delay 0.2
-        end tell
-        tell application "System Events"
-          key code 53
-        end tell
-        return "ok"
-        '''
-        return _run_osascript(script, mutation_possible=True)
 
     # ----- /corpus: deterministic Claude + Codex transcript inventory -----
     def _handle_corpus(self, q):

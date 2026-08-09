@@ -167,3 +167,42 @@ func TestAdversarialSSHGatewayRateLimitsAllowedRequests(t *testing.T) {
 		t.Fatalf("forwarded = %d, want 1", forwarded)
 	}
 }
+
+func TestSSHRateLimiterNormalizesDynamicRouteIDs(t *testing.T) {
+	limiter := NewMemoryRateLimiter(1, time.Minute)
+	remote := "127.0.0.1:12345"
+	if !limiter.Allow(remote, http.MethodGet, "/postures/first") {
+		t.Fatal("first posture request was rejected")
+	}
+	if limiter.Allow(remote, http.MethodGet, "/postures/second") {
+		t.Fatal("a new posture ID bypassed the route-class limit")
+	}
+}
+func TestSSHRateLimiterKeepsDistinctSessionRouteClassesIndependent(t *testing.T) {
+	limiter := NewMemoryRateLimiter(1, time.Minute)
+	remote := "127.0.0.1:12345"
+	if !limiter.Allow(remote, http.MethodGet, "/sessions/race/race-one") {
+		t.Fatal("race route was rejected")
+	}
+	if !limiter.Allow(remote, http.MethodGet, "/sessions/session-one/export") {
+		t.Fatal("session export shared the race route bucket")
+	}
+}
+
+func TestSSHRateLimiterHasGlobalBudgetAndBoundedState(t *testing.T) {
+	limiter := NewMemoryRateLimiter(1, time.Minute)
+	remote := "127.0.0.1:12345"
+	allowed := 0
+	for i := range 300 {
+		path := fmt.Sprintf("/attacker-controlled-%d/item", i)
+		if limiter.Allow(remote, http.MethodGet, path) {
+			allowed++
+		}
+	}
+	if allowed > 16 {
+		t.Fatalf("global admission allowed %d requests, want at most 16", allowed)
+	}
+	if len(limiter.hits) > 17 {
+		t.Fatalf("rate limiter retained %d buckets, want at most 17", len(limiter.hits))
+	}
+}

@@ -196,3 +196,34 @@ func TestLoadInternalHookTokenRequiresExactHexToken(t *testing.T) {
 		t.Fatalf("invalid token accepted: %q", got)
 	}
 }
+
+func TestLoadInternalHookTokenRejectsInsecureFileMetadata(t *testing.T) {
+	valid := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+	t.Run("group readable", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "internal-hook-token")
+		t.Setenv("PAIRLING_INTERNAL_HOOK_TOKEN_FILE", path)
+		if err := os.WriteFile(path, []byte(valid+"\n"), 0o640); err != nil {
+			t.Fatal(err)
+		}
+		if got := loadInternalHookToken(t.TempDir()); got != "" {
+			t.Fatalf("insecure token file accepted: %q", got)
+		}
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "target")
+		path := filepath.Join(root, "internal-hook-token")
+		t.Setenv("PAIRLING_INTERNAL_HOOK_TOKEN_FILE", path)
+		if err := os.WriteFile(target, []byte(valid+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, path); err != nil {
+			t.Fatal(err)
+		}
+		if got := loadInternalHookToken(t.TempDir()); got != "" {
+			t.Fatalf("symlinked token file accepted: %q", got)
+		}
+	})
+}

@@ -451,6 +451,16 @@ function verifyPackageIntegrity(env) {
   ) {
     throw new Error("payload manifest Python archive identities are invalid");
   }
+  const automationArchives = payloadManifest.automation_archives;
+  if (
+    !automationArchives ||
+    typeof automationArchives !== "object" ||
+    Array.isArray(automationArchives) ||
+    Object.keys(automationArchives).sort().join(",") !== "darwin-arm64,darwin-x64" ||
+    Object.values(automationArchives).some((digest) => !/^[0-9a-f]{64}$/.test(digest))
+  ) {
+    throw new Error("payload manifest automation archive identities are invalid");
+  }
   const runtimeManifests = payloadManifest.runtime_manifests;
   if (
     !runtimeManifests ||
@@ -489,18 +499,20 @@ function verifyPackageIntegrity(env) {
     runtimeManifest.source_revision !== payloadManifest.source_revision ||
     runtimeManifest.release_evidence_sha256 !== payloadManifest.release_evidence_sha256 ||
     runtimeManifest.python_archive_sha256 !== pythonArchives[platformKey] ||
+    runtimeManifest.automation_archive_sha256 !== automationArchives[platformKey] ||
+    !/^[0-9a-f]{64}$/.test(runtimeManifest.automation_tree_sha256 || "") ||
     runtimeDocument.digest !== runtimeManifests[platformKey] ||
     runtimeManifest.architecture !== architecture
   ) {
     throw new Error("runtime package identity does not match the Pairling payload");
   }
   const runtimeExpected = expectedEntries(runtimeManifest.files, {
-    allowedPrefixes: ["bin", "python", "provider-sdks"],
+    allowedPrefixes: ["automation", "bin", "python", "provider-sdks"],
     rejectBytecode: true,
     requireMode: true,
   });
   const runtimeDirectories = expectedDirectories(runtimeManifest.directories, {
-    allowedPrefixes: ["bin", "python", "provider-sdks"],
+    allowedPrefixes: ["automation", "bin", "python", "provider-sdks"],
   });
   const runtimeEntries = mergeExpected(runtimeExpected, runtimeDirectories);
   const runtimeCoreEntries = new Map(runtimeEntries);
@@ -563,7 +575,7 @@ function verifyPackageIntegrity(env) {
     });
     runtimeComponents.push(component);
   }
-  const prefixes = ["bin", "provider-sdks"];
+  const prefixes = ["automation", "bin", "provider-sdks"];
   if (existsSync(join(env.runtimePackageDir, "python"))) {
     prefixes.push("python");
   }
@@ -592,6 +604,21 @@ function verifyPackageIntegrity(env) {
     runtimeConnectd.identifier !== "dev.pairling.connectd"
   ) {
     throw new Error("selected connectd is not bound to the payload manifest");
+  }
+
+  const runtimeAutomation = Array.isArray(runtimeManifest.files)
+    ? runtimeManifest.files.find(
+        (entry) =>
+          entry?.path === "automation/Pairling.app/Contents/MacOS/PairlingAutomation",
+      )
+    : null;
+  if (
+    !runtimeAutomation ||
+    runtimeAutomation.identifier !== "dev.pairling.automation" ||
+    runtimeAutomation.architecture !== architecture ||
+    (runtimeConnectd.team_id && runtimeAutomation.team_id !== runtimeConnectd.team_id)
+  ) {
+    throw new Error("automation helper identity is incomplete or does not match connectd");
   }
 
   const runtimePython = Array.isArray(runtimeManifest.files)
@@ -625,6 +652,7 @@ function verifyPackageIntegrity(env) {
     runtimeRoot: env.runtimePackageDir,
     runtimeConnectd,
     runtimePython,
+    runtimeAutomation,
   };
   verifyRuntimeSources(integrity);
   return integrity;

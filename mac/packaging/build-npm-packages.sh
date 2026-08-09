@@ -4,8 +4,8 @@ export PYTHONDONTWRITEBYTECODE=1
 
 # Builds the three Pairling npm packages:
 #   pairling                        (CLI shim + source payload + integrity manifest)
-#   @pairling/runtime-darwin-arm64  (signed pairling-connectd, Apple Silicon)
-#   @pairling/runtime-darwin-x64    (signed pairling-connectd, Intel)
+#   @pairling/runtime-darwin-arm64  (signed connectd and automation helper)
+#   @pairling/runtime-darwin-x64    (signed connectd and automation helper)
 #
 # npm install of these packages runs no code (no lifecycle scripts); all
 # mutation happens in the explicit `pairling setup` flow inside the payload.
@@ -24,6 +24,8 @@ PREBUILT_ARM64=""
 PREBUILT_X64=""
 PREBUILT_PYTHON_ARM64=""
 PREBUILT_PYTHON_X64=""
+PREBUILT_AUTOMATION_ARM64=""
+PREBUILT_AUTOMATION_X64=""
 RELEASE_EVIDENCE="${PAIRLING_RELEASE_EVIDENCE:-}"
 VENDOR_PYTHON="0"
 
@@ -39,9 +41,9 @@ Options:
                           --vendor-python.
   --vendor-python         Vendor a signed CPython (dev.pairling.python) into
                           each runtime package (P3 Python custody).
-  --notarize              Notarize each connectd binary and (with
-                          --vendor-python) each CPython, via xcrun notarytool
-                          keychain profile pairling-notary.
+  --notarize              Notarize each connectd binary, each Pairling
+                          automation helper app, and (with --vendor-python)
+                          each CPython via xcrun notarytool keychain profile.
   --prebuilt-arm64 PATH   Use an already-built/signed arm64 pairling-connectd
                           instead of building (CI assembly mode).
   --prebuilt-x64 PATH     Same for x64.
@@ -49,8 +51,13 @@ Options:
                           Use an already-signed arm64 CPython archive.
   --prebuilt-python-x64 PATH
                           Same for x64.
+  --prebuilt-automation-arm64 PATH
+                          Use a signed, stapled arm64 Pairling automation
+                          helper archive from the release assets.
+  --prebuilt-automation-x64 PATH
+                          Same for x64.
   --release-evidence PATH Verify release revision, notarization, and all
-                          prebuilt digests against RELEASE-BINARIES.json schema 5.
+                          prebuilt digests against RELEASE-BINARIES.json schema 6.
   --allow-dirty           Permit a dirty source tree (dev builds only).
 
 Environment:
@@ -70,6 +77,8 @@ while [[ $# -gt 0 ]]; do
     --prebuilt-x64) PREBUILT_X64="${2:-}"; shift 2 ;;
     --prebuilt-python-arm64) PREBUILT_PYTHON_ARM64="${2:-}"; shift 2 ;;
     --prebuilt-python-x64) PREBUILT_PYTHON_X64="${2:-}"; shift 2 ;;
+    --prebuilt-automation-arm64) PREBUILT_AUTOMATION_ARM64="${2:-}"; shift 2 ;;
+    --prebuilt-automation-x64) PREBUILT_AUTOMATION_X64="${2:-}"; shift 2 ;;
     --release-evidence) RELEASE_EVIDENCE="${2:-}"; shift 2 ;;
     --vendor-python) VENDOR_PYTHON="1"; shift ;;
     --allow-dirty) ALLOW_DIRTY="1"; shift ;;
@@ -93,6 +102,8 @@ EVIDENCE_CONNECTD_ARM64_SHA=""
 EVIDENCE_CONNECTD_X64_SHA=""
 EVIDENCE_PYTHON_ARM64_SHA=""
 EVIDENCE_PYTHON_X64_SHA=""
+EVIDENCE_AUTOMATION_ARM64_SHA=""
+EVIDENCE_AUTOMATION_X64_SHA=""
 if [[ -n "$RELEASE_EVIDENCE" ]]; then
   evidence_identity="$(python3 "$REPO_ROOT/mac/packaging/npm-release-evidence.py" verify \
     --evidence "$RELEASE_EVIDENCE" --version "$VERSION" \
@@ -104,6 +115,8 @@ if [[ -n "$RELEASE_EVIDENCE" ]]; then
   EVIDENCE_CONNECTD_X64_SHA="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["asset_sha256"]["binaries"]["x64"])' <<<"$evidence_identity")"
   EVIDENCE_PYTHON_ARM64_SHA="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["asset_sha256"]["python"]["arm64"])' <<<"$evidence_identity")"
   EVIDENCE_PYTHON_X64_SHA="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["asset_sha256"]["python"]["x64"])' <<<"$evidence_identity")"
+  EVIDENCE_AUTOMATION_ARM64_SHA="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["asset_sha256"]["automation"]["arm64"])' <<<"$evidence_identity")"
+  EVIDENCE_AUTOMATION_X64_SHA="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["asset_sha256"]["automation"]["x64"])' <<<"$evidence_identity")"
   if [[ -n "${PAIRLING_SOURCE_REVISION:-}" && "$PAIRLING_SOURCE_REVISION" != "$EVIDENCE_REVISION" ]]; then
     fail "PAIRLING_SOURCE_REVISION does not match verified release evidence"
   fi
@@ -119,6 +132,7 @@ PACKAGED_SOURCE_PATHS=(
   "mac/connectd/internal"
   "mac/connectd/go.mod"
   "mac/connectd/go.sum"
+  "mac/automation-helper"
   "mac/install"
   "mac/mcp"
   "mac/packaging/bin/pairling"
@@ -131,6 +145,7 @@ PACKAGED_SOURCE_PATHS=(
   "npm"
   "relay/app_attest_validator.py"
   "thoughts/shared/specs/coding-agent-remote-control-capability-map.json"
+  "project.yml"
 )
 SOURCE_DIRTY="false"
 if git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 && \
@@ -257,7 +272,8 @@ require_release_artifact_evidence() {
   local requires_evidence="0" output
   local -a evidence_args
   if [[ -n "${PAIRLING_SOURCE_REVISION:-}" || -n "$PREBUILT_ARM64" || -n "$PREBUILT_X64" || \
-        -n "$PREBUILT_PYTHON_ARM64" || -n "$PREBUILT_PYTHON_X64" ]]; then
+        -n "$PREBUILT_PYTHON_ARM64" || -n "$PREBUILT_PYTHON_X64" || \
+        -n "$PREBUILT_AUTOMATION_ARM64" || -n "$PREBUILT_AUTOMATION_X64" ]]; then
     requires_evidence="1"
   fi
   if [[ "$requires_evidence" == "1" && -z "$RELEASE_EVIDENCE" ]]; then
@@ -275,6 +291,8 @@ require_release_artifact_evidence() {
   [[ -z "$PREBUILT_X64" ]] || evidence_args+=(--connectd-x64 "$PREBUILT_X64")
   [[ -z "$PREBUILT_PYTHON_ARM64" ]] || evidence_args+=(--python-arm64 "$PREBUILT_PYTHON_ARM64")
   [[ -z "$PREBUILT_PYTHON_X64" ]] || evidence_args+=(--python-x64 "$PREBUILT_PYTHON_X64")
+  [[ -z "$PREBUILT_AUTOMATION_ARM64" ]] || evidence_args+=(--automation-arm64 "$PREBUILT_AUTOMATION_ARM64")
+  [[ -z "$PREBUILT_AUTOMATION_X64" ]] || evidence_args+=(--automation-x64 "$PREBUILT_AUTOMATION_X64")
   output="$(python3 "$REPO_ROOT/mac/packaging/npm-release-evidence.py" "${evidence_args[@]}")" \
     || fail "release evidence does not bind the selected prebuilt assets"
   [[ "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["evidence_sha256"])' <<<"$output")" == "$EVIDENCE_SHA256" ]] \
@@ -333,7 +351,8 @@ if [[ "$RELEASE_MODE" == "1" ]]; then
   require_release_source_traceability
   [[ "$SOURCE_DIRTY" == "false" ]] || fail "source tree is dirty; commit first."
   if [[ -z "$PREBUILT_ARM64" || -z "$PREBUILT_X64" || \
-        -z "$PREBUILT_PYTHON_ARM64" || -z "$PREBUILT_PYTHON_X64" ]]; then
+        -z "$PREBUILT_PYTHON_ARM64" || -z "$PREBUILT_PYTHON_X64" || \
+        -z "$PREBUILT_AUTOMATION_ARM64" || -z "$PREBUILT_AUTOMATION_X64" ]]; then
     [[ -n "$SIGN_IDENTITY" && "$SIGN_IDENTITY" != "-" ]] \
       || fail "--release requires a real Developer ID identity for every locally created runtime asset."
     [[ "$NOTARIZE" == "1" ]] \
@@ -342,10 +361,11 @@ if [[ "$RELEASE_MODE" == "1" ]]; then
   # A release ships the vendored CPython (P3 custody) in the runtime packages.
   VENDOR_PYTHON="1"
   # Custody guard: CI has no Developer ID cert, so it MUST supply pre-signed
-  # python tarballs (built+signed on the release Mac). Never ship unsigned.
+  # CPython and stapled helper archives built on the release Mac.
   if [[ -z "$SIGN_IDENTITY" || "$SIGN_IDENTITY" == "-" ]]; then
-    [[ -n "$PREBUILT_PYTHON_ARM64" && -n "$PREBUILT_PYTHON_X64" ]] \
-      || fail "--release without a Developer ID identity requires --prebuilt-python-arm64 and --prebuilt-python-x64 (CI must not re-vendor/sign python)."
+    [[ -n "$PREBUILT_PYTHON_ARM64" && -n "$PREBUILT_PYTHON_X64" && \
+       -n "$PREBUILT_AUTOMATION_ARM64" && -n "$PREBUILT_AUTOMATION_X64" ]] \
+      || fail "--release without a Developer ID identity requires prebuilt Python and Pairling automation helper archives."
   fi
   BRANCH="main"
 else
@@ -382,9 +402,11 @@ rm -f \
   "$DIST_DIR"/*.tgz \
   "$DIST_DIR/SHASUMS256.txt" \
   "$DIST_DIR/CONNECTD-SHASUMS256.txt" \
+  "$DIST_DIR/AUTOMATION-SHASUMS256.txt" \
   "$DIST_DIR/NOTARIZATION-RECEIPTS.json" \
   "$DIST_DIR"/pairling-connectd-* \
   "$DIST_DIR"/pairling-python-*.tar.gz \
+  "$DIST_DIR"/pairling-automation-*.zip \
   2>/dev/null || true
 
 # --- payload assembly (mirrors build-helper-artifact.sh, minus the retired
@@ -497,6 +519,108 @@ sign_and_verify() {
   else
     log "WARNING: $binary is unsigned (PAIRLING_SIGN_IDENTITY unset). pairling setup will reject it under the default Team ID policy."
   fi
+}
+
+AUTOMATION_HELPER_BUNDLE_ID="dev.pairling.automation"
+AUTOMATION_HELPER_APP_NAME="Pairling.app"
+AUTOMATION_HELPER_EXECUTABLE="PairlingAutomation"
+
+verify_automation_helper_bundle() {
+  local app="$1" arch="$2" expected_arch bundle_id entitlement runtime_output
+  local executable="$app/Contents/MacOS/$AUTOMATION_HELPER_EXECUTABLE"
+  [[ -d "$app" && ! -L "$app" ]] || fail "automation helper bundle is missing or linked: $app"
+  [[ -f "$app/Contents/Info.plist" && ! -L "$app/Contents/Info.plist" ]] \
+    || fail "automation helper Info.plist is missing or linked: $app"
+  [[ -f "$executable" && ! -L "$executable" ]] \
+    || fail "automation helper executable is missing or linked: $app"
+  bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null || true)"
+  [[ "$bundle_id" == "$AUTOMATION_HELPER_BUNDLE_ID" ]] \
+    || fail "automation helper bundle identifier is invalid: $bundle_id"
+  expected_arch="$arch"
+  [[ "$expected_arch" != "x64" ]] || expected_arch="x86_64"
+  [[ "$(/usr/bin/lipo -archs "$executable" 2>/dev/null)" == "$expected_arch" ]] \
+    || fail "automation helper architecture does not match $arch: $app"
+  [[ -n "$SIGN_IDENTITY" ]] || return 0
+  /usr/bin/codesign --verify --strict --verbose=2 "$app" \
+    || fail "automation helper failed codesign verification: $app"
+  bundle_id="$(/usr/bin/codesign -dvv "$app" 2>&1 | sed -n 's/^Identifier=//p')"
+  [[ "$bundle_id" == "$AUTOMATION_HELPER_BUNDLE_ID" ]] \
+    || fail "automation helper signing identifier is invalid: $bundle_id"
+  runtime_output="$(/usr/bin/codesign -dvv "$app" 2>&1)"
+  [[ "$runtime_output" == *"Runtime Version="* ]] \
+    || fail "automation helper is missing the hardened runtime: $app"
+  entitlement="$(/usr/bin/codesign -d --entitlements :- "$app" 2>/dev/null)"
+  python3 -c '
+import plistlib
+import sys
+value = plistlib.loads(sys.stdin.buffer.read())
+raise SystemExit(0 if value.get("com.apple.security.automation.apple-events") is True else 1)
+' <<<"$entitlement" \
+    || fail "automation helper is missing the Apple Events entitlement: $app"
+  if [[ "$SIGN_IDENTITY" != "-" ]]; then
+    local team
+    team="$(/usr/bin/codesign -dvv "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+    [[ "$team" == "$EXPECTED_TEAM_ID" ]] \
+      || fail "automation helper TeamIdentifier '$team' != expected '$EXPECTED_TEAM_ID': $app"
+    /usr/bin/codesign --verify --strict --verbose=2 \
+      -R="anchor apple generic and certificate leaf[subject.OU] = \"$EXPECTED_TEAM_ID\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists" \
+      "$app" \
+      || fail "automation helper is not signed with the expected Developer ID Application certificate: $app"
+  fi
+}
+
+sign_automation_helper_bundle() {
+  local app="$1"
+  [[ -n "$SIGN_IDENTITY" ]] || {
+    log "WARNING: $app is unsigned (PAIRLING_SIGN_IDENTITY unset). pairling setup will reject it under the default Team ID policy."
+    return 0
+  }
+  if [[ "$SIGN_IDENTITY" == "-" ]]; then
+    /usr/bin/codesign --force --options runtime \
+      --entitlements "$SOURCE_ROOT/mac/automation-helper/PairlingAutomation.entitlements" \
+      --identifier "$AUTOMATION_HELPER_BUNDLE_ID" --sign - "$app"
+  else
+    /usr/bin/codesign --force --timestamp --options runtime \
+      --entitlements "$SOURCE_ROOT/mac/automation-helper/PairlingAutomation.entitlements" \
+      --identifier "$AUTOMATION_HELPER_BUNDLE_ID" --sign "$SIGN_IDENTITY" "$app"
+  fi
+}
+
+generate_automation_helper_project() {
+  command -v xcodegen >/dev/null 2>&1 \
+    || fail "xcodegen is required to build the Pairling automation helper"
+  [[ -f "$SOURCE_ROOT/project.yml" && -d "$SOURCE_ROOT/mac/automation-helper" ]] \
+    || fail "automation helper source is incomplete"
+  (
+    cd "$SOURCE_ROOT"
+    xcodegen generate
+  ) || fail "could not generate the Pairling automation helper project"
+}
+
+build_automation_helper() {
+  local arch="$1" destination="$2" xcode_arch derived built
+  xcode_arch="$arch"
+  [[ "$xcode_arch" != "x64" ]] || xcode_arch="x86_64"
+  derived="$WORK/automation-helper-$arch"
+  /usr/bin/xcodebuild \
+    -project "$SOURCE_ROOT/Pairling.xcodeproj" \
+    -scheme PairlingAutomation \
+    -configuration Release \
+    -derivedDataPath "$derived" \
+    ARCHS="$xcode_arch" \
+    ONLY_ACTIVE_ARCH=NO \
+    CODE_SIGNING_ALLOWED=NO \
+    MARKETING_VERSION="$VERSION" \
+    CURRENT_PROJECT_VERSION=1 \
+    build \
+    || fail "could not build the Pairling automation helper for $arch"
+  built="$derived/Build/Products/Release/$AUTOMATION_HELPER_APP_NAME"
+  [[ -d "$built" && ! -L "$built" ]] \
+    || fail "automation helper build output is missing for $arch"
+  mkdir -p "$(dirname "$destination")"
+  /usr/bin/ditto "$built" "$destination"
+  sign_automation_helper_bundle "$destination"
+  verify_automation_helper_bundle "$destination" "$arch"
 }
 
 verify_prebuilt() {
@@ -698,6 +822,80 @@ team_of() {
   printf '%s\n' "$team"
 }
 
+AUTOMATION_HELPER_ARM64="$BIN_BUILD/automation-helper-arm64/$AUTOMATION_HELPER_APP_NAME"
+AUTOMATION_HELPER_X64="$BIN_BUILD/automation-helper-x64/$AUTOMATION_HELPER_APP_NAME"
+AUTOMATION_ARCHIVE_ARM64="$DIST_DIR/pairling-automation-arm64.zip"
+AUTOMATION_ARCHIVE_X64="$DIST_DIR/pairling-automation-x64.zip"
+AUTOMATION_NOTARIZATION_TREE_ARM64=""
+AUTOMATION_NOTARIZATION_TREE_X64=""
+
+extract_prebuilt_automation_helper() {
+  local archive="$1" arch="$2" expected_sha="$3" destination="$4" expected_arch extraction
+  [[ -f "$archive" && ! -L "$archive" ]] \
+    || fail "prebuilt Pairling automation helper archive is missing or linked: $archive"
+  [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "prebuilt Pairling automation helper is not pinned by release evidence: $arch"
+  expected_arch="$arch"
+  [[ "$expected_arch" != "x64" ]] || expected_arch="x86_64"
+  extraction="$WORK/prebuilt-automation-$arch"
+  python3 "$SOURCE_ROOT/mac/install/automation_helper_lifecycle.py" extract-verify \
+    --archive "$archive" \
+    --destination "$extraction" \
+    --expected-sha256 "$expected_sha" \
+    --architecture "$expected_arch" \
+    || fail "prebuilt Pairling automation helper archive failed safe extraction, signature, identity, architecture, entitlement, or notarization verification: $arch"
+  mkdir -p "$(dirname "$destination")"
+  /usr/bin/ditto "$extraction/$AUTOMATION_HELPER_APP_NAME" "$destination"
+  verify_automation_helper_bundle "$destination" "$arch"
+}
+
+archive_automation_helper() {
+  local helper="$1" archive="$2"
+  rm -f "$archive"
+  (
+    cd "$(dirname "$helper")"
+    /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$(basename "$helper")" "$archive"
+  ) || fail "could not archive the Pairling automation helper: $helper"
+  [[ -f "$archive" && ! -L "$archive" ]] \
+    || fail "Pairling automation helper archive is missing or linked: $archive"
+}
+
+if [[ -n "$PREBUILT_AUTOMATION_ARM64" || -n "$PREBUILT_AUTOMATION_X64" ]]; then
+  [[ -n "$RELEASE_EVIDENCE" && -n "$PREBUILT_AUTOMATION_ARM64" && -n "$PREBUILT_AUTOMATION_X64" ]] \
+    || fail "prebuilt Pairling automation helper archives require --release-evidence and both architectures."
+  extract_prebuilt_automation_helper \
+    "$PREBUILT_AUTOMATION_ARM64" arm64 "$EVIDENCE_AUTOMATION_ARM64_SHA" "$AUTOMATION_HELPER_ARM64"
+  extract_prebuilt_automation_helper \
+    "$PREBUILT_AUTOMATION_X64" x64 "$EVIDENCE_AUTOMATION_X64_SHA" "$AUTOMATION_HELPER_X64"
+else
+  generate_automation_helper_project
+  build_automation_helper arm64 "$AUTOMATION_HELPER_ARM64"
+  build_automation_helper x64 "$AUTOMATION_HELPER_X64"
+fi
+
+if [[ "$NOTARIZE" == "1" ]]; then
+  for arch in arm64 x64; do
+    case "$arch" in
+      arm64) helper="$AUTOMATION_HELPER_ARM64" ;;
+      x64) helper="$AUTOMATION_HELPER_X64" ;;
+    esac
+    helper_tree_sha="$(tree_sha256 "$helper")"
+    notarize_subject "$helper" "pairling-automation-$arch" tree-sha256 "$helper_tree_sha"
+    /usr/bin/xcrun stapler staple "$helper" \
+      || fail "could not staple the notarization ticket to the Pairling automation helper: $arch"
+    /usr/bin/xcrun stapler validate "$helper" \
+      || fail "could not validate the stapled Pairling automation helper: $arch"
+    verify_automation_helper_bundle "$helper" "$arch"
+    case "$arch" in
+      arm64) AUTOMATION_NOTARIZATION_TREE_ARM64="$helper_tree_sha" ;;
+      x64) AUTOMATION_NOTARIZATION_TREE_X64="$helper_tree_sha" ;;
+    esac
+  done
+fi
+
+archive_automation_helper "$AUTOMATION_HELPER_ARM64" "$AUTOMATION_ARCHIVE_ARM64"
+archive_automation_helper "$AUTOMATION_HELPER_X64" "$AUTOMATION_ARCHIVE_X64"
+
 # --- stage the seven inert packages -----------------------------------------
 cp "$SOURCE_ROOT/npm/pairling/package.json" "$STAGE/pairling/package.json"
 cp "$SOURCE_ROOT/npm/pairling/README.md" "$STAGE/pairling/README.md"
@@ -707,11 +905,13 @@ chmod 755 "$STAGE/pairling/bin/pairling.mjs"
 
 release_evidence_field() {
   local section="$1" arch="$2" field="$3"
-  [[ "$section" == "python" && "$field" == "sha256" ]] || fail "unsupported loaded release evidence field"
-  case "$arch" in
-    arm64) printf '%s\n' "$EVIDENCE_PYTHON_ARM64_SHA" ;;
-    x64) printf '%s\n' "$EVIDENCE_PYTHON_X64_SHA" ;;
-    *) fail "unsupported release evidence architecture: $arch" ;;
+  [[ "$field" == "sha256" ]] || fail "unsupported loaded release evidence field"
+  case "$section:$arch" in
+    python:arm64) printf '%s\n' "$EVIDENCE_PYTHON_ARM64_SHA" ;;
+    python:x64) printf '%s\n' "$EVIDENCE_PYTHON_X64_SHA" ;;
+    automation:arm64) printf '%s\n' "$EVIDENCE_AUTOMATION_ARM64_SHA" ;;
+    automation:x64) printf '%s\n' "$EVIDENCE_AUTOMATION_X64_SHA" ;;
+    *) fail "unsupported release evidence asset: $section/$arch" ;;
   esac
 }
 
@@ -763,13 +963,18 @@ stage_provider_sdks() {
 
 
 stage_runtime() {
-  local arch="$1" binary="$2" prebuilt_python="$3"
-  local dir="$STAGE/runtime-darwin-$arch"
-  mkdir -p "$dir/bin"
+  local arch="$1" binary="$2" prebuilt_python="$3" automation_helper="$4" automation_archive="$5"
+  local dir="$STAGE/runtime-darwin-$arch" automation_archive_sha=""
+  [[ -f "$automation_archive" && ! -L "$automation_archive" ]] \
+    || fail "Pairling automation helper archive is missing or linked: $automation_archive"
+  automation_archive_sha="$(/usr/bin/shasum -a 256 "$automation_archive" | awk '{ print $1 }')"
+  mkdir -p "$dir/bin" "$dir/automation"
   cp "$SOURCE_ROOT/npm/runtime-darwin-$arch/package.json" "$dir/package.json"
   cp "$SOURCE_ROOT/npm/runtime-darwin-$arch/README.md" "$dir/README.md"
   cp "$binary" "$dir/bin/pairling-connectd"
   chmod 755 "$dir/bin/pairling-connectd"
+  /usr/bin/ditto "$automation_helper" "$dir/automation/$AUTOMATION_HELPER_APP_NAME"
+  verify_automation_helper_bundle "$dir/automation/$AUTOMATION_HELPER_APP_NAME" "$arch"
   stage_provider_sdks "$arch" "$dir"
 
   # P3 CPython. Custody rule (same as connectd): the Developer ID signing only
@@ -836,12 +1041,19 @@ stage_runtime() {
     python_team="$(team_of "$python_bin")"
     python_id="$(/usr/bin/codesign -dvv "$python_bin" 2>&1 | sed -n 's/^Identifier=//p')"
   fi
+  local automation_app="$dir/automation/$AUTOMATION_HELPER_APP_NAME"
+  local automation_executable="$automation_app/Contents/MacOS/$AUTOMATION_HELPER_EXECUTABLE"
+  local automation_team automation_id automation_tree_sha
+  automation_team="$(team_of "$automation_executable")"
+  automation_id="$(/usr/bin/codesign -dvv "$automation_executable" 2>&1 | sed -n 's/^Identifier=//p')"
+  automation_tree_sha="$(tree_sha256 "$automation_app")"
 
-  python3 - "$dir/manifest.json" "$dir" "$VERSION" "$REVISION" "$arch" "$EVIDENCE_SHA256" "$(team_of "$dir/bin/pairling-connectd")" "${python_team:-}" "${python_id:-}" "$python_archive_sha" <<'PY'
+
+  python3 - "$dir/manifest.json" "$dir" "$VERSION" "$REVISION" "$arch" "$EVIDENCE_SHA256" "$(team_of "$dir/bin/pairling-connectd")" "${python_team:-}" "${python_id:-}" "$python_archive_sha" "$automation_team" "$automation_id" "$automation_archive_sha" "$automation_tree_sha" <<'PY'
 import hashlib, json, stat, sys
 from pathlib import Path
 
-out, root_value, version, revision, architecture, evidence_sha256, team, python_team, python_id, python_archive_sha256 = sys.argv[1:]
+out, root_value, version, revision, architecture, evidence_sha256, team, python_team, python_id, python_archive_sha256, automation_team, automation_id, automation_archive_sha256, automation_tree_sha256 = sys.argv[1:]
 root = Path(root_value)
 
 def sha_file(path):
@@ -853,7 +1065,7 @@ def sha_file(path):
 
 files = []
 directories = []
-tops = [root / "bin", root / "provider-sdks"]
+tops = [root / "bin", root / "provider-sdks", root / "automation"]
 if (root / "python").exists():
     tops.append(root / "python")
 for top in tops:
@@ -893,6 +1105,10 @@ for top in tops:
             entry["team_id"] = python_team or None
             entry["identifier"] = python_id or None
             entry["architecture"] = architecture
+        elif relative == "automation/Pairling.app/Contents/MacOS/PairlingAutomation":
+            entry["team_id"] = automation_team or None
+            entry["identifier"] = automation_id or None
+            entry["architecture"] = architecture
         files.append(entry)
 
 json.dump({
@@ -902,26 +1118,30 @@ json.dump({
     "architecture": architecture,
     "release_evidence_sha256": evidence_sha256 or None,
     "python_archive_sha256": python_archive_sha256 or None,
+    "automation_archive_sha256": automation_archive_sha256,
+    "automation_tree_sha256": automation_tree_sha256,
     "directories": directories,
     "files": files,
 }, open(out, "w"), indent=2, sort_keys=True)
 open(out, "a").write("\n")
 PY
 }
-stage_runtime arm64 "$CONNECTD_ARM64" "$PREBUILT_PYTHON_ARM64"
-stage_runtime x64 "$CONNECTD_X64" "$PREBUILT_PYTHON_X64"
+stage_runtime arm64 "$CONNECTD_ARM64" "$PREBUILT_PYTHON_ARM64" "$AUTOMATION_HELPER_ARM64" "$AUTOMATION_ARCHIVE_ARM64"
+stage_runtime x64 "$CONNECTD_X64" "$PREBUILT_PYTHON_X64" "$AUTOMATION_HELPER_X64" "$AUTOMATION_ARCHIVE_X64"
 
 if [[ "$NOTARIZE" == "1" ]]; then
   python3 - "$DIST_DIR/NOTARIZATION-RECEIPTS.json" "$VERSION" "$REVISION" \
     "$(/usr/bin/shasum -a 256 "$CONNECTD_ARM64" | awk '{ print $1 }')" \
     "$(/usr/bin/shasum -a 256 "$CONNECTD_X64" | awk '{ print $1 }')" \
     "$(tree_sha256 "$STAGE/runtime-darwin-arm64/python")" \
-    "$(tree_sha256 "$STAGE/runtime-darwin-x64/python")" <<'PY' \
+    "$(tree_sha256 "$STAGE/runtime-darwin-x64/python")" \
+    "$AUTOMATION_NOTARIZATION_TREE_ARM64" \
+    "$AUTOMATION_NOTARIZATION_TREE_X64" <<'PY' \
     || fail "notarization receipts do not bind all final runtime subjects"
 import json, re, sys
 from pathlib import Path
 
-path, version, revision, connectd_arm, connectd_x64, python_arm, python_x64 = sys.argv[1:]
+path, version, revision, connectd_arm, connectd_x64, python_arm, python_x64, automation_arm, automation_x64 = sys.argv[1:]
 value = json.loads(Path(path).read_text(encoding="utf-8"))
 if set(value) != {"schema_version", "version", "source_revision", "assets"}:
     raise SystemExit("unexpected receipt-set keys")
@@ -932,6 +1152,8 @@ expected = {
     "pairling-connectd-x64": ("file-sha256", connectd_x64),
     "pairling-python-arm64": ("tree-sha256", python_arm),
     "pairling-python-x64": ("tree-sha256", python_x64),
+    "pairling-automation-arm64": ("tree-sha256", automation_arm),
+    "pairling-automation-x64": ("tree-sha256", automation_x64),
 }
 if set(value["assets"]) != set(expected):
     raise SystemExit("receipt-set asset labels mismatch")
@@ -957,7 +1179,9 @@ verify_final_release_evidence_assets() {
     --connectd-arm64 "$CONNECTD_ARM64" \
     --connectd-x64 "$CONNECTD_X64" \
     --python-arm64 "$DIST_DIR/pairling-python-arm64.tar.gz" \
-    --python-x64 "$DIST_DIR/pairling-python-x64.tar.gz")" \
+    --python-x64 "$DIST_DIR/pairling-python-x64.tar.gz" \
+    --automation-arm64 "$AUTOMATION_ARCHIVE_ARM64" \
+    --automation-x64 "$AUTOMATION_ARCHIVE_X64")" \
     || fail "final package assets do not match loaded release evidence"
   final_evidence_sha="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["evidence_sha256"])' <<<"$output")"
   [[ "$final_evidence_sha" == "$EVIDENCE_SHA256" ]] \
@@ -1116,10 +1340,10 @@ stage_runtime_component \
   "$RUNTIME_X64_MANIFEST_SHA"
 
 # --- payload integrity manifest ---------------------------------------------
-python3 - "$STAGE/pairling" "$VERSION" "$REVISION" "$SOURCE_DIRTY" "$EVIDENCE_SHA256" "$(team_of "$CONNECTD_ARM64")" "$CONNECTD_ARM64" "$(team_of "$CONNECTD_X64")" "$CONNECTD_X64" "$PYTHON_ARM64_ARCHIVE_SHA" "$PYTHON_X64_ARCHIVE_SHA" "$RUNTIME_ARM64_MANIFEST_SHA" "$RUNTIME_X64_MANIFEST_SHA" <<'PY'
+python3 - "$STAGE/pairling" "$VERSION" "$REVISION" "$SOURCE_DIRTY" "$EVIDENCE_SHA256" "$(team_of "$CONNECTD_ARM64")" "$CONNECTD_ARM64" "$(team_of "$CONNECTD_X64")" "$CONNECTD_X64" "$PYTHON_ARM64_ARCHIVE_SHA" "$PYTHON_X64_ARCHIVE_SHA" "$(/usr/bin/shasum -a 256 "$AUTOMATION_ARCHIVE_ARM64" | awk '{ print $1 }')" "$(/usr/bin/shasum -a 256 "$AUTOMATION_ARCHIVE_X64" | awk '{ print $1 }')" "$RUNTIME_ARM64_MANIFEST_SHA" "$RUNTIME_X64_MANIFEST_SHA" <<'PY'
 import hashlib, json, stat, sys
 from pathlib import Path
-pkg, version, revision, dirty, evidence_sha256, team_arm, bin_arm, team_x64, bin_x64, python_arm_sha, python_x64_sha, runtime_arm_sha, runtime_x64_sha = sys.argv[1:]
+pkg, version, revision, dirty, evidence_sha256, team_arm, bin_arm, team_x64, bin_x64, python_arm_sha, python_x64_sha, automation_arm_sha, automation_x64_sha, runtime_arm_sha, runtime_x64_sha = sys.argv[1:]
 pkg = Path(pkg)
 
 payload = pkg / "payload"
@@ -1158,6 +1382,10 @@ manifest = {
     "python_archives": {
         "darwin-arm64": python_arm_sha or None,
         "darwin-x64": python_x64_sha or None,
+    },
+    "automation_archives": {
+        "darwin-arm64": automation_arm_sha,
+        "darwin-x64": automation_x64_sha,
     },
     "runtime_manifests": {
         "darwin-arm64": runtime_arm_sha,
@@ -1359,7 +1587,11 @@ verify_runtime_component \
   "provider-sdks/packages/@github/copilot-darwin-x64"
 
 # --- deterministic pack ------------------------------------------------------
-python3 "$SOURCE_ROOT/mac/install/verify-payload-manifest.py" --release --archive \
+PAYLOAD_VERIFY_ARGS=(--archive)
+if [[ "$RELEASE_MODE" == "1" ]]; then
+  PAYLOAD_VERIFY_ARGS=(--release --archive)
+fi
+python3 "$SOURCE_ROOT/mac/install/verify-payload-manifest.py" "${PAYLOAD_VERIFY_ARGS[@]}" \
   "$STAGE/pairling/payload" \
   "$STAGE/pairling/payload-manifest.json"
 find "$STAGE" -exec touch -h -t 202001010000 {} +
@@ -1461,16 +1693,18 @@ for arch in arm64 x64; do
 done
 mkdir -p "$PACK_VERIFY_ROOT/pairling"
 tar -xzf "$DIST_DIR/pairling-$VERSION.tgz" -C "$PACK_VERIFY_ROOT/pairling"
-python3 "$SOURCE_ROOT/mac/install/verify-payload-manifest.py" --release --archive \
+python3 "$SOURCE_ROOT/mac/install/verify-payload-manifest.py" "${PAYLOAD_VERIFY_ARGS[@]}" \
   "$PACK_VERIFY_ROOT/pairling/package/payload" \
   "$PACK_VERIFY_ROOT/pairling/package/payload-manifest.json"
 rm -rf "$PACK_VERIFY_ROOT"
 (cd "$DIST_DIR" && /usr/bin/shasum -a 256 *.tgz > SHASUMS256.txt)
 
-# Keep the raw binaries next to the tarballs for the GitHub Release asset flow.
+# Keep the raw signed runtime assets next to the tarballs for the GitHub
+# Release flow. The helper archives contain the signed, stapled app bundles.
 cp "$CONNECTD_ARM64" "$DIST_DIR/pairling-connectd-arm64"
 cp "$CONNECTD_X64" "$DIST_DIR/pairling-connectd-x64"
 (cd "$DIST_DIR" && /usr/bin/shasum -a 256 pairling-connectd-arm64 pairling-connectd-x64 > CONNECTD-SHASUMS256.txt)
+(cd "$DIST_DIR" && /usr/bin/shasum -a 256 pairling-automation-arm64.zip pairling-automation-x64.zip > AUTOMATION-SHASUMS256.txt)
 
 log "Built npm packages $VERSION (source $REVISION, dirty=$SOURCE_DIRTY)"
 log "  dist: $DIST_DIR"

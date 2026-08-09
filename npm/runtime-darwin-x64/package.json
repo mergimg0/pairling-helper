@@ -1,6 +1,6 @@
 {
   "name": "@pairling/runtime-darwin-x64",
-  "version": "0.2.123",
+  "version": "0.2.125",
   "description": "Pairling Mac runtime binaries for Intel Macs. Installed automatically as an optional dependency of the `pairling` package \u2014 do not install directly.",
   "homepage": "https://pairling.dev",
   "bugs": {
@@ -9,6 +9,7 @@
   "license": "UNLICENSED",
   "author": "Pairling (https://pairling.dev)",
   "files": [
+    "automation",
     "bin",
     "python",
     "provider-sdks",

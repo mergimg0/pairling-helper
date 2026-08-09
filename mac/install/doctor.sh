@@ -113,7 +113,6 @@ PAIR_ROOT = APP_SUPPORT / "pair"
 USER_PLIST = home / "Library" / "LaunchAgents" / f"{PAIRLING_LABEL}.plist"
 CONNECTD_USER_PLIST = home / "Library" / "LaunchAgents" / f"{PAIRLING_CONNECTD_LABEL}.plist"
 PTYBROKER_USER_PLIST = home / "Library" / "LaunchAgents" / f"{PAIRLING_PTYBROKER_LABEL}.plist"
-CLAUDE_INJECTOR = home / "Applications" / "ClaudeInjector.app" / "Contents" / "MacOS" / "ClaudeInjector"
 
 sys.path.insert(0, str(repo_root / "mac" / "companiond"))
 from pairling_connectd_status import fetch_connectd_status, redacted_connectd_summary
@@ -122,6 +121,7 @@ from runtime_manifest import (
     ptybroker_payload_sha256,
     verified_managed_release_identity,
 )
+from pairling_automation import terminal_permissions_summary
 
 checks = []
 
@@ -394,32 +394,25 @@ def detected_tailnet_ip() -> str | None:
 
 
 def permission_readiness() -> dict:
-    helper_installed = CLAUDE_INJECTOR.exists()
-    grantee_path = str(CLAUDE_INJECTOR if helper_installed else Path("/usr/bin/osascript"))
+    """Report the signed helper's public, non-prompting capability only."""
+    terminal_control = terminal_permissions_summary(fresh=True)
     return {
-        "ios_local_network": {
-            "required_for": ["bonjour_pairing", "lan_route_validation"],
-            "status": "requires_user_prompt",
-        },
-        "ios_camera": {
-            "required_for": ["qr_scan"],
-            "status": "not_requested",
-        },
+        "tcc_databases": "not_read_or_modified",
         "mac_accessibility": {
-            "required_for": ["terminal_ui_synthesis"],
-            "status": "not_required_until_terminal_control",
-            "grantee_path": grantee_path,
-            "helper_installed": helper_installed,
-            "helper_path": str(CLAUDE_INJECTOR),
-            "doctor_probe": "reports_required_grantee",
+            "required_for": "terminal_control",
+            "status": terminal_control["accessibility"]["state"],
+            "grantee": "Pairling",
+            "grantee_bundle_id": terminal_control["helper"].get("bundle_id"),
+            "prompting": "disabled",
         },
         "mac_automation": {
-            "required_for": ["terminal_app_control"],
-            "status": "not_required_by_default",
-            "grantee_path": grantee_path,
-            "doctor_probe": "reports_required_grantee",
+            "required_for": "terminal_control",
+            "status": terminal_control["terminal_automation"]["state"],
+            "grantee": "Pairling",
+            "target": "Terminal",
+            "prompting": "disabled",
         },
-        "privacy_database": "not_modified",
+        "terminal_control": terminal_control,
     }
 
 
@@ -563,56 +556,80 @@ def ptybroker_deployment_status(*, launchd_loaded: bool, verified_release_root: 
     }
 
 
-def first_run_stage(*, installed: bool, running: bool, pair_window_open: bool, remote_ready: bool) -> str:
+def first_run_stage(
+    *,
+    installed: bool,
+    running: bool,
+    terminal_permissions_ready: bool,
+    helper_state: str,
+    provider_ready: bool,
+    pair_window_open: bool,
+    remote_ready: bool,
+) -> str:
     if not installed:
-        return "helper_missing"
+        return "runtime_not_installed"
     if not running:
-        return "runtime_not_ready"
-    if remote_ready and pair_window_open:
-        return "remote_ready"
-    if pair_window_open:
-        return "pair_window_open"
+        return "runtime_not_running"
+    if helper_state != "granted":
+        return "automation_helper_missing"
+    if not terminal_permissions_ready:
+        return "terminal_permissions_missing"
+    if not provider_ready:
+        return "provider_not_ready"
     if not remote_ready:
         return "remote_route_missing"
-    return "helper_running"
+    if not pair_window_open:
+        return "open_pairing_invitation"
+    return "ready_to_pair"
 
 
 def next_action_for_stage(stage: str, *, remote_status: str, pair_window_open: bool) -> dict:
-    if stage == "remote_ready":
-        return {
-            "id": "pair_iphone",
-            "label": "Pair iPhone",
-            "message": "Open Pairling on iPhone and pair with this Mac.",
-        }
-    if pair_window_open and remote_status != "ready":
-        return {
-            "id": "pair_local_or_retry_connect",
-            "label": "Pair locally or retry Connect",
-            "message": "A local pairing invitation is open. Pair locally now, or retry Pairling Connect after this Mac is ready.",
-        }
-    if stage == "remote_route_missing":
-        return {
-            "id": "authenticate_pairling_connect",
-            "label": "Authenticate Pairling Connect",
-            "message": "Approve Pairling Connect in the browser, then recheck this Mac.",
-        }
-    if stage == "helper_running":
-        return {
+    actions = {
+        "runtime_not_installed": {
+            "id": "install_runtime",
+            "label": "Install Pairling runtime",
+            "message": "Run pairling setup to install the verified Pairling runtime.",
+        },
+        "runtime_not_running": {
+            "id": "start_runtime",
+            "label": "Start Pairling runtime",
+            "message": "Run pairling setup and review the failing runtime checks.",
+        },
+        "automation_helper_missing": {
+            "id": "repair_automation_helper",
+            "label": "Install Pairling automation helper",
+            "message": "Run pairling setup to install the signed Pairling helper before pairing.",
+        },
+        "terminal_permissions_missing": {
+            "id": "finish_mac_permissions",
+            "label": "Finish Mac permissions",
+            "message": "Finish Pairling Accessibility and Pairling control of Terminal on this Mac.",
+        },
+        "provider_not_ready": {
+            "id": "install_provider",
+            "label": "Install an agent provider",
+            "message": "Install a supported agent provider before opening a pairing invitation.",
+        },
+        "remote_route_missing": {
+            "id": "finish_pairling_connect",
+            "label": "Finish Pairling Connect",
+            "message": "Finish Pairling Connect sign-in on this Mac so the private route becomes ready.",
+        },
+        "open_pairing_invitation": {
             "id": "open_pairing_invitation",
             "label": "Open pairing invitation",
-            "message": "Run pairling pair to open a pairing invitation, then pair from the iPhone.",
-        }
-    if stage == "runtime_not_ready":
-        return {
-            "id": "start_runtime",
-            "label": "Start the Pairling runtime",
-            "message": "Run pairling setup and review the failing runtime checks.",
-        }
-    return {
-        "id": "install_cli",
-        "label": "Install the Pairling CLI",
-        "message": "Run npm install -g pairling then pairling setup on this Mac before pairing.",
+            "message": "Open a pairing invitation after the private route and Mac permissions are ready.",
+        },
+        "ready_to_pair": {
+            "id": "pair_iphone",
+            "label": "Pair an iPhone",
+            "message": "Mac is ready. Scan the Pairling QR code on your iPhone.",
+        },
     }
+    action = dict(actions[stage])
+    action["remote_status"] = remote_status
+    action["pair_window_open"] = pair_window_open
+    return action
 
 
 manifest = None
@@ -1092,19 +1109,34 @@ pair_window_open = bool(active_pairs)
 tailnet_ip = detected_tailnet_ip()
 remote_ready = bool(connectd_summary.get("route_ready"))
 remote_status = "ready" if remote_ready else str(connectd_summary.get("status") or "missing_mac")
-local_pairing_ready = runtime_installed and runtime_running_for_first_run and pair_window_open
-product_ready = local_pairing_ready and remote_ready
+permissions = permission_readiness()
+terminal_control = permissions["terminal_control"]
+terminal_permissions_ready = terminal_control.get("terminal_control_ready") is True
+helper_state = str(terminal_control.get("helper", {}).get("state") or "unknown_error")
+provider_ready = any(path is not None for path in provider_evidence.values())
+runtime_ready = runtime_installed and runtime_running_for_first_run
+local_pairing_ready = runtime_ready and terminal_permissions_ready and provider_ready
+ready_to_pair = local_pairing_ready and remote_ready and pair_window_open
 stage = first_run_stage(
     installed=runtime_installed,
     running=runtime_running_for_first_run,
+    terminal_permissions_ready=terminal_permissions_ready,
+    helper_state=helper_state,
+    provider_ready=provider_ready,
     pair_window_open=pair_window_open,
     remote_ready=remote_ready,
 )
 first_run = {
-    "ok": local_pairing_ready,
-    "schema_version": 2,
+    "ok": ready_to_pair,
+    "schema_version": 3,
     "stage": stage,
-    "product_ready": product_ready,
+    "product_ready": ready_to_pair,
+    "ready_to_pair": ready_to_pair,
+    "runtime_ready": runtime_ready,
+    "remote_route_ready": remote_ready,
+    "terminal_permissions_ready": terminal_permissions_ready,
+    "provider_ready": provider_ready,
+    "pair_window_open": pair_window_open,
     "local_pairing_ready": local_pairing_ready,
     "helper": {
         "installed": runtime_installed,
@@ -1127,8 +1159,8 @@ first_run = {
         "mac_tailnet_ip": (connectd_summary.get("route") or {}).get("host") if isinstance(connectd_summary.get("route"), dict) else None,
         "iphone_tailnet_detected": "unknown_until_route_used",
         "preferred_remote_route": (connectd_summary.get("route") or {}).get("base_url") if isinstance(connectd_summary.get("route"), dict) else None,
-        "local_pairing_available": runtime_installed and runtime_running_for_first_run,
-        "bonjour_available": pair_window_open,
+        "local_pairing_available": False,
+        "bonjour_available": False,
         "standalone_tailnet_diagnostic_ip": tailnet_ip,
     },
     "connect": connectd_summary,
@@ -1137,19 +1169,19 @@ first_run = {
         "active_pair_count": len(active_pairs),
         "active_pairs": active_pairs[:3],
         "expires_in": active_pairs[0]["expires_in"] if active_pairs else None,
-        "bonjour": "advertised_by_pair_start_if_dns_sd_available" if pair_window_open else "open_pairing_invitation_to_advertise",
-        "qr_fallback": "available_from_pairling_pair_qr",
-        "manual_url_fallback": "available_from_pairling_pair_json",
+        "bonjour": "not_used_by_pairling_connect",
+        "qr_fallback": "available_from_pairling_pair_qr_after_ready_to_pair",
+        "manual_url_fallback": "available_from_pairling_pair_json_after_ready_to_pair",
     },
     "routes": {
         "localhost": tcp_accepts("127.0.0.1", PAIRLING_PORT),
-        "lan": "verified_after_pair_claim_host_chain",
+        "lan": "not_used_by_pairling_connect",
         "tailscale": remote_status,
         "pairling_connect": remote_status,
     },
-    "permissions": permission_readiness(),
+    "permissions": permissions,
     "provider_readiness": {
-        "status": "checked_by_runtime_after_pairing",
+        "status": "ready" if provider_ready else "no_supported_provider_detected",
         "detected_clis": provider_evidence,
     },
     "next_action": next_action_for_stage(stage, remote_status=remote_status, pair_window_open=pair_window_open),

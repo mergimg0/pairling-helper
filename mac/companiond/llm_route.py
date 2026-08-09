@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local provider CLI runner shared by /llm-route and Pairling tools."""
+"""Trusted local agent runner plus the filesystem-isolated remote route contract."""
 
 from __future__ import annotations
 
@@ -39,6 +39,33 @@ def find_executable(candidates: list[Path | str]) -> Path | None:
     return None
 
 
+def run_remote_llm(
+    *,
+    model: str,
+    prompt: str,
+    system: str | None = None,
+    timeout_seconds: int = 120,
+) -> str:
+    """Fail closed until a prompt-only backend has no access to local files.
+
+    Agent CLIs are intentionally excluded here. Disabling model-visible tools
+    does not prove that an agent process cannot load user configuration,
+    project instructions, hooks, or other filesystem context.
+    """
+    del prompt, system, timeout_seconds
+    if llm_route_model_family(model) is None:
+        raise LLMRouteError(
+            "invalid_model",
+            "model must be sonnet|haiku|opus|gpt-5.5|gpt-5.4|gpt-5.4-mini|gpt-5.3-codex",
+            400,
+        )
+    raise LLMRouteError(
+        "remote_llm_backend_unavailable",
+        "remote prompts cannot be isolated from local agent filesystem access",
+        503,
+    )
+
+
 def run_local_llm(
     *,
     model: str,
@@ -46,6 +73,7 @@ def run_local_llm(
     system: str | None = None,
     timeout_seconds: int = 120,
 ) -> str:
+    """Run an agent CLI only for trusted, locally constructed Pairling prompts."""
     family = llm_route_model_family(model)
     if family is None:
         raise LLMRouteError(

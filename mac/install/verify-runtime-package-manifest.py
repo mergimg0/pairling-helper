@@ -357,6 +357,32 @@ def sha256_file(path: Path) -> str:
             digest.update(chunk)
     return digest.hexdigest()
 
+def valid_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def tree_sha256(path: Path) -> str:
+    if path.is_symlink() or not path.is_dir():
+        raise ValueError("automation helper app is not a real directory")
+    digest = hashlib.sha256()
+    paths = [path, *sorted(path.rglob("*"), key=lambda item: item.relative_to(path).as_posix())]
+    for item in paths:
+        metadata = item.lstat()
+        relative = "." if item == path else item.relative_to(path).as_posix()
+        mode = f"{stat.S_IMODE(metadata.st_mode):04o}"
+        if stat.S_ISDIR(metadata.st_mode):
+            record = f"{relative}\0D\0{mode}\n"
+        elif stat.S_ISREG(metadata.st_mode):
+            record = f"{relative}\0F\0{mode}\0{sha256_file(item)}\n"
+        else:
+            raise ValueError(f"automation helper app has an unsupported entry: {relative}")
+        digest.update(record.encode("utf-8"))
+    return digest.hexdigest()
+
 def load_json_object(path: Path, label: str) -> tuple[dict[str, object] | None, str | None]:
     if path.is_symlink() or not path.is_file():
         return None, f"{label} must be a regular file, not a symlink"
@@ -1011,7 +1037,7 @@ def safe_relative(value: object) -> str | None:
     path = Path(value)
     if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
         return None
-    if not path.parts or path.parts[0] not in {"bin", "python", "provider-sdks"}:
+    if not path.parts or path.parts[0] not in {"automation", "bin", "python", "provider-sdks"}:
         return None
     return path.as_posix()
 
@@ -1085,7 +1111,7 @@ def inventory(
 ) -> tuple[dict[str, tuple[Path, int]], dict[str, tuple[Path, int]], str | None]:
     files: dict[str, tuple[Path, int]] = {}
     directories: dict[str, tuple[Path, int]] = {}
-    tops = [root / "bin", root / "provider-sdks"]
+    tops = [root / "automation", root / "bin", root / "provider-sdks"]
     if require_python or (root / "python").exists():
         tops.append(root / "python")
     for top in tops:
@@ -1222,7 +1248,7 @@ def verify_package_json(path: Path, version: str) -> tuple[bool, str | None]:
     required = {
         "name": f"@pairling/runtime-darwin-{arch}",
         "version": version,
-        "files": ["bin", "python", "provider-sdks", "manifest.json"],
+        "files": ["automation", "bin", "python", "provider-sdks", "manifest.json"],
         "os": ["darwin"],
         "engines": {"node": ">=20"},
         "publishConfig": {"access": "public"},
@@ -1249,7 +1275,14 @@ def verify_archive_shape(root: Path, manifest: dict[str, object], version: str) 
         and (item["path"] == "python" or item["path"].startswith("python/"))
         for item in manifest.get("directories", [])
     )
-    expected_root = {"README.md", "bin", "manifest.json", "package.json", "provider-sdks"}
+    expected_root = {
+        "README.md",
+        "automation",
+        "bin",
+        "manifest.json",
+        "package.json",
+        "provider-sdks",
+    }
     if has_python:
         expected_root.add("python")
     actual_root = {path.name for path in root.iterdir()}
@@ -1261,6 +1294,7 @@ def verify_archive_shape(root: Path, manifest: dict[str, object], version: str) 
         return "archive root has unexpected entries: " + ", ".join(unexpected)
     checks = (
         (root, True),
+        (root / "automation", True),
         (root / "bin", True),
         (root / "provider-sdks", True),
         (root / "README.md", False),
@@ -1456,21 +1490,23 @@ def verify_runtime_package_root(
     if expected_architecture is not None and architecture != expected_architecture:
         return 0, 0, "runtime package architecture does not match the expected package"
     evidence_sha256 = manifest.get("release_evidence_sha256")
-    if evidence_sha256 is not None and (
-        not isinstance(evidence_sha256, str)
-        or len(evidence_sha256) != 64
-        or any(character not in "0123456789abcdef" for character in evidence_sha256)
-    ):
+    if evidence_sha256 is not None and not valid_sha256(evidence_sha256):
         return 0, 0, "runtime package release evidence digest is invalid"
     if "python_archive_sha256" not in manifest:
         return 0, 0, "runtime package Python archive digest is missing"
     python_archive_sha256 = manifest.get("python_archive_sha256")
-    if python_archive_sha256 is not None and (
-        not isinstance(python_archive_sha256, str)
-        or len(python_archive_sha256) != 64
-        or any(character not in "0123456789abcdef" for character in python_archive_sha256)
-    ):
+    if python_archive_sha256 is not None and not valid_sha256(python_archive_sha256):
         return 0, 0, "runtime package Python archive digest is invalid"
+    if "automation_archive_sha256" not in manifest:
+        return 0, 0, "runtime package automation archive digest is missing"
+    automation_archive_sha256 = manifest.get("automation_archive_sha256")
+    if not valid_sha256(automation_archive_sha256):
+        return 0, 0, "runtime package automation archive digest is invalid"
+    if "automation_tree_sha256" not in manifest:
+        return 0, 0, "runtime package automation helper tree digest is missing"
+    automation_tree_sha256 = manifest.get("automation_tree_sha256")
+    if not valid_sha256(automation_tree_sha256):
+        return 0, 0, "runtime package automation helper tree digest is invalid"
     identity_entries = {
         item.get("path"): item
         for item in manifest.get("files", [])
@@ -1486,6 +1522,23 @@ def verify_runtime_package_root(
             0,
             0,
             "connectd identity is missing or does not match the runtime architecture",
+        )
+    automation_entry = identity_entries.get(
+        "automation/Pairling.app/Contents/MacOS/PairlingAutomation"
+    )
+    if (
+        not isinstance(automation_entry, dict)
+        or automation_entry.get("identifier") != "dev.pairling.automation"
+        or automation_entry.get("architecture") != architecture
+        or (
+            connectd.get("team_id")
+            and automation_entry.get("team_id") != connectd.get("team_id")
+        )
+    ):
+        return (
+            0,
+            0,
+            "automation helper identity is missing or does not match connectd",
         )
     python_entry = identity_entries.get("python/bin/python3")
     if require_vendored_python and python_entry is None:
@@ -1513,7 +1566,13 @@ def verify_runtime_package_root(
     file_count, directory_count, entry_error = verify_manifest_entries(root, manifest)
     if entry_error:
         return 0, 0, entry_error
-    scope_roots = [root / "bin", root / "provider-sdks"]
+    try:
+        actual_automation_tree_sha256 = tree_sha256(root / "automation" / "Pairling.app")
+    except (OSError, ValueError) as exc:
+        return 0, 0, f"cannot inspect automation helper tree: {exc}"
+    if actual_automation_tree_sha256 != automation_tree_sha256:
+        return 0, 0, "automation helper tree digest does not match the runtime manifest"
+    scope_roots = [root / "automation", root / "bin", root / "provider-sdks"]
     if (root / "python").exists():
         scope_roots.append(root / "python")
     try:

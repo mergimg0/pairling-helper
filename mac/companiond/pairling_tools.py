@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import re
-import socket
 import threading
 import time
 import uuid
@@ -28,8 +27,6 @@ MAX_OUTPUT_CHARS = 2_000
 IPHONE_TIMEOUT_MS_DEFAULT = 2_500
 IPHONE_TIMEOUT_MS_MAX = 5_000
 FAST_VIBE_CHECK_TIMEOUT_SECONDS = max(1, min(int(os.environ.get("PAIRLING_FAST_VIBE_TIMEOUT_SECONDS", "6")), 9))
-IPHONE_HOST = os.environ.get("PHONE_TS_HOST", os.environ.get("PAIRLING_PHONE_TOOLS_HOST", "iphone-15-pro"))
-IPHONE_PORT = int(os.environ.get("PHONE_TS_PORT", os.environ.get("PAIRLING_PHONE_TOOLS_PORT", "7724")))
 WORKER_LEASE_SECONDS = 60
 REVOKED_WORKER_TTL_SECONDS = 10 * 60
 COMPLETION_TOMBSTONE_TTL_SECONDS = 10 * 60
@@ -95,7 +92,7 @@ class PhoneToolAvailabilityStore:
                 "last_seen_at": current,
                 "expires_at": current + expires_in if running else current,
                 "listener_running": running,
-                "port": _bounded_int(payload.get("port"), default=IPHONE_PORT, minimum=0, maximum=65535),
+                "port": _bounded_int(payload.get("port"), default=0, minimum=0, maximum=0),
                 "tools": normalized_tools,
                 "app_state": str(payload.get("app_state") or "unknown")[:40],
                 "worker_id": worker_id,
@@ -687,26 +684,16 @@ class PhoneToolClient:
     def __init__(
         self,
         *,
-        host: str = IPHONE_HOST,
-        port: int = IPHONE_PORT,
-        token: str | None = None,
         work_queue: PhoneToolWorkQueue | None = None,
         target_device_id: str | None = None,
     ) -> None:
-        self.host = host
-        self.port = port
-        self.token = token if token is not None else _load_phone_token()
         self.work_queue = work_queue or PHONE_TOOL_WORK_QUEUE
         self.target_device_id = str(target_device_id or "").strip()[:160] or None
 
     def is_available(self, tool: str, *, now: float | None = None) -> bool:
-        if os.environ.get("PAIRLING_PHONE_TOOLS_DIRECT_TCP") == "1":
-            return True
         return self.work_queue.is_fresh(tool, target_device_id=self.target_device_id, now=now)
 
     def unavailable_reason(self, tool: str, *, now: float | None = None) -> str | None:
-        if os.environ.get("PAIRLING_PHONE_TOOLS_DIRECT_TCP") == "1":
-            return None
         return self.work_queue.unavailable_reason(
             tool,
             target_device_id=self.target_device_id,
@@ -714,50 +701,12 @@ class PhoneToolClient:
         )
 
     def run(self, tool: str, input_payload: dict[str, Any], *, timeout_ms: int) -> ToolResult:
-        if os.environ.get("PAIRLING_PHONE_TOOLS_DIRECT_TCP") != "1":
-            return self.work_queue.submit(
-                tool,
-                input_payload,
-                timeout_ms=timeout_ms,
-                target_device_id=self.target_device_id,
-            )
-        if not self.token:
-            return ToolResult(False, "iphone", reason="iphone_not_configured", error_message="phone token missing")
-        request = json.dumps({
-            "tool": tool,
-            "token": self.token,
-            "input": input_payload,
-        }, separators=(",", ":")) + "\n"
-        timeout = max(0.05, min(timeout_ms, IPHONE_TIMEOUT_MS_MAX) / 1000)
-        try:
-            with socket.create_connection((self.host, self.port), timeout=timeout) as sock:
-                sock.settimeout(timeout)
-                sock.sendall(request.encode("utf-8"))
-                buf = bytearray()
-                while True:
-                    chunk = sock.recv(65536)
-                    if not chunk:
-                        break
-                    buf.extend(chunk)
-                    if b"\n" in buf:
-                        break
-        except ConnectionRefusedError as exc:
-            return ToolResult(False, "iphone", reason="iphone_connection_refused", error_message=str(exc))
-        except socket.timeout as exc:
-            return ToolResult(False, "iphone", reason="iphone_timeout", error_message=str(exc))
-        except OSError as exc:
-            return ToolResult(False, "iphone", reason="iphone_unavailable", error_message=str(exc))
-
-        line = bytes(buf).split(b"\n", 1)[0]
-        try:
-            response = json.loads(line.decode("utf-8"))
-        except Exception as exc:
-            return ToolResult(False, "iphone", reason="iphone_bad_response", error_message=str(exc))
-        if not response.get("ok"):
-            message = str(response.get("error") or "unknown error")
-            reason = "iphone_token_rejected" if "token" in message.lower() else "iphone_tool_failed"
-            return ToolResult(False, "iphone", reason=reason, error_message=message)
-        return ToolResult(True, "iphone", result=str(response.get("result") or ""))
+        return self.work_queue.submit(
+            tool,
+            input_payload,
+            timeout_ms=timeout_ms,
+            target_device_id=self.target_device_id,
+        )
 
 
 class MacToolRunner:
@@ -795,6 +744,7 @@ class MacToolRunner:
             return ToolResult(False, "mac_fallback", reason=exc.code, error_message=exc.message)
         except Exception as exc:
             return ToolResult(False, "mac_fallback", reason=type(exc).__name__, error_message=str(exc))
+
 
 
 def run_pairling_tool(
@@ -1019,8 +969,8 @@ def _error(code: str, message: str, started: float, now: Callable[[], float], *,
 def _diagnostics(iphone_attempted: bool, phone: PhoneToolClient, mac_model: str) -> dict[str, Any]:
     return {
         "iphone_attempted": iphone_attempted,
-        "iphone_host": phone.host,
-        "iphone_port": phone.port,
+        "iphone_transport": "authenticated_reverse_queue",
+        "target_device_id": getattr(phone, "target_device_id", None),
         "mac_model": mac_model,
     }
 
@@ -1178,16 +1128,3 @@ def _project_label(path: str) -> str:
             if idx + 1 < len(parts):
                 return parts[idx + 1]
     return Path(path).parent.name
-
-
-def _load_phone_token() -> str | None:
-    for key in ("PAIRLING_PHONE_TOOLS_TOKEN", "PHONE_TOKEN"):
-        value = os.environ.get(key)
-        if value:
-            return value.strip()
-    token_file = Path(os.environ.get("PHONE_TOKEN_FILE", str(Path.home() / ".claude" / "scripts" / ".notify-token")))
-    try:
-        value = token_file.read_text().strip()
-        return value or None
-    except OSError:
-        return None

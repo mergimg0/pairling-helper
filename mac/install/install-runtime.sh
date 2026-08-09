@@ -49,6 +49,8 @@ PAIRLING_RUNTIME_PORT="${PAIRLING_RUNTIME_PORT:-7773}"
 PAIRLING_DAEMON_LABEL="dev.pairling.companiond"
 PAIRLING_CONNECTD_LABEL="dev.pairling.connectd"
 PAIRLING_PTYBROKER_LABEL="dev.pairling.ptybroker"
+AUTOMATION_HELPER_BUNDLE_ID="dev.pairling.automation"
+AUTOMATION_LAUNCH_AGENT_LABEL="dev.pairling.automation"
 APP_SUPPORT="${PAIRLING_APP_SUPPORT_ROOT:-${COMPANION_APP_SUPPORT_ROOT:-$HOME/Library/Application Support/Pairling}}"
 while [[ "$APP_SUPPORT" != "/" && "$APP_SUPPORT" == */ ]]; do
   APP_SUPPORT="${APP_SUPPORT%/}"
@@ -82,6 +84,13 @@ INSTALL_HISTORY="$STATE_ROOT/install-history.jsonl"
 USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_DAEMON_LABEL.plist"
 CONNECTD_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_CONNECTD_LABEL.plist"
 PTYBROKER_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_PTYBROKER_LABEL.plist"
+AUTOMATION_ROOT="$APP_SUPPORT/automation"
+AUTOMATION_APP_PATH="$AUTOMATION_ROOT/Pairling.app"
+AUTOMATION_ROLLBACK_APP="$AUTOMATION_ROOT/.Pairling.rollback.app"
+AUTOMATION_ABSENT_MARKER="$AUTOMATION_ROOT/.Pairling.rollback-absent"
+AUTOMATION_USER_PLIST="$HOME/Library/LaunchAgents/$AUTOMATION_LAUNCH_AGENT_LABEL.plist"
+AUTOMATION_AGENT_ACTIVATED=0
+LEGACY_INJECTOR_APP="$HOME/Applications/ClaudeInjector.app"
 MCP_SERVER_DIR="$HOME/.claude/mcp-servers"
 MCP_SERVER_SHIM="$MCP_SERVER_DIR/phone-tools.py"
 USER_PAIRLING_WRAPPER="${PAIRLING_USER_BIN_DIR:-$HOME/.local/bin}/pairling"
@@ -1132,9 +1141,10 @@ wizard_permissions_panel() {
     wizard_box_row "$inner" "installed yet. Pairing works without it." "${WZ_GREY:-}installed yet. Pairing works without it.${r}"
     wizard_box_row "$inner" "" ""
   fi
+  wizard_box_row "$inner" "Remote access needs no macOS sharing permission." "${WZ_PAPER:-}Remote access needs no macOS sharing permission.${r}"
   wizard_box_row "$inner" "Pairling Connect uses its private embedded route." "${WZ_PAPER:-}Pairling Connect uses its private embedded route.${r}"
-  wizard_box_row "$inner" "Local Network access and the same Wi-Fi are not" "${WZ_PAPER:-}Local Network access and the same Wi-Fi are not${r}"
-  wizard_box_row "$inner" "required for pairing." "${WZ_PAPER:-}required for pairing.${r}"
+  wizard_box_row "$inner" "Pairling needs one-time permission to control Terminal." "${WZ_PAPER:-}Pairling needs one-time permission to control Terminal.${r}"
+  wizard_box_row "$inner" "macOS lists Pairling in Accessibility and Automation." "${WZ_PAPER:-}macOS lists Pairling in Accessibility and Automation.${r}"
   wizard_box_bot "$inner"
 }
 
@@ -1215,7 +1225,7 @@ safety_step() {
     fi
   fi
   stage_note "If pairing stalls, run pairling doctor --json and confirm that Pairling Connect reports a ready route."
-  stage_note "Accessibility and Automation are only needed later if you enable typing into Terminal from the phone. Run pairling doctor --json to see the exact Mac grantee path before enabling it."
+  stage_note "Pairling verifies Accessibility and Apple Terminal control before pairing. Run pairling setup again if either permission is revoked."
   return 0
 }
 
@@ -1318,33 +1328,32 @@ install_mutation_on_exit() {
   return "$code"
 }
 
-# guided_permission_notice — advisory only. Surfaces ONLY the permissions the
-# code actually uses (verified against doctor.sh permission_readiness). This Mac
-# needs no privacy permission for basic Pairling Connect pairing. It never reads or modifies any privacy
-# setting and never blocks setup.
+# guided_permission_notice previews the mandatory local setup grants in a dry
+# run. The live setup invokes request_terminal_permissions instead, so consent
+# prompting remains confined to the explicit local setup path and blocks pairing
+# until the helper's harmless Terminal probe succeeds.
 guided_permission_notice() {
   if [ "${GUIDED_TTY:-0}" = 1 ]; then
-    # The guided screen frames the no-permission line and route requirement in a
-    # rounded panel, matching the safety_step panel. The copy is
-    # wrapped to fixed rows so the right border lines up. The stall and
-    # Accessibility lines stay plain notes below the box.
     wizard_palette_init
     local inner=60 b=$'\033[1m' r=$'\033[0m'
     wizard_box_top "$inner"
     wizard_box_row "$inner" "macOS permissions" "${b}${WZ_PAPER:-}macOS permissions${r}"
     wizard_box_row "$inner" "" ""
-    wizard_box_row "$inner" "This Mac needs no special privacy permission to pair." "${WZ_GREY:-}This Mac needs no special privacy permission to pair.${r}"
+    wizard_box_row "$inner" "Pairling setup will request Accessibility and Apple" "${WZ_PAPER:-}Pairling setup will request Accessibility and Apple${r}"
+    wizard_box_row "$inner" "Terminal control before it shows a pairing code." "${WZ_PAPER:-}Terminal control before it shows a pairing code.${r}"
+    wizard_box_row "$inner" "macOS will name Pairling in the permission prompt." "${WZ_GREY:-}macOS will name Pairling in the permission prompt.${r}"
+    wizard_box_row "$inner" "" ""
     wizard_box_row "$inner" "Pairling Connect uses its private embedded route." "${WZ_PAPER:-}Pairling Connect uses its private embedded route.${r}"
     wizard_box_row "$inner" "Local Network access and the same Wi-Fi are not" "${WZ_PAPER:-}Local Network access and the same Wi-Fi are not${r}"
     wizard_box_row "$inner" "required for pairing." "${WZ_PAPER:-}required for pairing.${r}"
+    wizard_box_row "$inner" "Remote Login, Screen Sharing, and Remote Management" "${WZ_PAPER:-}Remote Login, Screen Sharing, and Remote Management${r}"
+    wizard_box_row "$inner" "are not required. Pairling will not enable them." "${WZ_PAPER:-}are not required. Pairling will not enable them.${r}"
     wizard_box_bot "$inner"
-    stage_note "If pairing stalls, run pairling doctor --json and confirm that Pairling Connect reports a ready route."
-    stage_note "Accessibility and Automation are only needed if you later enable typing into Terminal from the phone, and macOS prompts then."
   else
-    stage_note "This Mac needs no special privacy permission to pair."
+    stage_note "Pairling setup will request Accessibility and Apple Terminal control before it shows a pairing code."
+    stage_note "macOS will name Pairling in the permission prompt."
     stage_note "Pairling Connect uses its private embedded route. Local Network access and the same Wi-Fi are not required for pairing."
-    stage_note "If pairing stalls, run pairling doctor --json and confirm that Pairling Connect reports a ready route."
-    stage_note "Accessibility and Automation are only needed if you later enable typing into Terminal from the phone, and macOS prompts then."
+    stage_note "Remote Login, Screen Sharing, and Remote Management are not required. Pairling will not enable them."
   fi
 }
 
@@ -2234,7 +2243,7 @@ write_install_transaction_journal() {
   "$PYTHON3_BIN" - \
     "$INSTALL_TRANSACTION_DIR" "$operation" "$expected_target" "$RELEASE_NAME" \
     "$CONFIG_FILE" "$CURRENT_LINK" "$PREVIOUS_LINK" \
-    "$USER_PLIST" "$CONNECTD_USER_PLIST" "$PTYBROKER_USER_PLIST" \
+    "$USER_PLIST" "$CONNECTD_USER_PLIST" "$PTYBROKER_USER_PLIST" "$AUTOMATION_USER_PLIST" \
     "$MCP_SERVER_SHIM" "$USER_PAIRLING_WRAPPER" "$RELEASES_ROOT" \
     "$MCP_CREDENTIAL" "$DEVICES_DB" <<'PY'
 import hashlib
@@ -2256,6 +2265,7 @@ from pathlib import Path
     companiond_plist,
     connectd_plist,
     ptybroker_plist,
+    automation_plist,
     mcp_server_shim,
     shell_wrapper,
     releases_root,
@@ -2318,6 +2328,7 @@ journal = {
         "companiond_plist": companiond_plist,
         "connectd_plist": connectd_plist,
         "ptybroker_plist": ptybroker_plist,
+        "automation_plist": automation_plist,
         "mcp_server_shim": mcp_server_shim,
         "shell_wrapper": shell_wrapper,
     },
@@ -2351,7 +2362,7 @@ validate_install_transaction_directory() {
   local directory="$1"
   "$PYTHON3_BIN" - \
     "$directory" "$CONFIG_FILE" "$CURRENT_LINK" "$PREVIOUS_LINK" \
-    "$USER_PLIST" "$CONNECTD_USER_PLIST" "$PTYBROKER_USER_PLIST" \
+    "$USER_PLIST" "$CONNECTD_USER_PLIST" "$PTYBROKER_USER_PLIST" "$AUTOMATION_USER_PLIST" \
     "$MCP_SERVER_SHIM" "$USER_PAIRLING_WRAPPER" "$RELEASES_ROOT" "$HOME" \
     "$MCP_CREDENTIAL" "$DEVICES_DB" <<'PY'
 import hashlib
@@ -2369,6 +2380,7 @@ from pathlib import Path
     companiond_plist,
     connectd_plist,
     ptybroker_plist,
+    automation_plist,
     mcp_server_shim,
     shell_wrapper,
     releases_root_value,
@@ -2412,6 +2424,7 @@ expected_destinations = {
     "companiond_plist": companiond_plist,
     "connectd_plist": connectd_plist,
     "ptybroker_plist": ptybroker_plist,
+    "automation_plist": automation_plist,
     "mcp_server_shim": mcp_server_shim,
     "shell_wrapper": shell_wrapper,
 }
@@ -2497,7 +2510,13 @@ else:
         raise SystemExit("install transaction expected target owner does not match this user")
 
 install_names = tuple(expected_destinations)
-required_names = {"pairdrop.json", "companiond.loaded", "connectd.loaded", "ptybroker.loaded"}
+required_names = {
+    "pairdrop.json",
+    "companiond.loaded",
+    "connectd.loaded",
+    "ptybroker.loaded",
+    "automation.loaded",
+}
 for name in install_names:
     kind_path = directory / f"{name}.kind"
     kind = kind_path.read_text(encoding="utf-8").strip()
@@ -2524,7 +2543,7 @@ for name in install_names:
     elif file_path.exists() or file_path.is_symlink() or target_path.exists() or target_path.is_symlink():
         raise SystemExit(f"install transaction has data for an absent snapshot: {name}")
 
-for name in ("companiond", "connectd", "ptybroker"):
+for name in ("companiond", "connectd", "ptybroker", "automation"):
     state = (directory / f"{name}.loaded").read_text(encoding="utf-8").strip()
     if state not in {"loaded", "absent", "skipped"}:
         raise SystemExit(f"install transaction launchd state is invalid: {name}")
@@ -3402,15 +3421,17 @@ begin_install_transaction() {
   if ! snapshot_install_path "$CONFIG_FILE" config ||
      ! snapshot_install_path "$CURRENT_LINK" current ||
      ! snapshot_install_path "$PREVIOUS_LINK" previous ||
-     ! snapshot_install_path "$USER_PLIST" companiond_plist ||
-     ! snapshot_install_path "$CONNECTD_USER_PLIST" connectd_plist ||
-     ! snapshot_install_path "$PTYBROKER_USER_PLIST" ptybroker_plist ||
+	     ! snapshot_install_path "$USER_PLIST" companiond_plist ||
+	     ! snapshot_install_path "$CONNECTD_USER_PLIST" connectd_plist ||
+	     ! snapshot_install_path "$PTYBROKER_USER_PLIST" ptybroker_plist ||
+	     ! snapshot_install_path "$AUTOMATION_USER_PLIST" automation_plist ||
      ! snapshot_install_path "$MCP_SERVER_SHIM" mcp_server_shim ||
      ! snapshot_install_path "$USER_PAIRLING_WRAPPER" shell_wrapper ||
      ! snapshot_pairdrop_directory ||
-     ! snapshot_launchd_loaded "$PAIRLING_DAEMON_LABEL" companiond ||
-     ! snapshot_launchd_loaded "$PAIRLING_CONNECTD_LABEL" connectd ||
-     ! snapshot_launchd_loaded "$PAIRLING_PTYBROKER_LABEL" ptybroker ||
+	     ! snapshot_launchd_loaded "$PAIRLING_DAEMON_LABEL" companiond ||
+	     ! snapshot_launchd_loaded "$PAIRLING_CONNECTD_LABEL" connectd ||
+	     ! snapshot_launchd_loaded "$PAIRLING_PTYBROKER_LABEL" ptybroker ||
+	     ! snapshot_launchd_loaded "$AUTOMATION_LAUNCH_AGENT_LABEL" automation ||
      ! write_install_transaction_journal "$operation"; then
     remove_install_transaction_tree "$staging" || true
     INSTALL_TRANSACTION_DIR=""
@@ -3431,12 +3452,14 @@ begin_install_transaction() {
 
 restore_install_transaction_snapshot() {
   local rollback_failed=0
+  restore_automation_helper_promotion || rollback_failed=1
   restore_install_path "$CONFIG_FILE" config || rollback_failed=1
   restore_install_path "$CURRENT_LINK" current || rollback_failed=1
   restore_install_path "$PREVIOUS_LINK" previous || rollback_failed=1
   restore_install_path "$USER_PLIST" companiond_plist || rollback_failed=1
   restore_install_path "$CONNECTD_USER_PLIST" connectd_plist || rollback_failed=1
   restore_install_path "$PTYBROKER_USER_PLIST" ptybroker_plist || rollback_failed=1
+  restore_install_path "$AUTOMATION_USER_PLIST" automation_plist || rollback_failed=1
   restore_install_path "$MCP_SERVER_SHIM" mcp_server_shim || rollback_failed=1
   restore_install_path "$USER_PAIRLING_WRAPPER" shell_wrapper || rollback_failed=1
   restore_pairdrop_directory || rollback_failed=1
@@ -3447,11 +3470,13 @@ restore_install_transaction_snapshot() {
   verify_restored_install_path "$USER_PLIST" companiond_plist || rollback_failed=1
   verify_restored_install_path "$CONNECTD_USER_PLIST" connectd_plist || rollback_failed=1
   verify_restored_install_path "$PTYBROKER_USER_PLIST" ptybroker_plist || rollback_failed=1
+  verify_restored_install_path "$AUTOMATION_USER_PLIST" automation_plist || rollback_failed=1
   verify_restored_install_path "$MCP_SERVER_SHIM" mcp_server_shim || rollback_failed=1
   verify_restored_install_path "$USER_PAIRLING_WRAPPER" shell_wrapper || rollback_failed=1
   verify_restored_pairdrop_directory || rollback_failed=1
   install_transaction_fault_point recovery_paths_restored
   restore_ptybroker_launchd_state || rollback_failed=1
+  restore_launch_agent_state "$AUTOMATION_LAUNCH_AGENT_LABEL" "$AUTOMATION_USER_PLIST" automation || rollback_failed=1
   restore_launch_agent_state "$PAIRLING_DAEMON_LABEL" "$USER_PLIST" companiond || rollback_failed=1
   restore_launch_agent_state "$PAIRLING_CONNECTD_LABEL" "$CONNECTD_USER_PLIST" connectd || rollback_failed=1
   cleanup_install_transaction_target || rollback_failed=1
@@ -3467,6 +3492,7 @@ commit_install_transaction() {
   INSTALL_TRANSACTION_ACTIVE=0
   INSTALL_TRANSACTION_DIR="$INSTALL_TRANSACTION_COMMITTED"
   install_transaction_fault_point transaction_committed
+  commit_automation_helper_promotion
   validate_install_transaction_directory "$INSTALL_TRANSACTION_DIR"
   remove_install_transaction_tree "$INSTALL_TRANSACTION_DIR"
   INSTALL_TRANSACTION_DIR=""
@@ -3515,6 +3541,7 @@ recover_pending_install_transaction() {
 
   if [[ -e "$INSTALL_TRANSACTION_COMMITTED" || -L "$INSTALL_TRANSACTION_COMMITTED" ]]; then
     validate_install_transaction_directory "$INSTALL_TRANSACTION_COMMITTED"
+    commit_automation_helper_promotion
     remove_install_transaction_tree "$INSTALL_TRANSACTION_COMMITTED"
     log "Finished cleanup for a committed Pairling install transaction." >&2
     return 0
@@ -3740,6 +3767,33 @@ PY
     return 1
   fi
 }
+stage_automation_helper() {
+  local destination="$1"
+  local runtime_root="${PAIRLING_RUNTIME_PACKAGE_ROOT:-}"
+  local source
+
+  if [[ -z "$runtime_root" ]]; then
+    if launchd_skipped; then
+      return 0
+    fi
+    log "ERROR: verified runtime package does not provide the Pairling automation helper." >&2
+    WIZARD_FATAL=1
+    return 1
+  fi
+  source="$runtime_root/automation/Pairling.app"
+  if [[ -L "$source" || ! -d "$source" || -e "$destination/Pairling.app" || -L "$destination/Pairling.app" ]]; then
+    log "ERROR: verified Pairling automation helper source is missing, linked, or has an unsafe destination." >&2
+    WIZARD_FATAL=1
+    return 1
+  fi
+
+  mkdir -p "$destination"
+  /usr/bin/ditto "$source" "$destination/Pairling.app"
+}
+
+
+
+
 
 stage_provider_runtime_assets() {
   local source="$1" destination="$2"
@@ -3886,9 +3940,11 @@ copy_release() {
   verify_payload_manifest
   verify_platform_runtime_manifest
   adopt_snapshot_python
-  mkdir -p "$tmp/bin" "$tmp/companiond" "$tmp/companiond/providers" "$tmp/companiond/integrations/aperture_cli" "$tmp/connectd" "$tmp/mac" "$tmp/mcp"
+  mkdir -p "$tmp/bin" "$tmp/automation" "$tmp/companiond" "$tmp/companiond/providers" "$tmp/companiond/integrations/aperture_cli" "$tmp/connectd" "$tmp/mac" "$tmp/mcp"
+  stage_automation_helper "$tmp/automation"
   stage_provider_sdks "$tmp/provider-sdks"
   cp "$REPO_ROOT/mac/companiond/pairlingd.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/pairling_automation.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/safe_filesystem.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/runtime_contract.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/runtime_manifest.py" "$tmp/companiond/"
@@ -4436,38 +4492,38 @@ PY
 
 install_shell_wrapper() {
   local target="$USER_PAIRLING_WRAPPER"
-  local tmp
+  local tmp trusted_shim
+  trusted_shim="${PAIRLING_TRUSTED_SHIM:-}"
   tmp="$(mktemp "${TMPDIR:-/tmp}/pairling-shell-wrapper.XXXXXX")"
-  cat >"$tmp" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-
+  {
+    printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
+    printf 'TRUSTED_NPM_SHIM=%q\n\n' "$trusted_shim"
+    cat <<'SH'
 if [[ -n "${PAIRLING_REPO_ROOT:-}" ]]; then
   exec "$PAIRLING_REPO_ROOT/mac/packaging/bin/pairling" "$@"
 fi
 
-find_npm_pairling_shim() {
+trusted_npm_pairling_shim() {
   local wrapper_path="$1"
-  local old_ifs="$IFS"
-  local dir candidate
-  IFS=:
-  for dir in $PATH; do
-    [[ -n "$dir" ]] || dir="."
-    candidate="$dir/pairling"
-    if [[ -x "$candidate" && "$candidate" != "$wrapper_path" ]] && "$candidate" --shim-print-env >/dev/null 2>&1; then
-      IFS="$old_ifs"
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-  IFS="$old_ifs"
-  return 1
+  local candidate="$TRUSTED_NPM_SHIM"
+  local canonical_dir canonical owner current_uid mode
+  [[ "$candidate" == /* && -f "$candidate" && -x "$candidate" && "$candidate" != "$wrapper_path" ]] || return 1
+  canonical_dir="$(cd "$(dirname "$candidate")" 2>/dev/null && pwd -P)" || return 1
+  canonical="$canonical_dir/$(basename "$candidate")"
+  [[ "$candidate" == "$canonical" ]] || return 1
+  owner="$(/usr/bin/stat -f '%u' "$candidate" 2>/dev/null)" || return 1
+  current_uid="$(/usr/bin/id -u)"
+  [[ "$owner" == "0" || "$owner" == "$current_uid" ]] || return 1
+  mode="$(/usr/bin/stat -f '%OLp' "$candidate" 2>/dev/null)" || return 1
+  (( (8#$mode & 0022) == 0 )) || return 1
+  "$candidate" --shim-print-env >/dev/null 2>&1 || return 1
+  printf '%s\n' "$candidate"
 }
 
 case "${1:-}" in
   setup|install|update|upgrade)
     WRAPPER_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-    if NPM_PAIRLING="$(find_npm_pairling_shim "$WRAPPER_PATH")"; then
+    if NPM_PAIRLING="$(trusted_npm_pairling_shim "$WRAPPER_PATH")"; then
       exec "$NPM_PAIRLING" "$@"
     fi
     ;;
@@ -4482,6 +4538,7 @@ fi
 printf 'Pairling runtime command is not installed. Run:\n  npm install -g pairling\n  pairling setup\nor use a repo-local mac/packaging/bin/pairling.\n' >&2
 exit 127
 SH
+  } >"$tmp"
   chmod 755 "$tmp"
   install_managed_file "$tmp" "$target" 0755
   rm -f "$tmp"
@@ -4571,6 +4628,7 @@ import os
 import secrets
 import shutil
 import sys
+
 from pathlib import Path
 
 source = Path(sys.argv[1])
@@ -4596,6 +4654,227 @@ finally:
         pass
 PY
 }
+automation_helper_architecture() {
+  local app="$1"
+  local executable="$app/Contents/MacOS/PairlingAutomation"
+  local architecture
+
+  if [[ -L "$app" || ! -d "$app" || -L "$executable" || ! -f "$executable" ]]; then
+    log "ERROR: Pairling automation helper bundle is missing or linked." >&2
+    return 1
+  fi
+  architecture="$(/usr/bin/lipo -archs "$executable" 2>/dev/null || true)"
+  case "$architecture" in
+    arm64|x86_64)
+      printf '%s\n' "$architecture"
+      ;;
+    *)
+      log "ERROR: Pairling automation helper has an unsupported architecture." >&2
+      return 1
+      ;;
+  esac
+}
+
+install_stable_automation_helper() {
+  local source="$RELEASE_ROOT/automation/Pairling.app"
+  local lifecycle="$RELEASE_ROOT/mac/install/automation_helper_lifecycle.py"
+  local architecture
+
+  if launchd_skipped; then
+    return 0
+  fi
+  architecture="$(automation_helper_architecture "$source")" || return 1
+  if [[ -L "$lifecycle" || ! -f "$lifecycle" ]]; then
+    log "ERROR: Pairling automation helper lifecycle module is missing or linked." >&2
+    return 1
+  fi
+  install_managed_file "$PLIST_BUILD_DIR/$AUTOMATION_LAUNCH_AGENT_LABEL.plist" "$AUTOMATION_USER_PLIST" 0644
+  if is_dry_run; then
+    log "dry-run: would install $AUTOMATION_APP_PATH"
+    return 0
+  fi
+  "$PYTHON3_BIN" "$RELEASE_ROOT/mac/install/automation_helper_lifecycle.py" install \
+    --source "$RELEASE_ROOT/automation/Pairling.app" \
+    --app-support "$APP_SUPPORT" \
+    --architecture "$architecture" \
+    --launch-agent-plist "$AUTOMATION_USER_PLIST"
+  AUTOMATION_AGENT_ACTIVATED=1
+}
+
+start_automation_agent() {
+  local lifecycle="$RELEASE_ROOT/mac/install/automation_helper_lifecycle.py"
+  local architecture
+
+  if launchd_skipped || [[ "$AUTOMATION_AGENT_ACTIVATED" == 1 ]]; then
+    return 0
+  fi
+  architecture="$(automation_helper_architecture "$AUTOMATION_APP_PATH")" || return 1
+  if [[ -L "$lifecycle" || ! -f "$lifecycle" ]]; then
+    log "ERROR: Pairling automation helper lifecycle module is missing or linked." >&2
+    return 1
+  fi
+  "$PYTHON3_BIN" "$lifecycle" verify \
+    --bundle "$AUTOMATION_APP_PATH" \
+    --architecture "$architecture"
+  install_managed_file "$PLIST_BUILD_DIR/$AUTOMATION_LAUNCH_AGENT_LABEL.plist" "$AUTOMATION_USER_PLIST" 0644
+  if is_dry_run; then
+    log "dry-run: would start $AUTOMATION_LAUNCH_AGENT_LABEL"
+    return 0
+  fi
+  reload_launch_agent "$AUTOMATION_LAUNCH_AGENT_LABEL" "$AUTOMATION_USER_PLIST"
+  AUTOMATION_AGENT_ACTIVATED=1
+}
+
+terminal_permission_setup_command() {
+  local operation="$1"
+  local setup="$RELEASE_ROOT/mac/install/terminal_permission_setup.py"
+
+  if [[ -L "$setup" || ! -f "$setup" ]]; then
+    log "ERROR: Pairling Terminal permission setup module is missing or linked." >&2
+    return 1
+  fi
+  "$PYTHON3_BIN" "$setup" "$operation" --app-support "$APP_SUPPORT"
+}
+
+terminal_permission_response_is_ready() {
+  "$PYTHON3_BIN" - "$1" <<'PY'
+import json
+import sys
+
+try:
+    value = json.loads(sys.argv[1])
+    capability = value["terminal_capability"]
+except (KeyError, TypeError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if capability.get("terminal_control_ready") is True else 1)
+PY
+}
+
+terminal_permission_response_reasons() {
+  "$PYTHON3_BIN" - "$1" <<'PY'
+import json
+import sys
+
+try:
+    value = json.loads(sys.argv[1])
+    capability = value["terminal_capability"]
+    reasons = capability.get("blocking_reasons", [])
+except (KeyError, TypeError, ValueError):
+    reasons = []
+if isinstance(reasons, list):
+    print("; ".join(str(reason) for reason in reasons if isinstance(reason, str)))
+PY
+}
+
+request_terminal_permissions() {
+  local response reasons interval timeout step waited=0
+  interval="${PAIRLING_TERMINAL_PERMISSION_POLL_INTERVAL:-2}"
+  timeout="${PAIRLING_TERMINAL_PERMISSION_WAIT_SECONDS:-300}"
+  case "$interval" in
+    ''|*[!0-9]*) interval=2 ;;
+  esac
+  case "$timeout" in
+    ''|*[!0-9]*) timeout=300 ;;
+  esac
+  [[ "$interval" -lt 1 ]] && interval=2
+  step="$interval"
+
+  stage_note "Pairling Connect uses its private embedded route. Remote Login, Screen Sharing, and Remote Management are not required and Pairling will not enable them."
+  stage_note "Pairling needs one-time permission for Accessibility and to control Apple Terminal."
+  stage_note "macOS will name Pairling in the permission prompt."
+  if ! response="$(terminal_permission_setup_command request)"; then
+    log "ERROR: Pairling could not request Mac permissions." >&2
+    return 1
+  fi
+  if terminal_permission_response_is_ready "$response"; then
+    stage_note "Pairling Accessibility, Terminal control, and the harmless Terminal probe are ready."
+    return 0
+  fi
+
+  reasons="$(terminal_permission_response_reasons "$response")"
+  stage_note "Finish Pairling permissions in System Settings, then return here. Pairling will check again without showing another prompt."
+  [[ -z "$reasons" ]] || stage_note "$reasons"
+  if [[ ! -t 0 ]]; then
+    log "ERROR: Mac permissions are required. Finish Pairling setup in a local Terminal, then rerun pairling setup." >&2
+    return 1
+  fi
+
+  while [[ "$waited" -lt "$timeout" ]]; do
+    sleep "$interval"
+    waited=$((waited + step))
+    if ! response="$(terminal_permission_setup_command probe)"; then
+      log "ERROR: Pairling could not recheck Mac permissions." >&2
+      return 1
+    fi
+    if terminal_permission_response_is_ready "$response"; then
+      stage_note "Pairling Accessibility, Terminal control, and the harmless Terminal probe are ready."
+      return 0
+    fi
+  done
+
+  log "ERROR: Mac permissions are still required. Finish Pairling setup locally, then rerun pairling setup." >&2
+  return 1
+}
+
+stop_automation_agent() {
+  if is_dry_run; then
+    log "dry-run: would stop $AUTOMATION_LAUNCH_AGENT_LABEL"
+    return 0
+  fi
+  launchctl bootout "gui/$(id -u)/$AUTOMATION_LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
+  launchctl bootout "gui/$(id -u)" "$AUTOMATION_USER_PLIST" >/dev/null 2>&1 || true
+  AUTOMATION_AGENT_ACTIVATED=0
+}
+
+automation_helper_lifecycle_path() {
+  local release_lifecycle="$RELEASE_ROOT/mac/install/automation_helper_lifecycle.py"
+  if [[ -n "$RELEASE_ROOT" && -f "$release_lifecycle" && ! -L "$release_lifecycle" ]]; then
+    printf '%s\n' "$release_lifecycle"
+  else
+    printf '%s\n' "$REPO_ROOT/mac/install/automation_helper_lifecycle.py"
+  fi
+}
+
+prepare_automation_helper_promotion() {
+  if is_dry_run || launchd_skipped; then return 0; fi
+  local lifecycle
+  lifecycle="$(automation_helper_lifecycle_path)"
+  stop_automation_agent
+  "$PYTHON3_BIN" "$lifecycle" prepare-promotion --app-support "$APP_SUPPORT"
+}
+
+restore_automation_helper_promotion() {
+  if is_dry_run || launchd_skipped; then return 0; fi
+  local lifecycle
+  lifecycle="$(automation_helper_lifecycle_path)"
+  stop_automation_agent
+  "$PYTHON3_BIN" "$lifecycle" restore-promotion --app-support "$APP_SUPPORT"
+}
+
+commit_automation_helper_promotion() {
+  if is_dry_run || launchd_skipped; then return 0; fi
+  local lifecycle
+  lifecycle="$(automation_helper_lifecycle_path)"
+  "$PYTHON3_BIN" "$lifecycle" commit-promotion --app-support "$APP_SUPPORT"
+}
+
+migrate_verified_legacy_injector() {
+  if is_dry_run || launchd_skipped; then return 0; fi
+  local lifecycle result
+  lifecycle="$(automation_helper_lifecycle_path)"
+  result="$("$PYTHON3_BIN" "$lifecycle" migrate-legacy \
+    --legacy-app "$LEGACY_INJECTOR_APP" \
+    --app-support "$APP_SUPPORT")" || return 1
+  case "$result" in
+    *'"outcome":"migrated"'*)
+      log "Archived the verified legacy ClaudeInjector wrapper."
+      ;;
+    *'"outcome":"legacy_helper_requires_manual_review"'*)
+      log "Legacy ClaudeInjector.app was not recognized and was left untouched for manual review." >&2
+      ;;
+  esac
+}
+
 
 start_user_agent() {
   install_managed_file "$PLIST_BUILD_DIR/$PAIRLING_DAEMON_LABEL.plist" "$USER_PLIST" 0644
@@ -5468,6 +5747,9 @@ rollback() {
   atomic_symlink_switch "$rollback_root" "$CURRENT_LINK"
   install_transaction_fault_point rollback_links_switched
   render_plists
+  prepare_automation_helper_promotion
+  install_stable_automation_helper
+  start_automation_agent
   start_user_agent
   ensure_ptybroker_agent
   start_connectd_agent
@@ -5561,7 +5843,7 @@ install_runtime() {
 
     stage_begin "macOS permissions"
     guided_permission_notice
-    stage_ok "no Mac privacy permission is required to pair"
+    stage_ok "would request Pairling Accessibility and Pairling control of Terminal before showing a pairing code"
 
     stage_begin "Providers"
     provider_setup_stage
@@ -5631,6 +5913,9 @@ install_runtime() {
 
   stage_begin "Starting Pairling services"
   render_plists
+  prepare_automation_helper_promotion
+  install_stable_automation_helper
+  start_automation_agent
   start_user_agent
   ensure_ptybroker_agent
   start_connectd_agent
@@ -5638,6 +5923,7 @@ install_runtime() {
   verify_runtime_activation
   install_transaction_fault_point activation_proved
   commit_install_transaction
+  migrate_verified_legacy_injector
   stage_ok "companiond, connectd, and ptybroker passed live activation checks"
 
   append_history "installed" "installed $RELEASE_NAME"
@@ -5658,17 +5944,13 @@ install_runtime() {
   fi
 
   stage_begin "macOS permissions"
+  request_terminal_permissions
   if [ "${WIZARD_TUI:-0}" = 1 ] && ! is_dry_run; then
-    # The safety step reads the live SafetyMonitorBridge status. Today it reports
-    # not installed, so it prints one advisory line and continues. When a future
-    # PairlingSafety.app is installed, it guides approval, Full Disk Access, and
-    # the evidence test. It never blocks pairing. The plain advisory notice is the
-    # WIZARD_TUI=0 fallback.
+    # The Safety Monitor remains optional. It is assessed only after Pairling has
+    # verified the mandatory Terminal-control permissions required for pairing.
     safety_step
-  else
-    guided_permission_notice
   fi
-  stage_ok "no Mac privacy permission is required to pair"
+  stage_ok "Pairling Mac permissions are ready for terminal control"
 
   stage_begin "Providers"
   provider_setup_stage
@@ -5712,6 +5994,7 @@ status_runtime() {
 start_runtime() {
   ensure_state
   render_plists
+  start_automation_agent
   start_user_agent
   ensure_ptybroker_agent
   start_connectd_agent
@@ -5720,6 +6003,7 @@ start_runtime() {
 
 stop_runtime() {
   stop_connectd_agent
+  stop_automation_agent
   stop_user_agent
   log "Stopped $PAIRLING_DAEMON_LABEL"
 }
@@ -5994,6 +6278,9 @@ if pair_id and secret:
         "pair_id": pair_id,
         "secret": secret,
     }
+    attest_challenge = str(payload.get("attest_challenge") or "")
+    if attest_challenge:
+        pair_params["attest_challenge"] = attest_challenge
     pair_params["role"] = invited_role
     pair_params["mac_ake_pub"] = mac_ake_pub
     pair_params["pv"] = "2"
@@ -6018,7 +6305,7 @@ if pair_id and secret:
         pair_params["mac_name"] = mac_name
         manual["install_id"] = install_id
         manual["mac_name"] = mac_name
-    payload.setdefault("pair_url", "pairling://pair?" + urllib.parse.urlencode(pair_params))
+    payload.setdefault("pair_url", "https://pairling.dev/pair/?" + urllib.parse.urlencode(pair_params))
     payload.setdefault("manual", manual)
 
 print(json.dumps(payload, indent=2, sort_keys=True))
@@ -6314,13 +6601,33 @@ render_pair_qr() {
   if ! command -v swift >/dev/null 2>&1; then
     return 1
   fi
-  swift - "$pair_url" <<'SWIFT'
+  (
+    umask 077
+    local source_dir=""
+    local source_file=""
+    cleanup_pair_qr_source() {
+      if [[ -n "$source_file" ]]; then
+        rm -f "$source_file"
+      fi
+      if [[ -n "$source_dir" ]]; then
+        rmdir "$source_dir" 2>/dev/null || true
+      fi
+    }
+    trap cleanup_pair_qr_source EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    source_dir="$(mktemp -d "/tmp/pairling-qr.XXXXXXXX")" || exit 1
+    chmod 700 "$source_dir" || exit 1
+    source_file="$source_dir/render.swift"
+    cat >"$source_file" <<'SWIFT'
 import CoreGraphics
 import CoreImage
 import Foundation
 
-guard CommandLine.arguments.count > 1,
-      let message = CommandLine.arguments[1].data(using: .utf8),
+let message = FileHandle.standardInput.readDataToEndOfFile()
+guard !message.isEmpty,
       let filter = CIFilter(name: "CIQRCodeGenerator") else {
     exit(2)
 }
@@ -6397,6 +6704,9 @@ while y < height + quietZone {
     y += 2
 }
 SWIFT
+    chmod 600 "$source_file" || exit 1
+    printf '%s' "$pair_url" | swift "$source_file"
+  )
 }
 
 diagnose_runtime() {
@@ -6506,7 +6816,7 @@ case "$cmd" in
     diagnose_runtime "$@"
     ;;
   uninstall)
-    "$REPO_ROOT/mac/install/uninstall-runtime.sh" "$@"
+    PAIRLING_DAEMON_PYTHON="$PYTHON3_BIN" "$REPO_ROOT/mac/install/uninstall-runtime.sh" "$@"
     ;;
   rollback|--rollback)
     rollback

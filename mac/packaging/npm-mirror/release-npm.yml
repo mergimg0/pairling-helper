@@ -75,6 +75,7 @@ jobs:
           mkdir -p dist/assets
           gh release download "$TAG" --pattern 'pairling-connectd-*' --dir dist/assets
           gh release download "$TAG" --pattern 'pairling-python-*.tar.gz' --dir dist/assets
+          gh release download "$TAG" --pattern 'pairling-automation-*.zip' --dir dist/assets
           gh release download "$TAG" --pattern 'NOTARIZATION-RECEIPTS.json' --dir dist/assets
           chmod 755 dist/assets/pairling-connectd-arm64 dist/assets/pairling-connectd-x64
 
@@ -90,6 +91,8 @@ jobs:
             --connectd-x64 dist/assets/pairling-connectd-x64 \
             --python-arm64 dist/assets/pairling-python-arm64.tar.gz \
             --python-x64 dist/assets/pairling-python-x64.tar.gz \
+            --automation-arm64 dist/assets/pairling-automation-arm64.zip \
+            --automation-x64 dist/assets/pairling-automation-x64.zip \
             --notarization-receipts dist/assets/NOTARIZATION-RECEIPTS.json
 
       - name: Assemble packages from mirrored sources
@@ -105,7 +108,9 @@ jobs:
             --prebuilt-arm64 dist/assets/pairling-connectd-arm64 \
             --prebuilt-x64 dist/assets/pairling-connectd-x64 \
             --prebuilt-python-arm64 dist/assets/pairling-python-arm64.tar.gz \
-            --prebuilt-python-x64 dist/assets/pairling-python-x64.tar.gz
+            --prebuilt-python-x64 dist/assets/pairling-python-x64.tar.gz \
+            --prebuilt-automation-arm64 dist/assets/pairling-automation-arm64.zip \
+            --prebuilt-automation-x64 dist/assets/pairling-automation-x64.zip
           cat dist/npm/SHASUMS256.txt
 
       - name: Publish with provenance (runtime packages first, meta last)

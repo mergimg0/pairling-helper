@@ -16,6 +16,7 @@ from pathlib import Path
 PAIRLING_DAEMON_LABEL = "dev.pairling.companiond"
 PAIRLING_CONNECTD_LABEL = "dev.pairling.connectd"
 PAIRLING_PTYBROKER_LABEL = "dev.pairling.ptybroker"
+PAIRLING_AUTOMATION_LABEL = "dev.pairling.automation"
 PAIRLING_RUNTIME_PORT = "7773"
 PAIRLING_RELAY_CLAIM_PUBLIC_KEY = "relay-claim-2026-07-v1.pem"
 COPILOT_SDK_VERSION = "1.0.8"
@@ -323,6 +324,26 @@ def ptybroker_plist(current: Path, logs: Path, python_bin: str) -> dict:
         "StandardErrorPath": str(logs / "ptybroker.err"),
     }
 
+def automation_plist(app_support: Path, logs: Path) -> dict:
+    root = Path(app_support) / "automation"
+    return {
+        "Label": PAIRLING_AUTOMATION_LABEL,
+        "ProgramArguments": [
+            str(root / "Pairling.app" / "Contents" / "MacOS" / "PairlingAutomation"),
+        ],
+        "EnvironmentVariables": {
+            "PAIRLING_AUTOMATION_ROOT": str(root),
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        },
+        "RunAtLoad": True,
+        "KeepAlive": {"Crashed": True},
+        "ProcessType": "Background",
+        "ThrottleInterval": 10,
+        "Umask": 0o077,
+        "StandardOutPath": str(logs / "automation.log"),
+        "StandardErrorPath": str(logs / "automation.err"),
+    }
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -332,6 +353,7 @@ def main() -> int:
     parser.add_argument("--daemon-python", default="/usr/local/bin/python3")
     parser.add_argument("--mirror-python", default="/usr/local/bin/python3", help=argparse.SUPPRESS)
     parser.add_argument("--pairdrop-root")
+    parser.add_argument("--app-support-root")
     parser.add_argument("--ssh-gateway", action="store_true",
                         help="render connectd with the loopback SSH-tunnel gateway enabled (SPEC-p5)")
     args = parser.parse_args()
@@ -340,6 +362,7 @@ def main() -> int:
     logs = Path(args.logs_root)
     out = Path(args.output_dir)
 
+    app_support = Path(args.app_support_root) if args.app_support_root else current.parent.parent
     try:
         pairdrop_root = canonical_pairdrop_root(args.pairdrop_root or (Path.home() / "PairDrop"))
     except ValueError as exc:
@@ -350,6 +373,10 @@ def main() -> int:
     )
     write_plist(out / f"{PAIRLING_PTYBROKER_LABEL}.plist", ptybroker_plist(current, logs, args.daemon_python))
     write_plist(out / f"{PAIRLING_CONNECTD_LABEL}.plist", connectd_plist(current, logs, ssh_gateway=args.ssh_gateway))
+    write_plist(
+        out / f"{PAIRLING_AUTOMATION_LABEL}.plist",
+        automation_plist(app_support, logs),
+    )
     return 0
 
 

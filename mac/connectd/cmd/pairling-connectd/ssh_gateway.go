@@ -29,7 +29,7 @@ func sshGatewayEnabledFromEnv(raw string) bool {
 // newSSHGatewayHandler builds the ExposureModeSSH gateway handler after
 // refusing any non-loopback bind address: the tunnel's remote end is the
 // only intended client, so 7775 never faces a network.
-func newSSHGatewayHandler(upstream *url.URL, maxBodyBytes int64, addr string) (*gateway.Handler, error) {
+func newSSHGatewayHandler(upstream *url.URL, maxBodyBytes int64, addr string, gatewayToken func() string) (*gateway.Handler, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
@@ -41,7 +41,8 @@ func newSSHGatewayHandler(upstream *url.URL, maxBodyBytes int64, addr string) (*
 		Upstream:     upstream,
 		MaxBodyBytes: maxBodyBytes,
 		Mode:         gateway.ExposureModeSSH,
-		RateLimiter:  gateway.NewMemoryRateLimiter(20, 5*time.Minute),
+		RateLimiter:  gateway.NewMemoryRateLimiter(120, 5*time.Minute),
+		GatewayToken: gatewayToken,
 	})
 }
 

@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
+PATH='/usr/bin:/bin:/usr/sbin:/sbin'
+export PATH
 
 PAIRLING_DAEMON_LABEL="dev.pairling.companiond"
 PAIRLING_CONNECTD_LABEL="dev.pairling.connectd"
 PAIRLING_PTYBROKER_LABEL="dev.pairling.ptybroker"
+AUTOMATION_LAUNCH_AGENT_LABEL="dev.pairling.automation"
 APP_SUPPORT="${PAIRLING_APP_SUPPORT_ROOT:-${COMPANION_APP_SUPPORT_ROOT:-$HOME/Library/Application Support/Pairling}}"
 while [[ "$APP_SUPPORT" != "/" && "$APP_SUPPORT" == */ ]]; do
   APP_SUPPORT="${APP_SUPPORT%/}"
@@ -16,6 +19,9 @@ done
 USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_DAEMON_LABEL.plist"
 CONNECTD_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_CONNECTD_LABEL.plist"
 PTYBROKER_USER_PLIST="$HOME/Library/LaunchAgents/$PAIRLING_PTYBROKER_LABEL.plist"
+AUTOMATION_USER_PLIST="$HOME/Library/LaunchAgents/$AUTOMATION_LAUNCH_AGENT_LABEL.plist"
+AUTOMATION_ROOT="$APP_SUPPORT/automation"
+AUTOMATION_HELPER_LIFECYCLE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/automation_helper_lifecycle.py"
 # Legacy: the silent-join mint broker, removed from the product. Torn down below.
 MINTD_SYSTEM_LABEL="dev.pairling.mintd"
 MINTD_SYSTEM_PLIST="/Library/LaunchDaemons/$MINTD_SYSTEM_LABEL.plist"
@@ -348,6 +354,14 @@ remove_state_tombstone() {
   /bin/chmod -RN "$tombstone" 2>/dev/null || true
   find -P "$tombstone" -type d -exec chmod u+rwx {} + 2>/dev/null || true
   find -P "$tombstone" -type f -exec chmod u+rw {} + 2>/dev/null || true
+  if launchd_skipped \
+    && [[ -n "${PAIRLING_TEST_UNINSTALL_DELETE_READY:-}" ]] \
+    && [[ -n "${PAIRLING_TEST_UNINSTALL_CONTINUE_DELETE:-}" ]]; then
+    : > "$PAIRLING_TEST_UNINSTALL_DELETE_READY"
+    while [[ ! -e "$PAIRLING_TEST_UNINSTALL_CONTINUE_DELETE" ]]; do
+      /bin/sleep 0.05
+    done
+  fi
   rm -rf "$tombstone"
   if [[ -e "$tombstone" || -L "$tombstone" ]]; then
     printf 'ERROR: Pairling could not remove uninstall staging path: %s\n' "$tombstone" >&2
@@ -428,8 +442,22 @@ bootout_user() {
     printf 'testing: skipped unloading %s\n' "$label"
     return
   fi
-  launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
-  launchctl bootout "gui/$(id -u)" "$plist" >/dev/null 2>&1 || true
+  /bin/launchctl bootout "gui/$(/usr/bin/id -u)/$label" >/dev/null 2>&1 || /usr/bin/true
+  /bin/launchctl bootout "gui/$(/usr/bin/id -u)" "$plist" >/dev/null 2>&1 || /usr/bin/true
+}
+
+remove_automation_helper_state() {
+  local python_bin="${PAIRLING_DAEMON_PYTHON:-}"
+  if [[ -z "$python_bin" || ! -x "$python_bin" ]]; then
+    python_bin="$(command -v python3 2>/dev/null || true)"
+  fi
+  if [[ -z "$python_bin" || ! -x "$python_bin" || ! -f "$AUTOMATION_HELPER_LIFECYCLE" ]]; then
+    printf 'ERROR: Pairling could not remove the automation helper safely.\n' >&2
+    return 1
+  fi
+  "$python_bin" "$AUTOMATION_HELPER_LIFECYCLE" uninstall \
+    --app-support "$APP_SUPPORT" \
+    --launch-agent-plist "$AUTOMATION_USER_PLIST"
 }
 
 bootout_system() {
@@ -446,10 +474,10 @@ bootout_system() {
     printf 'testing: skipped unloading system/%s\n' "$label"
     return
   fi
-  if sudo -n true >/dev/null 2>&1; then
-    sudo launchctl bootout "system/$label" >/dev/null 2>&1 || true
-    sudo launchctl bootout system "$plist" >/dev/null 2>&1 || true
-    sudo rm -f "$plist"
+  if /usr/bin/sudo -n /usr/bin/true >/dev/null 2>&1; then
+    /usr/bin/sudo /bin/launchctl bootout "system/$label" >/dev/null 2>&1 || /usr/bin/true
+    /usr/bin/sudo /bin/launchctl bootout system "$plist" >/dev/null 2>&1 || /usr/bin/true
+    /usr/bin/sudo /bin/rm -f "$plist"
   else
     printf 'Skipping %s removal: passwordless sudo is unavailable.\n' "$plist" >&2
   fi
@@ -461,7 +489,7 @@ bootout_system() {
 # and the _pairling_mint role account. Remove all three. Best-effort, sudo-gated.
 teardown_legacy_mintd() {
   if [[ ! -f "$MINTD_SYSTEM_PLIST" && ! -d "$MINTD_SYSTEM_DIR" ]] \
-     && ! id -u "$MINTD_SERVICE_ACCOUNT" >/dev/null 2>&1; then
+     && ! /usr/bin/id -u "$MINTD_SERVICE_ACCOUNT" >/dev/null 2>&1; then
     return
   fi
   if is_dry_run; then
@@ -473,12 +501,12 @@ teardown_legacy_mintd() {
     printf 'testing: skipped legacy silent-join mint broker removal\n'
     return
   fi
-  if sudo -n true >/dev/null 2>&1; then
-    sudo launchctl bootout "system/$MINTD_SYSTEM_LABEL" >/dev/null 2>&1 || true
-    sudo launchctl bootout system "$MINTD_SYSTEM_PLIST" >/dev/null 2>&1 || true
-    sudo rm -f "$MINTD_SYSTEM_PLIST"
-    sudo rm -rf "$MINTD_SYSTEM_DIR"
-    sudo /usr/sbin/sysadminctl -deleteUser "$MINTD_SERVICE_ACCOUNT" >/dev/null 2>&1 || true
+  if /usr/bin/sudo -n /usr/bin/true >/dev/null 2>&1; then
+    /usr/bin/sudo /bin/launchctl bootout "system/$MINTD_SYSTEM_LABEL" >/dev/null 2>&1 || /usr/bin/true
+    /usr/bin/sudo /bin/launchctl bootout system "$MINTD_SYSTEM_PLIST" >/dev/null 2>&1 || /usr/bin/true
+    /usr/bin/sudo /bin/rm -f "$MINTD_SYSTEM_PLIST"
+    /usr/bin/sudo /bin/rm -rf "$MINTD_SYSTEM_DIR"
+    /usr/bin/sudo /usr/sbin/sysadminctl -deleteUser "$MINTD_SERVICE_ACCOUNT" >/dev/null 2>&1 || /usr/bin/true
     printf 'Removed the legacy silent-join mint broker.\n'
   else
     printf 'Skipping legacy mint-broker removal: passwordless sudo is unavailable.\n' >&2
@@ -490,9 +518,12 @@ print_dry_run_plan() {
   bootout_user "$PAIRLING_DAEMON_LABEL" "$USER_PLIST"
   bootout_user "$PAIRLING_CONNECTD_LABEL" "$CONNECTD_USER_PLIST"
   bootout_user "$PAIRLING_PTYBROKER_LABEL" "$PTYBROKER_USER_PLIST"
+  bootout_user "$AUTOMATION_LAUNCH_AGENT_LABEL" "$AUTOMATION_USER_PLIST"
   printf 'dry-run: would remove LaunchAgent plist %s\n' "$USER_PLIST"
   printf 'dry-run: would remove LaunchAgent plist %s\n' "$CONNECTD_USER_PLIST"
   printf 'dry-run: would remove LaunchAgent plist %s\n' "$PTYBROKER_USER_PLIST"
+  printf 'dry-run: would remove LaunchAgent plist %s\n' "$AUTOMATION_USER_PLIST"
+  printf 'dry-run: would remove the owned Pairling automation helper, socket, and local secret under %s\n' "$AUTOMATION_ROOT"
   teardown_legacy_mintd
   printf 'dry-run: would remove Pairling pairing state %s\n' "$APP_SUPPORT/pair"
 
@@ -509,6 +540,7 @@ print_dry_run_plan() {
   fi
 
   printf 'dry-run: provider transcripts and user projects would not be removed.\n'
+  printf 'dry-run: macOS privacy permissions would not be changed.\n'
 }
 
 confirm
@@ -536,9 +568,12 @@ fi
 bootout_user "$PAIRLING_DAEMON_LABEL" "$USER_PLIST"
 bootout_user "$PAIRLING_CONNECTD_LABEL" "$CONNECTD_USER_PLIST"
 bootout_user "$PAIRLING_PTYBROKER_LABEL" "$PTYBROKER_USER_PLIST"
+bootout_user "$AUTOMATION_LAUNCH_AGENT_LABEL" "$AUTOMATION_USER_PLIST"
 rm -f "$USER_PLIST"
 rm -f "$CONNECTD_USER_PLIST"
 rm -f "$PTYBROKER_USER_PLIST"
+remove_automation_helper_state
+printf 'macOS privacy permissions were not changed. Remove Pairling access in System Settings if you want to revoke it.\n'
 teardown_legacy_mintd
 
 rm -rf "$APP_SUPPORT/pair" 2>/dev/null || true

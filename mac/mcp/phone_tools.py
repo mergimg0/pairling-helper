@@ -54,8 +54,6 @@ class PairlingToolsClient:
         self.timeout = timeout
 
     def run(self, tool: str, input_payload: dict[str, Any], *, strategy: str = "auto") -> str:
-        if os.environ.get("PAIRLING_TOOLS_DIRECT_IPHONE") == "1":
-            return _direct_iphone_diagnostic(tool, input_payload)
         request_payload: dict[str, Any] = {
             "tool": tool,
             "input": input_payload,
@@ -187,32 +185,6 @@ def _proof_headers(*, credential: dict[str, str], method: str, path_and_query: s
     }
 
 
-def _direct_iphone_diagnostic(tool: str, input_payload: dict[str, Any]) -> str:
-    socket = __import__("socket")
-    host = os.environ.get("PHONE_TS_HOST", "iphone-15-pro")
-    port = int(os.environ.get("PHONE_TS_PORT", "7724"))
-    timeout = float(os.environ.get("PHONE_TIMEOUT", "5"))
-    token = os.environ.get("PHONE_TOKEN")
-    if not token:
-        token_file = Path.home() / ".claude" / "scripts" / ".notify-token"
-        try:
-            token = token_file.read_text().strip()
-        except OSError as exc:
-            return f"[phone-tools] Direct iPhone diagnostic unavailable: token missing: {exc}"
-    request = json.dumps({"tool": tool, "token": token, "input": input_payload}) + "\n"
-    try:
-        with socket.create_connection((host, port), timeout=timeout) as sock:
-            sock.sendall(request.encode("utf-8"))
-            line = sock.recv(65536).split(b"\n", 1)[0]
-    except Exception as exc:
-        return f"[phone-tools] Direct iPhone diagnostic failed at {host}:{port}: {exc}"
-    try:
-        payload = json.loads(line.decode("utf-8"))
-    except Exception as exc:
-        return f"[phone-tools] Direct iPhone diagnostic bad response: {exc}"
-    if not payload.get("ok"):
-        return f"[phone-tools] Direct iPhone diagnostic tool failed: {payload.get('error', 'unknown error')}"
-    return str(payload.get("result") or "")
 
 
 CLIENT = PairlingToolsClient()

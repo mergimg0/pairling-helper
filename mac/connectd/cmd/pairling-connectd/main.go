@@ -122,6 +122,7 @@ func run(args []string) int {
 		log.Printf("cannot read build identity: %v", err)
 		return 1
 	}
+	gatewayToken := (&internalHookTokenCache{home: home}).load
 
 	statusStore := status.NewStore(*hostname)
 	statusStore.SetControlURLMode(controlURLMode(*controlURL))
@@ -177,6 +178,7 @@ func run(args []string) int {
 		PeerNodeResolver: tailscalePeerNodeResolver{localClient: func() (whoIsClient, error) {
 			return srv.LocalClient()
 		}},
+		GatewayToken: gatewayToken,
 	})
 	if err != nil {
 		log.Printf("cannot create gateway: %v", err)
@@ -215,6 +217,7 @@ func run(args []string) int {
 			Logger:          gatewayLogger{store: statusStore},
 			FunnelLimiter:   gateway.NewFunnelLimiter(120, 5, 6),
 			FunnelMacIDHash: funnelMacIDHash,
+			GatewayToken:    gatewayToken,
 		})
 		if ferr != nil {
 			log.Printf("cannot create funnel gateway: %v", ferr)
@@ -225,13 +228,7 @@ func run(args []string) int {
 			statusStore.SetLastError(ferr.Error())
 			log.Printf("cannot start funnel listener: %v", ferr)
 		} else {
-			funnelServer = &http.Server{
-				Handler:           funnelHandler,
-				ReadHeaderTimeout: 10 * time.Second,
-				ReadTimeout:       15 * time.Second,
-				WriteTimeout:      30 * time.Second,
-				IdleTimeout:       60 * time.Second,
-			}
+			funnelServer = newFunnelHTTPServer(funnelHandler)
 			if domains := srv.CertDomains(); len(domains) > 0 {
 				statusStore.SetFunnelHostname(domains[0])
 				log.Printf("pairling-connectd funnel listener open host=%s", domains[0])
@@ -252,7 +249,7 @@ func run(args []string) int {
 	// logged but does not bring down the tailnet listener.
 	var sshServer *http.Server
 	if *sshGatewayEnabled {
-		sshHandler, serr := newSSHGatewayHandler(upstream, *maxBodyBytes, *sshGatewayAddr)
+		sshHandler, serr := newSSHGatewayHandler(upstream, *maxBodyBytes, *sshGatewayAddr, gatewayToken)
 		if serr != nil {
 			log.Printf("cannot create ssh gateway: %v", serr)
 			return 1
@@ -297,6 +294,16 @@ func run(args []string) int {
 			return 1
 		}
 		return 0
+	}
+}
+
+func newFunnelHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 }
 
@@ -485,15 +492,15 @@ const (
 )
 
 type authOpenGate struct {
-	mu                   sync.Mutex
-	currentURL           string
-	lastAttempt          time.Time
-	lastStartSucceeded   bool
-	inFlight             bool
-	retryCooldown        time.Duration
-	now                  func() time.Time
-	start                authOpenStarter
-	runWorker            func(func())
+	mu                 sync.Mutex
+	currentURL         string
+	lastAttempt        time.Time
+	lastStartSucceeded bool
+	inFlight           bool
+	retryCooldown      time.Duration
+	now                func() time.Time
+	start              authOpenStarter
+	runWorker          func(func())
 }
 
 func newAuthOpenGate() *authOpenGate {
@@ -684,10 +691,36 @@ func refreshUpstreamStatus(
 	}
 }
 
+type internalHookTokenCache struct {
+	mu        sync.Mutex
+	home      string
+	token     string
+	checkedAt time.Time
+}
+
+func (cache *internalHookTokenCache) load() string {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	now := time.Now()
+	if !cache.checkedAt.IsZero() && now.Sub(cache.checkedAt) < time.Second {
+		return cache.token
+	}
+	cache.token = loadInternalHookToken(cache.home)
+	cache.checkedAt = now
+	return cache.token
+}
+
 func loadInternalHookToken(home string) string {
 	path := strings.TrimSpace(os.Getenv("PAIRLING_INTERNAL_HOOK_TOKEN_FILE"))
 	if path == "" {
 		path = filepath.Join(home, ".claude", "companion", "internal-hook-token")
+	}
+	metadata, err := os.Lstat(path)
+	if err != nil || !metadata.Mode().IsRegular() || metadata.Mode().Perm()&0o077 != 0 {
+		return ""
+	}
+	if system, ok := metadata.Sys().(*syscall.Stat_t); !ok || int(system.Uid) != os.Getuid() {
+		return ""
 	}
 	payload, err := os.ReadFile(path)
 	if err != nil {

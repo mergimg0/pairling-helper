@@ -734,7 +734,7 @@ _PROFILES: dict[str, AcpLaunchProfile] = {
     ),
     "omp": AcpLaunchProfile(
         provider_id="omp",
-        accepted_versions=("17.2.8",),
+        accepted_versions=("17.2.10",),
         allowed_channels=("stable",),
         argv_template=(
             "--profile",
@@ -757,7 +757,7 @@ _PROFILES: dict[str, AcpLaunchProfile] = {
         managed_files=(ManagedProfileFile("omp.yml", _OMP_CONFIG),),
         required_capabilities=(
             "agentInfo.name=oh-my-pi",
-            "agentInfo.version=17.2.8",
+            "agentInfo.version=17.2.10",
             "agentCapabilities.loadSession=true",
             "sessionCapabilities.list=true",
             "sessionCapabilities.resume=true",

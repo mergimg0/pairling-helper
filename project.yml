@@ -1,0 +1,454 @@
+name: Pairling
+options:
+  bundleIdPrefix: dev.pairling
+  deploymentTarget:
+    iOS: "26.0"
+    watchOS: "26.0"
+    macOS: "26.0"
+  developmentLanguage: en
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+    TARGETED_DEVICE_FAMILY: "1"
+  configs:
+    Release:
+      ENABLE_CODE_COVERAGE: NO
+      CLANG_COVERAGE_MAPPING: NO
+
+packages:
+  MarkdownUI:
+    url: https://github.com/gonzalezreal/swift-markdown-ui
+    exactVersion: 2.4.1
+  Splash:
+    url: https://github.com/JohnSundell/Splash
+    exactVersion: 0.16.0
+  # SPEC-p5: the SSH transport's direct-tcpip channel. First-party Apple
+  # package, the sole new dependency this spec adds. swift-nio comes in
+  # transitively; NIOHTTP1 (the response codec over the channel) is declared
+  # explicitly because NIOSSH's product does not re-export it.
+  SwiftNIOSSH:
+    url: https://github.com/apple/swift-nio-ssh
+    exactVersion: 0.13.0
+  SwiftNIO:
+    url: https://github.com/apple/swift-nio.git
+    exactVersion: 2.101.2
+  TalsecRuntime:
+    url: https://github.com/talsec/Free-RASP-iOS
+    exactVersion: 7.1.2
+
+targets:
+  Pairling:
+    type: application
+    platform: iOS
+    sources:
+      - path: Pairling
+        excludes:
+          - "**/*.bak"
+          - "**/.DS_Store"
+          - "AppIcon.icon"
+          - "AppIcon.icon/**"
+          - "Frameworks/**"
+          - "Resources/Fonts/*notch*"
+      - path: PairlingShared
+    dependencies:
+      - package: MarkdownUI
+      - package: Splash
+      - package: SwiftNIOSSH
+        product: NIOSSH
+      - package: SwiftNIO
+        product: NIOCore
+      - package: SwiftNIO
+        product: NIOHTTP1
+      - package: SwiftNIO
+        product: NIOPosix
+      - package: TalsecRuntime
+      - framework: Pairling/Frameworks/PairlingTailnet.xcframework
+        embed: false
+      - target: PairlingWidgets
+        embed: true
+      - target: PairlingWatch
+        embed: true
+      - target: PairlingShare
+        embed: true
+    info:
+      path: Pairling/Info.plist
+      properties:
+        CFBundleDisplayName: Pairling
+        CFBundleIconName: AppIcon
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "246"
+        UIAppFonts:
+          - stack-sans-headline-variable.ttf
+        ITSAppUsesNonExemptEncryption: false
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UIApplicationSupportsIndirectInputEvents: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIRequiredDeviceCapabilities:
+          - arm64
+        UIBackgroundModes:
+          - processing
+          - audio
+          - remote-notification
+        NSBonjourServices:
+          - _pairling-pair._tcp
+        BGTaskSchedulerPermittedIdentifiers:
+          - dev.pairling.ios.nightly-index
+          - dev.pairling.ios.pairdrop-transfer.*
+        PairlingTeamIdentifier: "$(DEVELOPMENT_TEAM)"
+        PairlingAppAttestEnvironment: "$(PAIRLING_APP_ATTEST_ENVIRONMENT)"
+        PairlingAPNSEnvironment: "$(PAIRLING_APNS_ENVIRONMENT)"
+        PairlingPhysicalRelayBaseURL: "$(PAIRLING_PHYSICAL_RELAY_BASE_URL)"
+        PairlingSourceRevision: "$(PAIRLING_SOURCE_REVISION)"
+        # No NSExceptionDomains: routes are dialed as IP literals (outside
+        # ATS scope) or through the embedded Go bridge (outside ATS entirely).
+        # A hardcoded personal-tailnet *.ts.net exception used to live here —
+        # it only worked for the developer's own tailnet and must not ship.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: >-
+          Pairling connects to your paired Mac on the local network to discover,
+          pair with, and control your agent sessions.
+        NSCameraUsageDescription: >-
+          Pairling uses the camera only to scan a Mac pairing QR code.
+        NSFaceIDUsageDescription: >-
+          Pairling uses Face ID to verify you before restoring trust or performing remote actions on a Mac you paired.
+        NSMicrophoneUsageDescription: >-
+          Pairling uses the microphone when you dictate prompts.
+        NSSpeechRecognitionUsageDescription: >-
+          Pairling transcribes dictated prompts before sending them to your
+          paired Mac.
+        # Required for Live Activities — without this Activity.request()
+        # silently fails. iOS 16.1+ feature; iOS 26 deployment target is fine.
+        NSSupportsLiveActivities: true
+        # Lets the lock-screen activity update from background SSE pushes.
+        NSSupportsLiveActivitiesFrequentUpdates: true
+        CFBundleURLTypes:
+          - CFBundleURLName: dev.pairling.ios.url
+            CFBundleURLSchemes:
+              - pairling
+        # OneStream currently exports `*-pairling.json`, so iOS sees the file
+        # as JSON. The reader validates the exact suffix and enforces file,
+        # nesting, and decoded-field bounds before routing any content.
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: OneStream Handoff
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - public.json
+        LSSupportsOpeningDocumentsInPlace: true
+    entitlements:
+      path: Pairling/Pairling.entitlements
+      properties:
+        com.apple.developer.associated-domains:
+          - applinks:pairling.dev
+        aps-environment: "$(PAIRLING_APNS_ENVIRONMENT)"
+        com.apple.developer.devicecheck.appattest-environment: "$(PAIRLING_APP_ATTEST_ENVIRONMENT)"
+        # Shared container for the share extension: it queues shared items
+        # here and the app drains them into a session on next foreground.
+        com.apple.security.application-groups:
+          - group.dev.pairling.ios
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.pairling.ios
+        PRODUCT_NAME: Pairling
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        DEVELOPMENT_TEAM: 965AVD34A3
+        PAIRLING_APNS_ENVIRONMENT: development
+        PAIRLING_APP_ATTEST_ENVIRONMENT: development
+        PAIRLING_SOURCE_REVISION: ""
+        CODE_SIGN_STYLE: Automatic
+      configs:
+        Debug:
+          PAIRLING_APNS_ENVIRONMENT: development
+          PAIRLING_APP_ATTEST_ENVIRONMENT: development
+        Release:
+          PAIRLING_APNS_ENVIRONMENT: production
+          PAIRLING_APP_ATTEST_ENVIRONMENT: production
+
+  # Widget Extension target — Live Activities (Lock Screen + Dynamic Island)
+  # live in this process. iOS launches it on demand when an Activity is
+  # active. Keep it tiny: pure SwiftUI, no networking, no business logic.
+  # State arrives via the shared PairlingActivityAttributes.ContentState the
+  # main app pushes through `activity.update(...)`.
+  PairlingWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: PairlingWidgets
+        excludes:
+          - "**/*.bak"
+          - "**/.DS_Store"
+      # The Lock Screen card is shared with the main app so "preview == ships".
+      # Per-file dual membership (NOT via PairlingShared/, which also compiles
+      # into the watchOS target — that target lacks the ActivityKit ContentState
+      # and iOS-26 glass this card's helpers reference).
+      - path: Pairling/Views/Shared/LiveActivityCardView.swift
+      # PairlingActivityAttributes is the ActivityKit attributes + ContentState
+      # for the Live Activity. Same per-file dual-membership reason: the widget
+      # needs the exact type the app pushes through activity.update(...), and it
+      # cannot come via PairlingShared/ (watchOS has no ActivityKit). One source
+      # file, two targets — no byte-identical copy to drift.
+      - path: Pairling/Foundation/PairlingActivityAttributes.swift
+      # The fleet Live Activity's attributes + ContentState. Same per-file
+      # dual-membership reason as the per-session attributes above: the widget
+      # needs the exact type the app pushes through activity.update(...).
+      - path: Pairling/Foundation/PairlingFleetActivityAttributes.swift
+      - path: Pairling/Resources/Fonts/stack-sans-headline-variable.ttf
+        buildPhase: resources
+    info:
+      path: PairlingWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: Pairling Widgets
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "246"
+        UIAppFonts:
+          - stack-sans-headline-variable.ttf
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.pairling.ios.pairlingwidgets
+        PRODUCT_NAME: PairlingWidgets
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        DEVELOPMENT_TEAM: 965AVD34A3
+        CODE_SIGN_STYLE: Automatic
+        SKIP_INSTALL: true
+
+  # Share Extension — "Send to Pairling" from any app. It cannot run the full
+  # app stack, so it is deliberately store-and-forward: it copies the shared
+  # item into the app-group inbox and returns immediately. The main app drains
+  # the inbox on next foreground and uploads through the existing PairDrop
+  # path. No networking, no auth, no business logic in the extension.
+  PairlingShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: PairlingShare
+        excludes:
+          - "**/*.bak"
+          - "**/.DS_Store"
+      # The inbox format is one source of truth, shared with the app so the
+      # writer and the drainer can never drift.
+      - path: Pairling/Foundation/ShareInbox.swift
+      - path: Pairling/Foundation/PairDropBackgroundRequest.swift
+    info:
+      path: PairlingShare/Info.plist
+      properties:
+        CFBundleDisplayName: Send to Pairling
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "246"
+        BGTaskSchedulerPermittedIdentifiers:
+          - dev.pairling.ios.pairdrop-transfer.*
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsImageWithMaxCount: 8
+              NSExtensionActivationSupportsFileWithMaxCount: 8
+              NSExtensionActivationSupportsText: true
+              NSExtensionActivationSupportsWebURLWithMaxCount: 4
+    entitlements:
+      path: PairlingShare/PairlingShare.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.dev.pairling.ios
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.pairling.ios.share
+        PRODUCT_NAME: PairlingShare
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        DEVELOPMENT_TEAM: 965AVD34A3
+        CODE_SIGN_STYLE: Automatic
+        SKIP_INSTALL: true
+
+  PairlingWatch:
+    type: application
+    platform: watchOS
+    sources:
+      - path: PairlingWatch
+        excludes:
+          - "**/*.bak"
+          - "**/.DS_Store"
+      - path: Pairling/AppIcon.icon
+      - path: PairlingShared
+    dependencies:
+      - target: PairlingWatchWidgets
+        embed: true
+    info:
+      path: PairlingWatch/Info.plist
+      properties:
+        CFBundleDisplayName: Pairling
+        CFBundleIconName: AppIcon
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "246"
+        WKApplication: true
+        WKCompanionAppBundleIdentifier: dev.pairling.ios
+    entitlements:
+      path: PairlingWatch/PairlingWatch.entitlements
+      properties:
+        # Shared container so the watch face complication reads the same
+        # snapshot the watch app persists.
+        com.apple.security.application-groups:
+          - group.dev.pairling.ios
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.pairling.ios.watchkitapp
+        PRODUCT_NAME: PairlingWatch
+        WATCHOS_DEPLOYMENT_TARGET: "26.0"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        DEVELOPMENT_TEAM: 965AVD34A3
+        CODE_SIGN_STYLE: Automatic
+
+  # Watch face complication. A tiny WidgetKit extension that reads the shared
+  # snapshot and shows the fleet's needs-you count on the watch face. watchOS
+  # emits TARGETED_DEVICE_FAMILY=4 on its own, so this target must not set it.
+  PairlingWatchWidgets:
+    type: app-extension
+    platform: watchOS
+    sources:
+      - path: PairlingWatchWidgets
+        excludes:
+          - "**/*.bak"
+          - "**/.DS_Store"
+      - path: PairlingShared
+    info:
+      path: PairlingWatchWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: Pairling Watch Widgets
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "246"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    entitlements:
+      path: PairlingWatchWidgets/PairlingWatchWidgets.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.dev.pairling.ios
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.pairling.ios.watchkitapp.widgets
+        PRODUCT_NAME: PairlingWatchWidgets
+        WATCHOS_DEPLOYMENT_TARGET: "26.0"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        DEVELOPMENT_TEAM: 965AVD34A3
+        CODE_SIGN_STYLE: Automatic
+        SKIP_INSTALL: true
+
+  PairlingAutomation:
+    type: application
+    platform: macOS
+    sources:
+      - path: mac/automation-helper
+        excludes:
+          - "PairlingAutomationTests/**"
+          - "**/.DS_Store"
+    scheme:
+      testTargets:
+        - PairlingAutomationTests
+    info:
+      path: mac/automation-helper/Info.plist
+      properties:
+        CFBundleDisplayName: Pairling
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        LSUIElement: true
+        NSAppleEventsUsageDescription: >-
+          Pairling needs access to Terminal to provide the terminal control you request from your paired iPhone.
+    entitlements:
+      path: mac/automation-helper/PairlingAutomation.entitlements
+      properties:
+        com.apple.security.automation.apple-events: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.pairling.automation
+        PRODUCT_NAME: Pairling
+        PRODUCT_MODULE_NAME: PairlingAutomation
+        EXECUTABLE_NAME: PairlingAutomation
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
+        DEVELOPMENT_TEAM: 965AVD34A3
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: Developer ID Application
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+      configs:
+        Debug:
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: YES
+
+  PairlingAutomationTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: mac/automation-helper/PairlingAutomationTests
+    dependencies:
+      - target: PairlingAutomation
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.pairling.automation.tests
+        PRODUCT_NAME: PairlingAutomationTests
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
+        DEVELOPMENT_TEAM: 965AVD34A3
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Pairling.app/Contents/MacOS/PairlingAutomation"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: Developer ID Application
+        TEST_TARGET_NAME: PairlingAutomation
+        GENERATE_INFOPLIST_FILE: YES
+
+  PairlingTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: PairlingTests
+    info:
+      path: PairlingTests/Info.plist
+      properties:
+        CFBundleDisplayName: Pairling Tests
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "246"
+    dependencies:
+      - target: Pairling
+      - package: SwiftNIOSSH
+        product: NIOSSH
+      - package: SwiftNIO
+        product: NIOCore
+      - package: SwiftNIO
+        product: NIOEmbedded
+      - package: SwiftNIO
+        product: NIOHTTP1
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.pairling.ios.tests
+        PRODUCT_NAME: PairlingTests
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        DEVELOPMENT_TEAM: 965AVD34A3
+        CODE_SIGN_STYLE: Automatic
+
+  PairlingUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: PairlingUITests
+    dependencies:
+      - target: Pairling
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.pairling.ios.uitests
+        PRODUCT_NAME: PairlingUITests
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        DEVELOPMENT_TEAM: 965AVD34A3
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: Pairling

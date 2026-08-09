@@ -1273,11 +1273,11 @@ _ACP_RELEASE_PROFILE_PINS = MappingProxyType(
             ),
         },
         "omp": {
-            "provider_version": "17.2.8",
+            "provider_version": "17.2.10",
             "provider_channel": "stable",
             "safe_launch_digest": (
-                "0a4add6e92e6f5edd6ecd6040e52c2de"
-                "abdad39c2522ef4efe905753458832bd"
+                "c2740b2a2aa8f7a2d3fe10f0d8224c9"
+                "4d6d26771861d4269d1f8ec5618f67186"
             ),
         },
         "grok_build": {

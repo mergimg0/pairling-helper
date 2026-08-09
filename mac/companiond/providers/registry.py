@@ -20,6 +20,7 @@ from .hermes import HermesProviderAdapter
 from .opencode import OpenCodeProviderAdapter
 from .openhands import OpenHandsProviderAdapter
 from .qwen import QwenCodeProviderAdapter
+from .omp import OmpProviderAdapter
 from .operations import provider_has_release_membership
 
 
@@ -32,6 +33,7 @@ _DIRECT_ADAPTER_IDS = {
     "copilot",
     "droid",
     "hermes_agent",
+    "omp",
     "opencode",
     "openhands",
     "qwen_code",
@@ -46,6 +48,7 @@ def provider_adapters(home: Path | None = None) -> list[ProviderAdapter]:
         CopilotProviderAdapter(home=home),
         FactoryDroidProviderAdapter(home=home),
         HermesProviderAdapter(home=home),
+        OmpProviderAdapter(home=home),
         OpenCodeProviderAdapter(home=home),
         OpenHandsProviderAdapter(home=home),
         QwenCodeProviderAdapter(home=home),

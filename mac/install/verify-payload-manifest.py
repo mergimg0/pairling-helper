@@ -719,6 +719,20 @@ def verify_payload_manifest(
             or any(character not in "0123456789abcdef" for character in digest)
         ):
             return 0, 0, f"manifest Python archive {architecture} digest is invalid"
+    automation_archives = manifest.get("automation_archives")
+    if not isinstance(automation_archives, dict) or set(automation_archives) != {
+        "darwin-arm64",
+        "darwin-x64",
+    }:
+        return 0, 0, "manifest automation archive architecture map is invalid"
+    for architecture in ("arm64", "x64"):
+        digest = automation_archives.get(f"darwin-{architecture}")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            return 0, 0, f"manifest automation archive {architecture} digest is invalid"
     runtime_manifests = manifest.get("runtime_manifests")
     if not isinstance(runtime_manifests, dict) or set(runtime_manifests) != {
         "darwin-arm64",

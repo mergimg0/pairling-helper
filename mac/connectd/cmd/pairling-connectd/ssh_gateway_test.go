@@ -13,7 +13,7 @@ import (
 func TestSSHGatewayRefusesNonLoopbackBind(t *testing.T) {
 	upstream, _ := url.Parse("http://127.0.0.1:7773")
 	for _, addr := range []string{"0.0.0.0:7775", ":7775", "192.168.1.10:7775", "[::]:7775"} {
-		if _, err := newSSHGatewayHandler(upstream, 1024, addr); err == nil {
+		if _, err := newSSHGatewayHandler(upstream, 1024, addr, nil); err == nil {
 			t.Fatalf("ssh gateway must refuse non-loopback bind %q", addr)
 		}
 	}
@@ -22,7 +22,7 @@ func TestSSHGatewayRefusesNonLoopbackBind(t *testing.T) {
 func TestSSHGatewayBuildsHandlerInSSHMode(t *testing.T) {
 	upstream, _ := url.Parse("http://127.0.0.1:7773")
 	for _, addr := range []string{"127.0.0.1:7775", "localhost:7775", "[::1]:7775"} {
-		handler, err := newSSHGatewayHandler(upstream, 1024, addr)
+		handler, err := newSSHGatewayHandler(upstream, 1024, addr, nil)
 		if err != nil {
 			t.Fatalf("loopback bind %q rejected: %v", addr, err)
 		}
