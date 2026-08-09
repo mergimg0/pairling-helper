@@ -1352,8 +1352,15 @@ def _open_regular_runtime_archive(archive_path: Path):
 def _extract_runtime_archive(archive_path: Path, destination: Path) -> str | None:
     seen: set[str] = set()
     directory_modes: list[tuple[Path, int]] = []
+    implicit_directories: set[Path] = set()
     total_bytes = 0
     member_count = 0
+
+    def remember_implicit_directories(path: Path) -> None:
+        while path != destination and not path.exists():
+            implicit_directories.add(path)
+            path = path.parent
+
     try:
         with _open_regular_runtime_archive(archive_path) as archive_file, tarfile.open(
             fileobj=archive_file,
@@ -1405,9 +1412,11 @@ def _extract_runtime_archive(archive_path: Path, destination: Path) -> str | Non
 
                 target = destination.joinpath(*parts)
                 if member.isdir():
+                    remember_implicit_directories(target.parent)
                     target.mkdir(mode=0o700, parents=True, exist_ok=True)
                     directory_modes.append((target, mode))
                     continue
+                remember_implicit_directories(target.parent)
                 target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                 source = archive.extractfile(member)
                 if source is None:
@@ -1442,6 +1451,11 @@ def _extract_runtime_archive(archive_path: Path, destination: Path) -> str | Non
         return f"cannot safely extract runtime archive: {type(exc).__name__}: {exc}"
     if not seen:
         return "runtime archive is empty"
+    for path in implicit_directories:
+        try:
+            path.chmod(0o755)
+        except OSError as exc:
+            return f"cannot apply npm implicit directory permissions: {type(exc).__name__}"
     for path, mode in sorted(
         directory_modes,
         key=lambda item: len(item[0].parts),
