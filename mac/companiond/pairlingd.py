@@ -2358,7 +2358,7 @@ def _broker_spawn_provider_identity(
     provider: str,
     native_id: str,
     project: str,
-    timeout: float = 2.0,
+    timeout: float = 10.0,
 ) -> dict | None:
     """Prove a live provider process before publishing a broker launch."""
     if not _broker_session_matches_spawn_request(
