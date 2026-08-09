@@ -893,8 +893,13 @@ if [[ "$NOTARIZE" == "1" ]]; then
   done
 fi
 
-archive_automation_helper "$AUTOMATION_HELPER_ARM64" "$AUTOMATION_ARCHIVE_ARM64"
-archive_automation_helper "$AUTOMATION_HELPER_X64" "$AUTOMATION_ARCHIVE_X64"
+if [[ -n "$PREBUILT_AUTOMATION_ARM64" ]]; then
+  /bin/cp -p "$PREBUILT_AUTOMATION_ARM64" "$AUTOMATION_ARCHIVE_ARM64"
+  /bin/cp -p "$PREBUILT_AUTOMATION_X64" "$AUTOMATION_ARCHIVE_X64"
+else
+  archive_automation_helper "$AUTOMATION_HELPER_ARM64" "$AUTOMATION_ARCHIVE_ARM64"
+  archive_automation_helper "$AUTOMATION_HELPER_X64" "$AUTOMATION_ARCHIVE_X64"
+fi
 
 # --- stage the seven inert packages -----------------------------------------
 cp "$SOURCE_ROOT/npm/pairling/package.json" "$STAGE/pairling/package.json"
