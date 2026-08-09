@@ -297,7 +297,7 @@ class AutomationHelperClient:
         fresh_identity: bool = False,
     ) -> dict[str, Any]:
         timeout = self._resolve_timeout(timeout_ms)
-        request_id = str(uuid.uuid4())
+        request_id = str(uuid.uuid4()).upper()
         try:
             self._verify_local_identity(fresh=fresh_identity)
             local_secret = self._load_local_secret()
