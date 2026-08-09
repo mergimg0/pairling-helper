@@ -218,7 +218,7 @@ def _require_real_bundle_tree(bundle: Path) -> None:
         for name in [*directories, *filenames]:
             entry = current / name
             entry_metadata = _lstat(entry)
-            if stat.S_ISLNK(entry_metadata.st_mode) or not (
+            if entry_metadata.st_uid != os.geteuid() or stat.S_ISLNK(entry_metadata.st_mode) or not (
                 stat.S_ISDIR(entry_metadata.st_mode) or stat.S_ISREG(entry_metadata.st_mode)
             ):
                 raise HelperLifecycleError("Pairling automation helper bundle is invalid.")
@@ -475,6 +475,22 @@ def _remove_owned_bundle(path: Path) -> None:
     if not path.exists() and not path.is_symlink():
         return
     _require_real_bundle_tree(path)
+    for parent, _directories, _filenames in os.walk(path, followlinks=False):
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+                raise HelperLifecycleError("Pairling automation helper bundle is invalid.")
+            os.fchmod(descriptor, stat.S_IMODE(metadata.st_mode) | stat.S_IWUSR)
+        except OSError as exc:
+            raise HelperLifecycleError("Pairling automation helper bundle is unavailable.") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
     shutil.rmtree(path)
 
 
