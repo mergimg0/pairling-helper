@@ -31,7 +31,7 @@ from .operations import (
     released_operation_ids_for_provider,
 )
 
-_SUPPORTED_VERSION = (0, 146, 0)
+_SUPPORTED_VERSION = (0, 147, 0)
 _MAX_REQUEST_BYTES = 256 * 1024
 _MAX_RESPONSE_LINE_BYTES = 1024 * 1024
 _MAX_TEXT_FIELD_BYTES = 64 * 1024
@@ -573,7 +573,7 @@ class _CodexAppServerProcess:
                 user_agent = response["userAgent"]
                 if not is_compatible_codex_app_server_version(user_agent):
                     raise CodexAppServerProtocolError(
-                        "Codex app-server requires the reviewed 0.146.0 protocol"
+                        "Codex app-server requires the reviewed 0.147.0 protocol"
                     )
                 self._write_message({"method": "initialized", "params": {}})
                 with self._state_lock:
@@ -1808,7 +1808,7 @@ class CodexAppServerDriver:
             raise ValueError("Codex driver requires an exact app-server binding")
         if not is_compatible_codex_app_server_version(binding.provider_version):
             raise CodexUnsupportedOperation(
-                "Codex driver requires the reviewed 0.146.0 app-server protocol"
+                "Codex driver requires the reviewed 0.147.0 app-server protocol"
             )
         self.binding = binding
         self._safe_launch_profile = {

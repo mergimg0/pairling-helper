@@ -56,7 +56,7 @@
       },
       {
         "source_id": "codex-release",
-        "uri": "https://github.com/openai/codex/releases/tag/rust-v0.146.0",
+        "uri": "https://github.com/openai/codex/releases/tag/rust-v0.147.0",
         "kind": "official_release"
       },
       {
@@ -81,27 +81,27 @@
       },
       {
         "source_id": "codex-thread-src",
-        "uri": "https://github.com/openai/codex/blob/e363b08c9175ac1cbe5893615dd2cb9ddf95043b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs",
+        "uri": "https://github.com/openai/codex/blob/be6e8eac029b183056b7e4402879f15d2c85f61b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs",
         "kind": "tagged_source"
       },
       {
         "source_id": "codex-turn-src",
-        "uri": "https://github.com/openai/codex/blob/e363b08c9175ac1cbe5893615dd2cb9ddf95043b/codex-rs/app-server-protocol/src/protocol/v2/turn.rs",
+        "uri": "https://github.com/openai/codex/blob/be6e8eac029b183056b7e4402879f15d2c85f61b/codex-rs/app-server-protocol/src/protocol/v2/turn.rs",
         "kind": "tagged_source"
       },
       {
         "source_id": "codex-item-src",
-        "uri": "https://github.com/openai/codex/blob/e363b08c9175ac1cbe5893615dd2cb9ddf95043b/codex-rs/app-server-protocol/src/protocol/v2/item.rs",
+        "uri": "https://github.com/openai/codex/blob/be6e8eac029b183056b7e4402879f15d2c85f61b/codex-rs/app-server-protocol/src/protocol/v2/item.rs",
         "kind": "tagged_source"
       },
       {
         "source_id": "codex-auth-src",
-        "uri": "https://github.com/openai/codex/blob/e363b08c9175ac1cbe5893615dd2cb9ddf95043b/codex-rs/app-server-transport/src/transport/auth.rs",
+        "uri": "https://github.com/openai/codex/blob/be6e8eac029b183056b7e4402879f15d2c85f61b/codex-rs/app-server-transport/src/transport/auth.rs",
         "kind": "tagged_source"
       },
       {
         "source_id": "codex-rc-src",
-        "uri": "https://github.com/openai/codex/blob/e363b08c9175ac1cbe5893615dd2cb9ddf95043b/codex-rs/app-server-protocol/src/protocol/v2/remote_control.rs",
+        "uri": "https://github.com/openai/codex/blob/be6e8eac029b183056b7e4402879f15d2c85f61b/codex-rs/app-server-protocol/src/protocol/v2/remote_control.rs",
         "kind": "tagged_source"
       },
       {
@@ -141,27 +141,27 @@
       },
       {
         "source_id": "omp-release",
-        "uri": "https://github.com/can1357/oh-my-pi/tree/v17.2.8",
+        "uri": "https://github.com/can1357/oh-my-pi/tree/v17.2.12",
         "kind": "official_release"
       },
       {
         "source_id": "omp-acp",
-        "uri": "https://github.com/can1357/oh-my-pi/blob/v17.2.8/packages/coding-agent/src/modes/acp/acp-agent.ts",
+        "uri": "https://github.com/can1357/oh-my-pi/blob/v17.2.12/packages/coding-agent/src/modes/acp/acp-agent.ts",
         "kind": "tagged_source"
       },
       {
         "source_id": "omp-rpc",
-        "uri": "https://github.com/can1357/oh-my-pi/blob/v17.2.8/packages/coding-agent/docs/rpc.md",
+        "uri": "https://github.com/can1357/oh-my-pi/blob/v17.2.12/packages/coding-agent/docs/rpc.md",
         "kind": "tagged_source"
       },
       {
         "source_id": "omp-approval",
-        "uri": "https://github.com/can1357/oh-my-pi/blob/v17.2.8/packages/coding-agent/docs/approval-mode.md",
+        "uri": "https://github.com/can1357/oh-my-pi/blob/v17.2.12/packages/coding-agent/docs/approval-mode.md",
         "kind": "tagged_source"
       },
       {
         "source_id": "omp-mcp",
-        "uri": "https://github.com/can1357/oh-my-pi/blob/v17.2.8/packages/coding-agent/docs/mcp-protocol-transports.md",
+        "uri": "https://github.com/can1357/oh-my-pi/blob/v17.2.12/packages/coding-agent/docs/mcp-protocol-transports.md",
         "kind": "tagged_source"
       },
       {
@@ -596,9 +596,9 @@
       "provider_id": "codex",
       "display_name": "OpenAI Codex CLI",
       "observed_versions": [
-        "installed @openai/codex 0.146.0",
-        "tag rust-v0.146.0",
-        "commit e363b08c9175ac1cbe5893615dd2cb9ddf95043b"
+        "installed @openai/codex 0.147.0",
+        "tag rust-v0.147.0",
+        "commit be6e8eac029b183056b7e4402879f15d2c85f61b"
       ],
       "observed_channels": [
         "app-server JSON-RPC v2 over stdio",
@@ -653,11 +653,11 @@
           "lifecycle": "provider_wide",
           "machine_readable": true,
           "maturity": "experimental",
-          "version_constraints": "0.146.0; app-server and WebSocket experimental; some fields/methods require initialize.capabilities.experimentalApi=true.",
+          "version_constraints": "0.147.0; app-server and WebSocket experimental; some fields/methods require initialize.capabilities.experimentalApi=true.",
           "remote_safety": "safe",
           "current_pairling_support": {
             "status": "partial",
-            "evidence": "The reviewed 0.146.0 app-server driver implements session.resume and session.fork for exact driver-owned thread targets. It also starts, lists and reads owned threads internally, but does not expose the row’s search, paging, restore, delete, subscription or metadata controls."
+            "evidence": "The reviewed 0.147.0 app-server driver implements session.resume and session.fork for exact driver-owned thread targets. It also starts, lists and reads owned threads internally, but does not expose the row’s search, paging, restore, delete, subscription or metadata controls."
           },
           "required_pairling_addition": "Retain resume/fork; add bounded search/page/status exposure and confirmed metadata, archive/restore/delete controls before treating the full lifecycle row as supported.",
           "shared_semantics": "session.lifecycle",
@@ -688,7 +688,7 @@
           "lifecycle": "during_turn",
           "machine_readable": true,
           "maturity": "experimental",
-          "version_constraints": "0.146.0; realtime requires experimentalApi and has no accepted remote contract.",
+          "version_constraints": "0.147.0; realtime requires experimentalApi and has no accepted remote contract.",
           "remote_safety": "safe",
           "current_pairling_support": {
             "status": "partial",
@@ -731,7 +731,7 @@
           "lifecycle": "during_turn",
           "machine_readable": true,
           "maturity": "experimental",
-          "version_constraints": "0.146.0; granular policy and some requests require experimentalApi.",
+          "version_constraints": "0.147.0; granular policy and some requests require experimentalApi.",
           "remote_safety": "confirmation",
           "current_pairling_support": {
             "status": "partial",
@@ -781,7 +781,7 @@
           "lifecycle": "before_turn",
           "machine_readable": true,
           "maturity": "experimental",
-          "version_constraints": "0.146.0; collaboration/dynamic tools experimental; plugin RPCs documented as under development.",
+          "version_constraints": "0.147.0; collaboration/dynamic tools experimental; plugin RPCs documented as under development.",
           "remote_safety": "confirmation",
           "current_pairling_support": {
             "status": "partial",
@@ -825,7 +825,7 @@
           "lifecycle": "during_turn",
           "machine_readable": true,
           "maturity": "experimental",
-          "version_constraints": "0.146.0; memory requires experimentalApi; rollback deprecated; plan delta semantics experimental.",
+          "version_constraints": "0.147.0; memory requires experimentalApi; rollback deprecated; plan delta semantics experimental.",
           "remote_safety": "safe",
           "current_pairling_support": {
             "status": "partial",
@@ -872,7 +872,7 @@
           "lifecycle": "during_turn",
           "machine_readable": true,
           "maturity": "experimental",
-          "version_constraints": "0.146.0; app-server experimental; process/raw events require experimentalApi.",
+          "version_constraints": "0.147.0; app-server experimental; process/raw events require experimentalApi.",
           "remote_safety": "required_local_only",
           "current_pairling_support": {
             "status": "partial",
@@ -905,7 +905,7 @@
           "lifecycle": "during_turn",
           "machine_readable": true,
           "maturity": "version_specific",
-          "version_constraints": "0.146.0 app-server-stdio reviewed driver only.",
+          "version_constraints": "0.147.0 app-server-stdio reviewed driver only.",
           "remote_safety": "confirmation",
           "current_pairling_support": {
             "status": "supported",
@@ -948,7 +948,7 @@
           "lifecycle": "provider_wide",
           "machine_readable": "qualified",
           "maturity": "experimental",
-          "version_constraints": "0.146.0; WebSocket and Remote Control RPCs experimental; official relay undocumented.",
+          "version_constraints": "0.147.0; WebSocket and Remote Control RPCs experimental; official relay undocumented.",
           "remote_safety": "confirmation",
           "current_pairling_support": {
             "status": "partial",
@@ -977,7 +977,7 @@
           "lifecycle": "provider_wide",
           "machine_readable": true,
           "maturity": "version_specific",
-          "version_constraints": "0.146.0 app-server-stdio reviewed driver only.",
+          "version_constraints": "0.147.0 app-server-stdio reviewed driver only.",
           "remote_safety": "safe",
           "current_pairling_support": {
             "status": "supported",
@@ -1011,7 +1011,7 @@
           "lifecycle": "provider_wide",
           "machine_readable": "qualified",
           "maturity": "experimental",
-          "version_constraints": "0.146.0; external import is local and potentially sensitive; cloud commands experimental; mcp-server is not a full session protocol.",
+          "version_constraints": "0.147.0; external import is local and potentially sensitive; cloud commands experimental; mcp-server is not a full session protocol.",
           "remote_safety": "confirmation",
           "current_pairling_support": {
             "status": "missing",
@@ -1426,8 +1426,8 @@
       "provider_id": "omp",
       "display_name": "Oh My Pi",
       "observed_versions": [
-        "OMP 17.2.8",
-        "commit 5af71dc9cf132538e072806424f71f43f734d9ae",
+        "OMP 17.2.12",
+        "commit 45e12e5bb758198a920c6070e7e64cb33b21beac",
         "patched ACP SDK 1.2.1",
         "RPC helper 0.1.0 Alpha"
       ],
@@ -1468,11 +1468,11 @@
           "lifecycle": "provider_wide",
           "machine_readable": true,
           "maturity": "public",
-          "version_constraints": "17.2.8; fork/form elicitation unstable; patched ACP 1.2.1.",
+          "version_constraints": "17.2.12; fork/form elicitation unstable; patched ACP 1.2.1.",
           "remote_safety": "confirmation",
           "current_pairling_support": {
             "status": "partial",
-            "evidence": "The exact 17.2.8 managed ACP profile implements session.prompt.send, conditional session.turn.interrupt, negotiated session.model.set, safe session.permissions.set, correlated session.approval.decide and correlated session.question.answer. Resume, fork, reasoning, provider-wide catalogs and reverse FS/terminal are not exposed."
+            "evidence": "The exact 17.2.12 managed ACP profile implements session.prompt.send, conditional session.turn.interrupt, negotiated session.model.set, safe session.permissions.set, correlated session.approval.decide and correlated session.question.answer. Resume, fork, reasoning, provider-wide catalogs and reverse FS/terminal are not exposed."
           },
           "required_pairling_addition": "Add exact load/resume/fork targets and separately attested provider-wide reads before exposure; keep reverse FS/terminal, plan and unsafe tools disabled.",
           "shared_semantics": "acp.session",
@@ -1521,7 +1521,7 @@
           "lifecycle": "during_turn",
           "machine_readable": true,
           "maturity": "version_specific",
-          "version_constraints": "17.2.8; Python helper 0.1.0 Alpha.",
+          "version_constraints": "17.2.12; Python helper 0.1.0 Alpha.",
           "remote_safety": "confirmation",
           "current_pairling_support": {
             "status": "partial",
@@ -1560,7 +1560,7 @@
           "lifecycle": "before_turn",
           "machine_readable": "qualified",
           "maturity": "unsafe",
-          "version_constraints": "17.2.8; effective mode not reported; plan auto-approval defect observed.",
+          "version_constraints": "17.2.12; effective mode not reported; plan auto-approval defect observed.",
           "remote_safety": "do_not_expose",
           "current_pairling_support": {
             "status": "not_applicable",
@@ -1607,7 +1607,7 @@
           "lifecycle": "provider_wide",
           "machine_readable": "qualified",
           "maturity": "public",
-          "version_constraints": "17.2.8; subagents headless yolo internally; checkpoints conversation-only.",
+          "version_constraints": "17.2.12; subagents headless yolo internally; checkpoints conversation-only.",
           "remote_safety": "required_local_only",
           "current_pairling_support": {
             "status": "partial",
@@ -1638,7 +1638,7 @@
           "lifecycle": "before_turn",
           "machine_readable": true,
           "maturity": "version_specific",
-          "version_constraints": "OMP 17.2.8 stable managed ACP profile.",
+          "version_constraints": "OMP 17.2.12 stable managed ACP profile.",
           "remote_safety": "confirmation",
           "current_pairling_support": {
             "status": "supported",
@@ -1680,7 +1680,7 @@
           "lifecycle": "provider_wide",
           "machine_readable": "qualified",
           "maturity": "version_specific",
-          "version_constraints": "17.2.8; stdio no auth; extensions unisolated.",
+          "version_constraints": "17.2.12; stdio no auth; extensions unisolated.",
           "remote_safety": "required_local_only",
           "current_pairling_support": {
             "status": "missing",

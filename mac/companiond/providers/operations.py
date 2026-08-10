@@ -752,7 +752,7 @@ REVIEWED_OPERATION_CATALOG = OperationCatalog(
 
 CODEX_APP_SERVER_SAFE_LAUNCH_PROFILE = {
     "provider_id": "codex",
-    "provider_version": "0.146.0",
+    "provider_version": "0.147.0",
     "provider_channel": "app-server-stdio",
     "argv_suffix": ("app-server", "--listen", "stdio://"),
     "client_version": "2026.08.03",
@@ -1075,7 +1075,7 @@ _DIRECT_RELEASE_DRIVER_PROFILES = MappingProxyType(
     {
         "codex": {
             "map_provider_id": "codex",
-            "provider_version": "0.146.0",
+            "provider_version": "0.147.0",
             "provider_channel": "app-server-stdio",
             "driver_contract": CODEX_APP_SERVER_SAFE_LAUNCH_PROFILE,
             "source_paths": (
@@ -1273,11 +1273,11 @@ _ACP_RELEASE_PROFILE_PINS = MappingProxyType(
             ),
         },
         "omp": {
-            "provider_version": "17.2.10",
+            "provider_version": "17.2.12",
             "provider_channel": "stable",
             "safe_launch_digest": (
-                "c2740b2a2aa8f7a2d3fe10f0d8224c9"
-                "4d6d26771861d4269d1f8ec5618f67186"
+                "ee6e02d15d771354a927361546c3c4f0"
+                "a05e14c3f0eb298eb2bff5798f137de1"
             ),
         },
         "grok_build": {
