@@ -459,6 +459,7 @@ class OmpProviderAdapter(ProviderAdapter):
             "interrupt",
             "terminate",
             "resume",
+            "spawn",
         }
 
     def create_control_driver(self, binding):
@@ -495,6 +496,7 @@ class OmpProviderAdapter(ProviderAdapter):
             "interrupt",
             "terminate",
             "resume",
+            "spawn",
         ) if installed else ("detect", "status")
         if not installed:
             notes = (
