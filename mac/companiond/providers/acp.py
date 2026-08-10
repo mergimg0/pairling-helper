@@ -725,10 +725,10 @@ class ACPControlDriver:
         self._cancel_requested = False
         self._generation_invalidated = False
         self._sandbox_active = False
-        self._last_advertised_operations: tuple[str, ...] = ()
-        self._last_snapshot_session_id: str | None = None
-        self._last_snapshot_generation = 0
-        self._last_snapshot_valid_until = 0.0
+        self._snapshot_proofs: dict[
+            str | None,
+            tuple[int, tuple[str, ...], float],
+        ] = {}
         self._receipts: dict[
             tuple[int, str],
             tuple[str, str | None, str, ProviderOperationResult],
@@ -1368,10 +1368,11 @@ class ACPControlDriver:
                     blocked = "provider canary attestation is missing or stale"
                 else:
                     blocked = "managed ACP child is disconnected"
-            self._last_advertised_operations = tuple(operations)
-            self._last_snapshot_session_id = session_id
-            self._last_snapshot_generation = self._generation
-            self._last_snapshot_valid_until = now + 5.0
+            self._snapshot_proofs[session_id] = (
+                self._generation,
+                tuple(operations),
+                now + 5.0,
+            )
             return ProviderControlSnapshot(
                 provider_id=self.binding.provider_id,
                 provider_version=self.binding.provider_version,
@@ -1396,15 +1397,16 @@ class ACPControlDriver:
         session_id: str | None,
         session_truth: dict[str, Any] | None,
     ) -> ProviderOperationCorrelation:
+        snapshot_proof = self._snapshot_proofs.get(session_id)
         if (
             session_id is None
             or capability_generation != self.capability_generation
             or not self._exact_session_truth(session_id, session_truth)
             or not self._canaries_attested(session_truth)
-            or self._last_snapshot_session_id != session_id
-            or self._last_snapshot_generation != capability_generation
-            or operation_id not in self._last_advertised_operations
-            or time.time() > self._last_snapshot_valid_until
+            or snapshot_proof is None
+            or snapshot_proof[0] != capability_generation
+            or operation_id not in snapshot_proof[1]
+            or time.time() > snapshot_proof[2]
         ):
             raise AcpStaleBinding(
                 "ACP operation correlation proof is unavailable"
@@ -1437,11 +1439,12 @@ class ACPControlDriver:
         except OperationCatalogError as exc:
             raise AcpUnavailableError(str(exc)) from exc
         with self._state_lock:
+            snapshot_proof = self._snapshot_proofs.get(session_id)
             snapshot_is_live = (
-                self._last_snapshot_generation == self._generation
-                and self._last_snapshot_session_id == session_id
-                and time.time() <= self._last_snapshot_valid_until
-                and operation_id in self._last_advertised_operations
+                snapshot_proof is not None
+                and snapshot_proof[0] == self._generation
+                and time.time() <= snapshot_proof[2]
+                and operation_id in snapshot_proof[1]
             )
         if not snapshot_is_live:
             raise AcpUnavailableError(f"ACP operation is not currently negotiated: {operation_id}")
@@ -2020,8 +2023,7 @@ class ACPControlDriver:
             self._active_prompt = False
             self._pending_permissions.clear()
             self._pending_elicitations.clear()
-            self._last_advertised_operations = ()
-            self._last_snapshot_valid_until = 0.0
+            self._snapshot_proofs.clear()
             if not self._generation_invalidated:
                 self._generation += 1
                 self._generation_invalidated = True
