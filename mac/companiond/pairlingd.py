@@ -23590,7 +23590,6 @@ def _provider_control_managed_target(session_id: str, provider: str):
     normalized["controllable"] = bool(
         available and lifecycle in {"launching", "running", "waiting"}
     )
-    normalized["session_instance_id"] = str(truth.get("binding_id") or "")
     return {
         "driver": driver,
         "provider_id": provider,
