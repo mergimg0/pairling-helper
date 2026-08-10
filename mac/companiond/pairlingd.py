@@ -12282,6 +12282,7 @@ def _omp_reconcile_provider_inventory(inventory: dict) -> None:
 
 def _capture_sessions_provider_inventory(provider: str) -> dict:
     """Capture one exact ambient and/or Pairling-owned provider generation."""
+    omp_inventory: dict | None = None
     if provider == "omp":
         if provider not in _session_membership_provider_ids():
             return {
@@ -12304,7 +12305,12 @@ def _capture_sessions_provider_inventory(provider: str) -> dict:
             }
         inventory = _omp_provider_inventory_from_process_rows(process_rows)
         _omp_reconcile_provider_inventory(inventory)
-        return inventory
+        if (
+            inventory.get("probe_state") != "exact"
+            or not bool(inventory.get("membership_complete"))
+        ):
+            return inventory
+        omp_inventory = inventory
     if provider not in _session_membership_provider_ids():
         return {
             "provider": provider,
@@ -12369,6 +12375,16 @@ def _capture_sessions_provider_inventory(provider: str) -> dict:
             "probe_state": "failed",
             "probe_reason": "managed_session_inventory_invalid",
             "membership_complete": False,
+            "checked_at": _time.time(),
+        }
+
+    if omp_inventory is not None:
+        return {
+            **omp_inventory,
+            "rows": (
+                copy.deepcopy(omp_inventory.get("rows") or [])
+                + copy.deepcopy(managed_rows)
+            ),
             "checked_at": _time.time(),
         }
 
