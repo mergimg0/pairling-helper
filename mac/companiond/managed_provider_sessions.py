@@ -683,6 +683,8 @@ class ManagedProviderSessionStore:
         result["claude_pid"] = 0
         result["started_at"] = int(float(result.pop("created_at") or 0))
         result["last_heartbeat"] = int(float(result.get("updated_at") or 0))
+        closed_at = result.get("closed_at")
+        result["closed_at"] = int(float(closed_at)) if closed_at is not None else None
         result["working_on"] = result.get("title") or None
         result["first_prompt"] = None
         attestation_json = result.pop("provider_attestation_json", None)
@@ -1703,7 +1705,9 @@ class ManagedProviderSessionStore:
             conn.execute(
                 """
                 UPDATE managed_provider_sessions
-                SET lifecycle='blocked', turn_state='blocked', blocked_reason=?,
+                SET lifecycle=CASE WHEN lifecycle='closed' THEN lifecycle ELSE 'blocked' END,
+                    turn_state=CASE WHEN lifecycle='closed' THEN turn_state ELSE 'blocked' END,
+                    blocked_reason=CASE WHEN lifecycle='closed' THEN blocked_reason ELSE ? END,
                     driver_available=0, updated_at=?
                 WHERE session_id=?
                 """,
