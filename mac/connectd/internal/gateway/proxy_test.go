@@ -48,6 +48,18 @@ func (l *recordingLogger) last() Event {
 	return l.events[len(l.events)-1]
 }
 
+func TestStatusRecorderPreservesStreamingFlush(t *testing.T) {
+	response := httptest.NewRecorder()
+	recorder := &statusRecorder{ResponseWriter: response, status: http.StatusOK}
+
+	if err := http.NewResponseController(recorder).Flush(); err != nil {
+		t.Fatalf("flush through status recorder: %v", err)
+	}
+	if !response.Flushed {
+		t.Fatal("wrapped response writer was not flushed")
+	}
+}
+
 func TestHandlerForwardsAllowedRequestAndPreservesAuthProofHeaders(t *testing.T) {
 	var sawRequest bool
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

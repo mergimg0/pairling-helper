@@ -3452,6 +3452,27 @@ class _RuntimeAdmission:
             pass
         self._released = True
 
+
+COMMAND_STREAM_MAX_SECONDS = 60.0
+_COMMAND_STREAM_LEASES_LOCK = threading.Lock()
+_COMMAND_STREAM_LEASES: dict[str, threading.Event] = {}
+
+
+def _replace_command_stream_lease(device_id: str) -> threading.Event:
+    lease = threading.Event()
+    with _COMMAND_STREAM_LEASES_LOCK:
+        previous = _COMMAND_STREAM_LEASES.get(device_id)
+        _COMMAND_STREAM_LEASES[device_id] = lease
+        if previous is not None:
+            previous.set()
+    return lease
+
+
+def _release_command_stream_lease(device_id: str, lease: threading.Event) -> None:
+    with _COMMAND_STREAM_LEASES_LOCK:
+        if _COMMAND_STREAM_LEASES.get(device_id) is lease:
+            _COMMAND_STREAM_LEASES.pop(device_id, None)
+
 PUBLIC_ENDPOINTS = {"/health", "/healthz", "/readyz", "/manifest", "/pair/psk-claim-v2", "/pair/psk-activate", "/pair/reauth-challenge", "/pair/reauth-claim"}
 
 LOCAL_CONTROL_PATHS = {
@@ -24095,23 +24116,35 @@ class Handler(BaseHTTPRequestHandler):
             admission.release()
             self._runtime_admission = None
 
+    def _release_command_stream_lease(self) -> None:
+        active = getattr(self, "_command_stream_lease", None)
+        if active is not None:
+            _release_command_stream_lease(*active)
+            self._command_stream_lease = None
+
     def _run_dispatch(self):
         self._runtime_admission = None
-        with _receipted_request_scope():
-            try:
-                return self._dispatch()
-            except socket.timeout:
-                self._release_runtime_admission()
-                self._send_json({"ok": False, "error": {"code": "request_timeout"}}, status=408)
-            except RequestBodyRejected as error:
-                self._release_runtime_admission()
+        self._command_stream_lease = None
+        self._pairling_sse_response = False
+        try:
+            with _receipted_request_scope():
+                try:
+                    return self._dispatch()
+                except socket.timeout:
+                    self._release_runtime_admission()
+                    self._send_json({"ok": False, "error": {"code": "request_timeout"}}, status=408)
+                except RequestBodyRejected as error:
+                    self._release_runtime_admission()
+                    self.close_connection = True
+                    self._send_json({
+                        "ok": False,
+                        "error": {"code": error.code, "message": error.message},
+                    }, status=error.status)
+                except ClientDisconnected:
+                    return
+        finally:
+            if self._pairling_sse_response:
                 self.close_connection = True
-                self._send_json({
-                    "ok": False,
-                    "error": {"code": error.code, "message": error.message},
-                }, status=error.status)
-            except ClientDisconnected:
-                return
 
     def do_GET(self):
         return self._run_dispatch()
@@ -24849,6 +24882,7 @@ class Handler(BaseHTTPRequestHandler):
                 },
             }, status=500)
         finally:
+            self._release_command_stream_lease()
             admission.release()
 
     # ----- /internal/*: loopback hook tier (claude session registry) -----
@@ -45756,13 +45790,18 @@ Worker instructions:
              on the local fs. Trivial.
 
         Sends one initial `event: catalog` immediately on connect; then any
-        change emits another. 20s keepalive. 30-min connection cap.
+        change emits another. 20s keepalive. One-minute connection cap.
         """
         cwd = q.get("cwd", [""])[0].strip()
         provider = q.get("provider", ["claude"])[0].lower()
         if not _valid_provider_filter(provider, allow_all=False):
             _send_unknown_provider(self, provider)
             return
+
+        device_id = str(getattr(self.pairling_auth, "device_id", "") or "")
+        lease = _replace_command_stream_lease(device_id) if device_id else threading.Event()
+        if device_id:
+            self._command_stream_lease = (device_id, lease)
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -45773,7 +45812,7 @@ Worker instructions:
 
         last_sig = ""
         last_keepalive = _time.time()
-        deadline = _time.time() + 1800  # 30 min
+        deadline = _time.time() + COMMAND_STREAM_MAX_SECONDS
 
         def _commands_frame(sig: str) -> bytes:
             items = _build_command_catalog(cwd=cwd, provider=provider)
@@ -45802,7 +45841,8 @@ Worker instructions:
             while _time.time() < deadline:
                 if not self._stream_authorization_is_current():
                     return
-                _time.sleep(5)
+                if lease.wait(timeout=5):
+                    return
 
                 # Re-sign + re-emit only if it changed.
                 try:
