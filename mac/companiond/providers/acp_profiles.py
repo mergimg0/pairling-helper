@@ -747,8 +747,6 @@ _PROFILES: dict[str, AcpLaunchProfile] = {
         accepted_versions=("semver:*",),
         allowed_channels=("stable",),
         argv_template=(
-            "--profile",
-            "pairling",
             "--cwd",
             "{cwd}",
             "--session-dir",
@@ -779,7 +777,7 @@ _PROFILES: dict[str, AcpLaunchProfile] = {
             "extensions_skills_rules_plan_disabled",
         ),
         overlay_metadata={
-            "profile": "pairling",
+            "auth_scope": "signed_in_user",
             "disabled": ["plan", "extensions", "skills", "rules", "task", "browser", "computer"],
             "permission_options": ["allow_once", "reject"],
             "unknown_extensions": "data_only",

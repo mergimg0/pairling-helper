@@ -1276,8 +1276,8 @@ _ACP_RELEASE_PROFILE_PINS = MappingProxyType(
             "provider_version": "semver:*",
             "provider_channel": "stable",
             "safe_launch_digest": (
-                "7009a7b88504e09e035cd3e6e704154e"
-                "4c0b0d7086ea29b7bf312f39bb1c5c55"
+                "b23e87ba209c91cace6f5bb931fe36cda"
+                "376a844141745276d113780c84d07b0"
             ),
         },
         "grok_build": {

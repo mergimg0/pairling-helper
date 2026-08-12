@@ -351,6 +351,7 @@ except Exception:
 try:
     from session_event_log import SessionEventLog as _SessionEventLog
     from session_event_ingest import (
+        OMP_PARSER_VERSION as _OMP_PARSER_VERSION,
         SUPPORTED_TRANSCRIPT_PROVIDERS as _SUPPORTED_TRANSCRIPT_PROVIDERS,
         SessionLogIngestor as _SessionLogIngestor,
         UnsupportedTranscriptProviderError as _UnsupportedTranscriptProviderError,
@@ -358,6 +359,7 @@ try:
 except Exception:
     _SessionEventLog = None
     _SessionLogIngestor = None
+    _OMP_PARSER_VERSION = 1
     _SUPPORTED_TRANSCRIPT_PROVIDERS = frozenset({"claude", "codex"})
 
     class _UnsupportedTranscriptProviderError(ValueError):
@@ -5982,6 +5984,11 @@ def _first_prompt_provider_confirmed(record: dict) -> bool:
     expected_text = str(record.get("text") or "")
     if provider not in {"claude", "codex", "omp"} or not native_id or not expected_text:
         return False
+    if provider == "omp" and native_id.startswith("pending-"):
+        try:
+            _capture_sessions_provider_inventory("omp")
+        except (OSError, RuntimeError):
+            return False
     try:
         boundary = _first_prompt_transcript_boundary(provider, native_id)
     except (OSError, RuntimeError, _UnsupportedTranscriptProviderError):
@@ -5989,14 +5996,14 @@ def _first_prompt_provider_confirmed(record: dict) -> bool:
     current_identity = str(boundary.get("transcript_session_id") or "")
     expected_identity = str(record.get("transcript_session_id") or "")
     if expected_identity and current_identity != expected_identity:
-        exact_codex_promotion = (
-            provider == "codex"
+        exact_pending_promotion = (
+            provider in {"codex", "omp"}
             and expected_identity.startswith("pending-")
             and _agent_registry_resolve_native_alias(
-                "codex", expected_identity
+                provider, expected_identity
             ) == current_identity
         )
-        if not exact_codex_promotion:
+        if not exact_pending_promotion:
             return False
     current_path = str(boundary.get("transcript_path") or "")
     expected_path = str(record.get("transcript_path") or "")
@@ -11301,6 +11308,25 @@ def _omp_executable_path_matches(observed: str, resolved_binary: Path) -> bool:
         return False
 
 
+def _omp_expected_executable_path(*, home: Path | None = None) -> Path | None:
+    if _provider_get is None or _provider_resolve_executable is None:
+        return None
+    adapter = _provider_get("omp", home=home or HOME)
+    if adapter is None:
+        return None
+    resolved = _provider_resolve_executable(
+        "omp",
+        adapter.candidates,
+        env_var="PAIRLING_OMP_BIN",
+    )
+    if resolved is None:
+        return None
+    try:
+        return resolved.path.resolve(strict=True)
+    except OSError:
+        return None
+
+
 def _omp_resume_terminal_identity_matches(
     identity: dict | None,
     *,
@@ -11378,7 +11404,7 @@ def _wait_for_omp_spawn_terminal_identity(
     canonical_project: str,
     timeout_seconds: float = 5.0,
 ) -> dict | None:
-    """Adopt the one OMP UUID bound to the provider process just launched."""
+    """Return OMP's exact transcript ID or its exact Pairling-owned process."""
     if not isinstance(provider_identity, dict):
         return None
     try:
@@ -11392,6 +11418,16 @@ def _wait_for_omp_spawn_terminal_identity(
         or ""
     )
     if pid <= 0 or started_at <= 0 or not provider_tty:
+        return None
+    resolved_binary = _omp_expected_executable_path()
+    expected_executable = str(provider_identity.get("executable_path") or "")
+    if (
+        resolved_binary is None
+        or not _omp_executable_path_matches(
+            expected_executable,
+            resolved_binary,
+        )
+    ):
         return None
 
     deadline = _time.monotonic() + max(0.0, timeout_seconds)
@@ -11427,6 +11463,42 @@ def _wait_for_omp_spawn_terminal_identity(
                     matches.append(terminal)
             if len(matches) == 1:
                 return matches[0]
+            pending_matches = []
+            for process in process_rows:
+                try:
+                    projects_match = os.path.realpath(
+                        str(process.get("project") or "")
+                    ) == os.path.realpath(canonical_project)
+                    process_started_at = float(process.get("started_at") or 0)
+                except (OSError, TypeError, ValueError):
+                    continue
+                if (
+                    int(process.get("pid") or 0) == pid
+                    and str(process.get("tty") or "") == provider_tty
+                    and process_started_at > 0
+                    and abs(process_started_at - started_at) <= 2
+                    and projects_match
+                    and expected_executable
+                    and os.path.realpath(
+                        str(process.get("executable_path") or "")
+                    ) == os.path.realpath(expected_executable)
+                ):
+                    pending_matches.append(process)
+            if len(pending_matches) == 1:
+                process = pending_matches[0]
+                return {
+                    "provider": "omp",
+                    "project": os.path.realpath(canonical_project),
+                    "pid": pid,
+                    "provider_tty": provider_tty,
+                    "process_started_at": started_at,
+                    "executable_path": str(
+                        process.get("executable_path") or ""
+                    ),
+                    "identity_probe_state": "pairling_pending_process",
+                    "can_control": True,
+                    "source": "pairling_owned_process",
+                }
         if _time.monotonic() >= deadline:
             return None
         _time.sleep(0.1)
@@ -12242,6 +12314,162 @@ def _omp_provider_inventory_from_process_rows(
     }
 
 
+def _omp_pairling_pending_terminal(
+    registry_row: dict | None,
+    process_rows: list[dict] | None = None,
+) -> dict | None:
+    """Bind one Pairling pending id to one exact live OMP process."""
+    if (
+        not isinstance(registry_row, dict)
+        or registry_row.get("closed_at") is not None
+        or str(registry_row.get("provider") or "").strip().lower() != "omp"
+    ):
+        return None
+    native_id = str(registry_row.get("native_id") or "")
+    project = str(registry_row.get("project") or "")
+    pid = int(registry_row.get("pid") or 0)
+    stored_terminal_tty = str(registry_row.get("terminal_tty") or "")
+    metadata = _registry_metadata_from_row(registry_row)
+    try:
+        expected_started_at = float(metadata.get("process_started_at") or 0)
+    except (TypeError, ValueError):
+        return None
+    expected_provider_tty = str(
+        metadata.get("provider_tty") or stored_terminal_tty
+    )
+    executable_path = str(metadata.get("executable_path") or "")
+    resolved_binary = _omp_expected_executable_path()
+    send_scope_id = _normalized_send_scope_id(
+        "omp", metadata.get("send_scope_id")
+    )
+    if (
+        not native_id.startswith("pending-")
+        or not _safe_agent_native_id(native_id)
+        or not project
+        or pid <= 0
+        or expected_started_at <= 0
+        or re.fullmatch(r"/dev/ttys[0-9]{3,}", expected_provider_tty) is None
+        or (
+            stored_terminal_tty
+            and re.fullmatch(r"/dev/ttys[0-9]{3,}", stored_terminal_tty) is None
+        )
+        or not executable_path
+        or resolved_binary is None
+        or not _omp_executable_path_matches(executable_path, resolved_binary)
+        or metadata.get("spawned_by") != "pairling"
+        or metadata.get("identity_probe_state") != "pairling_pending_process"
+        or str(metadata.get("pending_native_id") or "") != native_id
+        or send_scope_id != _qualified_session_id("omp", native_id)
+    ):
+        return None
+
+    candidates = process_rows
+    if candidates is None:
+        process_scan_ok, candidates = _scan_provider_process_rows("omp")
+        if not process_scan_ok:
+            return None
+    matches: list[dict] = []
+    for candidate in candidates:
+        if int(candidate.get("pid") or 0) != pid:
+            continue
+        candidate_provider_tty = str(
+            candidate.get("provider_tty")
+            or candidate.get("tty")
+            or candidate.get("terminal_tty")
+            or ""
+        )
+        if candidate_provider_tty != expected_provider_tty:
+            continue
+        if not bool(
+            candidate.get(
+                "control_eligible",
+                candidate.get("can_control", True),
+            )
+        ):
+            continue
+        try:
+            candidate_started_at = float(
+                candidate.get("process_started_at")
+                or candidate.get("started_at")
+                or 0
+            )
+            projects_match = os.path.realpath(
+                str(candidate.get("project") or "")
+            ) == os.path.realpath(project)
+        except (OSError, TypeError, ValueError):
+            continue
+        if (
+            candidate_started_at <= 0
+            or abs(candidate_started_at - expected_started_at) > 2
+            or not projects_match
+            or not _omp_executable_path_matches(
+                str(candidate.get("executable_path") or ""),
+                resolved_binary,
+            )
+        ):
+            continue
+        if (
+            stored_terminal_tty
+            and stored_terminal_tty != expected_provider_tty
+            and not _direct_terminal_binding_is_verified(
+                registry_row,
+                "omp",
+                pid,
+                provider_tty=expected_provider_tty,
+            )
+        ):
+            continue
+        matches.append(candidate)
+    if len(matches) != 1:
+        return None
+
+    candidate = matches[0]
+    broker_id = _normalized_send_scope_id("omp", metadata.get("broker_id"))
+    broker_session = (
+        _registry_owned_broker_session("omp", native_id, registry_row)
+        if broker_id
+        else None
+    )
+    broker_relation = _broker_runtime_relation() if broker_session is not None else ""
+    broker_controllable = bool(
+        broker_session is not None
+        and _broker_pid(broker_session) == pid
+        and _broker_slave_tty(broker_session) == expected_provider_tty
+        and broker_relation == "current"
+        and _broker_supports_current_atomic_control(broker_relation)
+    )
+    return {
+        "provider": "omp",
+        "session_id": native_id,
+        "native_id": native_id,
+        "project": os.path.realpath(project),
+        "title": str(
+            metadata.get("terminal_title")
+            or registry_row.get("working_on")
+            or "OMP session"
+        ),
+        "terminal_tty": stored_terminal_tty or expected_provider_tty,
+        "tty": expected_provider_tty,
+        "executable_path": executable_path,
+        "pid": pid,
+        "provider_pid": pid,
+        "process_started_at": expected_started_at,
+        "started_at": expected_started_at,
+        "command": str(candidate.get("command") or ""),
+        "identity_probe_state": "pairling_pending_process",
+        "identity_probe_reason": "awaiting_omp_transcript",
+        "can_control": broker_controllable if broker_id else True,
+        "control_profile": (
+            "current_atomic_v2"
+            if broker_controllable
+            else ("read_only" if broker_id else "direct_terminal_receipted")
+        ),
+        "source": "pairling_owned_process",
+        "send_scope_id": send_scope_id,
+        **({"broker_id": broker_id} if broker_id else {}),
+    }
+
+
 def _omp_sessions_from_inventory(inventory: dict) -> list[dict]:
     checked_at = float(inventory.get("checked_at") or _time.time())
     rows: list[dict] = []
@@ -12252,14 +12480,15 @@ def _omp_sessions_from_inventory(inventory: dict) -> list[dict]:
         project = str(terminal.get("project") or "")
         if not native_id or not project:
             continue
-        resumable = (
-            str(terminal.get("identity_probe_state") or "") == "exact"
-        )
+        identity_state = str(terminal.get("identity_probe_state") or "")
+        resumable = identity_state == "exact"
         direct_steerable = bool(
-            resumable and terminal.get("can_control")
+            identity_state in {"exact", "pairling_pending_process"}
+            and terminal.get("can_control")
         )
         broker_controllable = bool(
-            terminal.get("broker_id") and terminal.get("can_control")
+            terminal.get("broker_id")
+            and terminal.get("control_profile") == "current_atomic_v2"
         )
         capabilities = ["terminal_output", "terminal_surface"]
         if resumable:
@@ -12315,13 +12544,36 @@ def _omp_sessions_from_inventory(inventory: dict) -> list[dict]:
     return rows
 
 
-def _omp_reconcile_provider_inventory(inventory: dict) -> None:
+def _omp_reconcile_provider_inventory(
+    inventory: dict,
+    *,
+    registry_rows: list[dict] | None = None,
+) -> None:
     if (
         inventory.get("probe_state") != "exact"
         or not bool(inventory.get("membership_complete"))
     ):
         return
+    registry_rows = (
+        list(registry_rows)
+        if registry_rows is not None
+        else _agent_registry_live("omp", limit=1000)
+    )
     live_ids: set[str] = set()
+    for terminal in inventory.get("terminals") or []:
+        if str(terminal.get("identity_probe_state") or "") != "pairling_pending_process":
+            continue
+        native_id = str(terminal.get("native_id") or "")
+        pending_row = next(
+            (
+                row
+                for row in registry_rows
+                if str(row.get("native_id") or "") == native_id
+            ),
+            None,
+        )
+        if _omp_pairling_pending_terminal(pending_row, [terminal]) is not None:
+            live_ids.add(native_id)
     for terminal in inventory.get("terminals") or []:
         if str(terminal.get("identity_probe_state") or "") != "exact":
             continue
@@ -12350,19 +12602,38 @@ def _omp_reconcile_provider_inventory(inventory: dict) -> None:
             "source": "omp_terminal_record",
         }
         existing = _agent_registry_get("omp", native_id)
-        registry_terminal_tty = terminal_tty
-        if existing is not None and _omp_inventory_registry_process_matches(
+        pending_owner = None
+        if existing is None or not _omp_inventory_registry_process_matches(
             existing,
             [terminal],
         ):
+            pending_matches = [
+                row
+                for row in registry_rows
+                if _omp_pairling_pending_terminal(row, [terminal]) is not None
+            ]
+            if len(pending_matches) > 1:
+                continue
+            if len(pending_matches) == 1:
+                pending_owner = pending_matches[0]
+                existing = pending_owner
+        registry_terminal_tty = terminal_tty
+        existing_matches_canonical = (
+            existing is not None
+            and _omp_inventory_registry_process_matches(existing, [terminal])
+        )
+        if pending_owner is not None or existing_matches_canonical:
             durable_metadata = _registry_metadata_from_row(existing)
             metadata = {**durable_metadata, **metadata}
             existing_terminal_tty = str(existing.get("terminal_tty") or "")
             if re.fullmatch(r"/dev/ttys[0-9]{3,}", existing_terminal_tty):
                 registry_terminal_tty = existing_terminal_tty
                 terminal["terminal_tty"] = existing_terminal_tty
+        existing_native_id = str(
+            (existing or {}).get("native_id") or native_id
+        )
         broker_session = _registry_owned_broker_session(
-            "omp", native_id, existing
+            "omp", existing_native_id, existing
         )
         if (
             broker_session is not None
@@ -12407,8 +12678,13 @@ def _omp_reconcile_provider_inventory(inventory: dict) -> None:
             working_on=str(terminal.get("title") or ""),
         ):
             live_ids.add(native_id)
+            if pending_owner is not None:
+                pending_native_id = str(pending_owner.get("native_id") or "")
+                if pending_native_id and pending_native_id != native_id:
+                    _agent_registry_mark_closed("omp", pending_native_id)
+                    live_ids.add(pending_native_id)
 
-    for row in _agent_registry_live("omp", limit=1000):
+    for row in registry_rows:
         native_id = str(row.get("native_id") or "")
         if not native_id or native_id in live_ids:
             continue
@@ -12441,7 +12717,33 @@ def _capture_sessions_provider_inventory(provider: str) -> dict:
                 "membership_complete": False,
             }
         inventory = _omp_provider_inventory_from_process_rows(process_rows)
-        _omp_reconcile_provider_inventory(inventory)
+        registry_rows = _agent_registry_live("omp", limit=1000)
+        canonical_terminals = list(inventory.get("terminals") or [])
+        pending_terminals = []
+        for row in registry_rows:
+            pending_terminal = _omp_pairling_pending_terminal(row, process_rows)
+            if pending_terminal is None:
+                continue
+            if any(
+                int(terminal.get("pid") or 0)
+                == int(pending_terminal.get("pid") or 0)
+                and str(terminal.get("tty") or "")
+                == str(pending_terminal.get("tty") or "")
+                and abs(
+                    float(terminal.get("process_started_at") or 0)
+                    - float(pending_terminal.get("process_started_at") or 0)
+                )
+                <= 2
+                for terminal in canonical_terminals
+            ):
+                continue
+            pending_terminals.append(pending_terminal)
+        inventory["terminals"] = canonical_terminals + pending_terminals
+        inventory["rows"] = list(inventory["terminals"])
+        _omp_reconcile_provider_inventory(
+            inventory,
+            registry_rows=registry_rows,
+        )
         if (
             inventory.get("probe_state") != "exact"
             or not bool(inventory.get("membership_complete"))
@@ -13066,6 +13368,14 @@ def _session_has_verified_provider_process(
     native_id = str(row.get("native_id") or "")
     if provider in {"claude", "codex", "omp"} and not _registry_process_birth_matches(row, pid):
         return False
+
+    if provider == "omp" and native_id.startswith("pending-"):
+        pending_rows = inventory_rows
+        if pending_rows is None:
+            process_scan_ok, pending_rows = _scan_provider_process_rows("omp")
+            if not process_scan_ok:
+                return False
+        return _omp_pairling_pending_terminal(row, pending_rows) is not None
 
     candidates = inventory_rows
     if candidates is None:
@@ -16854,8 +17164,15 @@ def _direct_terminal_action_profile(
                 registry_row, inventory_live_terminal_rows
             )
             if provider == "codex"
-            else _omp_inventory_registry_process_matches(
-                registry_row, inventory_live_terminal_rows
+            else (
+                _omp_pairling_pending_terminal(
+                    registry_row, inventory_live_terminal_rows
+                )
+                is not None
+                if str(registry_row.get("native_id") or "").startswith("pending-")
+                else _omp_inventory_registry_process_matches(
+                    registry_row, inventory_live_terminal_rows
+                )
             )
         )
         if not matches_inventory:
@@ -17064,11 +17381,16 @@ def _terminal_surface_source(
                 live_terminal_rows = list(inventory.get("terminals") or [])
             else:
                 live_terminal_rows = []
-        if not _omp_inventory_registry_process_matches(
-            reg,
-            live_terminal_rows,
-            require_direct_control=False,
-        ):
+        identity_matches = (
+            _omp_pairling_pending_terminal(reg, live_terminal_rows) is not None
+            if native_id.startswith("pending-")
+            else _omp_inventory_registry_process_matches(
+                reg,
+                live_terminal_rows,
+                require_direct_control=False,
+            )
+        )
+        if not identity_matches:
             return {
                 "available": False,
                 "source": "unavailable",
@@ -38609,10 +38931,15 @@ Worker instructions:
                 provider_identity,
                 canonical_project=project,
             )
+            identity_probe_state = str(
+                (omp_session_identity or {}).get("identity_probe_state") or ""
+            )
             adopted_native_id = str(
                 (omp_session_identity or {}).get("native_id") or ""
             )
-            if not _safe_agent_native_id(adopted_native_id):
+            if identity_probe_state == "pairling_pending_process":
+                published_native_id = native_id
+            elif not _safe_agent_native_id(adopted_native_id):
                 ok = False
                 reason = "broker launch did not produce one exact OMP session identity"
                 if not reconciled_existing:
@@ -38661,8 +38988,23 @@ Worker instructions:
                 omp_metadata = {
                     "pending_native_id": native_id,
                     "broker_native_id": native_id,
+                    "identity_probe_state": str(
+                        omp_session_identity.get("identity_probe_state") or ""
+                    ),
+                    "provider_tty": str(
+                        omp_session_identity.get("provider_tty")
+                        or provider_identity.get("provider_tty")
+                        or provider_identity.get("tty")
+                        or session_tty
+                    ),
                     "process_started_at": float(
                         omp_session_identity.get("process_started_at") or 0
+                    ),
+                    "executable_path": str(
+                        omp_session_identity.get("executable_path") or ""
+                    ),
+                    "source": str(
+                        omp_session_identity.get("source") or ""
                     ),
                     "output_path": str(
                         omp_session_identity.get("output_path") or ""
@@ -39760,10 +40102,15 @@ Worker instructions:
                     terminal_identity,
                     canonical_project=project,
                 )
+                identity_probe_state = str(
+                    (omp_session_identity or {}).get("identity_probe_state") or ""
+                )
                 adopted_native_id = str(
                     (omp_session_identity or {}).get("native_id") or ""
                 )
-                if not _safe_agent_native_id(adopted_native_id):
+                if identity_probe_state == "pairling_pending_process":
+                    native_id = deterministic_native_id
+                elif not _safe_agent_native_id(adopted_native_id):
                     result = {
                         "ok": False,
                         "reason": (
@@ -39793,8 +40140,22 @@ Worker instructions:
             if omp_session_identity is not None:
                 omp_metadata = {
                     "pending_native_id": deterministic_native_id,
+                    "identity_probe_state": str(
+                        omp_session_identity.get("identity_probe_state") or ""
+                    ),
+                    "provider_tty": str(
+                        omp_session_identity.get("provider_tty")
+                        or (terminal_identity or {}).get("provider_tty")
+                        or ""
+                    ),
                     "process_started_at": float(
                         omp_session_identity.get("process_started_at") or 0
+                    ),
+                    "executable_path": str(
+                        omp_session_identity.get("executable_path") or ""
+                    ),
+                    "source": str(
+                        omp_session_identity.get("source") or ""
                     ),
                     "output_path": str(
                         omp_session_identity.get("output_path") or ""
@@ -41203,14 +41564,19 @@ Worker instructions:
             live_terminals = list(inventory.get("terminals") or [])
             tty = str(reg.get("terminal_tty") or "")
             pid = int(reg.get("pid") or 0)
-            if (
-                inventory.get("probe_state") != "exact"
-                or not bool(inventory.get("membership_complete"))
-                or not _omp_inventory_registry_process_matches(
+            identity_matches = (
+                _omp_pairling_pending_terminal(reg, live_terminals) is not None
+                if native_id.startswith("pending-")
+                else _omp_inventory_registry_process_matches(
                     reg,
                     live_terminals,
                     require_direct_control=True,
                 )
+            )
+            if (
+                inventory.get("probe_state") != "exact"
+                or not bool(inventory.get("membership_complete"))
+                or not identity_matches
             ):
                 self._finish_send_text_failure(
                     receipt_context,
@@ -41223,6 +41589,27 @@ Worker instructions:
                     error_code="process_identity_unverified",
                 )
                 return
+
+            if native_id.startswith("pending-"):
+                try:
+                    snapshot = self._terminal_app_surface_snapshot(
+                        public_session_id,
+                        automation_timeout=3.0,
+                    )
+                except (FileNotFoundError, PermissionError, RuntimeError):
+                    snapshot = None
+                if not _first_prompt_surface_is_ready("omp", snapshot):
+                    self._finish_send_text_failure(
+                        receipt_context,
+                        text,
+                        status=409,
+                        reason="OMP is still starting. No text was sent.",
+                        backend="terminal_app",
+                        tty=tty or None,
+                        pid=pid or None,
+                        error_code="provider_composer_not_ready",
+                    )
+                    return
 
             _mark_send_text_running(
                 receipt_context,
@@ -41326,6 +41713,25 @@ Worker instructions:
                 extra={"broker_id": broker_id},
             )
             return
+
+        if native_id.startswith("pending-"):
+            try:
+                snapshot = self._broker_surface_snapshot(public_session_id)
+            except (FileNotFoundError, PermissionError, RuntimeError):
+                snapshot = None
+            if not _first_prompt_surface_is_ready("omp", snapshot):
+                self._finish_send_text_failure(
+                    receipt_context,
+                    text,
+                    status=409,
+                    reason="OMP is still starting. No text was sent.",
+                    backend="pty_broker",
+                    tty=_broker_slave_tty(broker_session) or None,
+                    pid=_broker_pid(broker_session) or None,
+                    error_code="provider_composer_not_ready",
+                    extra={"broker_id": broker_id},
+                )
+                return
 
         _mark_send_text_running(
             receipt_context,
@@ -41453,6 +41859,30 @@ Worker instructions:
         except Exception:
             return None, "transcript_resolution_failed"
         if transcript_path is None:
+            if provider == "omp" and native_id.startswith("pending-"):
+                inventory = _capture_sessions_provider_inventory("omp")
+                terminals = list(inventory.get("terminals") or [])
+                row = _agent_registry_get("omp", native_id)
+                if (
+                    inventory.get("probe_state") == "exact"
+                    and bool(inventory.get("membership_complete"))
+                    and _omp_pairling_pending_terminal(row, terminals) is not None
+                ):
+                    try:
+                        transcript_offset = int(
+                            log.prepare_ingest(session_key, _OMP_PARSER_VERSION)
+                        )
+                        log_seq = int(log.last_seq(session_key))
+                        log_generation = int(log.get_generation(session_key))
+                    except Exception:
+                        return None, "session_log_boundary_failed"
+                    if transcript_offset == 0 and log_seq == 0 and log_generation > 0:
+                        return {
+                            "transcript_offset": 0,
+                            "log_seq": 0,
+                            "log_generation": log_generation,
+                        }, None
+                    return None, "pending_session_log_not_empty"
             return None, "transcript_source_unavailable"
         if not ingestor.ensure(session_key, provider, native_id, transcript_path):
             return None, "session_log_registration_failed"
