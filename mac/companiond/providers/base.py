@@ -114,6 +114,7 @@ class ManagedAuthVerification(str, Enum):
 class TerminalLaunchProfile(str, Enum):
     CLAUDE_PHONE = "claude_phone"
     CODEX_WORKSPACE = "codex_workspace"
+    OMP_WORKSPACE = "omp_workspace"
 
 
 @dataclass(frozen=True)

@@ -254,6 +254,10 @@
       ],
       "version_command": ["--version"],
       "docs_url": "https://github.com/can1357/oh-my-pi",
+      "terminal_launch": {
+        "profile": "omp_workspace",
+        "backends": ["terminal_app", "broker"]
+      },
       "managed_launch": {
         "control_channel": "stable",
         "ready_auth_states": ["unknown"],

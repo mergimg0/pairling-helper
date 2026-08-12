@@ -443,8 +443,8 @@ class OmpProviderAdapter(ProviderAdapter):
             Path("/usr/local/bin/omp"),
         ]
 
-    # External Terminal.app sessions stay read-only. Terminal control is
-    # available only after Pairling resumes the OMP session into its PTY broker.
+    # Exact Terminal.app sessions support receipted text and process signals.
+    # Atomic terminal-key control still requires Pairling's PTY broker.
     def supports(self, capability: str) -> bool:
         return capability in {
             "commands",
@@ -480,9 +480,13 @@ class OmpProviderAdapter(ProviderAdapter):
             from .acp import AcpProviderAdapter
 
             managed_probe = AcpProviderAdapter(_ENTRY, home=self.home).probe()
-        launchable = bool(
+        managed_launchable = bool(
             managed_probe is not None and managed_probe.availability.launchable
         )
+        terminal_launchable = bool(
+            installed and self.descriptor.terminal_launch is not None
+        )
+        launchable = managed_launchable or terminal_launchable
         capabilities = (
             "commands",
             "detect",
@@ -519,7 +523,11 @@ class OmpProviderAdapter(ProviderAdapter):
                 usable=installed,
                 launchable=launchable,
                 auth_state="unknown" if installed else "missing_cli",
-                config_state="pairling_managed" if launchable else ("ready" if config_path.is_file() else "missing"),
+                config_state=(
+                    "pairling_managed"
+                    if managed_launchable
+                    else ("ready" if config_path.is_file() else "missing")
+                ),
                 readable_sessions=0,
                 live_sessions=0,
                 controllable_sessions=0,

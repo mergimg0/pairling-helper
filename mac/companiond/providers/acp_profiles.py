@@ -15,7 +15,7 @@ import math
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -214,14 +214,24 @@ class AcpLaunchProfile:
             "managed_config_digest",
             hashlib.sha256(managed_encoded).hexdigest(),
         )
+        digest_versions = self.accepted_versions
+        digest_capabilities = self.required_capabilities
+        if self.provider_id == "omp":
+            digest_versions = ("semver:*",)
+            digest_capabilities = tuple(
+                "agentInfo.version=semver:*"
+                if capability.startswith("agentInfo.version=")
+                else capability
+                for capability in self.required_capabilities
+            )
         digest_payload = {
             "provider_id": self.provider_id,
-            "accepted_versions": self.accepted_versions,
+            "accepted_versions": digest_versions,
             "allowed_channels": self.allowed_channels,
             "argv_template": self.argv_template,
             "protocol_version": self.protocol_version,
             "managed_files": managed_payload,
-            "required_capabilities": self.required_capabilities,
+            "required_capabilities": digest_capabilities,
             "required_canaries": self.required_canaries,
             "overlay_metadata": _plain_json(metadata),
             "allow_mcp": self.allow_mcp,
@@ -734,7 +744,7 @@ _PROFILES: dict[str, AcpLaunchProfile] = {
     ),
     "omp": AcpLaunchProfile(
         provider_id="omp",
-        accepted_versions=("17.2.12",),
+        accepted_versions=("semver:*",),
         allowed_channels=("stable",),
         argv_template=(
             "--profile",
@@ -757,7 +767,7 @@ _PROFILES: dict[str, AcpLaunchProfile] = {
         managed_files=(ManagedProfileFile("omp.yml", _OMP_CONFIG),),
         required_capabilities=(
             "agentInfo.name=oh-my-pi",
-            "agentInfo.version=17.2.12",
+            "agentInfo.version=semver:*",
             "agentCapabilities.loadSession=true",
             "sessionCapabilities.list=true",
             "sessionCapabilities.resume=true",
@@ -984,7 +994,7 @@ def reviewed_acp_profile(
     installed_version: str,
     channel: str,
 ) -> AcpLaunchProfile | AcpProfileUnavailable:
-    """Return an executable profile only for the exact reviewed build/channel."""
+    """Return an executable profile bound to the exact installed build/channel."""
 
     normalized = str(provider_id or "").strip().lower().replace("-", "_")
     normalized = _PROVIDER_ALIASES.get(normalized, normalized)
@@ -1024,6 +1034,24 @@ def reviewed_acp_profile(
             f"provider channel is not reviewed: {normalized_channel or '<empty>'}",
             "channel_not_reviewed",
             profile.accepted_versions,
+        )
+    if normalized == "omp":
+        if re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", version) is None:
+            return AcpProfileUnavailable(
+                normalized,
+                f"installed provider version is not canonical: {version or '<empty>'}",
+                "version_not_reviewed",
+                profile.accepted_versions,
+            )
+        return replace(
+            profile,
+            accepted_versions=(version,),
+            required_capabilities=tuple(
+                f"agentInfo.version={version}"
+                if capability.startswith("agentInfo.version=")
+                else capability
+                for capability in profile.required_capabilities
+            ),
         )
     if version not in profile.accepted_versions:
         return AcpProfileUnavailable(

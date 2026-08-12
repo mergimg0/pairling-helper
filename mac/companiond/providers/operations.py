@@ -1273,11 +1273,11 @@ _ACP_RELEASE_PROFILE_PINS = MappingProxyType(
             ),
         },
         "omp": {
-            "provider_version": "17.2.12",
+            "provider_version": "semver:*",
             "provider_channel": "stable",
             "safe_launch_digest": (
-                "ee6e02d15d771354a927361546c3c4f0"
-                "a05e14c3f0eb298eb2bff5798f137de1"
+                "7009a7b88504e09e035cd3e6e704154e"
+                "4c0b0d7086ea29b7bf312f39bb1c5c55"
             ),
         },
         "grok_build": {
@@ -1401,6 +1401,14 @@ def provider_binding_has_release_membership(
     runtime_provider_id = _release_runtime_provider_id(provider_id)
     if runtime_provider_id is None or runtime_provider_id != provider_id:
         return False
+    if runtime_provider_id == "omp":
+        return (
+            provider_channel == "stable"
+            and re.fullmatch(
+                r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)",
+                provider_version,
+            ) is not None
+        )
     return any(
         spec["runtime_provider_id"] == runtime_provider_id
         and spec["provider_version"] == provider_version

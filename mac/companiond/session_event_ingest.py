@@ -34,7 +34,8 @@ MAX_LINE_BYTES = 32 * 1024 * 1024
 READ_CHUNK = 1024 * 1024
 CLAUDE_PARSER_VERSION = 3
 CODEX_PARSER_VERSION = 4
-SUPPORTED_TRANSCRIPT_PROVIDERS = frozenset({"claude", "codex"})
+OMP_PARSER_VERSION = 1
+SUPPORTED_TRANSCRIPT_PROVIDERS = frozenset({"claude", "codex", "omp"})
 
 _CODEX_TEXT_BLOCK_TYPES = {"text", "output_text", "input_text"}
 
@@ -216,10 +217,62 @@ def parse_codex_transcript_line(line: str, native_id: str, normalize_codex) -> l
     return events
 
 
+def parse_omp_transcript_line(line: str) -> list[dict]:
+    """Normalize one OMP v3 JSONL record into the shared transcript shape."""
+    try:
+        source = json.loads(line)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return parse_claude_transcript_line(line)
+    if not isinstance(source, dict):
+        return parse_claude_transcript_line(line)
+
+    normalized = {
+        "type": source.get("type"),
+        "uuid": source.get("id"),
+        "timestamp": source.get("timestamp"),
+    }
+    message = source.get("message")
+    if source.get("type") != "message" or not isinstance(message, dict):
+        return parse_claude_transcript_line(json.dumps(normalized))
+
+    role = str(message.get("role") or "")
+    if role == "toolResult":
+        normalized["type"] = "user"
+        normalized["message"] = {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": message.get("toolCallId"),
+                "content": message.get("content"),
+                "is_error": bool(message.get("isError")),
+            }],
+        }
+    else:
+        blocks = []
+        for block in message.get("content") or []:
+            if not isinstance(block, dict):
+                blocks.append(block)
+            elif block.get("type") == "toolCall":
+                blocks.append({
+                    "type": "tool_use",
+                    "id": block.get("id"),
+                    "name": block.get("name"),
+                    "input": block.get("arguments"),
+                })
+            else:
+                blocks.append(block)
+        normalized["type"] = role if role in {"user", "assistant"} else "unknown"
+        normalized["message"] = {"role": role or "unknown", "content": blocks}
+    return parse_claude_transcript_line(
+        json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
 class SessionLogIngestor:
     def __init__(self, log: SessionEventLog, hub, watcher, *, normalize_codex=None,
                  claude_parser_version: int = CLAUDE_PARSER_VERSION,
                  codex_parser_version: int = CODEX_PARSER_VERSION,
+                 omp_parser_version: int = OMP_PARSER_VERSION,
                  max_sessions: int = 128,
                  max_line_bytes: int = MAX_LINE_BYTES) -> None:
         self._log = log
@@ -228,6 +281,7 @@ class SessionLogIngestor:
         self._normalize_codex = normalize_codex
         self._claude_parser_version = max(1, int(claude_parser_version))
         self._codex_parser_version = max(1, int(codex_parser_version))
+        self._omp_parser_version = max(1, int(omp_parser_version))
         self._max_sessions = max(1, int(max_sessions))
         self._max_line_bytes = max(READ_CHUNK, int(max_line_bytes))
         self._lock = threading.RLock()
@@ -385,6 +439,8 @@ class SessionLogIngestor:
             parser_version = self._codex_parser_version
         elif provider == "claude":
             parser_version = self._claude_parser_version
+        elif provider == "omp":
+            parser_version = self._omp_parser_version
         else:  # Defensive guard for a corrupted in-memory binding.
             raise UnsupportedTranscriptProviderError(provider)
         reset_generation = None
@@ -709,6 +765,8 @@ class SessionLogIngestor:
                             ))
                         elif provider == "claude":
                             events.extend(parse_claude_transcript_line(line))
+                        elif provider == "omp":
+                            events.extend(parse_omp_transcript_line(line))
                         else:  # Defensive guard for a corrupted in-memory binding.
                             raise UnsupportedTranscriptProviderError(provider)
                 next_offset = offset + len(complete)

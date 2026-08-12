@@ -1106,7 +1106,7 @@ def _reviewed_provider_launch_command(
     project: str,
     backend: str,
 ) -> tuple[str, bool]:
-    """Build one exact reviewed legacy command without a provider fallback."""
+    """Build one exact reviewed terminal command without a provider fallback."""
     contract = _reviewed_terminal_launch_contract(provider)
     if contract is None or backend not in contract.backends:
         raise ValueError("provider has no reviewed command for this spawn backend")
@@ -1129,6 +1129,13 @@ def _reviewed_provider_launch_command(
         if backend == "terminal_app":
             command = f"cd {shlex.quote(project)} && {command}"
         return command, False
+    if profile is _TerminalLaunchProfile.OMP_WORKSPACE:
+        command = (
+            f"exec omp --cwd {shlex.quote(project)}"
+            if backend == "broker"
+            else f"cd {shlex.quote(project)} && exec omp"
+        )
+        return command, backend == "terminal_app"
     raise ValueError("provider launch profile is not implemented")
 
 
@@ -3347,6 +3354,7 @@ def _terminal_display_lines(buffer: str, payload: dict) -> tuple[str, list[str]]
 
 
 _HEALTH_PROBE_CACHE_SECONDS = 30.0
+_PAIRLING_CONNECT_STATUS_MISS_GRACE_SECONDS = 60.0
 _HEALTH_PAYLOAD_CACHE_SECONDS = 5.0
 REQUEST_READ_TIMEOUT_SECONDS = 15.0
 _health_probe_cache_lock = threading.Lock()
@@ -5579,7 +5587,7 @@ def _read_first_prompt_delivery(provider: str, native_id: str) -> dict | None:
 def _write_first_prompt_delivery(record: dict) -> None:
     provider = str(record.get("provider") or "")
     native_id = str(record.get("native_id") or "")
-    if provider not in {"claude", "codex"} or not native_id:
+    if provider not in {"claude", "codex", "omp"} or not native_id:
         raise ValueError("invalid first-prompt delivery identity")
     path = _first_prompt_delivery_path(provider, native_id)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -5601,7 +5609,7 @@ def _publish_first_prompt_delivery_receipt(record: dict) -> None:
         return
     provider = str(record.get("provider") or "")
     native_id = str(record.get("native_id") or "")
-    if provider not in {"claude", "codex"} or not native_id:
+    if provider not in {"claude", "codex", "omp"} or not native_id:
         return
     receipt_state = {
         "delivered": "applied",
@@ -5919,6 +5927,13 @@ def _first_prompt_line_has_exact_user_text(
             return False
         message = row.get("message") if isinstance(row.get("message"), dict) else {}
         rows = [row] if row.get("type") == "user" and message.get("role") == "user" else []
+    elif provider == "omp":
+        try:
+            row = json.loads(raw_line)
+        except (ValueError, json.JSONDecodeError):
+            return False
+        message = row.get("message") if isinstance(row.get("message"), dict) else {}
+        rows = [row] if row.get("type") == "message" and message.get("role") == "user" else []
     else:
         return False
     for row in rows:
@@ -5965,7 +5980,7 @@ def _first_prompt_provider_confirmed(record: dict) -> bool:
     provider = str(record.get("provider") or "")
     native_id = str(record.get("native_id") or "")
     expected_text = str(record.get("text") or "")
-    if provider not in {"claude", "codex"} or not native_id or not expected_text:
+    if provider not in {"claude", "codex", "omp"} or not native_id or not expected_text:
         return False
     try:
         boundary = _first_prompt_transcript_boundary(provider, native_id)
@@ -6011,6 +6026,11 @@ def _first_prompt_surface_is_ready(provider: str, snapshot: dict | None) -> bool
     rows = snapshot.get("rows")
     if not isinstance(rows, list):
         return False
+    if provider == "omp":
+        stripped_rows = [str(row or "").strip() for row in rows]
+        return any(row.startswith("╭") and row.endswith("╮") for row in stripped_rows) and any(
+            row.startswith("╰") and row.endswith("╯") for row in stripped_rows
+        )
     prompt_glyph = "›" if provider == "codex" else "❯" if provider == "claude" else ""
     if not prompt_glyph:
         return False
@@ -6267,7 +6287,7 @@ def _schedule_first_prompt_delivery(
     device_id: str | None = None,
 ) -> bool:
     """Durably wait for one exact provider composer, then submit once."""
-    if not text or provider not in {"claude", "codex"}:
+    if not text or provider not in {"claude", "codex", "omp"}:
         return False
     delivery_key = f"{provider}:{native_id}"
     text_hash = hashlib.sha256(text.encode()).hexdigest()
@@ -7415,7 +7435,7 @@ def _agent_registry_row_for_broker_id(provider: str, broker_id: str) -> dict | N
     """
     provider = str(provider or "").strip().lower()
     broker_id = str(broker_id or "").strip()
-    if provider not in {"claude", "codex"} or broker_id != _qualified_session_id(
+    if provider not in {"claude", "codex", "omp"} or broker_id != _qualified_session_id(
         provider, _parse_agent_session_ref(broker_id)[1]
     ):
         return None
@@ -7451,7 +7471,7 @@ def _normalized_send_scope_id(provider: str, value: object) -> str:
     scope_id = str(value or "").strip()
     scope_provider, scope_native_id = _parse_agent_session_ref(scope_id)
     if (
-        provider not in {"claude", "codex"}
+        provider not in {"claude", "codex", "omp"}
         or scope_provider != provider
         or not scope_native_id
         or not _safe_agent_native_id(scope_native_id)
@@ -7916,7 +7936,7 @@ def _agent_registry_resolve_native_alias(provider: str, native_id: str) -> str:
     """Return the canonical native id for an exact promoted alias."""
     provider = str(provider or "").strip().lower()
     native_id = str(native_id or "").strip()
-    if not native_id or provider not in {"claude", "codex"}:
+    if not native_id or provider not in {"claude", "codex", "omp"}:
         return native_id
     direct = _agent_registry_get(provider, native_id)
     if direct is not None and not direct.get("closed_at"):
@@ -10033,6 +10053,15 @@ def _pairling_connect_health() -> dict:
         try:
             status = fetch_connectd_status(timeout_seconds=0.7)
         except Exception:
+            status = {}
+        if not status:
+            with _health_probe_cache_lock:
+                last_ready = _health_probe_cache.get("pairling_connect_health_last_ready")
+            if (
+                last_ready is not None
+                and _time.time() - last_ready[0] <= _PAIRLING_CONNECT_STATUS_MISS_GRACE_SECONDS
+            ):
+                return _copy_cache_value(last_ready[1])
             return {"ready": False, "summary": None, "routes": []}
         try:
             routes = advertised_pairling_connect_routes(status)
@@ -10054,7 +10083,14 @@ def _pairling_connect_health() -> dict:
             route.get("source") == "pairling_connectd" and route.get("status") == "ready"
             for route in routes
         )
-        return {"ready": ready, "summary": summary, "routes": routes}
+        result = {"ready": ready, "summary": summary, "routes": routes}
+        if ready:
+            with _health_probe_cache_lock:
+                _health_probe_cache["pairling_connect_health_last_ready"] = (
+                    _time.time(),
+                    _copy_cache_value(result),
+                )
+        return result
 
     return _cached_probe("pairling_connect_health", _HEALTH_PROBE_CACHE_SECONDS, probe)
 
@@ -11336,6 +11372,66 @@ def _wait_for_omp_resume_terminal_identity(
         _time.sleep(0.25)
 
 
+def _wait_for_omp_spawn_terminal_identity(
+    provider_identity: dict | None,
+    *,
+    canonical_project: str,
+    timeout_seconds: float = 5.0,
+) -> dict | None:
+    """Adopt the one OMP UUID bound to the provider process just launched."""
+    if not isinstance(provider_identity, dict):
+        return None
+    try:
+        pid = int(provider_identity.get("pid") or 0)
+        started_at = float(provider_identity.get("started_at") or 0)
+    except (TypeError, ValueError):
+        return None
+    provider_tty = str(
+        provider_identity.get("provider_tty")
+        or provider_identity.get("tty")
+        or ""
+    )
+    if pid <= 0 or started_at <= 0 or not provider_tty:
+        return None
+
+    deadline = _time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        scan_ok, process_rows = _scan_provider_process_rows("omp")
+        if scan_ok:
+            inventory = _omp_provider_inventory_from_process_rows(
+                process_rows,
+                home=HOME,
+            )
+            matches = []
+            for terminal in inventory.get("terminals") or []:
+                if (
+                    str(terminal.get("identity_probe_state") or "") != "exact"
+                    or int(terminal.get("pid") or 0) != pid
+                    or str(terminal.get("terminal_tty") or "") != provider_tty
+                ):
+                    continue
+                try:
+                    candidate_started_at = float(
+                        terminal.get("process_started_at") or 0
+                    )
+                    projects_match = os.path.realpath(
+                        str(terminal.get("project") or "")
+                    ) == os.path.realpath(canonical_project)
+                except (OSError, TypeError, ValueError):
+                    continue
+                if (
+                    candidate_started_at > 0
+                    and abs(candidate_started_at - started_at) <= 2
+                    and projects_match
+                ):
+                    matches.append(terminal)
+            if len(matches) == 1:
+                return matches[0]
+        if _time.monotonic() >= deadline:
+            return None
+        _time.sleep(0.1)
+
+
 def _process_cwds(pids: list[int]) -> tuple[bool, dict[int, str]]:
     unique_pids = sorted({int(pid) for pid in pids if int(pid or 0) > 0})
     if not unique_pids:
@@ -12096,7 +12192,7 @@ def _omp_provider_inventory_from_process_rows(
             continue
         if process_project != record.project:
             continue
-        can_control = False
+        can_control = True
         runtime_metadata = _omp_session_runtime_metadata(Path(record.session_path))
         terminals.append({
             "provider": "omp",
@@ -12120,7 +12216,7 @@ def _omp_provider_inventory_from_process_rows(
             "can_control": can_control,
             "record_mtime": record.record_mtime,
             "record_fresh": record.fresh,
-            "identity_probe_reason": "terminal_app_mutation_not_atomic",
+            "identity_probe_reason": None,
             "source": "omp_terminal_record",
             "model": runtime_metadata.get("model"),
             "effort": runtime_metadata.get("effort"),
@@ -12159,26 +12255,26 @@ def _omp_sessions_from_inventory(inventory: dict) -> list[dict]:
         resumable = (
             str(terminal.get("identity_probe_state") or "") == "exact"
         )
+        direct_steerable = bool(
+            resumable and terminal.get("can_control")
+        )
         broker_controllable = bool(
             terminal.get("broker_id") and terminal.get("can_control")
         )
         capabilities = ["terminal_output", "terminal_surface"]
         if resumable:
             capabilities.insert(0, "resume")
+        if direct_steerable:
+            capabilities.extend(["send_text", "interrupt", "terminate"])
         if broker_controllable:
             capabilities.extend([
                 "terminal_control",
-                "send_text",
-                "interrupt",
-                "terminate",
             ])
         reason = (
             None
-            if broker_controllable
+            if direct_steerable
             else (
-                "terminal_requires_pairling_broker"
-                if resumable
-                else str(
+                str(
                     terminal.get("identity_probe_reason")
                     or "process_identity_unverified"
                 )
@@ -12189,6 +12285,8 @@ def _omp_sessions_from_inventory(inventory: dict) -> list[dict]:
             "id": _qualified_session_id("omp", native_id),
             "provider": "omp",
             "native_id": native_id,
+            "send_scope_id": terminal.get("send_scope_id") or None,
+            "broker_id": terminal.get("broker_id") or None,
             "project": project,
             "working_on": str(terminal.get("title") or "OMP session"),
             "started_at": int(started_at),
@@ -12207,9 +12305,9 @@ def _omp_sessions_from_inventory(inventory: dict) -> list[dict]:
             "context_pct": None,
             "capabilities": capabilities,
             "controllability": {
-                "can_send_text": broker_controllable,
-                "can_interrupt": broker_controllable,
-                "can_terminate": broker_controllable,
+                "can_send_text": direct_steerable,
+                "can_interrupt": direct_steerable,
+                "can_terminate": direct_steerable,
                 "can_control": broker_controllable,
                 "reason": reason,
             },
@@ -12252,6 +12350,17 @@ def _omp_reconcile_provider_inventory(inventory: dict) -> None:
             "source": "omp_terminal_record",
         }
         existing = _agent_registry_get("omp", native_id)
+        registry_terminal_tty = terminal_tty
+        if existing is not None and _omp_inventory_registry_process_matches(
+            existing,
+            [terminal],
+        ):
+            durable_metadata = _registry_metadata_from_row(existing)
+            metadata = {**durable_metadata, **metadata}
+            existing_terminal_tty = str(existing.get("terminal_tty") or "")
+            if re.fullmatch(r"/dev/ttys[0-9]{3,}", existing_terminal_tty):
+                registry_terminal_tty = existing_terminal_tty
+                terminal["terminal_tty"] = existing_terminal_tty
         broker_session = _registry_owned_broker_session(
             "omp", native_id, existing
         )
@@ -12280,12 +12389,19 @@ def _omp_reconcile_provider_inventory(inventory: dict) -> None:
                     else "read_only"
                 ),
             })
+        durable_send_scope_id = _durable_send_scope_id_from_registry_row(
+            existing,
+            provider="omp",
+            native_id=native_id,
+        )
+        if durable_send_scope_id:
+            terminal["send_scope_id"] = durable_send_scope_id
         if _agent_registry_upsert(
             "omp",
             native_id,
             project,
             pid=pid,
-            terminal_tty=terminal_tty,
+            terminal_tty=registry_terminal_tty,
             state="running",
             metadata=metadata,
             working_on=str(terminal.get("title") or ""),
@@ -13133,12 +13249,14 @@ def _omp_inventory_registry_process_matches(
         expected_started_at = float(metadata.get("process_started_at") or 0)
     except (TypeError, ValueError):
         return False
+    expected_provider_tty = str(metadata.get("provider_tty") or terminal_tty)
     if (
         not native_id
         or not project
         or pid <= 0
         or expected_started_at <= 0
         or re.fullmatch(r"/dev/ttys[0-9]{3,}", terminal_tty) is None
+        or re.fullmatch(r"/dev/ttys[0-9]{3,}", expected_provider_tty) is None
     ):
         return False
     candidates = live_terminal_rows
@@ -13159,7 +13277,10 @@ def _omp_inventory_registry_process_matches(
             continue
         if int(candidate.get("pid") or 0) != pid:
             continue
-        if str(candidate.get("terminal_tty") or candidate.get("tty") or "") != terminal_tty:
+        candidate_provider_tty = str(
+            candidate.get("tty") or candidate.get("terminal_tty") or ""
+        )
+        if candidate_provider_tty != expected_provider_tty:
             continue
         try:
             actual_started_at = float(
@@ -13175,8 +13296,16 @@ def _omp_inventory_registry_process_matches(
             ) == os.path.realpath(project)
         except OSError:
             projects_match = str(candidate.get("project") or "") == project
-        if projects_match:
-            return True
+        if not projects_match:
+            continue
+        if terminal_tty != expected_provider_tty and not _direct_terminal_binding_is_verified(
+            reg,
+            "omp",
+            pid,
+            provider_tty=expected_provider_tty,
+        ):
+            continue
+        return True
     return False
 
 
@@ -16952,17 +17081,29 @@ def _terminal_surface_source(
                 "can_terminate": False,
                 "control_profile": "read_only",
             }
+        direct_actions = _direct_terminal_action_profile(
+            "omp",
+            reg,
+            tty,
+            allowed=not broker_id,
+            inventory_live_terminal_rows=live_terminal_rows,
+        )
+        if direct_actions.get("control_profile") == "read_only":
+            return {
+                "available": False,
+                "source": "unavailable",
+                "reason": "process_identity_unverified",
+                "tty": tty,
+                "pid": int(reg.get("pid") or 0),
+                **direct_actions,
+            }
         return {
             "available": True,
             "source": "terminal_app_contents",
             "reason": "terminal_app_contents",
             "tty": tty,
             "pid": int(reg.get("pid") or 0),
-            "can_control": False,
-            "can_send_text": False,
-            "can_interrupt": False,
-            "can_terminate": False,
-            "control_profile": "read_only",
+            **direct_actions,
         }
 
     if provider == "claude":
@@ -30637,6 +30778,19 @@ class Handler(BaseHTTPRequestHandler):
             return _resolve_codex_transcript(native_id)
         if provider == "claude":
             return self._resolve_transcript(raw_session)
+        if provider == "omp":
+            reg = _agent_registry_get("omp", native_id) or {}
+            project = str(reg.get("project") or "")
+            if not project or _omp_saved_sessions is None:
+                return None
+            matches = [
+                record
+                for record in _omp_saved_sessions(project=project, limit=200)
+                if str(record.session_id) == native_id
+            ]
+            if len(matches) != 1:
+                return None
+            return Path(matches[0].session_path).resolve(strict=True)
         raise _UnsupportedTranscriptProviderError(provider)
 
     def _transcript_truth_for_session(
@@ -31642,6 +31796,29 @@ class Handler(BaseHTTPRequestHandler):
                 ):
                     try:
                         PTY_BROKER.register_alias(qualified, _broker_session_id(session))
+                    except Exception:
+                        pass
+                    return qualified, session
+        if provider == "omp":
+            registry_native_id = _agent_registry_resolve_native_alias(
+                "omp", native_id
+            )
+            reg = _agent_registry_get("omp", registry_native_id) or {}
+            broker_id = str(
+                _registry_metadata_from_row(reg).get("broker_id") or ""
+            ).strip()
+            if broker_id:
+                try:
+                    session = PTY_BROKER.get(broker_id)
+                except Exception:
+                    session = None
+                if session and _broker_session_owns_identity(
+                    session, "omp", native_id
+                ):
+                    try:
+                        PTY_BROKER.register_alias(
+                            qualified, _broker_session_id(session)
+                        )
                     except Exception:
                         pass
                     return qualified, session
@@ -38244,7 +38421,7 @@ Worker instructions:
             }, status=503)
             return
         if not _broker_is_current_runtime():
-            message = "New sessions require the current terminal broker. A session still owned by the previous runtime remains read-only until it finishes."
+            message = "New sessions require the current terminal broker. Control remains unavailable for a session owned by the previous runtime until it finishes."
             receipt = _finalize_spawn_action(
                 device_id=spawn_device_id,
                 provider=provider,
@@ -38271,6 +38448,8 @@ Worker instructions:
 
         capture_id = secrets.token_hex(12)
         native_id = native_id_override or ("pending-" + secrets.token_hex(8))
+        published_native_id = native_id
+        omp_session_identity: dict | None = None
         broker_session_id = _qualified_session_id(provider, native_id)
         broker_env = None
         if launch_context is not None:
@@ -38425,6 +38604,32 @@ Worker instructions:
                             + f"{type(error).__name__}: {str(error)[:120]}"
                         )
 
+        if ok and session is not None and provider == "omp":
+            omp_session_identity = _wait_for_omp_spawn_terminal_identity(
+                provider_identity,
+                canonical_project=project,
+            )
+            adopted_native_id = str(
+                (omp_session_identity or {}).get("native_id") or ""
+            )
+            if not _safe_agent_native_id(adopted_native_id):
+                ok = False
+                reason = "broker launch did not produce one exact OMP session identity"
+                if not reconciled_existing:
+                    try:
+                        cleanup = PTY_BROKER.terminate(broker_session_id)
+                        if not isinstance(cleanup, dict) or not cleanup.get("ok"):
+                            outcome_indeterminate = True
+                            reason += "; broker cleanup could not be confirmed"
+                    except Exception as error:
+                        outcome_indeterminate = True
+                        reason += (
+                            "; broker cleanup failed: "
+                            + f"{type(error).__name__}: {str(error)[:120]}"
+                        )
+            else:
+                published_native_id = adopted_native_id
+
         if ok and session is not None:
             session_tty = _broker_slave_tty(session)
             session_log = _broker_raw_log_path(session)
@@ -38451,9 +38656,27 @@ Worker instructions:
                     "launch_strategy": "direct_pairling",
                     "danger_mode": True,
                 }
+            omp_metadata = {}
+            if omp_session_identity is not None:
+                omp_metadata = {
+                    "pending_native_id": native_id,
+                    "broker_native_id": native_id,
+                    "process_started_at": float(
+                        omp_session_identity.get("process_started_at") or 0
+                    ),
+                    "output_path": str(
+                        omp_session_identity.get("output_path") or ""
+                    ),
+                    "session_path": str(
+                        omp_session_identity.get("session_path") or ""
+                    ),
+                    "record_mtime": float(
+                        omp_session_identity.get("record_mtime") or 0
+                    ),
+                }
             registry_ok = _agent_registry_upsert(
                 provider,
-                native_id,
+                published_native_id,
                 project,
                 pid=session_pid,
                 terminal_tty=session_tty,
@@ -38466,6 +38689,7 @@ Worker instructions:
                     "broker_socket": str(PTY_BROKER_SOCKET),
                     "spawn_action_id": spawn_action_id or None,
                     "spawn_body_hash": spawn_body_hash or None,
+                    **omp_metadata,
                     **launch_meta,
                     "broker_owner_pid": _broker_pid(session),
                 },
@@ -38501,6 +38725,14 @@ Worker instructions:
                         "idle",
                         event="spawn",
                     )
+                elif provider == "omp":
+                    try:
+                        PTY_BROKER.register_alias(
+                            _qualified_session_id("omp", published_native_id),
+                            broker_session_id,
+                        )
+                    except Exception:
+                        pass
 
         try:
             audit_path = HOME / ".claude" / "audit" / "spawn-sessions.jsonl"
@@ -38510,7 +38742,7 @@ Worker instructions:
                     "ts": _time.time(),
                     "project": project,
                     "provider": provider,
-                    "native_id": native_id,
+                    "native_id": published_native_id,
                     "tty": _broker_slave_tty(session) if session else "",
                     "pid": int(provider_identity.get("pid") or 0) if provider_identity else 0,
                     "terminal_log": str(_broker_raw_log_path(session)) if session and _broker_raw_log_path(session) else None,
@@ -38567,13 +38799,14 @@ Worker instructions:
         if first_prompt:
             first_prompt_scheduled = _schedule_first_prompt_delivery(
                 provider=provider,
-                native_id=native_id,
+                native_id=published_native_id,
                 text=first_prompt,
                 client_action_id=spawn_action_id or None,
                 device_id=spawn_device_id,
             )
         first_prompt_delivery = (
-            _read_first_prompt_delivery(provider, native_id) if first_prompt else None
+            _read_first_prompt_delivery(provider, published_native_id)
+            if first_prompt else None
         )
         response = {
             "ok": True,
@@ -38586,8 +38819,8 @@ Worker instructions:
             ),
             "project": project,
             "provider": provider,
-            "native_id": native_id,
-            "session_id": broker_session_id,
+            "native_id": published_native_id,
+            "session_id": _qualified_session_id(provider, published_native_id),
             "send_scope_id": broker_session_id,
             "session_mode": "terminal",
             "requested_session_mode": requested_session_mode,
@@ -38842,8 +39075,10 @@ Worker instructions:
         self._send_json({"ok": True, "handoffs": items})
 
     def _handle_spawn_session(self, q):
-        """Spawn a new Claude/Codex session. User-facing terminal sessions use
-        the Pairling-owned PTY broker. Terminal.app automation is retired.
+        """Spawn a reviewed provider session through an allowed launch backend.
+
+        Pairling PTY sessions use the owned broker. Reviewed providers may also
+        use the signed Pairling.app helper for a visible Terminal.app session.
 
         Security:
         - Project path must be absolute and exist on disk.
@@ -39161,7 +39396,13 @@ Worker instructions:
             "pending-"
             + hashlib.sha256(f"{device_id}\0{client_action_id}".encode()).hexdigest()[:16]
         )
+        existing_native_id = deterministic_native_id
         existing_row = _agent_registry_get(provider, deterministic_native_id)
+        if existing_row is None and provider == "omp":
+            existing_native_id = _agent_registry_resolve_native_alias(
+                "omp", deterministic_native_id
+            )
+            existing_row = _agent_registry_get("omp", existing_native_id)
         if existing_row is not None:
             existing_metadata = _registry_metadata_from_row(existing_row)
             if (
@@ -39183,13 +39424,13 @@ Worker instructions:
             if first_prompt:
                 first_prompt_scheduled = _schedule_first_prompt_delivery(
                     provider=provider,
-                    native_id=deterministic_native_id,
+                    native_id=existing_native_id,
                     text=first_prompt,
                     client_action_id=client_action_id,
                     device_id=device_id,
                 )
             first_prompt_delivery = (
-                _read_first_prompt_delivery(provider, deterministic_native_id)
+                _read_first_prompt_delivery(provider, existing_native_id)
                 if first_prompt
                 else None
             )
@@ -39204,15 +39445,15 @@ Worker instructions:
                 ),
                 "project": project,
                 "provider": provider,
-                "native_id": deterministic_native_id,
-                "session_id": _qualified_session_id(provider, deterministic_native_id),
+                "native_id": existing_native_id,
+                "session_id": _qualified_session_id(provider, existing_native_id),
                 "send_scope_id": (
                     _durable_send_scope_id_from_registry_row(
                         existing_row,
                         provider=provider,
-                        native_id=deterministic_native_id,
+                        native_id=existing_native_id,
                     )
-                    or _qualified_session_id(provider, deterministic_native_id)
+                    or _qualified_session_id(provider, existing_native_id)
                 ),
                 "tty": existing_row.get("terminal_tty") or "",
                 "pid": int(existing_row.get("pid") or 0),
@@ -39498,6 +39739,7 @@ Worker instructions:
         tty = str(result.get("tty") or "").strip() if result.get("ok") else ""
         pid = 0
         terminal_identity: dict | None = None
+        omp_session_identity: dict | None = None
         registry_written = False
         native_id = deterministic_native_id
         if result.get("ok"):
@@ -39513,6 +39755,27 @@ Worker instructions:
                     "pty_written": None,
                     "write_outcome": "unknown",
                 }
+            elif provider == "omp":
+                omp_session_identity = _wait_for_omp_spawn_terminal_identity(
+                    terminal_identity,
+                    canonical_project=project,
+                )
+                adopted_native_id = str(
+                    (omp_session_identity or {}).get("native_id") or ""
+                )
+                if not _safe_agent_native_id(adopted_native_id):
+                    result = {
+                        "ok": False,
+                        "reason": (
+                            "Terminal opened, but OMP's exact session identity "
+                            "could not be verified."
+                        ),
+                        "outcome_indeterminate": True,
+                        "pty_written": None,
+                        "write_outcome": "unknown",
+                    }
+                else:
+                    native_id = adopted_native_id
         if result.get("ok"):
             if tty and capture_log_path is not None:
                 _write_terminal_capture_mapping(
@@ -39522,6 +39785,27 @@ Worker instructions:
                     project=project,
                     capture_id=capture_id,
                 )
+            send_scope_id = _qualified_session_id(
+                provider,
+                deterministic_native_id if provider == "omp" else native_id,
+            )
+            omp_metadata = {}
+            if omp_session_identity is not None:
+                omp_metadata = {
+                    "pending_native_id": deterministic_native_id,
+                    "process_started_at": float(
+                        omp_session_identity.get("process_started_at") or 0
+                    ),
+                    "output_path": str(
+                        omp_session_identity.get("output_path") or ""
+                    ),
+                    "session_path": str(
+                        omp_session_identity.get("session_path") or ""
+                    ),
+                    "record_mtime": float(
+                        omp_session_identity.get("record_mtime") or 0
+                    ),
+                }
             registry_written = _agent_registry_upsert(
                 provider,
                 native_id,
@@ -39537,10 +39821,11 @@ Worker instructions:
                     "capture_backend": "script" if capture_log_path else None,
                     "terminal_source": "terminal_app_contents",
                     "capture_id": capture_id or None,
-                    "send_scope_id": _qualified_session_id(provider, native_id),
+                    "send_scope_id": send_scope_id,
                     "spawn_action_id": client_action_id,
                     "spawn_body_hash": spawn_body_hash,
                     **_provider_terminal_identity_metadata(terminal_identity),
+                    **omp_metadata,
                 },
                 working_on=f"New {provider.title()} session",
             )
@@ -39641,7 +39926,11 @@ Worker instructions:
             "provider": provider,
             "native_id": native_id,
             "session_id": _qualified_session_id(provider, native_id),
-            "send_scope_id": _qualified_session_id(provider, native_id),
+            "send_scope_id": (
+                _qualified_session_id(provider, deterministic_native_id)
+                if provider == "omp"
+                else _qualified_session_id(provider, native_id)
+            ),
             "session_mode": "terminal",
             "requested_session_mode": session_mode,
             "structured_fallback_reason": structured_fallback_reason,
@@ -39749,7 +40038,7 @@ Worker instructions:
             }, status=503)
             return
         if not _broker_is_current_runtime():
-            message = "Resume requires the current terminal broker. A session still owned by the previous runtime remains read-only until it finishes."
+            message = "Resume requires the current terminal broker. Control remains unavailable for a session owned by the previous runtime until it finishes."
             receipt = _finalize_receipted_mutation(
                 receipt_context,
                 state="rejected",
@@ -40861,7 +41150,7 @@ Worker instructions:
         text: str,
         receipt_context: dict | None = None,
     ) -> None:
-        """Send text only through the currently owned OMP PTY broker session."""
+        """Send through an owned OMP broker or an exact Terminal.app binding."""
         receipt_context = receipt_context or {}
         reg = _agent_registry_get("omp", native_id)
         if not reg:
@@ -40894,32 +41183,133 @@ Worker instructions:
             native_id=native_id,
         )
         broker_session = _registry_owned_broker_session("omp", native_id, reg)
+        if broker_session is None and durable_broker_id:
+            self._finish_send_text_failure(
+                receipt_context,
+                text,
+                status=503,
+                reason="OMP terminal broker is temporarily unavailable. No text was sent.",
+                state="failed",
+                validated=True,
+                backend="pty_broker",
+                tty=str(reg.get("terminal_tty") or "") or None,
+                pid=int(reg.get("pid") or 0) or None,
+                error_code="broker_unavailable",
+                extra={"broker_id": durable_broker_id},
+            )
+            return
         if broker_session is None:
-            if durable_broker_id:
-                self._finish_send_text_failure(
-                    receipt_context,
-                    text,
-                    status=503,
-                    reason="OMP terminal broker is temporarily unavailable. No text was sent.",
-                    state="failed",
-                    validated=True,
-                    backend="pty_broker",
-                    tty=str(reg.get("terminal_tty") or "") or None,
-                    pid=int(reg.get("pid") or 0) or None,
-                    error_code="broker_unavailable",
-                    extra={"broker_id": durable_broker_id},
+            inventory = _capture_sessions_provider_inventory("omp")
+            live_terminals = list(inventory.get("terminals") or [])
+            tty = str(reg.get("terminal_tty") or "")
+            pid = int(reg.get("pid") or 0)
+            if (
+                inventory.get("probe_state") != "exact"
+                or not bool(inventory.get("membership_complete"))
+                or not _omp_inventory_registry_process_matches(
+                    reg,
+                    live_terminals,
+                    require_direct_control=True,
                 )
-            else:
+            ):
                 self._finish_send_text_failure(
                     receipt_context,
                     text,
                     status=409,
-                    reason="OMP control requires a currently owned terminal broker.",
-                    backend="pty_broker",
-                    tty=str(reg.get("terminal_tty") or "") or None,
-                    pid=int(reg.get("pid") or 0) or None,
-                    error_code="broker_ownership_unverified",
+                    reason="OMP process identity changed; refresh before sending text.",
+                    backend="terminal_app",
+                    tty=tty or None,
+                    pid=pid or None,
+                    error_code="process_identity_unverified",
                 )
+                return
+
+            _mark_send_text_running(
+                receipt_context,
+                provider_id="omp",
+                binding_id=f"terminal_tty:{tty}",
+            )
+            result = _send_terminal_app_text_exact(tty, text)
+            if result.get("ok"):
+                _agent_registry_update_control(
+                    "omp", native_id, pid=pid, terminal_tty=tty,
+                    state="running", reopen=True,
+                )
+                _write_agent_turn_state(
+                    "omp", native_id, "thinking",
+                    started_at=_time.time(), event="send_text",
+                )
+            outcome_indeterminate = bool(result.get("outcome_indeterminate"))
+            pty_written = (
+                result.get("pty_written")
+                if "pty_written" in result
+                else (None if outcome_indeterminate else bool(result.get("ok")))
+            )
+            receipt = _make_send_text_receipt(
+                receipt_context,
+                client_action_id=receipt_context.get("client_action_id"),
+                state=(
+                    "applied"
+                    if result.get("ok")
+                    else ("indeterminate" if outcome_indeterminate else "failed")
+                ),
+                phases=_receipt_phases(
+                    validated=True,
+                    applied=bool(result.get("ok")),
+                    pty_written=pty_written,
+                ),
+                backend="terminal_app",
+                tty=tty,
+                pid=pid,
+                source_offset_reason="omp_transcript_confirmation",
+            )
+            if result.get("write_outcome"):
+                receipt["phases"]["pty_write_state"] = str(result["write_outcome"])
+            if not result.get("ok"):
+                _receipt_attach_response(
+                    receipt,
+                    http_status=int(result.get("status") or 502),
+                    error_code=str(
+                        result.get("error_code")
+                        or (
+                            "terminal_write_outcome_unknown"
+                            if outcome_indeterminate
+                            else "send_text_failed"
+                        )
+                    ),
+                    error_message=str(result.get("reason") or "Send failed."),
+                    fields={
+                        "reason": result.get("reason"),
+                        "write_outcome": result.get("write_outcome"),
+                        "outcome_indeterminate": outcome_indeterminate,
+                    },
+                )
+            _store_action_receipt(
+                receipt_context.get("device_id"),
+                str(
+                    receipt_context.get("session_id")
+                    or _qualified_session_id("omp", native_id)
+                ),
+                receipt_context.get("client_action_id"),
+                str(receipt_context.get("body_hash") or _receipt_body_hash(text)),
+                receipt,
+                action_kind="send_text",
+                audit_action={"type": "send_text", "chars": len(text)},
+            )
+            self._send_json(
+                {
+                    "ok": bool(result.get("ok")),
+                    "session_id": public_session_id,
+                    "tty": tty,
+                    "pid": pid,
+                    "reason": result.get("reason"),
+                    "error_code": result.get("error_code"),
+                    "write_outcome": result.get("write_outcome"),
+                    "outcome_indeterminate": outcome_indeterminate,
+                    "receipt": receipt,
+                },
+                status=200 if result.get("ok") else int(result.get("status") or 502),
+            )
             return
 
         broker_id = _broker_session_id(broker_session)
@@ -41768,7 +42158,7 @@ Worker instructions:
                 client_action_id=client_action_id or None,
                 state="applied" if ok else ("indeterminate" if outcome_indeterminate else "failed"),
                 phases=_receipt_phases(validated=True, applied=ok, pty_written=pty_written),
-                backend="pty_broker" if broker_id or provider == "omp" else "process_signal",
+                backend="pty_broker" if broker_id else "process_signal",
                 pid=pid,
             )
             if write_outcome:
@@ -42045,16 +42435,61 @@ Worker instructions:
                         pty_written=False,
                         write_outcome="none",
                     )
-                else:
+                    return
+
+                current, pid, verification_error = _verified_session_signal_target(
+                    "omp", native_id
+                )
+                if verification_error:
                     send_signal_result(
                         False,
-                        int(reg.get("pid") or 0) or None,
-                        "OMP control requires a currently owned terminal broker.",
+                        pid or None,
+                        "OMP process identity changed; refresh before sending control.",
                         409,
-                        error_code="broker_ownership_unverified",
-                        pty_written=False,
-                        write_outcome="none",
+                        error_code="process_identity_unverified",
                     )
+                    return
+
+                ok = True
+                err = None
+                error_code = None
+                outcome_indeterminate = False
+                if sig == signal.SIGTERM:
+                    mark_signal_running()
+                    termination = _terminate_direct_session_process(
+                        current or reg,
+                        "omp",
+                        pid,
+                    )
+                    ok = bool(termination.get("ok"))
+                    err = termination.get("error")
+                    error_code = termination.get("error_code")
+                    outcome_indeterminate = bool(
+                        termination.get("outcome_indeterminate")
+                    )
+                else:
+                    try:
+                        mark_signal_running()
+                        os.kill(pid, sig)
+                    except (ProcessLookupError, PermissionError, OSError) as exc:
+                        ok = False
+                        err = f"{type(exc).__name__}: {exc}"
+                if ok:
+                    _write_agent_turn_state(
+                        "omp", native_id, "idle", event=sig_name.lower()
+                    )
+                if ok and sig == signal.SIGTERM:
+                    _agent_registry_mark_closed("omp", native_id)
+                send_signal_result(
+                    ok,
+                    pid,
+                    err,
+                    409
+                    if error_code == "process_identity_unverified"
+                    else (200 if ok else 502),
+                    error_code=error_code,
+                    outcome_indeterminate=outcome_indeterminate,
+                )
                 return
 
             broker_id = _broker_session_id(broker_session)
