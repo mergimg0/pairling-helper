@@ -1379,6 +1379,7 @@ class ManagedProviderSessionStore:
         if live_only:
             where.append("closed_at IS NULL")
             where.append("lifecycle IN ('launching','running','waiting','blocked','closing')")
+            where.append("driver_available=1")
         if active_within_min is not None:
             where.append("updated_at>=?")
             params.append(time.time() - max(1, int(active_within_min)) * 60)
