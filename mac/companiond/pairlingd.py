@@ -11429,6 +11429,13 @@ def _wait_for_omp_spawn_terminal_identity(
         )
     ):
         return None
+    try:
+        if os.path.realpath(
+            str(provider_identity.get("project") or "")
+        ) != os.path.realpath(canonical_project):
+            return None
+    except OSError:
+        return None
 
     deadline = _time.monotonic() + max(0.0, timeout_seconds)
     while True:
@@ -11499,6 +11506,21 @@ def _wait_for_omp_spawn_terminal_identity(
                     "can_control": True,
                     "source": "pairling_owned_process",
                 }
+        elif (
+            _process_alive(pid)
+            and abs(_process_start_epoch(pid) - started_at) <= 2
+        ):
+            return {
+                "provider": "omp",
+                "project": os.path.realpath(canonical_project),
+                "pid": pid,
+                "provider_tty": provider_tty,
+                "process_started_at": started_at,
+                "executable_path": expected_executable,
+                "identity_probe_state": "pairling_pending_process",
+                "can_control": True,
+                "source": "pairling_owned_process",
+            }
         if _time.monotonic() >= deadline:
             return None
         _time.sleep(0.1)
@@ -12249,8 +12271,6 @@ def _omp_provider_inventory_from_process_rows(
 
     terminals: list[dict] = []
     for record in _omp_terminal_session_records(home=home):
-        if not record.fresh:
-            continue
         candidates = candidates_by_tty.get(record.terminal_tty) or []
         if len(candidates) != 1:
             continue

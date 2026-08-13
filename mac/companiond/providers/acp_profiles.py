@@ -757,7 +757,7 @@ _PROFILES: dict[str, AcpLaunchProfile] = {
             "--no-extensions",
             "--no-skills",
             "--no-rules",
-            "--tools=read,grep,glob,ast_grep,lsp,edit,write,bash,todo",
+            "--tools=read,grep,glob,ast_grep,lsp,edit,write,bash,todo,ask",
             "--config",
             "{config_root}/omp.yml",
             "acp",
