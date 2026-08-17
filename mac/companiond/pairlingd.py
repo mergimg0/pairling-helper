@@ -13177,6 +13177,12 @@ def _refresh_sessions_inventory_bundle(
         finally:
             _sessions_inventory_scan_context.active = previous_scan_state
         completed_at = _time.time()
+        # A multi-provider generation is committed only after every serial
+        # probe succeeds. Keep each exact probe's checked_at for evidence, but
+        # start cache freshness at this generation's commit so an early probe
+        # cannot expire before the generation is publishable.
+        for inventory in inventories.values():
+            inventory["refreshed_at"] = completed_at
         with _sessions_inventory_bundle_lock:
             if (
                 int(_sessions_inventory_bundle.get("generation") or 0)
@@ -13220,8 +13226,7 @@ def _refresh_sessions_inventory_bundle(
             and inventory.get("probe_state") == "exact"
             and bool(inventory.get("membership_complete"))
             and float(inventory.get("checked_at") or 0) > 0
-            and now - float(inventory.get("checked_at") or 0)
-            < _SESSION_INVENTORY_FRESH_SECONDS
+            and _sessions_inventory_is_fresh(inventory, now)
             for inventory in stored.values()
         ) else "incomplete"
         with _sessions_health_lock:
@@ -13247,6 +13252,18 @@ def _refresh_sessions_inventory_bundle(
         )
 
 
+def _sessions_inventory_is_fresh(inventory: object, now: float) -> bool:
+    if not isinstance(inventory, dict):
+        return False
+    refreshed_at = float(
+        inventory.get("refreshed_at") or inventory.get("checked_at") or 0
+    )
+    return (
+        refreshed_at > 0
+        and now - refreshed_at < _SESSION_INVENTORY_FRESH_SECONDS
+    )
+
+
 def _sessions_provider_inventory_bundle(
     requested: set[str],
     *,
@@ -13270,12 +13287,7 @@ def _sessions_provider_inventory_bundle(
         refreshing = bool(_sessions_inventory_bundle.get("refreshing"))
         stored = copy.deepcopy(_sessions_inventory_bundle.get("inventories") or {})
         provider_fresh = {
-            provider: (
-                isinstance(stored.get(provider), dict)
-                and float(stored[provider].get("checked_at") or 0) > 0
-                and now - float(stored[provider].get("checked_at") or 0)
-                < _SESSION_INVENTORY_FRESH_SECONDS
-            )
+            provider: _sessions_inventory_is_fresh(stored.get(provider), now)
             for provider in requested
         }
         refresh_providers = {
@@ -13353,12 +13365,7 @@ def _sessions_provider_inventory_bundle(
         if not refresh_timed_out:
             now = _time.time()
             provider_fresh = {
-                provider: (
-                    isinstance(stored.get(provider), dict)
-                    and float(stored[provider].get("checked_at") or 0) > 0
-                    and now - float(stored[provider].get("checked_at") or 0)
-                    < _SESSION_INVENTORY_FRESH_SECONDS
-                )
+                provider: _sessions_inventory_is_fresh(stored.get(provider), now)
                 for provider in requested
             }
             stale = any(not fresh for fresh in provider_fresh.values())
