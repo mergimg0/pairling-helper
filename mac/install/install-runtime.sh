@@ -34,6 +34,7 @@ PACKAGED_SOURCE_PATHS=(
   "mac/mcp"
   "mac/packaging/bin/pairling"
   "mac/packaging/pairling_attach.py"
+  "thoughts/shared/specs/coding-agent-remote-control-capability-map.json"
   "relay/app_attest_validator.py"
 )
 SOURCE_DIRTY="${PAIRLING_SOURCE_DIRTY:-$(read_source_stamp "$REPO_ROOT/mac/SOURCE_DIRTY")}"
@@ -286,9 +287,13 @@ verify_package_python_before_execution() {
   fi
 }
 
-verify_package_snapshot_before_execution
-verify_package_python_before_execution
-PYTHON3_BIN="$(resolve_python_bin)"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  verify_package_snapshot_before_execution
+  verify_package_python_before_execution
+  PYTHON3_BIN="$(resolve_python_bin)"
+else
+  PYTHON3_BIN="${PYTHON3_BIN:-$(command -v python3)}"
+fi
 CONTROL_PYTHON_BIN="$PYTHON3_BIN"
 
 pin_control_python() {
@@ -3806,6 +3811,80 @@ stage_provider_runtime_assets() {
   fi
 }
 
+stage_reviewed_provider_manifests() {
+  local destination="$1"
+  local capability_source="$REPO_ROOT/thoughts/shared/specs/coding-agent-remote-control-capability-map.json"
+  local operations_source="$REPO_ROOT/mac/companiond/providers/operations.py"
+  local packaged_capability_source="$REPO_ROOT/mac/companiond/providers/provider-control-capability-map.json"
+  local packaged_operations_source="$REPO_ROOT/mac/companiond/providers/reviewed-operation-manifest.json"
+  local capability_destination="$destination/provider-control-capability-map.json"
+  local operations_destination="$destination/reviewed-operation-manifest.json"
+  if [[ -L "$destination" || ! -d "$destination" ]]; then
+    log "ERROR: reviewed provider manifest source or destination is unsafe." >&2
+    WIZARD_FATAL=1
+    return 1
+  fi
+  if [[ -f "$capability_source" && ! -L "$capability_source" && \
+        -f "$operations_source" && ! -L "$operations_source" ]]; then
+    if [[ -e "$capability_destination" || -L "$capability_destination" || \
+          -e "$operations_destination" || -L "$operations_destination" ]]; then
+      log "ERROR: reviewed provider manifest source or destination is unsafe." >&2
+      WIZARD_FATAL=1
+      return 1
+    fi
+  elif [[ -f "$packaged_capability_source" && ! -L "$packaged_capability_source" && \
+          -f "$packaged_operations_source" && ! -L "$packaged_operations_source" && \
+          -f "$capability_destination" && ! -L "$capability_destination" && \
+          -f "$operations_destination" && ! -L "$operations_destination" ]] && \
+       /usr/bin/cmp -s "$packaged_capability_source" "$capability_destination" && \
+       /usr/bin/cmp -s "$packaged_operations_source" "$operations_destination"; then
+    # npm payload verification already authenticated these manifest-bound
+    # generated files. The generic JSON copy staged the same bytes, so retain
+    # them without replacing an existing destination.
+    return 0
+  else
+    log "ERROR: reviewed provider manifest source or destination is unsafe." >&2
+    WIZARD_FATAL=1
+    return 1
+  fi
+  if ! /bin/cp -p "$capability_source" "$capability_destination"; then
+    log "ERROR: reviewed provider capability map could not be staged." >&2
+    WIZARD_FATAL=1
+    return 1
+  fi
+  if ! "$PYTHON3_BIN" - \
+    "$operations_source" "$operations_destination" "$REPO_ROOT" "$REVISION" <<'PY'
+import importlib.util
+import json
+import os
+import sys
+
+source, destination, source_root, source_revision = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("_pairling_staged_operations", source)
+if spec is None or spec.loader is None:
+    raise SystemExit("cannot load reviewed provider operation module")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+payload = module.release_operation_manifest_payload(
+    source_revision=source_revision,
+    source_root=source_root,
+)
+encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(destination, flags, 0o644)
+with os.fdopen(descriptor, "wb") as handle:
+    handle.write(encoded)
+    handle.flush()
+    os.fsync(handle.fileno())
+PY
+  then
+    log "ERROR: reviewed provider operation manifest could not be staged." >&2
+    WIZARD_FATAL=1
+    return 1
+  fi
+}
+
 
 adopt_snapshot_python() {
   local candidate="${PAIRLING_DAEMON_PYTHON:-}"
@@ -3878,6 +3957,26 @@ adopt_current_release_sources() {
   activate_provider_sdk_environment "$RELEASE_ROOT" || return 1
   cleanup_source_snapshot
   unset PAIRLING_RUNTIME_PACKAGE_ROOT PAIRLING_CONNECTD_PREBUILT
+}
+
+adopt_verified_current_release_sources() {
+  local current_target current_identity current_root current_version current_revision current_dirty
+  if [[ ! -L "$CURRENT_LINK" ]]; then
+    log "ERROR: Pairling runtime/current is not a managed release link." >&2
+    return 1
+  fi
+  current_target="$(readlink "$CURRENT_LINK")"
+  if [[ -z "$current_target" ]] || ! current_identity="$(managed_release_identity "$current_target")"; then
+    log "ERROR: Pairling runtime/current is not a verified managed release." >&2
+    return 1
+  fi
+  IFS=$'\t' read -r current_root current_version current_revision current_dirty <<<"$current_identity"
+  if [[ -z "$current_root" || -z "$current_version" || -z "$current_revision" || -z "$current_dirty" ]]; then
+    log "ERROR: Pairling runtime/current has an incomplete managed release identity." >&2
+    return 1
+  fi
+  RELEASE_ROOT="$current_root"
+  adopt_current_release_sources
 }
 
 release_content_digest() {
@@ -3954,6 +4053,9 @@ copy_release() {
   cp "$REPO_ROOT/mac/companiond/pairdrop_store.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/compose_recording_store.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairling_connectd_status.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/provider_control_service.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/session_control_gateway.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/session_control_trust.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/local_control_client.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairling_devices.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/managed_provider_sessions.py" "$tmp/companiond/"
@@ -4000,6 +4102,7 @@ copy_release() {
   # without it silently degrades to the builtin fallbacks.
   cp "$REPO_ROOT/mac/companiond/providers/"*.json "$tmp/companiond/providers/"
   stage_provider_runtime_assets "$REPO_ROOT/mac/companiond/providers" "$tmp/companiond/providers"
+  stage_reviewed_provider_manifests "$tmp/companiond/providers"
   cp "$REPO_ROOT/mac/mcp/phone_tools.py" "$tmp/mcp/"
   build_connectd_binary "$tmp/connectd/pairling-connectd"
   stage_vendored_python "$tmp/python"
@@ -4098,6 +4201,7 @@ copy_runtime_source_tree() {
   cp "$REPO_ROOT/mac/companiond/providers/"*.py "$mac_root/companiond/providers/"
   cp "$REPO_ROOT/mac/companiond/providers/"*.json "$mac_root/companiond/providers/"
   stage_provider_runtime_assets "$REPO_ROOT/mac/companiond/providers" "$mac_root/companiond/providers"
+  stage_reviewed_provider_manifests "$mac_root/companiond/providers"
   cp "$REPO_ROOT/mac/companiond/integrations/__init__.py" "$mac_root/companiond/integrations/"
   cp "$REPO_ROOT/mac/companiond/integrations/aperture_cli/"*.py "$mac_root/companiond/integrations/aperture_cli/"
   cp "$REPO_ROOT/mac/connectd/go.mod" "$mac_root/connectd/"
@@ -5648,6 +5752,39 @@ PY
   PAIRLING_DAEMON_PYTHON="$PYTHON3_BIN" "$REPO_ROOT/mac/install/doctor.sh" --json >"$doctor_json" 2>"$doctor_error" || doctor_status=$?
   if [[ "$doctor_status" != 0 ]]; then
     cat "$doctor_error" >&2
+    "$PYTHON3_BIN" - "$doctor_json" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+try:
+    payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    print("ERROR: Pairling doctor failure summary is unavailable.", file=sys.stderr)
+    raise SystemExit(0)
+
+failed = [
+    row
+    for row in payload.get("checks", [])
+    if isinstance(row, dict) and row.get("status") != "ok"
+]
+if not failed:
+    print(
+        "ERROR: Pairling doctor exited nonzero without failed JSON checks.",
+        file=sys.stderr,
+    )
+    raise SystemExit(0)
+
+summaries = []
+for row in failed[:24]:
+    check_id = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(row.get("id") or "unknown"))[:96]
+    severity = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(row.get("severity") or "unknown"))[:32]
+    status = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(row.get("status") or "unknown"))[:32]
+    summary = re.sub(r"\s+", " ", str(row.get("summary") or "")).strip()[:240]
+    summaries.append(f"{check_id}[{severity}/{status}]: {summary}")
+print("ERROR: Pairling doctor failed checks: " + "; ".join(summaries), file=sys.stderr)
+PY
     log "ERROR: Pairling doctor exited $doctor_status during activation proof." >&2
     rm -f "$doctor_json" "$doctor_error"
     return 1
@@ -5992,6 +6129,7 @@ status_runtime() {
 }
 
 start_runtime() {
+  adopt_verified_current_release_sources
   ensure_state
   render_plists
   start_automation_agent
@@ -6754,6 +6892,10 @@ commands:
   rollback
 EOF
 }
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
 
 cmd="${1:-setup}"
 shift || true

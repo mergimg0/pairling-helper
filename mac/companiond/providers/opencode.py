@@ -37,6 +37,7 @@ from .opencode_protocol import (
     OpenCodeCapabilityError,
     OpenCodeEndpointDenied,
     OpenCodeError,
+    OpenCodeEventCursorError,
     OpenCodeEventState,
     OpenCodeEventStream,
     OpenCodeHTTPTransport,
@@ -69,6 +70,8 @@ class OpenCodeControlError(ControlContractError):
 
 class OpenCodeControlDriver:
     """Normalized controls over one exact, owned OpenCode server binding."""
+
+    generation_refresh_safe = True
     safe_launch_profile = {
         "reviewed": True,
         "establishes_loopback_auth": True,
@@ -95,7 +98,7 @@ class OpenCodeControlDriver:
         self._blocked_reason = blocked_reason
         self._lock = threading.RLock()
         self._generation = 1
-        self._last_signature: str | None = None
+        self._last_signatures: dict[str, str] = {}
         self._session_native_ids: dict[str, str] = {}
         self._attached_native_ids: set[str] = set()
         self._models: dict[str, tuple[str, str]] = {}
@@ -272,7 +275,7 @@ class OpenCodeControlDriver:
             )
         self._ensure_server(workspace)
         self._generation = max(1, expected_generation - 1)
-        self._last_signature = None
+        self._last_signatures.clear()
         self.resume_session(
             native_id,
             expected_directory=workspace,
@@ -295,23 +298,129 @@ class OpenCodeControlDriver:
             "provider_cursor": self._provider_cursor(),
         }
 
+    @property
+    def capability_generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    def refresh_session_binding(
+        self,
+        session_truth: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            if not isinstance(session_truth, Mapping):
+                raise OpenCodeControlError(
+                    "OpenCode session binding refresh requires exact truth"
+                )
+            session_id = session_truth.get("session_id")
+            expected_generation = session_truth.get(
+                "capability_generation"
+            )
+            if (
+                not isinstance(session_id, str)
+                or session_truth.get("provider_id") != "opencode"
+                or session_truth.get("binding_id")
+                != self.binding.binding_id
+                or session_truth.get("provider_version")
+                != self.binding.provider_version
+                or session_truth.get("provider_channel")
+                != self.binding.provider_channel
+                or session_truth.get("driver_available") is not True
+                or session_truth.get("lifecycle")
+                not in {"running", "waiting"}
+                or isinstance(expected_generation, bool)
+                or not isinstance(expected_generation, int)
+                or expected_generation < 1
+                or expected_generation > self._generation
+            ):
+                raise OpenCodeControlError(
+                    "OpenCode session binding refresh proof is stale"
+                )
+            native_id = _native_session_id(session_id, session_truth)
+            workspace = _workspace_from_truth(
+                session_truth,
+                require_exists=True,
+            )
+            server = self._require_server()
+            verify_inputs = getattr(server, "verify_launch_inputs", None)
+            if (
+                workspace is None
+                or workspace.resolve(strict=False)
+                != server.cwd.resolve(strict=False)
+                or self._managed_native_id != native_id
+                or native_id not in self._attached_native_ids
+                or self._session_native_ids.get(session_id) != native_id
+                or not callable(verify_inputs)
+                or verify_inputs() is not True
+            ):
+                raise OpenCodeControlError(
+                    "OpenCode session binding refresh ownership changed"
+                )
+            fresh = server.transport.negotiate(
+                expected_version=self.binding.provider_version,
+                launch_digest=server.launch_digest,
+            )
+            if (
+                fresh.version != self.binding.provider_version
+                or fresh.launch_digest != server.launch_digest
+                or fresh.capability_digest
+                != server.profile.capability_digest
+            ):
+                raise OpenCodeControlError(
+                    "OpenCode session binding refresh capabilities changed"
+                )
+            session = server.transport.get_session(native_id)
+            if (
+                not session_matches_directory(session, server.cwd)
+                or not has_pairling_permission_rules(session)
+            ):
+                raise OpenCodeControlError(
+                    "OpenCode session binding refresh session changed"
+                )
+            return {
+                "binding_id": self.binding.binding_id,
+                "session_id": session_id,
+                "native_session_id": native_id,
+                "capability_generation": self._generation,
+                "driver_available": True,
+                "lifecycle": "live",
+                "provider_cursor": self._provider_cursor(),
+            }
+
+
     def poll_events(
         self,
-        _provider_cursor: str | None = None,
+        provider_cursor: str | None = None,
     ) -> dict[str, Any]:
-        self._require_server()
-        target_native_id = self._managed_native_id
-        if target_native_id is None and len(self._attached_native_ids) == 1:
-            target_native_id = next(iter(self._attached_native_ids))
-        events = [
-            _managed_event(event, self._clock())
-            for event in self.event_state.public_events()
-            if _event_belongs_to_session(event, target_native_id)
-        ]
-        return {
-            "events": events,
-            "provider_cursor": self._provider_cursor(),
-        }
+        with self._lock:
+            self._require_server()
+            after_cursor = 0
+            if provider_cursor is not None:
+                after_cursor, cursor_generation = _parse_provider_cursor(
+                    provider_cursor
+                )
+                if cursor_generation > self._generation:
+                    raise OpenCodeEventCursorError(
+                        "OpenCode provider event cursor is invalid"
+                    )
+            target_native_id = self._managed_native_id
+            if (
+                target_native_id is None
+                and len(self._attached_native_ids) == 1
+            ):
+                target_native_id = next(iter(self._attached_native_ids))
+            events = [
+                _managed_event(event, self._clock(), event_cursor)
+                for event_cursor, event
+                in self.event_state.public_event_records(
+                    after_cursor=after_cursor
+                )
+                if _event_belongs_to_session(event, target_native_id)
+            ]
+            return {
+                "events": events,
+                "provider_cursor": self._provider_cursor(),
+            }
 
     # Provider-native session discovery and history stay on typed methods.
     # No generic route or provider argv reaches this module.
@@ -475,6 +584,11 @@ class OpenCodeControlDriver:
         session_truth: dict[str, Any] | None,
     ) -> ProviderControlSnapshot:
         now = float(self._clock())
+        signature_scope = (
+            "provider"
+            if session_id is None
+            else f"session:{session_id}"
+        )
         with self._lock:
             try:
                 if session_id is None:
@@ -483,14 +597,18 @@ class OpenCodeControlDriver:
                     )
                 if not isinstance(session_truth, dict):
                     return self._blocked_snapshot(
-                        now, "opencode_session_truth_missing"
+                        now,
+                        "opencode_session_truth_missing",
+                        signature_scope=signature_scope,
                     )
                 if (
                     session_truth.get("provider_id") != "opencode"
                     or session_truth.get("session_id") != session_id
                 ):
                     return self._blocked_snapshot(
-                        now, "opencode_session_truth_mismatch"
+                        now,
+                        "opencode_session_truth_mismatch",
+                        signature_scope=signature_scope,
                     )
                 workspace = _workspace_from_truth(
                     session_truth,
@@ -498,7 +616,9 @@ class OpenCodeControlDriver:
                 )
                 if workspace is None:
                     return self._blocked_snapshot(
-                        now, "opencode_workspace_unproven"
+                        now,
+                        "opencode_workspace_unproven",
+                        signature_scope=signature_scope,
                     )
                 server = self._ensure_server(workspace)
                 native_id = _native_session_id(
@@ -507,7 +627,9 @@ class OpenCodeControlDriver:
                 session = server.transport.get_session(native_id)
                 if not session_matches_directory(session, server.cwd):
                     return self._blocked_snapshot(
-                        now, "opencode_session_workspace_mismatch"
+                        now,
+                        "opencode_session_workspace_mismatch",
+                        signature_scope=signature_scope,
                     )
                 self._session_native_ids[session_id] = native_id
                 self._refresh_model_catalog(server)
@@ -523,11 +645,19 @@ class OpenCodeControlDriver:
                 )
             except OpenCodeError as exc:
                 self._blocked_reason = exc.code
-                return self._blocked_snapshot(now, exc.code)
+                return self._blocked_snapshot(
+                    now,
+                    exc.code,
+                    signature_scope=signature_scope,
+                )
             except (OpenCodeControlError, OSError):
                 reason = "opencode_control_precondition_failed"
                 self._blocked_reason = reason
-                return self._blocked_snapshot(now, reason)
+                return self._blocked_snapshot(
+                    now,
+                    reason,
+                    signature_scope=signature_scope,
+                )
 
     def operation_correlation(
         self,
@@ -962,6 +1092,7 @@ class OpenCodeControlDriver:
             values=(),
             choices=(),
             blocked_reason=None,
+            signature_scope="provider",
         )
 
     def _session_snapshot(
@@ -1012,6 +1143,7 @@ class OpenCodeControlDriver:
                     if operations
                     else "opencode_resume_unavailable"
                 ),
+                signature_scope=f"session:{session_id}",
             )
 
         operations: list[str] = []
@@ -1199,12 +1331,15 @@ class OpenCodeControlDriver:
             values=tuple(values),
             choices=tuple(choices),
             blocked_reason=None,
+            signature_scope=f"session:{session_id}",
         )
 
     def _blocked_snapshot(
         self,
         now: float,
         reason: str,
+        *,
+        signature_scope: str,
     ) -> ProviderControlSnapshot:
         return self._make_snapshot(
             now=now,
@@ -1212,6 +1347,7 @@ class OpenCodeControlDriver:
             values=(),
             choices=(),
             blocked_reason=reason,
+            signature_scope=signature_scope,
         )
 
     def _make_snapshot(
@@ -1222,6 +1358,7 @@ class OpenCodeControlDriver:
         values: tuple[ControlValue, ...],
         choices: tuple[ControlChoices, ...],
         blocked_reason: str | None,
+        signature_scope: str,
     ) -> ProviderControlSnapshot:
         signature = fingerprint(
             {
@@ -1248,9 +1385,10 @@ class OpenCodeControlDriver:
                 "blocked": blocked_reason,
             }
         )
+        previous_signature = self._last_signatures.get(signature_scope)
         if (
-            self._last_signature is not None
-            and signature != self._last_signature
+            previous_signature is not None
+            and signature != previous_signature
         ):
             self._generation += 1
             values = tuple(
@@ -1270,7 +1408,7 @@ class OpenCodeControlDriver:
                 )
                 for item in values
             )
-        self._last_signature = signature
+        self._last_signatures[signature_scope] = signature
         return ProviderControlSnapshot(
             provider_id=self.binding.provider_id,
             provider_version=self.binding.provider_version,
@@ -1600,7 +1738,7 @@ class OpenCodeControlDriver:
 
     def _bump_generation(self) -> None:
         self._generation += 1
-        self._last_signature = None
+        self._last_signatures.clear()
 
     def _provider_cursor(self) -> str:
         return f"opencode:{self.event_state.cursor}:{self._generation}"
@@ -1991,6 +2129,20 @@ def _trusted_project_path(project: str) -> Path:
     return path
 
 
+def _parse_provider_cursor(value: str) -> tuple[int, int]:
+    parts = value.split(":") if isinstance(value, str) else []
+    if (
+        len(parts) != 3
+        or parts[0] != "opencode"
+        or not parts[1].isdigit()
+        or not parts[2].isdigit()
+    ):
+        raise OpenCodeEventCursorError(
+            "OpenCode provider event cursor is invalid"
+        )
+    return int(parts[1]), int(parts[2])
+
+
 def _event_belongs_to_session(
     event: Mapping[str, Any],
     target_native_id: str | None,
@@ -2139,6 +2291,7 @@ def _validated_questionnaire_answers(
 def _managed_event(
     event: Mapping[str, Any],
     observed_at: float,
+    event_cursor: int,
 ) -> dict[str, Any]:
     event_type = str(event.get("type") or "status")
     properties = (
@@ -2191,11 +2344,25 @@ def _managed_event(
     elif event_type == "message.part.updated":
         part = properties.get("part")
         if isinstance(part, Mapping) and part.get("type") == "text":
-            kind = "partial_text"
+            full_text = part.get("text")
+            kind = (
+                "block_text"
+                if isinstance(full_text, str)
+                else "partial_text"
+            )
             payload = {
-                "text": str(properties.get("delta") or part.get("text") or ""),
+                "text": (
+                    full_text
+                    if isinstance(full_text, str)
+                    else str(properties.get("delta") or "")
+                ),
                 "role": "assistant",
+                "block_index": 0,
             }
+            part_id = part.get("id")
+            session_id = properties.get("sessionID")
+            if isinstance(part_id, str) and isinstance(session_id, str):
+                payload["source_uuid"] = f"{session_id}:{part_id}"
         elif isinstance(part, Mapping) and part.get("type") == "tool":
             status = str(part.get("status") or "")
             call_id = str(part.get("id") or "")
@@ -2213,7 +2380,7 @@ def _managed_event(
                     "is_error": status == "error",
                 }
     return {
-        "provider_cursor": "opencode-event:" + fingerprint(event),
+        "provider_cursor": f"opencode-event:{event_cursor}",
         "observed_at": float(observed_at),
         "kind": kind,
         "payload": payload,

@@ -15,6 +15,7 @@ from pathlib import Path
 COMPANIOND_ROOT = Path(__file__).resolve().parents[1] / "companiond"
 sys.path.insert(0, str(COMPANIOND_ROOT))
 from provider_runtime_assets import PROVIDER_RUNTIME_ASSET_DIGESTS  # noqa: E402
+from providers.capability_graph import validate_capability_graph  # noqa: E402
 
 
 UNSAFE_MODE_BITS = 0o7022
@@ -34,6 +35,7 @@ GENERATED_RELEASE_PAYLOAD_FILES = frozenset(
         "payload/mac/SOURCE_BRANCH",
         "payload/mac/SOURCE_DIRTY",
         "payload/mac/companiond/providers/provider-control-capability-map.json",
+        "payload/mac/companiond/providers/coding-agent-remote-control-capability-map.schema.json",
         "payload/mac/companiond/providers/reviewed-operation-manifest.json",
     }
 )
@@ -51,6 +53,7 @@ CANONICAL_DAEMON_SOURCE_PATHS = (
     "mac/companiond/providers/base.py",
     "mac/companiond/providers/codex.py",
     "mac/companiond/providers/codex_app_server.py",
+    "mac/companiond/providers/capability_graph.py",
     "mac/companiond/providers/controls.py",
     "mac/companiond/providers/operations.py",
     "mac/companiond/providers/registry.py",
@@ -405,80 +408,12 @@ def verify_release_capability_membership(
     if membership_errors:
         return str(membership_errors[0])
 
-    capability_index: dict[tuple[str, str], dict[str, object]] = {}
-    agents = capability_map.get("agents")
-    if not isinstance(agents, list):
-        return "packaged capability map agents must be an array"
-    for agent in agents:
-        if not isinstance(agent, dict):
-            continue
-        provider_id = agent.get("provider_id")
-        capabilities = agent.get("capabilities")
-        if not isinstance(provider_id, str) or not isinstance(capabilities, list):
-            continue
-        for capability in capabilities:
-            if not isinstance(capability, dict):
-                continue
-            capability_key = capability.get("capability_key")
-            if isinstance(capability_key, str):
-                cell = (provider_id, capability_key)
-                if cell in capability_index:
-                    return f"duplicate packaged capability row: {provider_id}/{capability_key}"
-                capability_index[cell] = capability
-
-    catalog_ids = {
-        row.get("id")
-        for row in release_manifest.get("operations", [])
-        if isinstance(row, dict) and isinstance(row.get("id"), str)
-    }
-    seen_cells: set[tuple[str, str]] = set()
-    for membership in release_manifest.get("release_memberships", []):
-        if not isinstance(membership, dict):
-            return "packaged provider release membership row must be an object"
-        map_provider_id = membership.get("map_provider_id")
-        capabilities = membership.get("capabilities")
-        if not isinstance(map_provider_id, str) or not isinstance(capabilities, list):
-            return "packaged provider release membership identity is invalid"
-        for released in capabilities:
-            if not isinstance(released, dict):
-                return "packaged released capability membership must be an object"
-            capability_key = released.get("capability_key")
-            operation_ids = released.get("operation_ids")
-            cell = (map_provider_id, capability_key)
-            capability = capability_index.get(cell)
-            if capability is None:
-                return (
-                    "packaged release membership capability row is missing: "
-                    f"{map_provider_id}/{capability_key}"
-                )
-            if cell in seen_cells:
-                return (
-                    "duplicate packaged release membership capability row: "
-                    f"{map_provider_id}/{capability_key}"
-                )
-            seen_cells.add(cell)
-            support = capability.get("current_pairling_support")
-            if (
-                not isinstance(support, dict)
-                or support.get("status") not in {"supported", "partial"}
-            ):
-                return (
-                    "packaged release membership capability is not implemented: "
-                    f"{map_provider_id}/{capability_key}"
-                )
-            declared = capability.get("pairling_operation_ids")
-            if (
-                not isinstance(operation_ids, list)
-                or not operation_ids
-                or len(set(operation_ids)) != len(operation_ids)
-                or not isinstance(declared, list)
-                or not set(operation_ids).issubset(set(declared))
-                or not set(operation_ids).issubset(catalog_ids)
-            ):
-                return (
-                    "packaged release membership operation set is not exact: "
-                    f"{map_provider_id}/{capability_key}"
-                )
+    graph_errors = validate_capability_graph(
+        capability_map,
+        operation_manifest=release_manifest,
+    )
+    if graph_errors:
+        return f"packaged capability graph: {graph_errors[0]}"
     return None
 
 

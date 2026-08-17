@@ -63,6 +63,8 @@ _MAX_ACTION_RESULTS = 512
 _SNAPSHOT_TTL = 5.0
 _VERSION_RE = re.compile(r"(?<![0-9])([0-9]+\.[0-9]+\.[0-9]+)(?![0-9])")
 _MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,255}\Z")
+_AUTH_SELECTION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_MAX_SETTINGS_BYTES = 256 * 1024
 _MANAGED_LIVE_LIFECYCLES = ("running", "waiting")
 _PROVIDER_ID = "qwen_code"
 _EVENT_LIFECYCLE_STATUS = {
@@ -224,6 +226,55 @@ def _file_digest(path: Path) -> str:
         for chunk in iter(lambda: handle.read(128 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+def _qwen_auth_selection(config_path: Path) -> str | None:
+    """Return only the bounded selected auth identity, never credentials."""
+    try:
+        info = config_path.stat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or info.st_size > _MAX_SETTINGS_BYTES
+        ):
+            return None
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    security = payload.get("security")
+    auth = security.get("auth") if isinstance(security, dict) else None
+    selected = auth.get("selectedType") if isinstance(auth, dict) else None
+    if not isinstance(selected, str) or _AUTH_SELECTION_RE.fullmatch(selected) is None:
+        return None
+    return selected
+
+
+
+
+def _qwen_auth_selection(config_path: Path) -> str | None:
+    """Return only the bounded selected auth identity, never credentials."""
+    try:
+        info = config_path.stat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or info.st_size > _MAX_SETTINGS_BYTES
+        ):
+            return None
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    security = payload.get("security")
+    auth = security.get("auth") if isinstance(security, dict) else None
+    selected = auth.get("selectedType") if isinstance(auth, dict) else None
+    if (
+        not isinstance(selected, str)
+        or _AUTH_SELECTION_RE.fullmatch(selected) is None
+    ):
+        return None
+    return selected
 
 
 def _probe_sidecar(runtime: QwenRuntimeEvidence) -> dict[str, Any]:
@@ -749,7 +800,9 @@ class QwenControlDriver:
         try:
             reply = client.request("session.start", payload, timeout=40.0)
         except QwenUnavailableError as exc:
-            if exc.code == "session_initialize_failed":
+            if exc.code == "managed_provider_auth_unavailable":
+                self._blocked_reason = exc.code
+            elif exc.code == "session_initialize_failed":
                 self._blocked_reason = "auth_or_session_initialization_failed"
             raise
         if (
@@ -1607,30 +1660,52 @@ class QwenCodeProviderAdapter(ProviderAdapter):
             notes.append(error_code)
             if error_code == "cli_missing":
                 setup_actions.append("install_cli")
-            elif error_code in {"cli_version_unsupported", "sdk_version_unsupported", "node_version_unsupported"}:
+            elif error_code in {
+                "cli_version_unsupported",
+                "sdk_version_unsupported",
+                "node_version_unsupported",
+            }:
                 setup_actions.append("update_cli")
             else:
                 setup_actions.append("repair_provider")
+        config_path = self.home / ".qwen" / "settings.json"
+        auth_selection = _qwen_auth_selection(config_path)
+        auth_configured = auth_selection is not None
+        if runtime is not None and not auth_configured:
+            setup_actions.append("configure_auth")
+            notes.append(
+                "Managed Qwen sessions require security.auth.selectedType in "
+                "~/.qwen/settings.json"
+            )
         installed = error_code != "cli_missing"
         usable = runtime is not None
+        launchable = usable and auth_configured
         capabilities = (
-            "detect", "status", "spawn", "live_state", "send_text", "interrupt", "terminate", "mcp", "worker_telemetry"
-        ) if usable else ("detect", "status")
-        if usable:
+            (
+                "detect", "status", "spawn", "live_state", "send_text",
+                "interrupt", "terminate", "mcp", "worker_telemetry",
+            )
+            if launchable
+            else ("detect", "status")
+        )
+        if launchable:
             notes.extend((
-                "Authentication is verified when a safe SDK session initializes",
+                "Authentication is re-verified when a safe SDK session initializes",
                 "ACP fallback is disabled unless separately versioned and conformance-gated",
                 "SDK 0.1.8 does not advertise schema-constrained output",
             ))
-        config_path = self.home / ".qwen" / "settings.json"
         availability = ProviderAvailability(
             provider_id=self.descriptor.provider_id,
             display_name=self.descriptor.display_name,
             kind=self.descriptor.kind,
             installed=installed,
             usable=usable,
-            launchable=usable,
-            auth_state="unknown" if usable else "unavailable",
+            launchable=launchable,
+            auth_state=(
+                "configured"
+                if auth_configured
+                else "missing" if usable else "unavailable"
+            ),
             config_state="present" if config_path.is_file() else "unknown",
             readable_sessions=0,
             live_sessions=0,
@@ -1646,7 +1721,12 @@ class QwenCodeProviderAdapter(ProviderAdapter):
             config_path=str(config_path),
             config_exists=config_path.is_file(),
         )
-        return ProviderProbeResult(self.descriptor, availability, diagnostics, time.time())
+        return ProviderProbeResult(
+            self.descriptor,
+            availability,
+            diagnostics,
+            time.time(),
+        )
 
     def create_control_driver(self, binding: ProviderControlBinding) -> QwenControlDriver:
         if binding.provider_id != self.descriptor.provider_id:
@@ -1660,6 +1740,12 @@ class QwenCodeProviderAdapter(ProviderAdapter):
             return QwenControlDriver(binding, runtime, blocked_reason="provider_version_mismatch")
         if binding.provider_channel != "stable":
             return QwenControlDriver(binding, runtime, blocked_reason="provider_channel_unsupported")
+        if _qwen_auth_selection(self.home / ".qwen" / "settings.json") is None:
+            return QwenControlDriver(
+                binding,
+                runtime,
+                blocked_reason="managed_provider_auth_unavailable",
+            )
         return QwenControlDriver(binding, runtime)
 
 

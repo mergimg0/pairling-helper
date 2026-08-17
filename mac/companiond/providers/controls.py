@@ -6,9 +6,15 @@ import json
 import math
 import re
 import time
+from functools import lru_cache
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Mapping, Protocol, runtime_checkable
+from .capability_graph import (
+    CapabilityGraphCatalog,
+    CapabilityGraphError,
+    GraphOperationContract,
+)
 
 from .operations import (
     InputType,
@@ -41,11 +47,18 @@ _SNAPSHOT_FIELDS = {
     "capability_generation",
     "observed_at",
     "valid_until",
+    "capability_graph_digest",
     "advertised_operations",
     "values",
     "choices",
     "blocked_reason",
     "provider_cursor",
+}
+_SEMANTIC_ATTESTATION_FIELDS = {
+    "operation_id",
+    "implementation_operation_id",
+    "semantic_digest",
+    "proofs",
 }
 _SESSION_FIELDS = {"provider_id", "session_id", "binding_id", "capability_generation"}
 _RESULT_FIELDS = {
@@ -205,6 +218,67 @@ class ControlChoices:
     operation_id: str
     input_id: str
     choices: tuple[ControlChoice, ...]
+@dataclass(frozen=True)
+class ProviderOperationSemanticAttestation:
+    operation_id: str
+    implementation_operation_id: str
+    semantic_digest: str
+    proofs: tuple[str, ...]
+
+    def validate(self) -> None:
+        _validate_opaque("operation_id", self.operation_id, 128)
+        _validate_opaque(
+            "implementation_operation_id",
+            self.implementation_operation_id,
+            256,
+        )
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", self.semantic_digest) is None:
+            raise ControlContractError("operation semantic digest is invalid")
+        if (
+            not isinstance(self.proofs, tuple)
+            or not self.proofs
+            or len(set(self.proofs)) != len(self.proofs)
+        ):
+            raise ControlContractError(
+                "operation semantic proofs must be a nonempty unique tuple"
+            )
+        for proof in self.proofs:
+            _validate_opaque("operation semantic proof", proof, 96)
+
+    def to_payload(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "operation_id": self.operation_id,
+            "implementation_operation_id": self.implementation_operation_id,
+            "semantic_digest": self.semantic_digest,
+            "proofs": list(self.proofs),
+        }
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> "ProviderOperationSemanticAttestation":
+        _require_exact_object(
+            payload,
+            _SEMANTIC_ATTESTATION_FIELDS,
+            "provider operation semantic attestation",
+        )
+        proofs = payload["proofs"]
+        if not isinstance(proofs, list) or not all(
+            isinstance(proof, str) for proof in proofs
+        ):
+            raise ControlContractError(
+                "provider operation semantic proofs must be a string list"
+            )
+        result = cls(
+            operation_id=payload["operation_id"],
+            implementation_operation_id=payload["implementation_operation_id"],
+            semantic_digest=payload["semantic_digest"],
+            proofs=tuple(proofs),
+        )
+        result.validate()
+        return result
 
 
 @dataclass(frozen=True)
@@ -221,6 +295,8 @@ class ProviderControlSnapshot:
     choices: tuple[ControlChoices, ...]
     blocked_reason: str | None
     provider_cursor: str
+    semantic_attestations: tuple[ProviderOperationSemanticAttestation, ...] = ()
+    capability_graph_digest: str | None = None
 
     @property
     def binding(self) -> ProviderControlBinding:
@@ -230,12 +306,24 @@ class ProviderControlSnapshot:
             self.provider_channel,
             self.binding_id,
         )
+    def attestation_for(
+        self,
+        operation_id: str,
+    ) -> ProviderOperationSemanticAttestation:
+        for attestation in self.semantic_attestations:
+            if attestation.operation_id == operation_id:
+                return attestation
+        raise ControlContractError(
+            f"provider operation {operation_id} lacks semantic attestation"
+        )
+
 
     def validate(
         self,
         *,
         now: float | None = None,
         catalog: OperationCatalog = REVIEWED_OPERATION_CATALOG,
+        require_semantic_attestations: bool = False,
     ) -> None:
         _validate_provider_id(self.provider_id)
         _validate_opaque("provider_version", self.provider_version, 160)
@@ -265,6 +353,52 @@ class ProviderControlSnapshot:
                 definitions[operation_id] = catalog.require(operation_id)
             except OperationCatalogError as exc:
                 raise ControlContractError(str(exc)) from exc
+        if not self.semantic_attestations:
+            if self.capability_graph_digest is not None and (
+                not isinstance(self.capability_graph_digest, str)
+                or re.fullmatch(
+                    r"sha256:[0-9a-f]{64}",
+                    self.capability_graph_digest,
+                )
+                is None
+            ):
+                raise ControlContractError(
+                    "snapshot capability graph digest is invalid"
+                )
+            if (
+                require_semantic_attestations
+                and self.capability_graph_digest is None
+            ):
+                raise ControlContractError(
+                    "snapshot lacks capability graph attestation"
+                )
+        else:
+            if (
+                not isinstance(self.capability_graph_digest, str)
+                or re.fullmatch(
+                    r"sha256:[0-9a-f]{64}",
+                    self.capability_graph_digest,
+                )
+                is None
+            ):
+                raise ControlContractError(
+                    "snapshot capability graph digest is invalid"
+                )
+            attested_operation_ids = []
+            for attestation in self.semantic_attestations:
+                if not isinstance(
+                    attestation,
+                    ProviderOperationSemanticAttestation,
+                ):
+                    raise ControlContractError(
+                        "snapshot contains an invalid semantic attestation"
+                    )
+                attestation.validate()
+                attested_operation_ids.append(attestation.operation_id)
+            if tuple(attested_operation_ids) != self.advertised_operations:
+                raise ControlContractError(
+                    "semantic attestations do not exactly match advertised operations"
+                )
 
         seen_values: set[tuple[str, str]] = set()
         for item in self.values:
@@ -501,6 +635,7 @@ def control_driver_for_adapter(
         binding.provider_id,
         binding.provider_version,
         binding.provider_channel,
+
     ):
         return None
     factory = getattr(adapter, "create_control_driver", None)
@@ -541,6 +676,127 @@ def _filter_snapshot_to_release_membership(
             if choices.operation_id in advertised_set
         ),
     )
+@lru_cache(maxsize=1)
+def _runtime_capability_graph() -> CapabilityGraphCatalog:
+    try:
+        return CapabilityGraphCatalog.from_path()
+    except CapabilityGraphError as exc:
+        raise ControlContractError(
+            f"reviewed capability graph is unavailable: {exc}"
+        ) from exc
+
+
+def _verified_semantic_proofs(
+    contract: GraphOperationContract,
+    *,
+    snapshot: ProviderControlSnapshot,
+    definition: Any,
+    session_id: str | None,
+    session_truth: dict[str, Any] | None,
+) -> tuple[str, ...]:
+    available = {
+        "operation_discovered",
+        "release_member",
+        "exact_implementation",
+        "fresh_generation",
+        "safe_policy_active",
+    }
+    session_bound = any(
+        descriptor.input_type is InputType.PROVIDER_SESSION
+        for descriptor in definition.inputs
+    )
+    exact_live_session = bool(
+        session_bound
+        and session_id is not None
+        and isinstance(session_truth, dict)
+        and session_truth.get("provider_id") == snapshot.provider_id
+        and session_truth.get("session_id") == session_id
+        and session_truth.get("binding_id") == snapshot.binding_id
+        and session_truth.get("capability_generation")
+        == snapshot.capability_generation
+        and session_truth.get("is_live") is True
+        and session_truth.get("controllable") is True
+    )
+    if exact_live_session:
+        available.update(
+            {
+                "exact_session",
+                "owned_process_live",
+                "pending_request_correlated",
+            }
+        )
+    choice_inputs = {
+        descriptor.input_id
+        for descriptor in definition.inputs
+        if descriptor.required and descriptor.input_type is InputType.CHOICE
+    }
+    advertised_choice_inputs = {
+        group.input_id
+        for group in snapshot.choices
+        if group.operation_id == contract.operation_id
+    }
+    if choice_inputs.issubset(advertised_choice_inputs):
+        available.add("safe_choices_discovered")
+    if (
+        isinstance(session_truth, dict)
+        and session_truth.get("provider_authenticated") is True
+    ):
+        available.add("provider_authenticated")
+    missing = [
+        proof
+        for proof in contract.runtime_proofs_required
+        if proof not in available
+    ]
+    if missing:
+        raise ControlContractError(
+            f"provider operation {contract.operation_id} lacks locally verified "
+            f"proofs: {', '.join(missing)}"
+        )
+    return contract.runtime_proofs_required
+
+
+def _attest_snapshot_semantics(
+    snapshot: ProviderControlSnapshot,
+    *,
+    session_id: str | None,
+    session_truth: dict[str, Any] | None,
+    catalog: OperationCatalog,
+    graph: CapabilityGraphCatalog,
+) -> ProviderControlSnapshot:
+    attestations = []
+    for operation_id in snapshot.advertised_operations:
+        try:
+            contract = graph.require_operation(
+                snapshot.provider_id,
+                snapshot.provider_version,
+                snapshot.provider_channel,
+                operation_id,
+            )
+            definition = catalog.require(operation_id)
+        except (CapabilityGraphError, OperationCatalogError) as exc:
+            raise ControlContractError(str(exc)) from exc
+        proofs = _verified_semantic_proofs(
+            contract,
+            snapshot=snapshot,
+            definition=definition,
+            session_id=session_id,
+            session_truth=session_truth,
+        )
+        attestations.append(
+            ProviderOperationSemanticAttestation(
+                operation_id=contract.operation_id,
+                implementation_operation_id=(
+                    contract.implementation_operation_id
+                ),
+                semantic_digest=contract.semantic_digest,
+                proofs=proofs,
+            )
+        )
+    return replace(
+        snapshot,
+        semantic_attestations=tuple(attestations),
+        capability_graph_digest=graph.graph_digest,
+    )
 
 
 def validated_driver_snapshot(
@@ -550,6 +806,7 @@ def validated_driver_snapshot(
     session_truth: dict[str, Any] | None,
     now: float | None = None,
     catalog: OperationCatalog = REVIEWED_OPERATION_CATALOG,
+    graph: CapabilityGraphCatalog | None = None,
 ) -> ProviderControlSnapshot:
     binding = getattr(driver, "binding", None)
     if not isinstance(binding, ProviderControlBinding):
@@ -566,9 +823,24 @@ def validated_driver_snapshot(
         raise ControlContractError("provider driver returned an invalid control snapshot")
     if snapshot.binding != binding:
         raise ControlContractError("provider snapshot does not match the driver binding")
+    if snapshot.semantic_attestations or snapshot.capability_graph_digest is not None:
+        raise ControlContractError(
+            "provider drivers cannot self-assert reviewed semantic attestations"
+        )
     snapshot.validate(now=now, catalog=catalog)
     snapshot = _filter_snapshot_to_release_membership(snapshot)
-    snapshot.validate(now=now, catalog=catalog)
+    snapshot = _attest_snapshot_semantics(
+        snapshot,
+        session_id=session_id,
+        session_truth=session_truth,
+        catalog=catalog,
+        graph=graph or _runtime_capability_graph(),
+    )
+    snapshot.validate(
+        now=now,
+        catalog=catalog,
+        require_semantic_attestations=True,
+    )
     return snapshot
 
 
@@ -799,15 +1071,21 @@ def provider_control_status_payload(
     now: float | None = None,
     catalog: OperationCatalog = REVIEWED_OPERATION_CATALOG,
 ) -> dict[str, Any]:
-    snapshot.validate(now=now, catalog=catalog)
+    snapshot.validate(
+        now=now,
+        catalog=catalog,
+        require_semantic_attestations=True,
+    )
     values: dict[str, dict[str, Any]] = {}
     for item in snapshot.values:
         values.setdefault(item.operation_id, {})[item.input_id] = _wire_value(item.value)
     choices: dict[str, dict[str, list[dict[str, Any]]]] = {}
     for group in snapshot.choices:
-        choices.setdefault(group.operation_id, {})[group.input_id] = [choice.to_payload() for choice in group.choices]
+        choices.setdefault(group.operation_id, {})[group.input_id] = [
+            choice.to_payload() for choice in group.choices
+        ]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "provider_id": snapshot.provider_id,
         "provider_version": snapshot.provider_version,
         "provider_channel": snapshot.provider_channel,
@@ -815,7 +1093,11 @@ def provider_control_status_payload(
         "capability_generation": snapshot.capability_generation,
         "observed_at": snapshot.observed_at,
         "valid_until": snapshot.valid_until,
-        "advertised_operations": list(snapshot.advertised_operations),
+        "capability_graph_digest": snapshot.capability_graph_digest,
+        "advertised_operations": [
+            attestation.to_payload()
+            for attestation in snapshot.semantic_attestations
+        ],
         "values": values,
         "choices": choices,
         "blocked_reason": snapshot.blocked_reason,
@@ -828,13 +1110,20 @@ def parse_provider_control_status(
     *,
     now: float | None = None,
     catalog: OperationCatalog = REVIEWED_OPERATION_CATALOG,
+    graph: CapabilityGraphCatalog | None = None,
 ) -> ProviderControlSnapshot:
     _require_exact_object(payload, _SNAPSHOT_FIELDS, "provider control snapshot")
-    if payload["schema_version"] != 1:
+    if payload["schema_version"] != 2:
         raise ControlContractError("unknown provider control snapshot schema version")
-    advertised = payload["advertised_operations"]
-    if not isinstance(advertised, list) or not all(isinstance(item, str) for item in advertised):
-        raise ControlContractError("advertised_operations must be a string list")
+    advertised_payload = payload["advertised_operations"]
+    if not isinstance(advertised_payload, list):
+        raise ControlContractError(
+            "advertised_operations must be a semantic attestation list"
+        )
+    attestations = tuple(
+        ProviderOperationSemanticAttestation.from_payload(row)
+        for row in advertised_payload
+    )
     values_payload = payload["values"]
     choices_payload = payload["choices"]
     if not isinstance(values_payload, Mapping) or not isinstance(choices_payload, Mapping):
@@ -872,13 +1161,46 @@ def parse_provider_control_status(
             capability_generation=payload["capability_generation"],
             observed_at=payload["observed_at"],
             valid_until=payload["valid_until"],
-            advertised_operations=tuple(advertised),
+            advertised_operations=tuple(
+                attestation.operation_id for attestation in attestations
+            ),
             values=tuple(values),
             choices=tuple(choices),
             blocked_reason=payload["blocked_reason"],
             provider_cursor=payload["provider_cursor"],
+            semantic_attestations=attestations,
+            capability_graph_digest=payload["capability_graph_digest"],
         )
-        snapshot.validate(now=now, catalog=catalog)
+        snapshot.validate(
+            now=now,
+            catalog=catalog,
+            require_semantic_attestations=True,
+        )
+        graph_catalog = graph or _runtime_capability_graph()
+        if snapshot.capability_graph_digest != graph_catalog.graph_digest:
+            raise ControlContractError(
+                "provider snapshot capability graph digest is stale"
+            )
+        for attestation in attestations:
+            try:
+                contract = graph_catalog.require_operation(
+                    snapshot.provider_id,
+                    snapshot.provider_version,
+                    snapshot.provider_channel,
+                    attestation.operation_id,
+                )
+            except CapabilityGraphError as exc:
+                raise ControlContractError(str(exc)) from exc
+            if (
+                attestation.implementation_operation_id
+                != contract.implementation_operation_id
+                or attestation.semantic_digest != contract.semantic_digest
+                or attestation.proofs != contract.runtime_proofs_required
+            ):
+                raise ControlContractError(
+                    f"provider operation {attestation.operation_id} has a "
+                    "mismatched semantic attestation"
+                )
         return snapshot
     except (TypeError, ValueError, OperationCatalogError) as exc:
         if isinstance(exc, ControlContractError):

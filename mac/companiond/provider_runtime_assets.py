@@ -9,7 +9,7 @@ from pathlib import Path
 PROVIDER_RUNTIME_ASSETS = (
     (
         "claude_agent_sidecar.mjs",
-        "0449f937fc1b007ca2fe22fec59691925fb38eb10900024be5151f5e4f0bcbcf",
+        "4c27ae18ff7553b4587562e24ce7c7ada3c80c8e382c0363953b71a60f1846fc",
     ),
     (
         "copilot_sdk_sidecar.mjs",
@@ -17,7 +17,7 @@ PROVIDER_RUNTIME_ASSETS = (
     ),
     (
         "qwen_sdk_sidecar.mjs",
-        "37cef8616221fc7d477ccc0892d115df849ffa89213afae6fa77f7aa21b5f940",
+        "2027f817fcf2774fd50a7fa753895dc92049ce9e63c47aebd6d7a95ddbbae924",
     ),
     (
         "gemini-seatbelt.sb",

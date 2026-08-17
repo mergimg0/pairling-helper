@@ -59,6 +59,9 @@ _ANSI_COLOR_NAMES = ("black", "red", "green", "yellow", "blue", "magenta", "cyan
 # the local-socket contract bounded, but large enough for the maximum grid the
 # broker itself permits.
 _RPC_MAX_FRAME_BYTES = 16 * 1024 * 1024
+_FOCUS_REPORTING_ENABLE = b"\x1b[?1004h"
+_FOCUS_REPORTING_DISABLE = b"\x1b[?1004l"
+_FOCUS_IN = b"\x1b[I"
 _PASTE_RENDER_TIMEOUT_SECONDS = 2.0
 TERMINAL_SURFACE_MAX_LINKS = 128
 
@@ -1586,6 +1589,8 @@ class PTYBrokerSession:
         self._type_mode_last_sequence = 0
         self._type_mode_receipts: dict[int, tuple[str, dict]] = {}
         self._feed_marks: deque[tuple[int, float]] = deque(maxlen=4096)
+        self._terminal_protocol_tail = b""
+        self._focus_reporting_enabled = False
         self._reader_thread: threading.Thread | None = None
         self._reader_finished = threading.Event()
         self._capture_finalize_lock = threading.Lock()
@@ -1934,6 +1939,50 @@ class PTYBrokerSession:
             except Exception:
                 pass
 
+    def _terminal_protocol_responses_for_output(self, data: bytes) -> bytes:
+        """Model this headless terminal as focused when reporting is enabled."""
+        sequences = (
+            (_FOCUS_REPORTING_ENABLE, True),
+            (_FOCUS_REPORTING_DISABLE, False),
+        )
+        combined = self._terminal_protocol_tail + bytes(data)
+        responses = bytearray()
+        position = 0
+        while position < len(combined):
+            matches = [
+                (index, sequence, enabled)
+                for sequence, enabled in sequences
+                if (index := combined.find(sequence, position)) >= 0
+            ]
+            if not matches:
+                break
+            index, sequence, enabled = min(matches, key=lambda match: match[0])
+            if enabled and not self._focus_reporting_enabled:
+                responses.extend(_FOCUS_IN)
+            self._focus_reporting_enabled = enabled
+            position = index + len(sequence)
+
+        tail = b""
+        max_prefix = max(len(sequence) for sequence, _enabled in sequences) - 1
+        for length in range(min(len(combined), max_prefix), 0, -1):
+            candidate = combined[-length:]
+            if any(sequence.startswith(candidate) for sequence, _enabled in sequences):
+                tail = candidate
+                break
+        self._terminal_protocol_tail = tail
+        return bytes(responses)
+
+    def _write_terminal_protocol_responses(self, responses: bytes) -> None:
+        if not responses:
+            return
+        try:
+            with self._input_transaction_lock:
+                with self._lock:
+                    self._write_master_locked(responses, count_input=False)
+        except PTYWriteError:
+            # A focus transition racing process exit is ordinary EOF behavior.
+            pass
+
     def raw_tail(self, since: int = 0) -> tuple[bytes, int, int, bool, int, float | None]:
         # Offsets are stream-absolute (total bytes ever produced), not
         # ring-relative: a ring trim must surface as an explicit gap for a
@@ -1957,14 +2006,15 @@ class PTYBrokerSession:
                         break
             return bytes(self._raw[start_abs - earliest:]), total, total, reset, gap, feed_at
 
-    def _write_locked(self, data: bytes) -> int:
+    def _write_master_locked(self, data: bytes, *, count_input: bool) -> int:
         if self.master_fd < 0:
             raise PTYWriteError(
                 "session is not started",
                 bytes_written=0,
                 total_bytes=len(data),
             )
-        self._input_epoch += 1
+        if count_input:
+            self._input_epoch += 1
         # The master fd is non-blocking; a type-mode burst (or a paste) can
         # hit EAGAIN when the slave side is momentarily full. Apply bounded
         # backpressure instead of failing the keystroke: wait for
@@ -2004,6 +2054,9 @@ class PTYBrokerSession:
                 ) from exc
         self.last_activity = time.time()
         return total_written
+
+    def _write_locked(self, data: bytes) -> int:
+        return self._write_master_locked(data, count_input=True)
 
     def write(self, data: bytes) -> None:
         # Serialize every PTY input with proofed controls. A local attached
@@ -2567,7 +2620,9 @@ class PTYBrokerSession:
                         self.raw_log_path,
                         tail_bytes=capture_tail_bytes,
                     )
+                terminal_responses = self._terminal_protocol_responses_for_output(data)
                 self._ingest_output(data)
+                self._write_terminal_protocol_responses(terminal_responses)
         finally:
             if log_f:
                 log_f.close()

@@ -715,6 +715,10 @@ class ACPControlDriver:
             "initialize": {},
         }
         self._active_prompt = False
+        self._prompt_sequence = 0
+        self._active_message_source_uuid: str | None = None
+        self._active_message_text = ""
+        self._active_message_truncated = False
         self._pending_permissions: dict[str, _PendingPermission] = {}
         self._pending_elicitations: dict[str, _PendingElicitation] = {}
         self._latest_usage: dict[str, Any] | None = None
@@ -1602,6 +1606,9 @@ class ACPControlDriver:
             rpc = self._rpc
             self._blocked_reason = "managed ACP session is closed"
             self._active_prompt = False
+            self._active_message_source_uuid = None
+            self._active_message_text = ""
+            self._active_message_truncated = False
             self._pending_permissions.clear()
             self._pending_elicitations.clear()
         if rpc is not None:
@@ -1616,6 +1623,17 @@ class ACPControlDriver:
         with self._state_lock:
             if self._active_prompt:
                 raise AcpUnavailableError("ACP session already has an active prompt")
+            self._prompt_sequence += 1
+            source_material = (
+                f"{self._session_instance_id or native_id}\0"
+                f"{self._generation}\0{self._prompt_sequence}"
+            )
+            self._active_message_source_uuid = (
+                "acp-message:"
+                + hashlib.sha256(source_material.encode("utf-8")).hexdigest()
+            )
+            self._active_message_text = ""
+            self._active_message_truncated = False
             self._active_prompt = True
         self._publish("lifecycle", {"status": "running"})
         try:
@@ -1632,6 +1650,18 @@ class ACPControlDriver:
                 self._last_stop_reason = _bounded_text(stop, 160) if stop is not None else None
                 cancelled = self._cancel_requested
                 self._cancel_requested = False
+                final_source_uuid = self._active_message_source_uuid
+                final_text = self._active_message_text
+            if final_source_uuid and final_text:
+                self._publish(
+                    "content",
+                    {
+                        "text": final_text,
+                        "role": "assistant",
+                        "source_uuid": final_source_uuid,
+                        "block_index": 0,
+                    },
+                )
             if cancelled and isinstance(stop, str) and "cancel" in stop.casefold():
                 correlation = {
                     "session_id": native_id,
@@ -1651,6 +1681,9 @@ class ACPControlDriver:
         finally:
             with self._state_lock:
                 self._active_prompt = False
+                self._active_message_source_uuid = None
+                self._active_message_text = ""
+                self._active_message_truncated = False
 
     def _set_model(self, model: str) -> dict[str, Any]:
         models = {value for value, _ in self._models()}
@@ -1759,6 +1792,39 @@ class ACPControlDriver:
                 "blocked_reason": self._blocked_reason,
             }
 
+    def _correlate_active_prompt_chunk(
+        self,
+        update: Mapping[str, Any],
+        kind: str,
+        payload: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        discriminator = (
+            update.get("sessionUpdate")
+            or update.get("session_update")
+            or update.get("type")
+        )
+        if discriminator != "agent_message_chunk":
+            return kind, payload
+        with self._state_lock:
+            source_uuid = self._active_message_source_uuid
+            if source_uuid is None:
+                return kind, payload
+            fragment = payload.get("text")
+            if isinstance(fragment, str) and fragment and not self._active_message_truncated:
+                combined = self._active_message_text + fragment
+                self._active_message_truncated = (
+                    len(combined.encode("utf-8", errors="replace"))
+                    > _MAX_SAFE_STRING_BYTES
+                )
+                self._active_message_text = _redacted_public_text(
+                    combined,
+                    _MAX_SAFE_STRING_BYTES,
+                )
+        correlated = dict(payload)
+        correlated["source_uuid"] = source_uuid
+        correlated["block_index"] = 0
+        return "delta", correlated
+
     def _on_notification(self, message: Mapping[str, Any]) -> None:
         method = message.get("method")
         if method not in _KNOWN_NOTIFICATIONS:
@@ -1775,6 +1841,11 @@ class ACPControlDriver:
             if not isinstance(update, Mapping):
                 return
             kind, payload = _normalize_session_update(str(native), update)
+            kind, payload = self._correlate_active_prompt_chunk(
+                update,
+                kind,
+                payload,
+            )
             self._observe_canary(
                 "typed_session_updates",
                 {"kind": kind, "session_id": native, "sequence": self._event_seq + 1},
@@ -2021,6 +2092,9 @@ class ACPControlDriver:
             rpc = self._rpc
             self._blocked_reason = _bounded_text(reason, 512)
             self._active_prompt = False
+            self._active_message_source_uuid = None
+            self._active_message_text = ""
+            self._active_message_truncated = False
             self._pending_permissions.clear()
             self._pending_elicitations.clear()
             self._snapshot_proofs.clear()

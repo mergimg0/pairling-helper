@@ -748,6 +748,8 @@ class _CopilotSDKSidecarProcess:
 
 
 class CopilotSDKDriver:
+    generation_refresh_safe = True
+
     def __init__(self, binding: ProviderControlBinding, *, process: _CopilotSDKSidecarProcess):
         if binding.provider_id != "copilot":
             raise CopilotSDKUnavailable("Copilot driver binding provider is invalid")
@@ -758,10 +760,11 @@ class CopilotSDKDriver:
         self.binding = binding
         self.process = process
         self._attached_sessions: dict[str, str] = {}
-        self._last_signature: str | None = None
+        self._last_signatures: dict[str, str] = {}
         self._capability_generation = 0
         self._current_models: frozenset[str] = frozenset()
         self._last_discovery: dict[str, Any] = {}
+        self._capability_lock = threading.RLock()
         self._action_lock = threading.RLock()
         self._action_results: OrderedDict[
             tuple[int, str],
@@ -895,6 +898,21 @@ class CopilotSDKDriver:
         return tuple(result)
 
     def _discover(
+        self,
+        *,
+        native_session_id: str | None,
+        working_directory: str | None,
+        pairling_session_id: str | None,
+    ) -> tuple[dict[str, Any], int]:
+        with self._capability_lock:
+            return self._discover_locked(
+                native_session_id=native_session_id,
+                working_directory=working_directory,
+                pairling_session_id=pairling_session_id,
+            )
+
+
+    def _discover_locked(
         self,
         *,
         native_session_id: str | None,
@@ -1057,6 +1075,19 @@ class CopilotSDKDriver:
         session_id: str | None,
         session_truth: dict[str, Any] | None,
     ) -> ProviderControlSnapshot:
+        with self._capability_lock:
+            return self._snapshot_locked(
+                session_id=session_id,
+                session_truth=session_truth,
+            )
+
+
+    def _snapshot_locked(
+        self,
+        *,
+        session_id: str | None,
+        session_truth: dict[str, Any] | None,
+    ) -> ProviderControlSnapshot:
         if session_id is not None and not self._is_owned_session(session_id, session_truth):
             return self._blocked_snapshot("session_not_owned_by_copilot_sdk_driver")
 
@@ -1179,18 +1210,24 @@ class CopilotSDKDriver:
 
         signature = json.dumps(
             {
-                "operations": operations,
+                "operations": [
+                    operation
+                    for operation in operations
+                    if operation not in {
+                        "session.approval.decide",
+                        "session.resume",
+                    }
+                ],
                 "models": models,
-                "approvals": [item.request_id for item in self.process.pending_approvals()],
-                "resume_targets": resume_targets if session_id is not None else (),
-                "process_generation": self.process.capability_generation,
             },
             sort_keys=True,
             separators=(",", ":"),
         )
-        if self._last_signature is not None and signature != self._last_signature:
+        signature_scope = session_id or "__provider__"
+        previous_signature = self._last_signatures.get(signature_scope)
+        if previous_signature is not None and signature != previous_signature:
             self._capability_generation += 1
-        self._last_signature = signature
+        self._last_signatures[signature_scope] = signature
         self._current_models = frozenset(model_id for model_id, _ in models)
         generation = self._effective_generation()
         if generation != canary_generation:
@@ -1707,6 +1744,78 @@ class CopilotSDKDriver:
         return tuple(result)
 
 
+    @property
+    def capability_generation(self) -> int:
+        return self._effective_generation()
+
+
+    def refresh_session_binding(
+        self,
+        session_truth: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        with self._capability_lock:
+            return self._refresh_session_binding_locked(session_truth)
+
+
+    def _refresh_session_binding_locked(
+        self,
+        session_truth: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        session_id = (
+            session_truth.get("session_id")
+            if isinstance(session_truth, dict)
+            else None
+        )
+        if (
+            not isinstance(session_id, str)
+            or not self._is_owned_session(
+                session_id,
+                session_truth,
+                allow_stale_generation=True,
+            )
+        ):
+            raise CopilotStaleBinding(
+                "Copilot SDK session binding cannot be refreshed"
+            )
+        native_id = self._native_session_id(session_id)
+        working_directory = self._safe_working_directory(
+            session_truth.get("cwd")
+        )
+        if (
+            not self.process.is_available
+            or self._attached_sessions.get(native_id) != working_directory
+        ):
+            raise CopilotSDKUnavailable(
+                "Copilot SDK session is unavailable"
+            )
+        discovery, generation = self._discover(
+            native_session_id=native_id,
+            working_directory=working_directory,
+            pairling_session_id=session_id,
+        )
+        blocked = self._discovery_blocked_reason(
+            discovery,
+            native_session_id=native_id,
+            working_directory=working_directory,
+            binding_id=self.binding.binding_id,
+            capability_generation=generation,
+            pairling_session_id=session_id,
+        )
+        if blocked is not None:
+            raise CopilotStaleBinding(
+                f"Copilot SDK session binding refresh failed: {blocked}"
+            )
+        return {
+            "binding_id": self.binding.binding_id,
+            "session_id": session_id,
+            "native_session_id": native_id,
+            "capability_generation": generation,
+            "driver_available": True,
+            "lifecycle": "live",
+            "provider_cursor": str(self.process.provider_cursor),
+        }
+
+
     def _blocked_snapshot(self, reason: str) -> ProviderControlSnapshot:
         now = time.time()
         return ProviderControlSnapshot(
@@ -1725,15 +1834,38 @@ class CopilotSDKDriver:
         )
 
     def _effective_generation(self) -> int:
-        return max(1, self._capability_generation + self.process.capability_generation)
+        with self._capability_lock:
+            return max(
+                1,
+                self._capability_generation
+                + self.process.capability_generation,
+            )
 
-    def _is_owned_session(self, session_id: str, truth: dict[str, Any] | None) -> bool:
+    def _is_owned_session(
+        self,
+        session_id: str,
+        truth: dict[str, Any] | None,
+        *,
+        allow_stale_generation: bool = False,
+    ) -> bool:
         native_id = _safe_identifier(
             truth.get("native_id") if isinstance(truth, dict) else None,
             512,
         )
         project = truth.get("project") if isinstance(truth, dict) else None
         cwd = truth.get("cwd") if isinstance(truth, dict) else None
+        generation = (
+            truth.get("capability_generation")
+            if isinstance(truth, dict)
+            else None
+        )
+        generation_matches = bool(
+            type(generation) is int
+            and (
+                allow_stale_generation
+                or generation == self._effective_generation()
+            )
+        )
         return bool(
             isinstance(truth, dict)
             and native_id is not None
@@ -1744,8 +1876,7 @@ class CopilotSDKDriver:
             and truth.get("owner") == "provider_driver"
             and truth.get("terminal_backed") is False
             and truth.get("binding_id") == self.binding.binding_id
-            and type(truth.get("capability_generation")) is int
-            and truth.get("capability_generation") == self._effective_generation()
+            and generation_matches
             and truth.get("is_live") is True
             and truth.get("controllable") is True
             and _safe_identifier(truth.get("session_instance_id"), 512) is not None

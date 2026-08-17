@@ -399,7 +399,17 @@ class _EventJournal:
             sequence = self._rows[-1]["sequence"] if self._rows else 0
             return self._format_cursor(sequence)
 
-    def append(self, run_id: str, event: Mapping[str, Any]) -> dict[str, Any]:
+    def records(self) -> tuple[dict[str, Any], ...]:
+        with self._lock:
+            return tuple(dict(row) for row in self._rows)
+
+    def append(
+        self,
+        run_id: str,
+        event: Mapping[str, Any],
+        *,
+        durable: bool = False,
+    ) -> dict[str, Any]:
         with self._lock:
             sequence = self._next_sequence
             self._next_sequence += 1
@@ -417,6 +427,8 @@ class _EventJournal:
             fd = os.open(self._path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
             try:
                 os.write(fd, encoded)
+                if durable:
+                    os.fsync(fd)
             finally:
                 os.close(fd)
             try:
@@ -518,12 +530,18 @@ class HermesRunsControlDriver:
         self._stream_threads: dict[str, threading.Thread] = {}
         self._actions: dict[str, _ActionResult] = {}
         self._action_order: deque[str] = deque()
+        self._prepared_prompt_correlations: dict[
+            tuple[str, str],
+            ProviderOperationCorrelation,
+        ] = {}
+        self._dispatch_boundaries: dict[str, Callable[[], None]] = {}
         self._last_statuses: dict[str, dict[str, Any]] = {}
         self._unsafe_runtime_reason: str | None = None
         self._target_authorizations: dict[
             tuple[str, str, str],
             _TargetAuthorization,
         ] = {}
+        self._restore_correlated_prompt_actions()
 
     @property
     def capability_generation(self) -> int:
@@ -847,6 +865,7 @@ class HermesRunsControlDriver:
     ) -> ProviderOperationCorrelation:
         if (
             session_id is None
+            or _ACTION_ID_RE.fullmatch(client_action_id or "") is None
             or capability_generation != self.capability_generation
             or not _session_truth_matches(
                 self.binding,
@@ -866,10 +885,61 @@ class HermesRunsControlDriver:
             raise HermesRunsProtocolError(
                 "Hermes operation is not currently advertised"
             )
-        return ProviderOperationCorrelation(
+        correlation = ProviderOperationCorrelation(
             client_action_id,
             snapshot.provider_cursor,
         )
+        if operation_id != "session.prompt.send":
+            return correlation
+        key = (client_action_id, session_id)
+        with self._lock:
+            existing = self._prepared_prompt_correlations.get(key)
+            if existing is not None:
+                return existing
+            self._journal.append(
+                "",
+                {
+                    "type": "operation.prepared",
+                    "operation_id": operation_id,
+                    "client_action_id": client_action_id,
+                    "provider_cursor": correlation.provider_cursor,
+                    "session_id": session_id,
+                },
+                durable=True,
+            )
+            self._prepared_prompt_correlations[key] = correlation
+            while (
+                len(self._prepared_prompt_correlations)
+                > _MAX_ACTION_RESULTS
+            ):
+                oldest = next(
+                    iter(self._prepared_prompt_correlations)
+                )
+                self._prepared_prompt_correlations.pop(oldest, None)
+        return correlation
+
+    def arm_operation_dispatch_boundary(
+        self,
+        *,
+        operation_id: str,
+        client_action_id: str,
+        session_id: str,
+        provider_correlation: ProviderOperationCorrelation,
+        before_write: Callable[[], None],
+    ) -> None:
+        key = (client_action_id, session_id)
+        with self._lock:
+            if (
+                operation_id != "session.prompt.send"
+                or not callable(before_write)
+                or self._prepared_prompt_correlations.get(key)
+                != provider_correlation
+                or client_action_id in self._dispatch_boundaries
+            ):
+                raise HermesRunsProtocolError(
+                    "Hermes operation dispatch boundary is unavailable"
+                )
+            self._dispatch_boundaries[client_action_id] = before_write
 
     def execute(
         self,
@@ -898,15 +968,24 @@ class HermesRunsControlDriver:
                 "Hermes operation correlation proof is unavailable"
             )
         with self._execute_lock:
-            result = self._execute_locked(
-                operation_id=operation_id,
-                input_payload=input_payload,
-                binding_id=binding_id,
-                capability_generation=capability_generation,
-                session_id=session_id,
-                client_action_id=client_action_id,
-                prepared_attachments=prepared_attachments,
-            )
+            try:
+                result = self._execute_locked(
+                    operation_id=operation_id,
+                    input_payload=input_payload,
+                    binding_id=binding_id,
+                    capability_generation=capability_generation,
+                    session_id=session_id,
+                    client_action_id=client_action_id,
+                    prepared_attachments=prepared_attachments,
+                    provider_correlation=provider_correlation,
+                )
+            finally:
+                if operation_id == "session.prompt.send":
+                    with self._lock:
+                        self._dispatch_boundaries.pop(
+                            client_action_id,
+                            None,
+                        )
         if not has_reserved_correlation:
             return result
         normalized = ProviderOperationResult(
@@ -936,6 +1015,7 @@ class HermesRunsControlDriver:
         session_id: str | None,
         client_action_id: str,
         prepared_attachments: tuple[Any, ...] = (),
+        provider_correlation: ProviderOperationCorrelation,
     ) -> ProviderOperationResult:
         if (
             binding_id != self.binding.binding_id
@@ -1088,13 +1168,16 @@ class HermesRunsControlDriver:
                 {"reason": "operation_not_supported"},
             )
         else:
-            result = handler(
-                operation_id=operation_id,
-                payload=normalized_input,
-                session_id=session_id,
-                client_action_id=client_action_id,
-                probe=probe,
-            )
+            execute_args = {
+                "operation_id": operation_id,
+                "payload": normalized_input,
+                "session_id": session_id,
+                "client_action_id": client_action_id,
+                "probe": probe,
+            }
+            if operation_id == "session.prompt.send":
+                execute_args["provider_correlation"] = provider_correlation
+            result = handler(**execute_args)
         self._remember_action(
             client_action_id,
             fingerprint,
@@ -1153,11 +1236,14 @@ class HermesRunsControlDriver:
             raise HermesRunsProtocolError("invalid Hermes run id")
         with self._lock:
             if run_id not in self._run_sessions:
-                raise HermesRunsProtocolError("Hermes run is not owned by this driver")
+                raise HermesRunsProtocolError(
+                    "Hermes run is not owned by this driver"
+                )
         terminal_seen = False
         try:
             for provider_event in self._transport.stream_sse(
-                _run_path(run_id, "/events"), authenticated=True
+                _run_path(run_id, "/events"),
+                authenticated=True,
             ):
                 normalized = self._normalize_event(run_id, provider_event)
                 if normalized is None:
@@ -1169,10 +1255,13 @@ class HermesRunsControlDriver:
                     "run.cancelled",
                 }
         except Exception as exc:
-            self._journal.append(run_id, {
-                "type": "transport.disconnected",
-                "reason": _bounded_text(exc, 256),
-            })
+            self._journal.append(
+                run_id,
+                {
+                    "type": "transport.disconnected",
+                    "reason": _bounded_text(exc, 256),
+                },
+            )
         if not terminal_seen:
             self._reconcile_run_status(run_id)
 
@@ -1270,11 +1359,25 @@ class HermesRunsControlDriver:
         except HermesRunsError:
             return _ProbeResult("hermes_transport_probe_failed", {}, (), {})
 
-    def _execute_prompt(self, *, operation_id, payload, session_id, client_action_id, probe):
+    def _execute_prompt(
+        self,
+        *,
+        operation_id,
+        payload,
+        session_id,
+        client_action_id,
+        probe,
+        provider_correlation,
+    ):
         del probe
         prompt = payload.get("prompt")
         if not isinstance(prompt, str) or not prompt:
-            return self._result(operation_id, client_action_id, OperationResultStatus.REJECTED, {"reason": "prompt_required"})
+            return self._result(
+                operation_id,
+                client_action_id,
+                OperationResultStatus.REJECTED,
+                {"reason": "prompt_required"},
+            )
         with self._lock:
             existing_run = self._active_runs.get(session_id)
         if existing_run and self._run_is_active(existing_run):
@@ -1282,21 +1385,53 @@ class HermesRunsControlDriver:
                 operation_id,
                 existing_run,
                 OperationResultStatus.REJECTED,
-                {"reason": "run_already_active", "run_id": existing_run},
+                {
+                    "reason": "run_already_active",
+                    "run_id": existing_run,
+                },
             )
+        with self._lock:
+            before_write = self._dispatch_boundaries.pop(
+                client_action_id,
+                None,
+            )
+        if before_write is not None:
+            before_write()
         response = self._transport.request(
             "POST",
             "/v1/runs",
             payload={"input": prompt, "session_id": session_id},
             authenticated=True,
         )
-        run_id = response.body.get("run_id") if response.status == 202 else None
-        if not _safe_run_id(run_id) or response.body.get("status") != "started":
-            return self._result(operation_id, client_action_id, OperationResultStatus.REJECTED, {"reason": "run_start_rejected"})
+        run_id = (
+            response.body.get("run_id")
+            if response.status == 202
+            else None
+        )
+        if (
+            not _safe_run_id(run_id)
+            or response.body.get("status") != "started"
+        ):
+            return self._result(
+                operation_id,
+                client_action_id,
+                OperationResultStatus.REJECTED,
+                {"reason": "run_start_rejected"},
+            )
         with self._lock:
             self._active_runs[session_id] = run_id
             self._run_sessions[run_id] = session_id
-        self._journal.append(run_id, {"type": "run.started", "session_id": session_id})
+        self._journal.append(
+            run_id,
+            {
+                "type": "run.started",
+                "session_id": session_id,
+                "operation_id": operation_id,
+                "client_action_id": client_action_id,
+                "provider_cursor": provider_correlation.provider_cursor,
+            },
+            durable=True,
+        )
         if self._auto_stream:
             thread = threading.Thread(
                 target=self.consume_run_events,
@@ -1311,7 +1446,11 @@ class HermesRunsControlDriver:
             operation_id,
             run_id,
             OperationResultStatus.APPLIED,
-            {"run_id": run_id, "session_id": session_id, "status": "started"},
+            {
+                "run_id": run_id,
+                "session_id": session_id,
+                "status": "started",
+            },
         )
 
     def _execute_interrupt(self, *, operation_id, payload, session_id, client_action_id, probe):
@@ -1326,7 +1465,15 @@ class HermesRunsControlDriver:
         self._journal.append(run_id, {"type": "run.stopping"})
         return self._result(operation_id, run_id, OperationResultStatus.APPLIED, {"run_id": run_id, "status": "stopping"})
 
-    def _execute_resume(self, *, operation_id, payload, session_id, client_action_id, probe):
+    def _execute_resume(
+        self,
+        *,
+        operation_id,
+        payload,
+        session_id,
+        client_action_id,
+        probe,
+    ):
         del probe
         target, reason = self._revalidate_target_session(
             operation_id,
@@ -1633,6 +1780,97 @@ class HermesRunsControlDriver:
         if pending is not None and self._pending_by_run.get(pending.run_id) == approval_id:
             self._pending_by_run.pop(pending.run_id, None)
 
+    def _restore_correlated_prompt_actions(self) -> None:
+        rows = self._journal.records()
+        for row in rows:
+            if (
+                row.get("type") != "operation.prepared"
+                or row.get("operation_id") != "session.prompt.send"
+            ):
+                continue
+            action_id = row.get("client_action_id")
+            session_id = row.get("session_id")
+            provider_cursor = row.get("provider_cursor")
+            if (
+                not isinstance(action_id, str)
+                or _ACTION_ID_RE.fullmatch(action_id) is None
+                or not _safe_session_id(session_id)
+                or not isinstance(provider_cursor, str)
+            ):
+                continue
+            try:
+                generation, _ = self._journal._parse_cursor(
+                    provider_cursor
+                )
+            except HermesEventCursorExpired:
+                continue
+            if generation != self.capability_generation:
+                continue
+            self._prepared_prompt_correlations[(action_id, session_id)] = (
+                ProviderOperationCorrelation(action_id, provider_cursor)
+            )
+        for row in rows:
+            if (
+                row.get("type") != "run.started"
+                or row.get("operation_id") != "session.prompt.send"
+            ):
+                continue
+            action_id = row.get("client_action_id")
+            run_id = row.get("run_id")
+            session_id = row.get("session_id")
+            provider_cursor = row.get("provider_cursor")
+            if (
+                not isinstance(action_id, str)
+                or _ACTION_ID_RE.fullmatch(action_id) is None
+                or not _safe_run_id(run_id)
+                or not _safe_session_id(session_id)
+                or not isinstance(provider_cursor, str)
+            ):
+                continue
+            try:
+                generation, _ = self._journal._parse_cursor(
+                    provider_cursor
+                )
+            except HermesEventCursorExpired:
+                continue
+            if generation != self.capability_generation:
+                continue
+            correlation = ProviderOperationCorrelation(
+                action_id,
+                provider_cursor,
+            )
+            self._prepared_prompt_correlations[
+                (action_id, session_id)
+            ] = correlation
+            result = ProviderOperationResult(
+                operation_id="session.prompt.send",
+                provider_operation_id=action_id,
+                status=OperationResultStatus.APPLIED,
+                public_result={
+                    "run_id": run_id,
+                    "session_id": session_id,
+                    "status": "started",
+                },
+                provider_cursor=provider_cursor,
+            )
+            self._actions[action_id] = _ActionResult(
+                f"journal:{row.get('cursor')}",
+                session_id,
+                result,
+            )
+            self._action_order.append(action_id)
+            self._active_runs[session_id] = run_id
+            self._run_sessions[run_id] = session_id
+        while len(self._action_order) > _MAX_ACTION_RESULTS:
+            oldest = self._action_order.popleft()
+            self._actions.pop(oldest, None)
+        while (
+            len(self._prepared_prompt_correlations)
+            > _MAX_ACTION_RESULTS
+        ):
+            oldest = next(iter(self._prepared_prompt_correlations))
+            self._prepared_prompt_correlations.pop(oldest, None)
+
     def _remember_action(
         self,
         action_id: str,
@@ -1653,10 +1891,19 @@ class HermesRunsControlDriver:
                 oldest = self._action_order.popleft()
                 self._actions.pop(oldest, None)
 
-    def _result(self, operation_id, provider_operation_id, status, public_result):
+    def _result(
+        self,
+        operation_id,
+        provider_operation_id,
+        status,
+        public_result,
+    ):
         return ProviderOperationResult(
             operation_id=operation_id,
-            provider_operation_id=self._safe_text(provider_operation_id, 512),
+            provider_operation_id=self._safe_text(
+                provider_operation_id,
+                512,
+            ),
             status=status,
             public_result=self._safe_value(public_result),
             provider_cursor=self._journal.cursor,
@@ -1676,15 +1923,23 @@ def _validated_loopback_base_url(value: str) -> str:
         or parsed.port is None
         or not (1 <= parsed.port <= 65535)
     ):
-        raise HermesRunsProtocolError("Hermes server must use authenticated loopback HTTP")
-    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+        raise HermesRunsProtocolError(
+            "Hermes server must use authenticated loopback HTTP"
+        )
+    host = (
+        f"[{parsed.hostname}]"
+        if ":" in parsed.hostname
+        else parsed.hostname
+    )
     return f"http://{host}:{parsed.port}"
 
 
 def _bounded_read(response, limit: int) -> bytes:
     raw = response.read(limit + 1)
     if len(raw) > limit:
-        raise HermesRunsProtocolError("Hermes response exceeds size limit")
+        raise HermesRunsProtocolError(
+            "Hermes response exceeds size limit"
+        )
     return raw
 
 
@@ -1694,9 +1949,13 @@ def _decode_json_object(raw: bytes) -> dict[str, Any]:
     try:
         value = json.loads(raw.decode("utf-8"))
     except Exception as exc:
-        raise HermesRunsProtocolError("Hermes returned invalid JSON") from exc
+        raise HermesRunsProtocolError(
+            "Hermes returned invalid JSON"
+        ) from exc
     if not isinstance(value, dict):
-        raise HermesRunsProtocolError("Hermes returned a non-object JSON payload")
+        raise HermesRunsProtocolError(
+            "Hermes returned a non-object JSON payload"
+        )
     return value
 
 

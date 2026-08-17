@@ -424,7 +424,7 @@
       "docs_url": "https://qwenlm.github.io/qwen-code-docs/",
       "managed_launch": {
         "control_channel": "stable",
-        "ready_auth_states": ["unknown"],
+        "ready_auth_states": ["configured"],
         "ready_config_states": ["present", "unknown"],
         "auth_verification": "runtime"
       }

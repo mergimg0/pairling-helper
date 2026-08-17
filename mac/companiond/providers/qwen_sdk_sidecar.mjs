@@ -133,6 +133,14 @@ function safeError(error) {
   return { code, message: code };
 }
 
+function initializationFailureCode(error) {
+  const message = error instanceof Error ? error.message.toLowerCase() : "";
+  if (message.includes("no auth type is selected")) {
+    return "managed_provider_auth_unavailable";
+  }
+  return "session_initialize_failed";
+}
+
 function parseModels(payload) {
   const rows = payload && typeof payload === "object" && Array.isArray(payload.models) ? payload.models : [];
   const models = [];
@@ -320,11 +328,11 @@ async function startSession(payload) {
       forked: payload.fork === true,
     });
     return { session_id: sessionId, models: session.models, permission_mode: permissionMode };
-  } catch {
+  } catch (error) {
     sessions.delete(sessionId);
     queue.close();
     try { await query.close(); } catch {}
-    throw new ProtocolError("session_initialize_failed");
+    throw new ProtocolError(initializationFailureCode(error));
   }
 }
 

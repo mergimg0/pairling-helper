@@ -118,7 +118,7 @@ class FactoryDroidProviderAdapter:
             if self.supports(capability)
         )
         notes: list[str] = [
-            "Public Factory stream-jsonrpc; default structured sessions are spec/off.",
+            "Public Factory stream-jsonrpc; reviewed structured sessions are auto/off.",
             f"Structured controls require the exact supported Droid CLI {DROID_SUPPORTED_VERSION}.",
         ]
         if failure:

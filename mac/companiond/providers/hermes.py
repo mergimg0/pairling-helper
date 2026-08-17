@@ -29,6 +29,7 @@ from .controls import (
     ProviderControlBinding,
     ProviderControlSnapshot,
     ProviderOperationResult,
+    ProviderOperationCorrelation,
     ProviderSessionIdentity,
     OperationResultStatus,
 )
@@ -273,6 +274,8 @@ class UnavailableHermesControlDriver:
 class DeferredHermesManagedLaunchDriver:
     """Launch one reviewed Hermes server lazily for a managed Pairling session."""
 
+    requires_post_registration_first_prompt = True
+
     safe_launch_profile = {
         "reviewed": True,
         "establishes_loopback_auth": True,
@@ -293,16 +296,19 @@ class DeferredHermesManagedLaunchDriver:
         *,
         store: HermesOwnedServerStore,
         binary_path: Path,
+        profile_parent: Path | None = None,
     ):
         self.binding = binding
         self._store = store
         self._binary_path = binary_path
+        self._profile_parent = profile_parent
         self._lock = threading.RLock()
         self._runtime: HermesRunsControlDriver | None = None
         self._native_session_id: str | None = None
         self._managed_run_id: str | None = None
         self._managed_run_baseline: str | None = None
         self._profile_root: Path | None = None
+        self._profile_home: Path | None = None
         self._profile_identity: tuple[int, int] | None = None
         self._owner_nonce: str | None = None
         self._owns_server = False
@@ -353,8 +359,13 @@ class DeferredHermesManagedLaunchDriver:
                 profile_home,
                 profile_state,
                 profile_identity,
-            ) = _create_managed_profile(self._store, self.binding)
+            ) = _create_managed_profile(
+                self._store,
+                self.binding,
+                profile_parent=self._profile_parent,
+            )
             self._profile_root = profile_root
+            self._profile_home = profile_home
             self._profile_identity = profile_identity
             runtime: HermesRunsControlDriver | None = None
             try:
@@ -435,11 +446,13 @@ class DeferredHermesManagedLaunchDriver:
                 runtime = self._runtime
                 native_id = self._native_session_id
                 profile_root = self._profile_root
+                profile_home = self._profile_home
                 owns_server = self._owns_server
             if (
                 runtime is None
                 or native_id is None
                 or profile_root is None
+                or profile_home is None
                 or not owns_server
                 or set(launch_result) != expected_keys
                 or launch_result.get("native_session_id") != native_id
@@ -452,11 +465,12 @@ class DeferredHermesManagedLaunchDriver:
                 != runtime.capability_generation
             ):
                 return False
+            config_path = profile_home / "config.yaml"
             _require_private_file(
-                profile_root / "home" / "config.yaml",
+                config_path,
                 "Hermes managed profile config",
             )
-            if (profile_root / "home" / "config.yaml").read_bytes() != _MANAGED_CONFIG:
+            if config_path.read_bytes() != _MANAGED_CONFIG:
                 return False
             readiness = runtime.snapshot(
                 session_id=None,
@@ -502,10 +516,9 @@ class DeferredHermesManagedLaunchDriver:
         cursor = (
             str(events[-1].get("cursor"))
             if events
-            else runtime.snapshot(
-                session_id=None,
-                session_truth=None,
-            ).provider_cursor
+            else provider_cursor
+            if provider_cursor is not None
+            else baseline
         )
         return {"events": events, "provider_cursor": cursor}
 
@@ -580,10 +593,62 @@ class DeferredHermesManagedLaunchDriver:
                 qualified_id=_qualified_managed_session_id(native_id),
                 native_id=native_id,
             )
-        baseline = runtime.snapshot(
-            session_id=None,
-            session_truth=None,
-        ).provider_cursor
+        if operation_id == "session.terminate":
+            identity = payload.get("session")
+            if isinstance(identity, ProviderSessionIdentity):
+                identity_matches = (
+                    identity.provider_id == self.binding.provider_id
+                    and identity.session_id == native_id
+                    and identity.binding_id == self.binding.binding_id
+                    and identity.capability_generation
+                    == runtime.capability_generation
+                )
+            elif isinstance(identity, Mapping):
+                identity_matches = (
+                    identity.get("provider_id") == self.binding.provider_id
+                    and identity.get("session_id") == native_id
+                    and identity.get("binding_id") == self.binding.binding_id
+                    and identity.get("capability_generation")
+                    == runtime.capability_generation
+                )
+            else:
+                identity_matches = False
+            if (
+                binding_id != self.binding.binding_id
+                or capability_generation != runtime.capability_generation
+            ):
+                status = OperationResultStatus.REJECTED
+                public_result = {"reason": "stale_binding"}
+            elif not identity_matches:
+                status = OperationResultStatus.REJECTED
+                public_result = {"reason": "session_identity_mismatch"}
+            elif prepared_attachments:
+                status = OperationResultStatus.REJECTED
+                public_result = {"reason": "attachments_not_supported"}
+            else:
+                status = OperationResultStatus.APPLIED
+                public_result = {"status": "terminating"}
+            return ProviderOperationResult(
+                operation_id=operation_id,
+                provider_operation_id=client_action_id,
+                status=status,
+                public_result=public_result,
+                provider_cursor=runtime.snapshot(
+                    session_id=None,
+                    session_truth=None,
+                ).provider_cursor,
+            )
+        baseline = (
+            provider_correlation.provider_cursor
+            if isinstance(
+                provider_correlation,
+                ProviderOperationCorrelation,
+            )
+            else runtime.snapshot(
+                session_id=None,
+                session_truth=None,
+            ).provider_cursor
+        )
         result = runtime.execute(
             operation_id=operation_id,
             input_payload=payload,
@@ -609,9 +674,26 @@ class DeferredHermesManagedLaunchDriver:
         capability_generation: int,
         session_id: str | None,
         session_truth: dict[str, Any] | None,
-    ):
+    ) -> ProviderOperationCorrelation:
         runtime = self._require_runtime()
         native_id = self._native_session_for(session_id)
+        if operation_id == "session.terminate":
+            snapshot = self.snapshot(
+                session_id=session_id,
+                session_truth=session_truth,
+            )
+            if (
+                native_id is None
+                or capability_generation != snapshot.capability_generation
+                or operation_id not in snapshot.advertised_operations
+            ):
+                raise HermesRunsProtocolError(
+                    "Hermes managed termination correlation proof is unavailable"
+                )
+            return ProviderOperationCorrelation(
+                client_action_id,
+                snapshot.provider_cursor,
+            )
         return runtime.operation_correlation(
             operation_id=operation_id,
             client_action_id=client_action_id,
@@ -621,6 +703,29 @@ class DeferredHermesManagedLaunchDriver:
                 session_truth,
                 native_id,
             ),
+        )
+
+    def arm_operation_dispatch_boundary(
+        self,
+        *,
+        operation_id: str,
+        client_action_id: str,
+        session_id: str,
+        provider_correlation: ProviderOperationCorrelation,
+        before_write,
+    ) -> None:
+        runtime = self._require_runtime()
+        native_id = self._native_session_for(session_id)
+        if native_id is None:
+            raise HermesRunsProtocolError(
+                "Hermes operation dispatch boundary is unavailable"
+            )
+        runtime.arm_operation_dispatch_boundary(
+            operation_id=operation_id,
+            client_action_id=client_action_id,
+            session_id=native_id,
+            provider_correlation=provider_correlation,
+            before_write=before_write,
         )
 
     def recover(
@@ -709,6 +814,7 @@ class DeferredHermesManagedLaunchDriver:
             profile_root = self._profile_root
             profile_identity = self._profile_identity
             self._profile_root = None
+            self._profile_home = None
             self._profile_identity = None
         _remove_owned_profile(profile_root, profile_identity)
 
@@ -845,6 +951,11 @@ def create_control_driver(
             binding,
             store=owned_store,
             binary_path=executable,
+            profile_parent=(
+                home.expanduser() / ".hermes" / "profiles"
+                if home is not None
+                else None
+            ),
         )
     except HermesRunsError:
         return UnavailableHermesControlDriver(binding, "hermes_owned_server_record_invalid")
@@ -1170,11 +1281,25 @@ def _resolve_reviewed_binary(
 def _create_managed_profile(
     store: HermesOwnedServerStore,
     binding: ProviderControlBinding,
+    *,
+    profile_parent: Path | None = None,
 ) -> tuple[Path, Path, Path, tuple[int, int]]:
     _ensure_private_directory(store.root)
-    profiles_root = store.root / "profiles"
+    if profile_parent is None:
+        profiles_root = store.root / "profiles"
+        profile_root = store.managed_profile_root(binding.binding_id)
+        profile_home = profile_root / "home"
+        profile_state = profile_root / "state"
+    else:
+        profiles_root = profile_parent.expanduser()
+        _ensure_private_directory(profiles_root.parent)
+        profile_root = (
+            profiles_root
+            / f"pairling-{_binding_digest(binding.binding_id)}"
+        )
+        profile_home = profile_root
+        profile_state = profile_root / ".pairling-state"
     _ensure_private_directory(profiles_root)
-    profile_root = store.managed_profile_root(binding.binding_id)
     try:
         profile_root.mkdir(mode=0o700)
     except FileExistsError as exc:
@@ -1183,8 +1308,6 @@ def _create_managed_profile(
         ) from exc
     try:
         _ensure_private_directory(profile_root)
-        profile_home = profile_root / "home"
-        profile_state = profile_root / "state"
         _ensure_private_directory(profile_home)
         _ensure_private_directory(profile_state)
         _managed_profile_environment(profile_home, profile_state, source={})
@@ -1304,13 +1427,37 @@ def _qualify_managed_snapshot(
     snapshot: ProviderControlSnapshot,
     qualified_id: str,
 ) -> ProviderControlSnapshot:
+    advertised = list(snapshot.advertised_operations)
     values = []
     for value in snapshot.values:
         identity = value.value
         if isinstance(identity, ProviderSessionIdentity):
             identity = replace(identity, session_id=qualified_id)
         values.append(replace(value, value=identity))
-    return replace(snapshot, values=tuple(values))
+    if (
+        snapshot.blocked_reason is None
+        and "session.terminate" not in advertised
+    ):
+        advertised.append("session.terminate")
+        values.append(
+            ControlValue(
+                "session.terminate",
+                "session",
+                ProviderSessionIdentity(
+                    snapshot.provider_id,
+                    qualified_id,
+                    snapshot.binding_id,
+                    snapshot.capability_generation,
+                ),
+            )
+        )
+    qualified = replace(
+        snapshot,
+        advertised_operations=tuple(advertised),
+        values=tuple(values),
+    )
+    qualified.validate(now=snapshot.observed_at)
+    return qualified
 
 
 def _native_managed_input(

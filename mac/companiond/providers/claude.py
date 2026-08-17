@@ -47,6 +47,14 @@ class ClaudeProviderAdapter(ProviderAdapter):
             Path("/usr/local/bin/claude"),
         ]
 
+    def managed_launch_provider_version(self) -> str:
+        # Terminal detection reports the ambient CLI. Managed control launches
+        # the independently pinned Agent SDK payload, whose embedded Claude
+        # runtime is the binding identity reviewed for this release.
+        from .claude_agent_sdk import CLAUDE_CODE_VERSION
+
+        return CLAUDE_CODE_VERSION
+
     def create_control_driver(self, binding):
         # Import lazily so provider detection stays available when Node or the
         # pinned Agent SDK dependency is absent. Launch performs the live SDK

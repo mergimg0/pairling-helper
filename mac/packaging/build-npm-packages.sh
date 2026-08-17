@@ -445,6 +445,8 @@ python3 "$SOURCE_ROOT/mac/install/verify-runtime-package-manifest.py" \
   || fail "could not stage the reviewed provider runtime asset inventory"
 cp "$SOURCE_ROOT/thoughts/shared/specs/coding-agent-remote-control-capability-map.json" \
   "$MACPAY/companiond/providers/provider-control-capability-map.json"
+cp "$SOURCE_ROOT/thoughts/shared/specs/coding-agent-remote-control-capability-map.schema.json" \
+  "$MACPAY/companiond/providers/coding-agent-remote-control-capability-map.schema.json"
 python3 - "$SOURCE_ROOT/mac/companiond/providers/operations.py" \
   "$MACPAY/companiond/providers/reviewed-operation-manifest.json" \
   "$SOURCE_ROOT" "$REVISION" <<'PY'

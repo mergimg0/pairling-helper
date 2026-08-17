@@ -127,7 +127,13 @@ def ensure_directory_fd(
             try:
                 child_fd = _open_directory_component(descriptor, component, current)
             except FileNotFoundError:
-                os.mkdir(component, mode, dir_fd=descriptor)
+                try:
+                    os.mkdir(component, mode, dir_fd=descriptor)
+                except FileExistsError:
+                    # Another request may have created this component after
+                    # the descriptor-relative lookup. Opening it below still
+                    # enforces directory type, inode stability, and no symlinks.
+                    pass
                 child_fd = _open_directory_component(descriptor, component, current)
             os.close(descriptor)
             descriptor = child_fd
@@ -197,7 +203,13 @@ def authorize_path(raw_path: str | Path, *, roots: Iterable[str | Path]) -> Auth
     candidate = _absolute_path(raw_path, label="path")
     for raw_root in roots:
         configured_root = _absolute_path(raw_root, label="authorized root")
-        canonical_root = configured_root.resolve(strict=True)
+        try:
+            canonical_root = configured_root.resolve(strict=True)
+        except FileNotFoundError:
+            # Provider transcript roots are optional and independently
+            # provisioned. An absent earlier root must not hide a valid later
+            # root from the authorization boundary.
+            continue
         for prefix in (configured_root, canonical_root):
             try:
                 relative = candidate.relative_to(prefix)

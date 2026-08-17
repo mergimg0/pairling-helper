@@ -760,6 +760,7 @@ CODEX_APP_SERVER_SAFE_LAUNCH_PROFILE = {
 
 _COMMON_RELEASE_SOURCE_PATHS = (
     "mac/companiond/providers/operations.py",
+    "mac/companiond/providers/capability_graph.py",
     "mac/companiond/providers/controls.py",
     "mac/companiond/providers/registry.py",
 )
@@ -891,6 +892,7 @@ _RELEASE_CAPABILITIES_BY_MAP_PROVIDER_ID = MappingProxyType(
                 (
                     "session.prompt.send",
                     "session.turn.interrupt",
+                    "session.terminate",
                     "session.resume",
                     "session.fork",
                 ),
@@ -1051,7 +1053,6 @@ _RELEASE_CAPABILITIES_BY_MAP_PROVIDER_ID = MappingProxyType(
                     "session.model.set",
                     "session.reasoning.set",
                     "session.permissions.set",
-                    "session.plan.start",
                     "provider.config.read",
                     "provider.commands.read",
                     "provider.mcp.read",
@@ -1276,8 +1277,8 @@ _ACP_RELEASE_PROFILE_PINS = MappingProxyType(
             "provider_version": "semver:*",
             "provider_channel": "stable",
             "safe_launch_digest": (
-                "b23e87ba209c91cace6f5bb931fe36cda"
-                "376a844141745276d113780c84d07b0"
+                "1b32e1bf8d928a0ca734441254a328133"
+                "d7c144d05eca46f547daaf7e148d496"
             ),
         },
         "grok_build": {

@@ -29,14 +29,22 @@ let activeQuery = null;
 let inputQueue = null;
 let activeSessionId = null;
 let activeProject = null;
+let activeTitle = null;
 let activeBindingId = null;
 let initialization = null;
 let systemCapabilities = new Set();
 let currentModel = null;
 let currentPermissionMode = "default";
 let queryConsumer = null;
+let queryActivation = null;
+let expectedSessionId = null;
+let logicalSessionClosed = false;
 let sessionReadyResolve = null;
 let sessionReadyReject = null;
+let sessionReadyPromise = null;
+let sessionInitialized = false;
+let cachedQueryCapabilities = [];
+let currentMcpServers = [];
 const permissionWaiters = new Map();
 const questionWaiters = new Map();
 const preInitEvents = [];
@@ -52,7 +60,9 @@ const SECRET_PATTERNS = [
 
 class InputQueue {
   constructor(initialMessage = null) {
-    this.values = initialMessage ? [initialMessage] : [];
+    this.values = initialMessage
+      ? [{ value: initialMessage, resolve: null, reject: null }]
+      : [];
     this.waiters = [];
     this.closed = false;
   }
@@ -63,14 +73,33 @@ class InputQueue {
 
   next() {
     if (this.values.length > 0) {
-      return Promise.resolve({ value: this.values.shift(), done: false });
+      const entry = this.values.shift();
+      entry.resolve?.();
+      return Promise.resolve({ value: entry.value, done: false });
     }
     if (this.closed) return Promise.resolve({ value: undefined, done: true });
     return new Promise((resolve) => this.waiters.push(resolve));
   }
 
+  push(value) {
+    if (this.closed) {
+      return Promise.reject(new Error("input queue is closed"));
+    }
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter({ value, done: false });
+      return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+      this.values.push({ value, resolve, reject });
+    });
+  }
+
   close() {
     this.closed = true;
+    for (const entry of this.values.splice(0)) {
+      entry.reject?.(new Error("input queue closed before delivery"));
+    }
     for (const resolve of this.waiters.splice(0)) {
       resolve({ value: undefined, done: true });
     }
@@ -571,10 +600,12 @@ function optionalText(request, key, limit) {
   return value;
 }
 
-function requireSession(request) {
+async function requireSession(request) {
   const value = requiredText(request, "session_id", 256);
-  if (!activeQuery || value !== activeSessionId) throw new Error("stale session binding");
-  return value;
+  if (value !== activeSessionId) throw new Error("stale session binding");
+  const query = await ensureActiveQuery();
+  if (value !== activeSessionId) throw new Error("stale session binding");
+  return query;
 }
 
 function userMessage(text, sessionId = activeSessionId) {
@@ -587,15 +618,123 @@ function userMessage(text, sessionId = activeSessionId) {
   };
 }
 
-async function* oneMessage(message) {
-  yield message;
-}
 
 function resetSessionReady() {
-  return new Promise((resolve, rejectPromise) => {
+  sessionReadyPromise = new Promise((resolve, rejectPromise) => {
     sessionReadyResolve = resolve;
     sessionReadyReject = rejectPromise;
   });
+  return sessionReadyPromise;
+}
+
+async function waitForSessionReady(ready) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      ready,
+      new Promise((_, rejectPromise) => {
+        timer = setTimeout(
+          () => rejectPromise(new Error("session initialization timed out")),
+          20_000,
+        );
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+function queryOptions({ resumeSessionId = null, newSessionId = null } = {}) {
+  return {
+    cwd: activeProject,
+    title: activeTitle || undefined,
+    permissionMode: currentPermissionMode,
+    includePartialMessages: true,
+    enableFileCheckpointing: true,
+    canUseTool,
+    ...(resumeSessionId ? { resume: resumeSessionId } : {}),
+    ...(newSessionId ? { sessionId: newSessionId } : {}),
+  };
+}
+
+async function activateQuery({
+  firstPrompt = "",
+  resumeSessionId = null,
+  newSessionId = null,
+} = {}) {
+  if (resumeSessionId && newSessionId) {
+    throw new Error("Claude SDK query identity is ambiguous");
+  }
+  const requiredSessionId = resumeSessionId || newSessionId;
+  const deferredInitialization = Boolean(newSessionId && !firstPrompt);
+  const ready = resetSessionReady();
+  sessionInitialized = false;
+  expectedSessionId = requiredSessionId;
+  if (newSessionId) currentMcpServers = [];
+  const queue = new InputQueue(
+    firstPrompt ? userMessage(firstPrompt, requiredSessionId) : null,
+  );
+  const query = sdk.query({
+    prompt: queue,
+    options: queryOptions({ resumeSessionId, newSessionId }),
+  });
+  cachedQueryCapabilities = reviewedQueryCapabilities(query);
+  inputQueue = queue;
+  activeQuery = query;
+  queryConsumer = consumeQuery(query);
+  try {
+    initialization = await query.initializationResult();
+    if (newSessionId) {
+      if (activeSessionId && activeSessionId !== newSessionId) {
+        throw new Error("new SDK session identity changed");
+      }
+      activeSessionId = newSessionId;
+    }
+    if (deferredInitialization) {
+      // The SDK resolves control initialization before it emits system/init.
+      // Keep the one query input stream open until a real user prompt arrives.
+      ready.catch(() => {});
+      return query;
+    }
+    const nativeId = await waitForSessionReady(ready);
+    if (typeof nativeId !== "string" || !nativeId) {
+      throw new Error("SDK did not return a session id");
+    }
+    if (requiredSessionId && nativeId !== requiredSessionId) {
+      throw new Error("resumed SDK session identity changed");
+    }
+    return query;
+  } catch (error) {
+    queue.close();
+    query.close();
+    if (activeQuery === query) activeQuery = null;
+    if (newSessionId && activeSessionId === newSessionId && !sessionInitialized) {
+      activeSessionId = null;
+    }
+    throw error;
+  } finally {
+    expectedSessionId = null;
+  }
+}
+
+async function ensureActiveQuery() {
+  if (logicalSessionClosed) throw new Error("Claude SDK session is closed");
+  if (activeQuery) return activeQuery;
+  if (!activeSessionId || !activeProject || !activeBindingId) {
+    throw new Error("Claude SDK session is unavailable");
+  }
+  if (!queryActivation) {
+    const resumeSessionId = activeSessionId;
+    queryActivation = activateQuery({ resumeSessionId }).finally(() => {
+      queryActivation = null;
+    });
+  }
+  await queryActivation;
+  if (!activeQuery || activeSessionId === null) {
+    throw new Error("Claude SDK session resume failed");
+  }
+  return activeQuery;
 }
 
 async function requestClaudeQuestions(input, options, questionRequestId, toolUseId) {
@@ -789,19 +928,23 @@ async function consumeQuery(query) {
     if (activeQuery === query) {
       activeQuery = null;
       inputQueue?.close();
+      inputQueue = null;
       for (const [approvalId, waiter] of permissionWaiters) {
-        denyWaiter(approvalId, waiter, "Claude session closed");
+        denyWaiter(approvalId, waiter, "Claude query returned");
       }
       for (const [questionRequestId, waiter] of questionWaiters) {
         denyQuestionWaiter(
           questionRequestId,
           waiter,
-          "Claude session closed",
+          "Claude query returned",
         );
       }
       if (!activeSessionId) preInitEvents.length = 0;
       if (activeSessionId) {
-        event("lifecycle", { subtype: "session_closed", status: "closed" });
+        event("lifecycle", {
+          subtype: logicalSessionClosed ? "session_closed" : "query_returned",
+          status: logicalSessionClosed ? "closed" : "waiting",
+        });
       }
     }
   }
@@ -813,18 +956,27 @@ function normalizeSDKMessage(message) {
     return;
   }
   if (message.type === "system" && message.subtype === "init") {
-    if (typeof message.session_id === "string" && message.session_id) activeSessionId = message.session_id;
-    if (activeSessionId) {
-      for (const pending of preInitEvents.splice(0)) {
-        writeFrame({
-          type: "event",
-          event: { ...pending, session_id: activeSessionId },
-        });
-      }
+    const candidateSessionId = typeof message.session_id === "string" && message.session_id
+      ? message.session_id
+      : null;
+    const requiredSessionId = expectedSessionId || activeSessionId;
+    if (!candidateSessionId || (requiredSessionId && candidateSessionId !== requiredSessionId)) {
+      const error = new Error("Claude SDK session identity changed");
+      sessionReadyReject?.(error);
+      throw error;
+    }
+    activeSessionId = candidateSessionId;
+    sessionInitialized = true;
+    for (const pending of preInitEvents.splice(0)) {
+      writeFrame({
+        type: "event",
+        event: { ...pending, session_id: activeSessionId },
+      });
     }
     if (Array.isArray(message.capabilities)) {
       systemCapabilities = new Set(message.capabilities.filter((item) => typeof item === "string"));
     }
+    if (Array.isArray(message.mcp_servers)) currentMcpServers = message.mcp_servers;
     if (typeof message.model === "string") currentModel = message.model;
     if (typeof message.permissionMode === "string") currentPermissionMode = message.permissionMode;
     sessionReadyResolve?.(activeSessionId);
@@ -835,6 +987,16 @@ function normalizeSDKMessage(message) {
       permission_mode: currentPermissionMode,
       capabilities: [...systemCapabilities].slice(0, 128),
     }, bounded(message.uuid || randomUUID(), 256));
+    return;
+  }
+  if (message.type === "system" && message.subtype === "commands_changed") {
+    if (Array.isArray(message.commands) && initialization) {
+      initialization = { ...initialization, commands: message.commands };
+    }
+    event("lifecycle", {
+      subtype: "commands_changed",
+      status: "updated",
+    }, message.uuid);
     return;
   }
   if (message.type === "stream_event") {
@@ -934,14 +1096,7 @@ function normalizeSDKMessage(message) {
   }, message.uuid || message.id);
 }
 
-async function discovery() {
-  if (!activeQuery || !activeSessionId) throw new Error("Claude SDK session is not initialized");
-  const [commands, models, agents, mcp] = await Promise.all([
-    activeQuery.supportedCommands(),
-    activeQuery.supportedModels(),
-    activeQuery.supportedAgents(),
-    activeQuery.mcpServerStatus(),
-  ]);
+function reviewedQueryCapabilities(query) {
   const capabilities = [];
   const methods = [
     ["streamInput", "stream_input"],
@@ -961,13 +1116,24 @@ async function discovery() {
     ["rewindFiles", "rewind_files"],
   ];
   for (const [method, capability] of methods) {
-    if (typeof activeQuery[method] === "function") capabilities.push(capability);
+    if (typeof query?.[method] === "function") capabilities.push(capability);
   }
   if (typeof sdk.getSessionMessages === "function") capabilities.push("session.history.read");
   capabilities.push("ask_user_question");
+  return capabilities;
+}
+
+async function discovery() {
+  if (!activeSessionId || !initialization) {
+    throw new Error("Claude SDK session is not initialized");
+  }
+  const commands = Array.isArray(initialization.commands) ? initialization.commands : [];
+  const models = Array.isArray(initialization.models) ? initialization.models : [];
+  const agents = Array.isArray(initialization.agents) ? initialization.agents : [];
+  const mcp = Array.isArray(currentMcpServers) ? currentMcpServers : [];
   return {
     native_session_id: activeSessionId,
-    capabilities,
+    capabilities: cachedQueryCapabilities,
     models: models.map((row) => ({
       value: bounded(row.value, 256),
       display_name: bounded(row.displayName || row.value, 500),
@@ -995,8 +1161,18 @@ async function discovery() {
 }
 
 async function streamText(text) {
+  await ensureActiveQuery();
+  const ready = sessionInitialized ? null : sessionReadyPromise;
+  const queue = inputQueue;
+  if (!queue) throw new Error("Claude SDK input stream is unavailable");
   const message = userMessage(text);
-  await activeQuery.streamInput(oneMessage(message));
+  await queue.push(message);
+  if (ready) {
+    const nativeId = await waitForSessionReady(ready);
+    if (nativeId !== activeSessionId) {
+      throw new Error("Claude SDK session identity changed");
+    }
+  }
   return message.uuid;
 }
 
@@ -1027,31 +1203,22 @@ async function handle(request) {
       case "launch": {
         exactFields(request, ["project", "title", "first_prompt", "binding_id"]);
         await loadSDK();
-        if (activeQuery) throw new Error("sidecar already owns a Claude session");
+        if (activeQuery || activeSessionId) throw new Error("sidecar already owns a Claude session");
         activeProject = requiredText(request, "project", 4096);
         activeBindingId = requiredText(request, "binding_id", 256);
-        const title = optionalText(request, "title", 500);
+        activeTitle = optionalText(request, "title", 500);
         const firstPrompt = optionalText(request, "first_prompt", 200_000);
-        const ready = resetSessionReady();
-        inputQueue = new InputQueue(firstPrompt ? userMessage(firstPrompt, null) : null);
-        activeQuery = sdk.query({
-          prompt: inputQueue,
-          options: {
-            cwd: activeProject,
-            title: title || undefined,
-            permissionMode: "default",
-            includePartialMessages: true,
-            enableFileCheckpointing: true,
-            canUseTool,
-          },
+        currentPermissionMode = "default";
+        logicalSessionClosed = false;
+        const reservedSessionId = randomUUID();
+        const query = await activateQuery({
+          firstPrompt,
+          newSessionId: reservedSessionId,
         });
-        queryConsumer = consumeQuery(activeQuery);
-        initialization = await activeQuery.initializationResult();
-        const nativeId = await Promise.race([
-          ready,
-          new Promise((_, rejectPromise) => setTimeout(() => rejectPromise(new Error("session initialization timed out")), 20_000)),
-        ]);
-        if (typeof nativeId !== "string" || !nativeId) throw new Error("SDK did not return a session id");
+        const nativeId = activeSessionId;
+        if (!query || typeof nativeId !== "string" || !nativeId) {
+          throw new Error("SDK did not return a session id");
+        }
         reply(request, { native_session_id: nativeId, provider_operation_id: `launch:${nativeId}` });
         return;
       }
@@ -1062,22 +1229,22 @@ async function handle(request) {
       }
       case "prompt": {
         exactFields(request, ["session_id", "prompt", "client_action_id"]);
-        requireSession(request);
+        await requireSession(request);
         const messageUuid = await streamText(requiredText(request, "prompt", 200_000));
         reply(request, { accepted: true, message_uuid: messageUuid, provider_operation_id: operationId(request, "prompt") });
         return;
       }
       case "steer": {
         exactFields(request, ["session_id", "instruction", "client_action_id"]);
-        requireSession(request);
+        await requireSession(request);
         const messageUuid = await streamText(requiredText(request, "instruction", 200_000));
         reply(request, { accepted: true, message_uuid: messageUuid, provider_operation_id: operationId(request, "steer") });
         return;
       }
       case "interrupt": {
         exactFields(request, ["session_id", "client_action_id"]);
-        requireSession(request);
-        const receipt = await activeQuery.interrupt();
+        const query = await requireSession(request);
+        const receipt = await query.interrupt();
         reply(request, {
           still_queued: Array.isArray(receipt?.still_queued) ? receipt.still_queued : [],
           cancelled: Array.isArray(receipt?.cancelled) ? receipt.cancelled : [],
@@ -1087,8 +1254,9 @@ async function handle(request) {
       }
       case "terminate": {
         exactFields(request, ["session_id", "client_action_id"]);
-        requireSession(request);
+        const query = await requireSession(request);
         const providerOperationId = operationId(request, "terminate");
+        logicalSessionClosed = true;
         for (const [approvalId, waiter] of permissionWaiters) {
           denyWaiter(approvalId, waiter, "Claude session terminated");
         }
@@ -1100,14 +1268,13 @@ async function handle(request) {
           );
         }
         inputQueue?.close();
-        activeQuery.close();
-        activeQuery = null;
+        query.close();
         reply(request, { terminated: true, provider_operation_id: providerOperationId });
         return;
       }
       case "compact": {
         exactFields(request, ["session_id", "client_action_id"]);
-        requireSession(request);
+        await requireSession(request);
         const commands = await activeQuery.supportedCommands();
         const supported = commands.some((row) => row.name?.replace(/^\//, "").toLowerCase() === "compact"
           || row.aliases?.some((alias) => alias.replace(/^\//, "").toLowerCase() === "compact"));
@@ -1118,7 +1285,7 @@ async function handle(request) {
       }
       case "rewind": {
         exactFields(request, ["session_id", "message_id", "client_action_id"]);
-        requireSession(request);
+        await requireSession(request);
         const messageId = requiredText(request, "message_id", 256);
         const dryRun = await activeQuery.rewindFiles(messageId, { dryRun: true });
         if (!dryRun?.canRewind) throw new Error(bounded(dryRun?.error || "rewind dry-run rejected", 300));
@@ -1132,7 +1299,7 @@ async function handle(request) {
       }
       case "set_model": {
         exactFields(request, ["session_id", "model", "client_action_id"]);
-        requireSession(request);
+        await requireSession(request);
         const model = requiredText(request, "model", 256);
         const models = await activeQuery.supportedModels();
         if (!models.some((row) => row.value === model)) throw new Error("model is not in the live SDK catalog");
@@ -1143,7 +1310,7 @@ async function handle(request) {
       }
       case "set_permission_mode": {
         exactFields(request, ["session_id", "mode", "client_action_id"]);
-        requireSession(request);
+        await requireSession(request);
         const mode = requiredText(request, "mode", 64);
         if (!SAFE_PERMISSION_MODES.has(mode)) {
           reject(request, "safe_mode_required", "permission mode is not approved for remote control");
@@ -1163,7 +1330,7 @@ async function handle(request) {
           "approval_digest",
           "decision",
         ]);
-        requireSession(request);
+        await requireSession(request);
         const approvalId = requiredText(request, "approval_id", 256);
         const bindingId = requiredText(request, "binding_id", 256);
         const toolUseId = requiredText(request, "tool_use_id", 256);
@@ -1204,7 +1371,7 @@ async function handle(request) {
           "decision",
           "answers",
         ]);
-        requireSession(request);
+        await requireSession(request);
         const questionRequestId = requiredText(
           request,
           "question_request_id",
@@ -1311,7 +1478,7 @@ async function handle(request) {
       }
       case "read_commands": {
         exactFields(request, []);
-        requireActiveQuery();
+        await requireActiveQuery();
         const commands = await activeQuery.supportedCommands();
         reply(request, {
           commands: commands.map((row) => ({
@@ -1325,7 +1492,7 @@ async function handle(request) {
       }
       case "read_agents": {
         exactFields(request, ["session_id"]);
-        requireSession(request);
+        await requireSession(request);
         const agents = await activeQuery.supportedAgents();
         reply(request, {
           agents: agents.map((row) => ({
@@ -1338,7 +1505,7 @@ async function handle(request) {
       }
       case "read_status": {
         exactFields(request, ["session_id"]);
-        requireSession(request);
+        await requireSession(request);
         const liveInitialization = await activeQuery.initializationResult();
         reply(request, {
           status: {
@@ -1355,14 +1522,14 @@ async function handle(request) {
       }
       case "read_mcp": {
         exactFields(request, []);
-        requireActiveQuery();
+        await requireActiveQuery();
         const status = await activeQuery.mcpServerStatus();
         reply(request, { servers: status.map((row) => ({ name: bounded(row.name, 256), status: row.status })) });
         return;
       }
       case "mcp_reconnect": {
         exactFields(request, ["session_id", "server_id", "client_action_id"]);
-        requireSession(request);
+        await requireSession(request);
         const serverId = requiredText(request, "server_id", 256);
         const status = await activeQuery.mcpServerStatus();
         if (!status.some((row) => row.name === serverId)) throw new Error("MCP server is not in the live SDK catalog");
@@ -1372,7 +1539,7 @@ async function handle(request) {
       }
       case "mcp_set_enabled": {
         exactFields(request, ["session_id", "server_id", "enabled", "client_action_id"]);
-        requireSession(request);
+        await requireSession(request);
         const serverId = requiredText(request, "server_id", 256);
         if (typeof request.enabled !== "boolean") throw new Error("enabled must be boolean");
         const status = await activeQuery.mcpServerStatus();
@@ -1387,7 +1554,7 @@ async function handle(request) {
       }
       case "read_account": {
         exactFields(request, []);
-        requireActiveQuery();
+        await requireActiveQuery();
         const account = await activeQuery.accountInfo();
         reply(request, {
           organization: bounded(account?.organization || "", 500),
@@ -1398,13 +1565,13 @@ async function handle(request) {
       }
       case "read_context": {
         exactFields(request, ["session_id"]);
-        requireSession(request);
+        await requireSession(request);
         reply(request, { context: await activeQuery.getContextUsage() });
         return;
       }
       case "read_history": {
         exactFields(request, ["session_id"]);
-        requireSession(request);
+        await requireSession(request);
         if (typeof sdk.getSessionMessages !== "function") throw new Error("session history is unavailable");
         const messages = await sdk.getSessionMessages(activeSessionId, { dir: activeProject });
         reply(request, { messages: projectHistoryMessages(messages) });
@@ -1412,7 +1579,7 @@ async function handle(request) {
       }
       case "read_diagnostics": {
         exactFields(request, []);
-        requireActiveQuery();
+        await requireActiveQuery();
         reply(request, {
           diagnostics: {
             session_id: activeSessionId,
@@ -1432,11 +1599,15 @@ async function handle(request) {
   }
 }
 
-function requireActiveQuery() {
-  if (!activeQuery || !activeSessionId || !activeBindingId) throw new Error("Claude SDK session is unavailable");
+async function requireActiveQuery() {
+  if (!activeSessionId || !activeBindingId) {
+    throw new Error("Claude SDK session is unavailable");
+  }
+  return ensureActiveQuery();
 }
 
 async function shutdown() {
+  logicalSessionClosed = true;
   for (const [approvalId, waiter] of permissionWaiters) {
     denyWaiter(approvalId, waiter, "Claude sidecar closed");
   }
@@ -1449,8 +1620,8 @@ async function shutdown() {
   }
   inputQueue?.close();
   activeQuery?.close();
-  activeQuery = null;
   await Promise.race([queryConsumer || Promise.resolve(), new Promise((resolve) => setTimeout(resolve, 250))]);
+  activeQuery = null;
 }
 
 process.once("SIGTERM", () => {

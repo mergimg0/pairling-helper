@@ -41,11 +41,13 @@ _FIXED_EXEC_ARGS = (
     "--output-format",
     "stream-jsonrpc",
 )
+_READ_ONLY_INTERACTION_MODE = "auto"
+_READ_ONLY_AUTONOMY_LEVEL = "off"
 _REQUIRED_HELP_TOKENS = (
     "--input-format",
     "stream-jsonrpc",
     "--output-format",
-    "--use-spec",
+    "--auto",
     "--cwd",
 )
 _UNSTABLE_CHANNEL_MARKERS = (
@@ -236,6 +238,61 @@ def _safe_identifier(value: Any, *, limit: int = 512) -> str | None:
     return value
 
 
+def _droid_session_id_matches(
+    requested_session_id: str | None,
+    native_session_id: str,
+) -> bool:
+    return requested_session_id in {
+        native_session_id,
+        f"droid:{native_session_id}",
+    }
+
+
+def _native_control_session_id(
+    session_id: Any,
+    session_truth: Mapping[str, Any] | None,
+    *,
+    binding_id: str,
+) -> str:
+    requested = _safe_identifier(session_id)
+    if requested is None:
+        raise FactoryDroidUnavailable("invalid_session_id")
+    if not requested.startswith("droid:"):
+        if (
+            isinstance(session_truth, Mapping)
+            and session_truth.get("native_id") is not None
+        ):
+            native_id = _safe_identifier(
+                session_truth.get("native_id")
+            )
+            if (
+                native_id != requested
+                or session_truth.get("provider_id") != "droid"
+                or session_truth.get("session_id") != requested
+                or session_truth.get("binding_id") != binding_id
+            ):
+                raise FactoryDroidStaleControl(
+                    "session_truth_identity_stale"
+                )
+        return requested
+    if not isinstance(session_truth, Mapping):
+        raise FactoryDroidStaleControl(
+            "session_truth_identity_stale"
+        )
+    native_id = _safe_identifier(session_truth.get("native_id"))
+    if (
+        native_id is None
+        or requested != f"droid:{native_id}"
+        or session_truth.get("provider_id") != "droid"
+        or session_truth.get("session_id") != requested
+        or session_truth.get("binding_id") != binding_id
+    ):
+        raise FactoryDroidStaleControl(
+            "session_truth_identity_stale"
+        )
+    return native_id
+
+
 def _droid_operation_id(
     binding_id: str,
     capability_generation: int,
@@ -419,8 +476,8 @@ def probe_factory_droid_launch(
             "args": _FIXED_EXEC_ARGS,
             "version": version,
             "protocol": DROID_PROTOCOL_VERSION,
-            "default_mode": "spec",
-            "default_autonomy": "off",
+            "default_mode": _READ_ONLY_INTERACTION_MODE,
+            "default_autonomy": _READ_ONLY_AUTONOMY_LEVEL,
             "skip_permissions_unsafe": False,
             "help_digest": help_digest,
         },
@@ -911,6 +968,8 @@ class _DroidJsonRpcProcess:
 
 class FactoryDroidJsonRpcDriver:
     """Pinned, local, public JSON-RPC driver for one Factory Droid binding."""
+    generation_refresh_safe = True
+
 
     binding: ProviderControlBinding
 
@@ -978,6 +1037,132 @@ class FactoryDroidJsonRpcDriver:
         ] = OrderedDict()
 
     @property
+    def capability_generation(self) -> int:
+        with self._state_lock:
+            return self._capability_generation
+
+    def refresh_session_binding(
+        self,
+        session_truth: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        if not isinstance(session_truth, Mapping):
+            raise FactoryDroidStaleControl(
+                "managed_generation_truth_shape_stale"
+            )
+        persisted_generation = session_truth.get(
+            "capability_generation"
+        )
+        cwd_value = session_truth.get("cwd")
+        if (
+            isinstance(persisted_generation, bool)
+            or not isinstance(persisted_generation, int)
+            or not isinstance(cwd_value, (str, Path))
+        ):
+            raise FactoryDroidStaleControl(
+                "managed_generation_truth_shape_stale"
+            )
+        try:
+            expected_cwd = _safe_cwd(cwd_value)
+        except FactoryDroidError as exc:
+            raise FactoryDroidStaleControl(
+                "managed_generation_workspace_stale"
+            ) from exc
+        with self._state_lock:
+            current_id = self._current_session_id
+            generation = self._capability_generation
+            target = self._session_target
+            transport = self._transport
+            if (
+                current_id is None
+                or session_truth.get("provider_id") != "droid"
+                or session_truth.get("binding_id")
+                != self.binding.binding_id
+                or session_truth.get("provider_version")
+                != self.binding.provider_version
+                or session_truth.get("provider_channel")
+                != self.binding.provider_channel
+                or session_truth.get("session_id")
+                != f"droid:{current_id}"
+                or session_truth.get("native_id") != current_id
+                or session_truth.get("managed") is not True
+                or session_truth.get("owner") != "provider_driver"
+            ):
+                raise FactoryDroidStaleControl(
+                    "managed_generation_truth_identity_stale"
+                )
+            if (
+                session_truth.get("driver_available") is not True
+                or session_truth.get("lifecycle")
+                not in {"launching", "running", "waiting"}
+                or persisted_generation < 1
+                or persisted_generation >= generation
+            ):
+                raise FactoryDroidStaleControl(
+                    "managed_generation_truth_state_stale"
+                )
+            if self._cwd != expected_cwd:
+                raise FactoryDroidStaleControl(
+                    "managed_generation_workspace_stale"
+                )
+            reconnect_required = (
+                transport is None
+                or not transport.healthy
+                or target is None
+                or target.session_id != current_id
+                or target.binding_id != self.binding.binding_id
+                or target.capability_generation != generation
+                or target.cwd != expected_cwd
+            )
+        if reconnect_required:
+            self.attach_session(
+                current_id,
+                expected_cwd=expected_cwd,
+            )
+        with self._state_lock:
+            current_id = self._current_session_id
+            generation = self._capability_generation
+            target = self._session_target
+            if (
+                current_id is None
+                or session_truth.get("session_id")
+                != f"droid:{current_id}"
+                or session_truth.get("native_id") != current_id
+            ):
+                raise FactoryDroidStaleControl(
+                    "managed_generation_reconnect_identity_stale"
+                )
+            if persisted_generation >= generation:
+                raise FactoryDroidStaleControl(
+                    "managed_generation_reconnect_state_stale"
+                )
+            if self._cwd != expected_cwd:
+                raise FactoryDroidStaleControl(
+                    "managed_generation_reconnect_workspace_stale"
+                )
+            if (
+                target is None
+                or target.session_id != current_id
+                or target.binding_id != self.binding.binding_id
+                or target.capability_generation != generation
+                or target.cwd != expected_cwd
+            ):
+                raise FactoryDroidStaleControl(
+                    "managed_generation_reconnect_target_stale"
+                )
+            return {
+                "binding_id": self.binding.binding_id,
+                "session_id": f"droid:{current_id}",
+                "native_session_id": current_id,
+                "capability_generation": generation,
+                "generation_resume_cursor": (
+                    f"{generation}:0:"
+                    f"{self.launch_evidence.launch_digest[:16]}"
+                ),
+                "lifecycle": "live",
+                "driver_available": True,
+            }
+
+    @property
     def session_id(self) -> str | None:
         with self._state_lock:
             return self._current_session_id
@@ -996,8 +1181,8 @@ class FactoryDroidJsonRpcDriver:
         params: dict[str, Any] = {
             "machineId": "pairling-local",
             "cwd": str(safe_cwd),
-            "interactionMode": "spec",
-            "autonomyLevel": "off",
+            "interactionMode": _READ_ONLY_INTERACTION_MODE,
+            "autonomyLevel": _READ_ONLY_AUTONOMY_LEVEL,
             "skipPermissionsUnsafe": False,
             "worktree": bool(worktree),
         }
@@ -1020,7 +1205,7 @@ class FactoryDroidJsonRpcDriver:
                 result,
                 expected_cwd=None if worktree else safe_cwd,
             )
-            if not self._is_spec_read_only():
+            if not self._is_read_only():
                 raise FactoryDroidUnavailable(
                     "owned_session_not_read_only"
                 )
@@ -1045,17 +1230,21 @@ class FactoryDroidJsonRpcDriver:
             if first_prompt:
                 if not isinstance(first_prompt, str) or len(first_prompt) > 200_000:
                     raise FactoryDroidUnavailable("message_text_invalid")
+                with self._state_lock:
+                    self._working_state = "running"
                 self._rpc(
                     "droid.add_user_message",
                     {
-                        "messageId": "managed-launch-first-prompt",
+                        "messageId": str(uuid.uuid4()).lower(),
                         "text": first_prompt,
                     },
                 )
-                with self._state_lock:
-                    self._working_state = "running"
             with self._state_lock:
                 generation = self._capability_generation
+                generation_resume_cursor = (
+                    f"{generation}:0:"
+                    f"{self.launch_evidence.launch_digest[:16]}"
+                )
             return {
                 "provider_id": self.binding.provider_id,
                 "provider_version": self.binding.provider_version,
@@ -1063,6 +1252,7 @@ class FactoryDroidJsonRpcDriver:
                 "binding_id": self.binding.binding_id,
                 "native_session_id": native_id,
                 "capability_generation": generation,
+                "provider_cursor": generation_resume_cursor,
             }
         except BaseException:
             self.close()
@@ -1087,14 +1277,16 @@ class FactoryDroidJsonRpcDriver:
             )
             result = self._require_object(call.result, "load result")
             self._adopt_session(safe_session_id, result, expected_cwd=expected)
-            if not self._is_spec_read_only():
+            if not self._is_read_only():
                 self._update_settings(
                     {
-                        "interactionMode": "spec",
-                        "autonomyLevel": "off",
+                        "interactionMode": _READ_ONLY_INTERACTION_MODE,
+                        "autonomyLevel": _READ_ONLY_AUTONOMY_LEVEL,
                     }
                 )
-                self._cancel_pending_approvals("attach_lowered_to_spec")
+                self._cancel_pending_approvals(
+                    "attach_lowered_to_read_only"
+                )
             self._verify_capability_canaries()
         except BaseException:
             self.close()
@@ -1148,65 +1340,68 @@ class FactoryDroidJsonRpcDriver:
                         "provider.usage.read",
                     ]
                 )
-                if self._working_state == "idle":
-                    operations.extend(
-                        [
-                            "session.prompt.send",
-                            "session.compact",
-                            "session.model.set",
-                            "session.reasoning.set",
-                            "session.permissions.set",
-                            "session.plan.start",
-                        ]
-                    )
-                    reviewed_target = self._reviewed_target_locked(
-                        require_fresh=True
-                    )
-                    if (
-                        target is not None
-                        and reviewed_target is not None
-                        and target == reviewed_target
-                    ):
-                        target_choices = (
-                            ControlChoice(
-                                reviewed_target.session_id,
-                                "Current Factory Droid session",
-                            ),
-                        )
+                if session_id is not None:
+                    if self._working_state == "idle":
                         operations.extend(
-                            ["session.resume", "session.fork"]
+                            [
+                                "session.prompt.send",
+                                "session.compact",
+                                "session.model.set",
+                                "session.reasoning.set",
+                                "session.permissions.set",
+                            ]
                         )
-                        choices.extend(
-                            (
-                                ControlChoices(
-                                    "session.resume",
-                                    "target_session",
-                                    target_choices,
-                                ),
-                                ControlChoices(
-                                    "session.fork",
-                                    "target_session",
-                                    target_choices,
+                        reviewed_target = self._reviewed_target_locked(
+                            require_fresh=True
+                        )
+                        if (
+                            target is not None
+                            and reviewed_target is not None
+                            and target == reviewed_target
+                        ):
+                            target_choices = (
+                                ControlChoice(
+                                    reviewed_target.session_id,
+                                    "Current Factory Droid session",
                                 ),
                             )
+                            operations.extend(
+                                ["session.resume", "session.fork"]
+                            )
+                            choices.extend(
+                                (
+                                    ControlChoices(
+                                        "session.resume",
+                                        "target_session",
+                                        target_choices,
+                                    ),
+                                    ControlChoices(
+                                        "session.fork",
+                                        "target_session",
+                                        target_choices,
+                                    ),
+                                )
+                            )
+                    else:
+                        operations.extend(
+                            ["session.turn.steer", "session.turn.interrupt"]
                         )
-                else:
-                    operations.extend(
-                        ["session.turn.steer", "session.turn.interrupt"]
+                    operations.append("session.terminate")
+                    identity = ProviderSessionIdentity(
+                        "droid",
+                        session_id,
+                        self.binding.binding_id,
+                        generation,
                     )
-                operations.append("session.terminate")
-                identity = ProviderSessionIdentity(
-                    "droid", current_id, self.binding.binding_id, generation
-                )
-                for operation_id in operations:
-                    if operation_id.startswith("session."):
-                        values.append(
-                            ControlValue(operation_id, "session", identity)
-                        )
-                self._append_model_choices(operations, values, choices)
-                self._append_permission_choices(operations, values, choices)
-                self._append_approval_choices(operations, choices)
-                self._append_questionnaire_values(operations, values, choices)
+                    for operation_id in operations:
+                        if operation_id.startswith("session."):
+                            values.append(
+                                ControlValue(operation_id, "session", identity)
+                            )
+                    self._append_model_choices(operations, values, choices)
+                    self._append_permission_choices(operations, values, choices)
+                    self._append_approval_choices(operations, choices)
+                    self._append_questionnaire_values(operations, values, choices)
             observed = time.time()
             return ProviderControlSnapshot(
                 provider_id="droid",
@@ -1238,14 +1433,22 @@ class FactoryDroidJsonRpcDriver:
             raise FactoryDroidUnsupportedOperation(
                 "operation_correlation_not_supported"
             )
+        native_session_id = _native_control_session_id(
+            session_id,
+            session_truth,
+            binding_id=self.binding.binding_id,
+        )
         with self._state_lock:
             current_session_id = self._current_session_id
             current_generation = self._capability_generation
-            healthy = self._transport is not None and self._transport.healthy
+            healthy = (
+                self._transport is not None
+                and self._transport.healthy
+            )
             cursor = self._provider_cursor_locked()
         if (
             not healthy
-            or current_session_id != session_id
+            or current_session_id != native_session_id
             or capability_generation != current_generation
             or not isinstance(session_truth, dict)
             or session_truth.get("provider_id") != "droid"
@@ -1303,7 +1506,6 @@ class FactoryDroidJsonRpcDriver:
             "session.permissions.set",
             "session.approval.decide",
             "session.question.answer",
-            "session.plan.start",
             "provider.config.read",
             "provider.commands.read",
             "provider.mcp.read",
@@ -1786,7 +1988,13 @@ class FactoryDroidJsonRpcDriver:
             raise FactoryDroidUnavailable("cwd_canary_failed")
         mode = settings.get("interactionMode")
         autonomy = settings.get("autonomyLevel")
-        if (mode, autonomy) not in {("spec", "off"), ("auto", "low")}:
+        if (mode, autonomy) not in {
+            (
+                _READ_ONLY_INTERACTION_MODE,
+                _READ_ONLY_AUTONOMY_LEVEL,
+            ),
+            ("auto", "low"),
+        }:
             raise FactoryDroidUnavailable("permission_policy_canary_failed")
         tools = self._require_object(
             self._rpc(
@@ -1858,11 +2066,13 @@ class FactoryDroidJsonRpcDriver:
             self._mcp_tools = _sanitize(mcp_tools_result["tools"])
             self._commands = _sanitize(commands_result["commands"])
 
-    def _is_spec_read_only(self) -> bool:
+    def _is_read_only(self) -> bool:
         with self._state_lock:
             return (
-                self._settings.get("interactionMode") == "spec"
-                and self._settings.get("autonomyLevel") == "off"
+                self._settings.get("interactionMode")
+                == _READ_ONLY_INTERACTION_MODE
+                and self._settings.get("autonomyLevel")
+                == _READ_ONLY_AUTONOMY_LEVEL
             )
 
     def _reviewed_target_locked(
@@ -1985,9 +2195,11 @@ class FactoryDroidJsonRpcDriver:
         session_id: str,
         session_truth: Mapping[str, Any] | None,
     ) -> None:
-        safe_session_id = _safe_identifier(session_id)
-        if safe_session_id is None:
-            raise FactoryDroidUnavailable("invalid_session_id")
+        safe_session_id = _native_control_session_id(
+            session_id,
+            session_truth,
+            binding_id=self.binding.binding_id,
+        )
         expected_cwd = None
         if (
             isinstance(session_truth, Mapping)
@@ -2017,7 +2229,14 @@ class FactoryDroidJsonRpcDriver:
         if generation != self._capability_generation:
             raise FactoryDroidStaleControl("capability_generation_stale")
         if operation_id.startswith("session."):
-            if session_id is None or session_id != self._current_session_id:
+            if (
+                session_id is None
+                or self._current_session_id is None
+                or not _droid_session_id_matches(
+                    session_id,
+                    self._current_session_id,
+                )
+            ):
                 raise FactoryDroidStaleControl("session_id_stale")
             if self._transport is None or not self._transport.healthy:
                 raise FactoryDroidStaleControl("provider_connection_stale")
@@ -2120,7 +2339,7 @@ class FactoryDroidJsonRpcDriver:
             with self._state_lock:
                 public = {
                     "protocol_version": DROID_PROTOCOL_VERSION,
-                    "read_only": self._is_spec_read_only(),
+                    "read_only": self._is_read_only(),
                     "session_id": self._current_session_id,
                     "cwd": str(self._cwd) if self._cwd is not None else None,
                     "sandbox": _sanitize(self._settings.get("sandbox")),
@@ -2284,10 +2503,10 @@ class FactoryDroidJsonRpcDriver:
             )
         if operation_id == "session.permissions.set":
             permission = payload.get("permissions")
-            if permission == "spec":
+            if permission == "read-only":
                 params = {
-                    "interactionMode": "spec",
-                    "autonomyLevel": "off",
+                    "interactionMode": _READ_ONLY_INTERACTION_MODE,
+                    "autonomyLevel": _READ_ONLY_AUTONOMY_LEVEL,
                 }
             elif permission == "auto-low":
                 with self._state_lock:
@@ -2311,9 +2530,9 @@ class FactoryDroidJsonRpcDriver:
                     "permission_mode_not_advertised"
                 )
             call = self._update_settings(params)
-            if permission == "spec":
+            if permission == "read-only":
                 self._cancel_pending_approvals(
-                    "permissions_lowered_to_spec"
+                    "permissions_lowered_to_read_only"
                 )
             self._verify_capability_canaries()
             return self._rpc_result(
@@ -2326,23 +2545,6 @@ class FactoryDroidJsonRpcDriver:
             return self._decide_approval(payload)
         if operation_id == "session.question.answer":
             return self._answer_questionnaire(payload)
-        if operation_id == "session.plan.start":
-            call = self._update_settings(
-                {
-                    "interactionMode": "spec",
-                    "autonomyLevel": "off",
-                }
-            )
-            self._cancel_pending_approvals(
-                "plan_mode_started"
-            )
-            self._verify_capability_canaries()
-            return self._rpc_result(
-                operation_id,
-                call,
-                OperationResultStatus.APPLIED,
-                {"mode": "spec"},
-            )
         raise FactoryDroidUnsupportedOperation(
             "unreviewed_pairling_operation"
         )
@@ -2651,7 +2853,7 @@ class FactoryDroidJsonRpcDriver:
         if "session.permissions.set" not in operations:
             return
         permission_choices = [
-            ControlChoice("spec", "Read-only spec")
+            ControlChoice("read-only", "Read-only")
         ]
         sandbox = self._settings.get("sandbox")
         if (
@@ -2673,7 +2875,7 @@ class FactoryDroidJsonRpcDriver:
             "auto-low"
             if self._settings.get("interactionMode") == "auto"
             and self._settings.get("autonomyLevel") == "low"
-            else "spec"
+            else "read-only"
         )
         values.append(
             ControlValue(
@@ -2804,23 +3006,38 @@ class FactoryDroidJsonRpcDriver:
         notification_type = notification.get("type")
         with self._state_lock:
             if notification_type == "droid_working_state_changed":
-                state = notification.get("state")
-                if isinstance(state, str):
-                    self._working_state = (
-                        "idle" if state == "idle" else state
+                state = notification.get("newState")
+                if not isinstance(state, str) or not state:
+                    raise FactoryDroidProtocolError(
+                        "working_state_notification_invalid"
                     )
+                self._working_state = state
+                public_state = (
+                    "idle" if state == "idle" else "running"
+                )
                 self._append_event_locked(
-                    "working_state", {"state": self._working_state}
+                    "lifecycle",
+                    {
+                        "subtype": public_state,
+                        "status": public_state,
+                        "provider_state": state,
+                    },
                 )
             elif notification_type in {
                 "assistant_text_delta",
                 "thinking_text_delta",
             }:
                 self._append_event_locked(
-                    notification_type,
+                    (
+                        "partial_text"
+                        if notification_type
+                        == "assistant_text_delta"
+                        else "block_thinking"
+                    ),
                     {
                         "message_id": notification.get("messageId"),
                         "block_index": notification.get("blockIndex"),
+                        "role": "assistant",
                         "text": _bounded_text(
                             notification.get("textDelta", "")
                         ),
@@ -2835,6 +3052,15 @@ class FactoryDroidJsonRpcDriver:
                     {
                         "message_id": notification.get("messageId"),
                         "block_index": notification.get("blockIndex"),
+                    },
+                )
+            elif notification_type == "agent_turn_completed":
+                self._append_event_locked(
+                    "lifecycle",
+                    {
+                        "subtype": "completed",
+                        "status": "completed",
+                        "message_id": notification.get("messageId"),
                     },
                 )
             elif notification_type == "settings_updated":
@@ -3006,8 +3232,10 @@ class FactoryDroidJsonRpcDriver:
                 "permission_request_has_no_safe_cancel"
             )
         if (
-            self._settings.get("interactionMode") == "spec"
-            and self._settings.get("autonomyLevel") == "off"
+            self._settings.get("interactionMode")
+            == _READ_ONLY_INTERACTION_MODE
+            and self._settings.get("autonomyLevel")
+            == _READ_ONLY_AUTONOMY_LEVEL
         ):
             offered = ["cancel"]
         tool_uses = params.get("toolUses")

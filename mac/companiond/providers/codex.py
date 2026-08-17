@@ -53,6 +53,17 @@ class CodexProviderAdapter(ProviderAdapter):
             Path("/usr/local/bin/codex"),
         ]
 
+    def managed_launch_provider_version(self) -> str | None:
+        env_var = _ENTRY.env_override if _ENTRY is not None else "PAIRLING_CODEX_BIN"
+        resolved = resolve_executable("codex", self.candidates, env_var=env_var)
+        if resolved is None:
+            return None
+        observed = cli_version(resolved.path)
+        if not is_compatible_codex_app_server_version(observed):
+            return None
+        return normalized_codex_app_server_version(observed)
+
+
     def create_control_driver(
         self,
         binding: ProviderControlBinding,

@@ -17,7 +17,14 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
+
+from providers.controls import (
+    OperationResultStatus,
+    ProviderOperationCorrelation,
+    ProviderSessionIdentity,
+    execute_provider_operation,
+)
 
 
 _TERMINAL_CAPABILITIES = frozenset({
@@ -50,6 +57,41 @@ _METADATA_KEYS = frozenset({
     "reasoning", "permission", "command_id", "session_update", "plan_step",
 })
 _LIVE_LIFECYCLES = frozenset({"launching", "running", "waiting", "blocked", "closing"})
+_PROTOCOL_SESSION_ID_RE = re.compile(r"ses_[A-Za-z0-9_-]{16,128}\Z")
+_PROTOCOL_ID_PATTERNS = {
+    "request": re.compile(r"req_[A-Za-z0-9_-]{16,128}\Z"),
+    "negotiation context": re.compile(r"neg_[A-Za-z0-9_-]{16,128}\Z"),
+    "action": re.compile(r"act_[A-Za-z0-9_-]{16,128}\Z"),
+    "snapshot": re.compile(r"snp_[A-Za-z0-9_-]{16,128}\Z"),
+    "lease": re.compile(r"lea_[A-Za-z0-9_-]{16,128}\Z"),
+    "confirmation": re.compile(r"cnf_[A-Za-z0-9_-]{16,128}\Z"),
+    "recovery": re.compile(r"rec_[A-Za-z0-9_-]{16,128}\Z"),
+    "event": re.compile(r"evt_[A-Za-z0-9_-]{16,128}\Z"),
+}
+_PROTOCOL_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_PROTOCOL_ACTION_STATES = frozenset({
+    "reserved",
+    "dispatch_started",
+    "applied",
+    "rejected",
+    "in_progress",
+    "outcome_unknown",
+})
+_PROTOCOL_ACTION_TRANSITIONS = {
+    "reserved": frozenset({"rejected", "dispatch_started"}),
+    "dispatch_started": frozenset({
+        "applied", "rejected", "in_progress", "outcome_unknown",
+    }),
+    "in_progress": frozenset({
+        "applied", "rejected", "in_progress", "outcome_unknown",
+    }),
+    "outcome_unknown": frozenset({
+        "applied", "rejected", "outcome_unknown",
+    }),
+    "applied": frozenset({"applied"}),
+    "rejected": frozenset({"rejected"}),
+}
+_MAX_PROTOCOL_RECORD_BYTES = 2 * 1024 * 1024
 _MAX_VISIBLE_TEXT = 64 * 1024
 _MAX_INPUT_TEXT = 16 * 1024
 _MAX_METADATA_TEXT = 2048
@@ -97,8 +139,21 @@ class ManagedProviderForkOutcomeUnknown(ManagedProviderSessionError):
     code = "managed_provider_fork_outcome_unknown"
 
 
+class ManagedProviderFirstPromptOutcomeUnknown(ManagedProviderSessionError):
+    code = "managed_provider_first_prompt_outcome_unknown"
+    outcome_indeterminate = True
+
+    def __init__(self, message: str, *, session_id: str):
+        super().__init__(message)
+        self.session_id = str(session_id)
+
+
 class ManagedProviderBindingStale(ManagedProviderSessionError):
     code = "managed_session_binding_stale"
+
+
+class ManagedSessionControlStateError(ManagedProviderSessionError):
+    code = "managed_session_control_state_invalid"
 
 
 def _qualified_session_id(provider: str, native_id: str) -> str:
@@ -109,6 +164,97 @@ def _qualified_session_id(provider: str, native_id: str) -> str:
     if not native_id or len(native_id) > 512 or any(ch in native_id for ch in "\r\n\0"):
         raise ValueError("invalid native session id")
     return f"{provider}:{native_id}"
+
+
+def _new_protocol_session_id() -> str:
+    return f"ses_{secrets.token_urlsafe(24)}"
+
+
+def _validate_protocol_session_id(value: Any) -> str:
+    protocol_session_id = str(value or "")
+    if _PROTOCOL_SESSION_ID_RE.fullmatch(protocol_session_id) is None:
+        raise ManagedProviderSessionError(
+            "managed protocol session identity is invalid"
+        )
+    return protocol_session_id
+
+
+def _validate_protocol_id(kind: str, value: Any) -> str:
+    identity = str(value or "")
+    pattern = _PROTOCOL_ID_PATTERNS[kind]
+    if pattern.fullmatch(identity) is None:
+        raise ManagedSessionControlStateError(
+            f"protocol {kind} identity is invalid"
+        )
+    return identity
+
+
+def _validate_protocol_digest(value: Any) -> str:
+    digest = str(value or "")
+    if _PROTOCOL_DIGEST_RE.fullmatch(digest) is None:
+        raise ManagedSessionControlStateError("protocol digest is invalid")
+    return digest
+
+
+def _protocol_text(name: str, value: Any, *, limit: int = 512) -> str:
+    text = str(value or "")
+    if (
+        not text
+        or len(text) > limit
+        or any(character in text for character in "\r\n\0")
+    ):
+        raise ManagedSessionControlStateError(
+            f"protocol {name} is invalid"
+        )
+    return text
+
+
+def _protocol_time(name: str, value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ManagedSessionControlStateError(f"protocol {name} is invalid")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ManagedSessionControlStateError(f"protocol {name} is invalid")
+    return result
+
+
+def _protocol_record(
+    value: bytes,
+    *,
+    expected_digest: str | None = None,
+) -> tuple[str, str]:
+    if not isinstance(value, bytes) or not value:
+        raise ManagedSessionControlStateError(
+            "canonical protocol record must be nonempty bytes"
+        )
+    if len(value) > _MAX_PROTOCOL_RECORD_BYTES:
+        raise ManagedSessionControlStateError(
+            "canonical protocol record exceeds the persistence limit"
+        )
+    try:
+        text = value.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ManagedSessionControlStateError(
+            "canonical protocol record is not UTF-8"
+        ) from exc
+    try:
+        decoded = json.loads(text)
+    except (TypeError, ValueError) as exc:
+        raise ManagedSessionControlStateError(
+            "canonical protocol record is not JSON"
+        ) from exc
+    if not isinstance(decoded, dict):
+        raise ManagedSessionControlStateError(
+            "canonical protocol record must be an object"
+        )
+    digest = f"sha256:{hashlib.sha256(value).hexdigest()}"
+    if expected_digest is not None and (
+        _validate_protocol_digest(expected_digest) != digest
+    ):
+        raise ManagedSessionControlStateError(
+            "canonical protocol record digest is mismatched"
+        )
+    return text, digest
 
 
 def _object_dict(value: Any) -> dict:
@@ -357,12 +503,24 @@ def _event_payload(event: dict) -> dict:
         payload = {}
     merged = dict(payload)
     for key in (
-        "text", "content", "role", "name", "tool_name", "call_id", "item_id",
-        "input", "is_error", "status", "reason", "message", "error", "subtype",
+        "text", "content", "delta", "role", "name", "tool_name", "call_id", "item_id",
+        "source_uuid", "message_id", "block_index", "input", "is_error",
+        "status", "reason", "message", "error", "subtype",
     ):
         if key in event and key not in merged:
             merged[key] = event[key]
     return merged
+
+
+def _managed_source_uuid(provider: str, value: Any) -> str:
+    """Return a stable public identity without exposing the provider's value."""
+    identity = _bounded_text(value, 1024).strip()
+    if not identity:
+        return ""
+    digest = hashlib.sha256(
+        f"{provider}\0{identity}".encode("utf-8", errors="replace")
+    ).hexdigest()
+    return f"managed:{digest}"
 
 
 def _normalize_kind(event: dict, payload: dict) -> tuple[str, str | None]:
@@ -371,7 +529,11 @@ def _normalize_kind(event: dict, payload: dict) -> tuple[str, str | None]:
         return source, str(payload.get("subtype") or source) if source == "lifecycle" else None
     if source in {"assistant.message", "user.message"}:
         return "block_text", None
-    if source in {"assistant.message_delta", "assistant.text_delta"}:
+    if source in {
+        "assistant.message_delta",
+        "assistant.text_delta",
+        "message.delta",
+    }:
         return "partial_text", None
     if source in {"assistant.reasoning", "assistant.reasoning_delta"}:
         return "block_thinking", None
@@ -409,14 +571,40 @@ def normalize_driver_event(event_value: Any, *, provider: str, binding_id: str,
     public_payload: dict[str, Any] = {}
     role = _bounded_text(payload.get("role") or event.get("role"), 64)
     if not role:
-        source_role = str(event.get("kind") or event.get("type") or "").partition(".")[0]
-        if source_role in {"assistant", "user", "system"}:
-            role = source_role
+        source = str(event.get("kind") or event.get("type") or "").strip().lower()
+        if source == "message.delta":
+            role = "assistant"
+        else:
+            source_role = source.partition(".")[0]
+            if source_role in {"assistant", "user", "system"}:
+                role = source_role
     if kind in {"block_text", "block_thinking", "partial_text"}:
-        text = payload.get("text", payload.get("content", payload.get("message", "")))
-        public_payload["text"] = _redact_value(text, text_limit=_MAX_VISIBLE_TEXT)
+        text = payload.get(
+            "text",
+            payload.get(
+                "content",
+                payload.get("message", payload.get("delta", "")),
+            ),
+        )
+        public_payload["text"] = _redact_value(
+            text,
+            text_limit=_MAX_VISIBLE_TEXT,
+        )
         if role:
             public_payload["role"] = role
+        source_uuid = _managed_source_uuid(
+            provider,
+            payload.get("source_uuid") or payload.get("message_id"),
+        )
+        if source_uuid:
+            public_payload["source_uuid"] = source_uuid
+        block_index = payload.get("block_index")
+        if (
+            isinstance(block_index, int)
+            and not isinstance(block_index, bool)
+            and 0 <= block_index <= 1_000_000
+        ):
+            public_payload["block_index"] = block_index
     elif kind == "tool_call":
         public_payload["name"] = _bounded_text(
             payload.get("name") or payload.get("tool_name") or "tool", 160
@@ -458,7 +646,13 @@ def normalize_driver_event(event_value: Any, *, provider: str, binding_id: str,
                 metadata[canonical] = _redact_value(
                     source[key], text_limit=_MAX_METADATA_TEXT
                 )
-    cursor = event.get("cursor") or event.get("provider_cursor")
+    # ``cursor`` may be only an event position while ``provider_cursor`` is
+    # the adapter's opaque resumable token. Persist the latter whenever the
+    # adapter supplies both; feeding the position back can invalidate the
+    # provider's generation or launch-identity proof.
+    cursor = event.get("provider_cursor")
+    if cursor is None:
+        cursor = event.get("cursor")
     event_id = event.get("event_id")
     if cursor is None:
         identity = json.dumps(
@@ -521,6 +715,16 @@ class ManagedProviderSessionStore:
                 """
                 CREATE TABLE IF NOT EXISTS managed_provider_sessions (
                     session_id TEXT PRIMARY KEY,
+                    protocol_session_id TEXT NOT NULL UNIQUE,
+                    protocol_owner_id TEXT,
+                    protocol_ownership_epoch INTEGER NOT NULL DEFAULT 0,
+                    protocol_state TEXT,
+                    protocol_state_version INTEGER NOT NULL DEFAULT 0,
+                    protocol_event_stream_id TEXT,
+                    protocol_last_event_sequence INTEGER NOT NULL DEFAULT -1,
+                    protocol_last_event_digest TEXT,
+                    protocol_terminal INTEGER NOT NULL DEFAULT 0,
+                    protocol_terminal_at REAL,
                     provider TEXT NOT NULL,
                     native_id TEXT NOT NULL,
                     binding_id TEXT NOT NULL,
@@ -601,6 +805,225 @@ class ManagedProviderSessionStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_managed_provider_forks_state
                     ON managed_provider_forks(state, updated_at);
+                CREATE TABLE IF NOT EXISTS session_control_negotiations (
+                    context_id TEXT PRIMARY KEY,
+                    principal_id TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    version_major INTEGER NOT NULL,
+                    version_minor INTEGER NOT NULL,
+                    transport_profile TEXT NOT NULL,
+                    extensions_json TEXT NOT NULL,
+                    schema_digest TEXT NOT NULL,
+                    runtime_revision TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    request_digest TEXT NOT NULL,
+                    response_json TEXT NOT NULL,
+                    response_digest TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    last_seen_at REAL NOT NULL,
+                    revoked_at REAL,
+                    UNIQUE(principal_id, request_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_control_negotiations_expiry
+                    ON session_control_negotiations(expires_at, revoked_at);
+                CREATE TABLE IF NOT EXISTS session_control_snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    protocol_session_id TEXT NOT NULL,
+                    context_id TEXT NOT NULL,
+                    principal_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    binding_digest TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    snapshot_digest TEXT NOT NULL,
+                    issued_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    created_at REAL NOT NULL,
+                    UNIQUE(protocol_session_id, generation, snapshot_digest),
+                    FOREIGN KEY(protocol_session_id)
+                        REFERENCES managed_provider_sessions(protocol_session_id),
+                    FOREIGN KEY(context_id)
+                        REFERENCES session_control_negotiations(context_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_control_snapshots_current
+                    ON session_control_snapshots(
+                        protocol_session_id, generation, expires_at DESC
+                    );
+                CREATE TABLE IF NOT EXISTS session_control_actions (
+                    action_id TEXT PRIMARY KEY,
+                    protocol_session_id TEXT NOT NULL,
+                    context_id TEXT NOT NULL,
+                    principal_id TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    binding_digest TEXT NOT NULL,
+                    operation_id TEXT NOT NULL,
+                    implementation_operation_id TEXT NOT NULL,
+                    semantic_digest TEXT NOT NULL,
+                    arguments_digest TEXT NOT NULL,
+                    mutation INTEGER NOT NULL,
+                    request_json TEXT NOT NULL,
+                    request_digest TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    provider_operation_id TEXT,
+                    provider_cursor TEXT,
+                    result_json TEXT,
+                    result_digest TEXT,
+                    reserved_at REAL NOT NULL,
+                    dispatch_started_at REAL,
+                    completed_at REAL,
+                    updated_at REAL NOT NULL,
+                    FOREIGN KEY(protocol_session_id)
+                        REFERENCES managed_provider_sessions(protocol_session_id),
+                    FOREIGN KEY(context_id)
+                        REFERENCES session_control_negotiations(context_id),
+                    FOREIGN KEY(snapshot_id)
+                        REFERENCES session_control_snapshots(snapshot_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_control_actions_recovery
+                    ON session_control_actions(
+                        protocol_session_id, state, updated_at
+                    );
+                CREATE TABLE IF NOT EXISTS session_control_authority_keys (
+                    key_id TEXT PRIMARY KEY,
+                    algorithm TEXT NOT NULL,
+                    public_key_format TEXT NOT NULL,
+                    public_key TEXT NOT NULL,
+                    hardware_backed INTEGER NOT NULL,
+                    activated_at REAL NOT NULL,
+                    retired_at REAL,
+                    verify_until REAL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                    idx_session_control_authority_keys_active
+                    ON session_control_authority_keys(retired_at)
+                    WHERE retired_at IS NULL;
+                CREATE TABLE IF NOT EXISTS session_control_leases (
+                    lease_id TEXT PRIMARY KEY,
+                    protocol_session_id TEXT NOT NULL,
+                    context_id TEXT NOT NULL,
+                    principal_id TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    binding_digest TEXT NOT NULL,
+                    epoch INTEGER NOT NULL,
+                    lease_json TEXT NOT NULL,
+                    lease_digest TEXT NOT NULL,
+                    issued_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    revoked_at REAL,
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY(protocol_session_id)
+                        REFERENCES managed_provider_sessions(protocol_session_id),
+                    FOREIGN KEY(context_id)
+                        REFERENCES session_control_negotiations(context_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_control_leases_active
+                    ON session_control_leases(
+                        protocol_session_id, scope, expires_at, revoked_at
+                    );
+                CREATE TABLE IF NOT EXISTS session_control_confirmations (
+                    confirmation_id TEXT PRIMARY KEY,
+                    protocol_session_id TEXT NOT NULL,
+                    context_id TEXT NOT NULL,
+                    principal_id TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    binding_digest TEXT NOT NULL,
+                    operation_id TEXT NOT NULL,
+                    implementation_operation_id TEXT NOT NULL,
+                    semantic_digest TEXT NOT NULL,
+                    arguments_digest TEXT NOT NULL,
+                    confirmation_json TEXT NOT NULL,
+                    confirmation_digest TEXT NOT NULL,
+                    issued_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    revoked_at REAL,
+                    consumed_action_id TEXT UNIQUE,
+                    consumed_at REAL,
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY(protocol_session_id)
+                        REFERENCES managed_provider_sessions(protocol_session_id),
+                    FOREIGN KEY(context_id)
+                        REFERENCES session_control_negotiations(context_id),
+                    FOREIGN KEY(snapshot_id)
+                        REFERENCES session_control_snapshots(snapshot_id),
+                    FOREIGN KEY(consumed_action_id)
+                        REFERENCES session_control_actions(action_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_control_confirmations_live
+                    ON session_control_confirmations(
+                        protocol_session_id, principal_id, expires_at
+                    );
+                CREATE TABLE IF NOT EXISTS session_control_recovery (
+                    recovery_id TEXT PRIMARY KEY,
+                    action_id TEXT NOT NULL UNIQUE,
+                    protocol_session_id TEXT NOT NULL,
+                    context_id TEXT NOT NULL,
+                    principal_id TEXT NOT NULL,
+                    strategy TEXT NOT NULL,
+                    handle_json TEXT NOT NULL,
+                    handle_digest TEXT NOT NULL,
+                    not_before REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    state TEXT NOT NULL,
+                    result_json TEXT,
+                    result_digest TEXT,
+                    created_at REAL NOT NULL,
+                    resolved_at REAL,
+                    FOREIGN KEY(action_id)
+                        REFERENCES session_control_actions(action_id),
+                    FOREIGN KEY(protocol_session_id)
+                        REFERENCES managed_provider_sessions(protocol_session_id),
+                    FOREIGN KEY(context_id)
+                        REFERENCES session_control_negotiations(context_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_control_recovery_live
+                    ON session_control_recovery(state, not_before, expires_at);
+                CREATE TABLE IF NOT EXISTS session_control_recovery_attempts (
+                    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recovery_id TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    request_digest TEXT NOT NULL,
+                    response_json TEXT,
+                    response_digest TEXT,
+                    outcome TEXT,
+                    started_at REAL NOT NULL,
+                    completed_at REAL,
+                    UNIQUE(recovery_id, request_digest),
+                    FOREIGN KEY(recovery_id)
+                        REFERENCES session_control_recovery(recovery_id)
+                );
+                CREATE TABLE IF NOT EXISTS session_control_events (
+                    event_id TEXT PRIMARY KEY,
+                    protocol_session_id TEXT NOT NULL,
+                    action_id TEXT,
+                    generation INTEGER NOT NULL,
+                    stream_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    previous_event_digest TEXT,
+                    event_digest TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    binding_digest TEXT NOT NULL,
+                    before_state TEXT,
+                    before_state_version INTEGER,
+                    after_state TEXT NOT NULL,
+                    after_state_version INTEGER NOT NULL,
+                    terminal INTEGER NOT NULL,
+                    event_json TEXT NOT NULL,
+                    observed_at REAL NOT NULL,
+                    created_at REAL NOT NULL,
+                    UNIQUE(protocol_session_id, generation, sequence),
+                    UNIQUE(protocol_session_id, generation, event_digest),
+                    FOREIGN KEY(protocol_session_id)
+                        REFERENCES managed_provider_sessions(protocol_session_id),
+                    FOREIGN KEY(action_id)
+                        REFERENCES session_control_actions(action_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_control_events_cursor
+                    ON session_control_events(
+                        protocol_session_id, generation, sequence
+                    );
                 """
             )
             session_columns = {
@@ -633,6 +1056,15 @@ class ManagedProviderSessionStore:
                 "fork_action_id": "TEXT",
                 "fork_reservation_token": "TEXT",
                 "fork_provider_operation_id": "TEXT",
+                "protocol_owner_id": "TEXT",
+                "protocol_ownership_epoch": "INTEGER NOT NULL DEFAULT 0",
+                "protocol_state": "TEXT",
+                "protocol_state_version": "INTEGER NOT NULL DEFAULT 0",
+                "protocol_event_stream_id": "TEXT",
+                "protocol_last_event_sequence": "INTEGER NOT NULL DEFAULT -1",
+                "protocol_last_event_digest": "TEXT",
+                "protocol_terminal": "INTEGER NOT NULL DEFAULT 0",
+                "protocol_terminal_at": "REAL",
             }
             for column, declaration in migrations.items():
                 if column not in session_columns:
@@ -640,6 +1072,52 @@ class ManagedProviderSessionStore:
                         "ALTER TABLE managed_provider_sessions "
                         f"ADD COLUMN {column} {declaration}"
                     )
+            if "protocol_session_id" not in session_columns:
+                conn.execute(
+                    "ALTER TABLE managed_provider_sessions "
+                    "ADD COLUMN protocol_session_id TEXT"
+                )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "idx_managed_provider_sessions_protocol_identity "
+                "ON managed_provider_sessions(protocol_session_id)"
+            )
+            protocol_identity_rows = conn.execute(
+                "SELECT session_id, protocol_session_id "
+                "FROM managed_provider_sessions ORDER BY session_id"
+            ).fetchall()
+            seen_protocol_session_ids: set[str] = set()
+            for row in protocol_identity_rows:
+                raw_identity = row["protocol_session_id"]
+                if raw_identity is None or not str(raw_identity):
+                    protocol_session_id = _new_protocol_session_id()
+                    while protocol_session_id in seen_protocol_session_ids:
+                        protocol_session_id = _new_protocol_session_id()
+                    conn.execute(
+                        "UPDATE managed_provider_sessions "
+                        "SET protocol_session_id=? WHERE session_id=?",
+                        (protocol_session_id, str(row["session_id"])),
+                    )
+                else:
+                    protocol_session_id = _validate_protocol_session_id(
+                        raw_identity
+                    )
+                if protocol_session_id in seen_protocol_session_ids:
+                    raise ManagedProviderSessionError(
+                        "managed protocol session identity is duplicated"
+                    )
+                seen_protocol_session_ids.add(protocol_session_id)
+            conn.execute(
+                "UPDATE managed_provider_sessions "
+                "SET protocol_last_event_sequence=-1 "
+                "WHERE protocol_last_event_sequence=0 "
+                "AND protocol_state IS NULL "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM session_control_events "
+                "WHERE session_control_events.protocol_session_id="
+                "managed_provider_sessions.protocol_session_id"
+                ")"
+            )
             fork_columns = {
                 str(row["name"])
                 for row in conn.execute(
@@ -650,6 +1128,17 @@ class ManagedProviderSessionStore:
                 conn.execute(
                     "ALTER TABLE managed_provider_forks "
                     "ADD COLUMN provider_profile_id TEXT NOT NULL DEFAULT ''"
+                )
+            confirmation_columns = {
+                str(row["name"])
+                for row in conn.execute(
+                    "PRAGMA table_info(session_control_confirmations)"
+                ).fetchall()
+            }
+            if "revoked_at" not in confirmation_columns:
+                conn.execute(
+                    "ALTER TABLE session_control_confirmations "
+                    "ADD COLUMN revoked_at REAL"
                 )
 
     @contextmanager
@@ -668,6 +1157,21 @@ class ManagedProviderSessionStore:
             raise
         finally:
             conn.close()
+
+    @staticmethod
+    def _allocate_protocol_session_id(conn: sqlite3.Connection) -> str:
+        for _attempt in range(8):
+            candidate = _new_protocol_session_id()
+            exists = conn.execute(
+                "SELECT 1 FROM managed_provider_sessions "
+                "WHERE protocol_session_id=?",
+                (candidate,),
+            ).fetchone()
+            if exists is None:
+                return candidate
+        raise ManagedProviderSessionError(
+            "could not allocate a unique protocol session identity"
+        )
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict | None:
@@ -865,10 +1369,12 @@ class ManagedProviderSessionStore:
                         f"managed session identity already bound: {session_id}"
                     )
                 return self._row(existing)
+            protocol_session_id = self._allocate_protocol_session_id(conn)
             conn.execute(
                 """
                 INSERT INTO managed_provider_sessions(
-                    session_id, provider, native_id, binding_id,
+                    session_id, protocol_session_id, provider, native_id,
+                    binding_id,
                     capability_generation, project, title, source_install_id,
                     lifecycle, capabilities_json, provider_cursor, turn_state,
                     blocked_reason, driver_available, provider_version,
@@ -878,11 +1384,12 @@ class ManagedProviderSessionStore:
                     provider_attestation_required,
                     provider_attestation_expires_at, created_at, updated_at,
                     closed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, 'running',
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, 'running',
                           NULL, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                 """,
                 (
-                    session_id, str(provider).lower(), str(native_id), binding_id,
+                    session_id, protocol_session_id,
+                    str(provider).lower(), str(native_id), binding_id,
                     generation, project,
                     _redact_value(title or "Managed session", text_limit=500),
                     _bounded_text(source_install_id, 256), json.dumps(caps),
@@ -924,6 +1431,19 @@ class ManagedProviderSessionStore:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM managed_provider_sessions WHERE session_id=?", (str(session_id),)
+            ).fetchone()
+        return self._row(row)
+
+    def get_by_protocol_session_id(
+        self,
+        protocol_session_id: str,
+    ) -> dict | None:
+        identity = _validate_protocol_session_id(protocol_session_id)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM managed_provider_sessions "
+                "WHERE protocol_session_id=?",
+                (identity,),
             ).fetchone()
         return self._row(row)
 
@@ -1278,11 +1798,13 @@ class ManagedProviderSessionStore:
             child_instance = (
                 f"{child_binding}:{child_generation}:{child_native_id}"
             )
+            child_protocol_session_id = self._allocate_protocol_session_id(conn)
             try:
                 conn.execute(
                     """
                     INSERT INTO managed_provider_sessions(
-                        session_id, provider, native_id, binding_id,
+                        session_id, protocol_session_id, provider, native_id,
+                        binding_id,
                         capability_generation, project, title,
                         source_install_id, lifecycle, capabilities_json,
                         provider_cursor, turn_state, blocked_reason,
@@ -1295,12 +1817,13 @@ class ManagedProviderSessionStore:
                         fork_parent_session_id, fork_action_id,
                         fork_reservation_token, fork_provider_operation_id,
                         created_at, updated_at, closed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'blocked', ?, ?,
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'blocked', ?, ?,
                               'blocked', ?, 0, ?, ?, ?, ?, NULL, NULL, NULL,
                               ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL)
                     """,
                     (
                         child_id,
+                        child_protocol_session_id,
                         str(reservation["provider"]),
                         str(child_native_id),
                         child_binding,
@@ -1419,9 +1942,31 @@ class ManagedProviderSessionStore:
         ]
         return {
             "session_id": row["session_id"],
+            "protocol_session_id": row["protocol_session_id"],
+            "protocol_ownership": {
+                "owner_id": row.get("protocol_owner_id"),
+                "epoch": int(row.get("protocol_ownership_epoch") or 0),
+            },
+            "protocol_typestate": {
+                "state": row.get("protocol_state"),
+                "state_version": int(row.get("protocol_state_version") or 0),
+                "terminal": bool(row.get("protocol_terminal")),
+            },
+            "protocol_cursor": {
+                "stream_id": row.get("protocol_event_stream_id"),
+                "sequence": int(
+                    row["protocol_last_event_sequence"]
+                    if row.get("protocol_last_event_sequence") is not None
+                    else -1
+                ),
+                "previous_event_digest": row.get(
+                    "protocol_last_event_digest"
+                ),
+            },
             "provider": row["provider"],
             "provider_id": row["provider"],
             "native_id": row["native_id"],
+            "turn_state": row.get("turn_state"),
             "managed": True,
             "owner": "provider_driver",
             "project": row["project"],
@@ -1583,25 +2128,33 @@ class ManagedProviderSessionStore:
         binding_id: str,
         expected_generation: int,
         capability_generation: int,
+        provider_cursor: str | None,
     ) -> dict | None:
-        """CAS a reviewed live binding's capability generation.
+        """CAS a reviewed live binding's generation and resume cursor.
 
         The manager calls this only through a driver's explicit
         ``generation_refresh_safe`` proof seam. Historical records keep the
-        generation under which they were observed.
+        generation under which they were observed, while the owner row moves
+        to the exact cursor from which the new generation can resume.
         """
         new_generation = int(capability_generation)
         if new_generation < 0:
             raise ValueError("capability_generation must be non-negative")
+        normalized_cursor = (
+            _bounded_text(provider_cursor, 512)
+            if provider_cursor is not None
+            else None
+        )
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 """
                 UPDATE managed_provider_sessions
-                SET capability_generation=?, updated_at=?
+                SET capability_generation=?, provider_cursor=?, updated_at=?
                 WHERE session_id=? AND binding_id=? AND capability_generation=?
                 """,
                 (
                     new_generation,
+                    normalized_cursor,
                     time.time(),
                     str(session_id),
                     str(binding_id),
@@ -1737,6 +2290,1802 @@ class ManagedProviderSessionStore:
         return self._row(row)
 
 
+    @staticmethod
+    def _protocol_persistence_row(row: sqlite3.Row | None) -> dict | None:
+        if row is None:
+            return None
+        result = dict(row)
+        extensions_json = result.get("extensions_json")
+        if extensions_json is not None:
+            try:
+                extensions = json.loads(extensions_json)
+            except (TypeError, ValueError) as exc:
+                raise ManagedSessionControlStateError(
+                    "persisted negotiation extensions are invalid"
+                ) from exc
+            if not isinstance(extensions, list) or not all(
+                isinstance(item, str) for item in extensions
+            ):
+                raise ManagedSessionControlStateError(
+                    "persisted negotiation extensions are invalid"
+                )
+            result["extensions"] = tuple(extensions)
+        return result
+
+    @staticmethod
+    def _active_protocol_negotiation_locked(
+        conn: sqlite3.Connection,
+        context_id: str,
+        principal_id: str,
+        *,
+        now: float,
+    ) -> sqlite3.Row:
+        row = conn.execute(
+            "SELECT * FROM session_control_negotiations WHERE context_id=?",
+            (context_id,),
+        ).fetchone()
+        if row is None:
+            raise ManagedSessionControlStateError(
+                "protocol negotiation context is unknown"
+            )
+        if str(row["principal_id"]) != principal_id:
+            raise ManagedSessionControlStateError(
+                "protocol negotiation principal is mismatched"
+            )
+        if row["revoked_at"] is not None or now >= float(row["expires_at"]):
+            raise ManagedSessionControlStateError(
+                "protocol negotiation context is expired or revoked"
+            )
+        return row
+
+    def create_protocol_negotiation(
+        self,
+        *,
+        context_id: str,
+        principal_id: str,
+        request_id: str,
+        version_major: int,
+        version_minor: int,
+        transport_profile: str,
+        extensions: Iterable[str],
+        schema_digest: str,
+        runtime_revision: str,
+        request_record: bytes,
+        response_record: bytes,
+        expires_at: float,
+        now: float | None = None,
+    ) -> tuple[dict, bool]:
+        context = _validate_protocol_id("negotiation context", context_id)
+        principal = _protocol_text("principal identity", principal_id, limit=256)
+        request = _validate_protocol_id("request", request_id)
+        major = int(version_major)
+        minor = int(version_minor)
+        if major < 0 or minor < 0:
+            raise ManagedSessionControlStateError(
+                "protocol negotiation version is invalid"
+            )
+        profile = _protocol_text(
+            "transport profile",
+            transport_profile,
+            limit=64,
+        )
+        extension_values = tuple(sorted({
+            _protocol_text("extension identity", item, limit=256)
+            for item in extensions
+        }))
+        schema = _validate_protocol_digest(schema_digest)
+        revision = _protocol_text(
+            "runtime revision",
+            runtime_revision,
+            limit=256,
+        )
+        request_json, request_digest = _protocol_record(request_record)
+        response_json, response_digest = _protocol_record(response_record)
+        created_at = time.time() if now is None else _protocol_time("time", now)
+        expiry = _protocol_time("negotiation expiry", expires_at)
+        if expiry <= created_at:
+            raise ManagedSessionControlStateError(
+                "protocol negotiation expiry is not in the future"
+            )
+        extensions_json = json.dumps(
+            extension_values,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM session_control_negotiations "
+                "WHERE context_id=? OR (principal_id=? AND request_id=?)",
+                (context, principal, request),
+            ).fetchone()
+            if existing is not None:
+                expected = {
+                    "context_id": context,
+                    "principal_id": principal,
+                    "request_id": request,
+                    "version_major": major,
+                    "version_minor": minor,
+                    "transport_profile": profile,
+                    "extensions_json": extensions_json,
+                    "schema_digest": schema,
+                    "runtime_revision": revision,
+                    "request_digest": request_digest,
+                    "response_digest": response_digest,
+                    "expires_at": expiry,
+                }
+                if any(existing[key] != value for key, value in expected.items()):
+                    raise ManagedSessionControlStateError(
+                        "protocol negotiation identity is already bound"
+                    )
+                return self._protocol_persistence_row(existing), True
+            conn.execute(
+                """
+                INSERT INTO session_control_negotiations(
+                    context_id, principal_id, request_id,
+                    version_major, version_minor, transport_profile,
+                    extensions_json, schema_digest, runtime_revision,
+                    request_json, request_digest, response_json,
+                    response_digest, created_at, expires_at,
+                    last_seen_at, revoked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    context,
+                    principal,
+                    request,
+                    major,
+                    minor,
+                    profile,
+                    extensions_json,
+                    schema,
+                    revision,
+                    request_json,
+                    request_digest,
+                    response_json,
+                    response_digest,
+                    created_at,
+                    expiry,
+                    created_at,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM session_control_negotiations WHERE context_id=?",
+                (context,),
+            ).fetchone()
+        return self._protocol_persistence_row(row), False
+
+    def protocol_negotiation(
+        self,
+        context_id: str,
+        *,
+        principal_id: str,
+        now: float | None = None,
+    ) -> dict:
+        context = _validate_protocol_id("negotiation context", context_id)
+        principal = _protocol_text("principal identity", principal_id, limit=256)
+        observed_at = time.time() if now is None else _protocol_time("time", now)
+        with self._lock, self._connect() as conn:
+            row = self._active_protocol_negotiation_locked(
+                conn,
+                context,
+                principal,
+                now=observed_at,
+            )
+            conn.execute(
+                "UPDATE session_control_negotiations "
+                "SET last_seen_at=? WHERE context_id=?",
+                (observed_at, context),
+            )
+        return self._protocol_persistence_row(row)
+
+    def revoke_protocol_negotiation(
+        self,
+        context_id: str,
+        *,
+        principal_id: str,
+        now: float | None = None,
+    ) -> None:
+        context = _validate_protocol_id("negotiation context", context_id)
+        principal = _protocol_text("principal identity", principal_id, limit=256)
+        revoked_at = time.time() if now is None else _protocol_time("time", now)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT principal_id, revoked_at "
+                "FROM session_control_negotiations WHERE context_id=?",
+                (context,),
+            ).fetchone()
+            if row is None or str(row["principal_id"]) != principal:
+                raise ManagedSessionControlStateError(
+                    "protocol negotiation context is unknown"
+                )
+            if row["revoked_at"] is None:
+                conn.execute(
+                    "UPDATE session_control_negotiations "
+                    "SET revoked_at=?, last_seen_at=? WHERE context_id=?",
+                    (revoked_at, revoked_at, context),
+                )
+
+    def publish_protocol_snapshot(
+        self,
+        *,
+        snapshot_id: str,
+        protocol_session_id: str,
+        context_id: str,
+        principal_id: str,
+        generation: int,
+        binding_digest: str,
+        snapshot_record: bytes,
+        issued_at: float,
+        expires_at: float,
+        now: float | None = None,
+    ) -> tuple[dict, bool]:
+        snapshot = _validate_protocol_id("snapshot", snapshot_id)
+        session = _validate_protocol_session_id(protocol_session_id)
+        context = _validate_protocol_id("negotiation context", context_id)
+        principal = _protocol_text("principal identity", principal_id, limit=256)
+        capability_generation = int(generation)
+        if capability_generation < 1:
+            raise ManagedSessionControlStateError(
+                "protocol snapshot generation is invalid"
+            )
+        binding = _validate_protocol_digest(binding_digest)
+        snapshot_json, snapshot_digest = _protocol_record(snapshot_record)
+        issued = _protocol_time("snapshot issue time", issued_at)
+        expiry = _protocol_time("snapshot expiry", expires_at)
+        observed_at = time.time() if now is None else _protocol_time("time", now)
+        if expiry <= issued or expiry <= observed_at:
+            raise ManagedSessionControlStateError(
+                "protocol snapshot is already expired"
+            )
+        with self._lock, self._connect() as conn:
+            negotiation = self._active_protocol_negotiation_locked(
+                conn,
+                context,
+                principal,
+                now=observed_at,
+            )
+            if expiry > float(negotiation["expires_at"]):
+                raise ManagedSessionControlStateError(
+                    "protocol snapshot outlives its negotiation context"
+                )
+            owner = conn.execute(
+                "SELECT capability_generation, closed_at "
+                "FROM managed_provider_sessions WHERE protocol_session_id=?",
+                (session,),
+            ).fetchone()
+            if (
+                owner is None
+                or int(owner["capability_generation"]) != capability_generation
+            ):
+                raise ManagedSessionControlStateError(
+                    "protocol snapshot session generation is stale"
+                )
+            existing = conn.execute(
+                "SELECT * FROM session_control_snapshots "
+                "WHERE snapshot_id=? OR "
+                "(protocol_session_id=? AND generation=? AND snapshot_digest=?)",
+                (
+                    snapshot,
+                    session,
+                    capability_generation,
+                    snapshot_digest,
+                ),
+            ).fetchone()
+            if existing is not None:
+                expected = {
+                    "snapshot_id": snapshot,
+                    "protocol_session_id": session,
+                    "context_id": context,
+                    "principal_id": principal,
+                    "generation": capability_generation,
+                    "binding_digest": binding,
+                    "snapshot_digest": snapshot_digest,
+                    "issued_at": issued,
+                    "expires_at": expiry,
+                }
+                if any(existing[key] != value for key, value in expected.items()):
+                    raise ManagedSessionControlStateError(
+                        "protocol snapshot identity is already bound"
+                    )
+                return self._protocol_persistence_row(existing), True
+            conn.execute(
+                """
+                INSERT INTO session_control_snapshots(
+                    snapshot_id, protocol_session_id, context_id,
+                    principal_id, generation, binding_digest,
+                    snapshot_json, snapshot_digest, issued_at,
+                    expires_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot,
+                    session,
+                    context,
+                    principal,
+                    capability_generation,
+                    binding,
+                    snapshot_json,
+                    snapshot_digest,
+                    issued,
+                    expiry,
+                    observed_at,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM session_control_snapshots WHERE snapshot_id=?",
+                (snapshot,),
+            ).fetchone()
+        return self._protocol_persistence_row(row), False
+
+    def current_protocol_snapshot(
+        self,
+        protocol_session_id: str,
+        *,
+        context_id: str,
+        principal_id: str,
+        now: float | None = None,
+    ) -> dict | None:
+        session = _validate_protocol_session_id(protocol_session_id)
+        context = _validate_protocol_id("negotiation context", context_id)
+        principal = _protocol_text("principal identity", principal_id, limit=256)
+        observed_at = time.time() if now is None else _protocol_time("time", now)
+        with self._connect() as conn:
+            self._active_protocol_negotiation_locked(
+                conn,
+                context,
+                principal,
+                now=observed_at,
+            )
+            row = conn.execute(
+                "SELECT * FROM session_control_snapshots "
+                "WHERE protocol_session_id=? AND context_id=? "
+                "AND principal_id=? AND expires_at>? "
+                "ORDER BY generation DESC, issued_at DESC LIMIT 1",
+                (session, context, principal, observed_at),
+            ).fetchone()
+        return self._protocol_persistence_row(row)
+
+
+    def protocol_snapshot(self, snapshot_id: str) -> dict | None:
+        snapshot = _validate_protocol_id("snapshot", snapshot_id)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM session_control_snapshots WHERE snapshot_id=?",
+                (snapshot,),
+            ).fetchone()
+        return self._protocol_persistence_row(row)
+
+    def reserve_protocol_action(
+        self,
+        *,
+        action_id: str,
+        protocol_session_id: str,
+        context_id: str,
+        principal_id: str,
+        snapshot_id: str,
+        generation: int,
+        binding_digest: str,
+        operation_id: str,
+        implementation_operation_id: str,
+        semantic_digest: str,
+        arguments_digest: str,
+        mutation: bool,
+        request_record: bytes,
+        request_digest: str | None = None,
+        now: float | None = None,
+    ) -> tuple[dict, bool]:
+        action = _validate_protocol_id("action", action_id)
+        session = _validate_protocol_session_id(protocol_session_id)
+        context = _validate_protocol_id("negotiation context", context_id)
+        principal = _protocol_text("principal identity", principal_id, limit=256)
+        snapshot = _validate_protocol_id("snapshot", snapshot_id)
+        capability_generation = int(generation)
+        if capability_generation < 1 or not isinstance(mutation, bool):
+            raise ManagedSessionControlStateError(
+                "protocol action generation or mutation class is invalid"
+            )
+        binding = _validate_protocol_digest(binding_digest)
+        operation = _protocol_text("operation identity", operation_id, limit=128)
+        implementation = _protocol_text(
+            "implementation operation identity",
+            implementation_operation_id,
+            limit=256,
+        )
+        semantic = _validate_protocol_digest(semantic_digest)
+        arguments = _validate_protocol_digest(arguments_digest)
+        request_json, calculated_request_digest = _protocol_record(
+            request_record,
+            expected_digest=request_digest,
+        )
+        reserved_at = time.time() if now is None else _protocol_time("time", now)
+        with self._lock, self._connect() as conn:
+            self._active_protocol_negotiation_locked(
+                conn,
+                context,
+                principal,
+                now=reserved_at,
+            )
+            snapshot_row = conn.execute(
+                "SELECT * FROM session_control_snapshots WHERE snapshot_id=?",
+                (snapshot,),
+            ).fetchone()
+            if (
+                snapshot_row is None
+                or str(snapshot_row["protocol_session_id"]) != session
+                or str(snapshot_row["context_id"]) != context
+                or str(snapshot_row["principal_id"]) != principal
+                or int(snapshot_row["generation"]) != capability_generation
+                or str(snapshot_row["binding_digest"]) != binding
+                or reserved_at >= float(snapshot_row["expires_at"])
+            ):
+                raise ManagedSessionControlStateError(
+                    "protocol action snapshot authority is stale"
+                )
+            owner = conn.execute(
+                "SELECT capability_generation, closed_at "
+                "FROM managed_provider_sessions WHERE protocol_session_id=?",
+                (session,),
+            ).fetchone()
+            if (
+                owner is None
+                or owner["closed_at"] is not None
+                or int(owner["capability_generation"]) != capability_generation
+            ):
+                raise ManagedSessionControlStateError(
+                    "protocol action session authority is stale"
+                )
+            existing = conn.execute(
+                "SELECT * FROM session_control_actions WHERE action_id=?",
+                (action,),
+            ).fetchone()
+            if existing is not None:
+                expected = {
+                    "protocol_session_id": session,
+                    "context_id": context,
+                    "principal_id": principal,
+                    "snapshot_id": snapshot,
+                    "generation": capability_generation,
+                    "binding_digest": binding,
+                    "operation_id": operation,
+                    "implementation_operation_id": implementation,
+                    "semantic_digest": semantic,
+                    "arguments_digest": arguments,
+                    "mutation": 1 if mutation else 0,
+                    "request_digest": calculated_request_digest,
+                }
+                if any(existing[key] != value for key, value in expected.items()):
+                    raise ManagedSessionControlStateError(
+                        "protocol action identity is already bound"
+                    )
+                return self._protocol_persistence_row(existing), True
+            conn.execute(
+                """
+                INSERT INTO session_control_actions(
+                    action_id, protocol_session_id, context_id,
+                    principal_id, snapshot_id, generation,
+                    binding_digest, operation_id,
+                    implementation_operation_id, semantic_digest,
+                    arguments_digest, mutation, request_json,
+                    request_digest, state, provider_operation_id,
+                    provider_cursor, result_json, result_digest,
+                    reserved_at, dispatch_started_at, completed_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved',
+                          NULL, NULL, NULL, NULL, ?, NULL, NULL, ?)
+                """,
+                (
+                    action,
+                    session,
+                    context,
+                    principal,
+                    snapshot,
+                    capability_generation,
+                    binding,
+                    operation,
+                    implementation,
+                    semantic,
+                    arguments,
+                    1 if mutation else 0,
+                    request_json,
+                    calculated_request_digest,
+                    reserved_at,
+                    reserved_at,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM session_control_actions WHERE action_id=?",
+                (action,),
+            ).fetchone()
+        return self._protocol_persistence_row(row), False
+
+    def protocol_action(self, action_id: str) -> dict | None:
+        action = _validate_protocol_id("action", action_id)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM session_control_actions WHERE action_id=?",
+                (action,),
+            ).fetchone()
+        return self._protocol_persistence_row(row)
+
+    def mark_protocol_action_dispatch_started(
+        self,
+        action_id: str,
+        *,
+        provider_operation_id: str | None,
+        provider_cursor: str | None,
+        now: float | None = None,
+    ) -> dict:
+        action = _validate_protocol_id("action", action_id)
+        provider_operation = (
+            _protocol_text(
+                "provider operation identity",
+                provider_operation_id,
+                limit=512,
+            )
+            if provider_operation_id is not None
+            else None
+        )
+        cursor = (
+            _protocol_text("provider cursor", provider_cursor, limit=512)
+            if provider_cursor is not None
+            else None
+        )
+        started_at = time.time() if now is None else _protocol_time("time", now)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM session_control_actions WHERE action_id=?",
+                (action,),
+            ).fetchone()
+            if row is None:
+                raise ManagedSessionControlStateError(
+                    "protocol action identity is unknown"
+                )
+            state = str(row["state"])
+            if state == "dispatch_started":
+                if (
+                    row["provider_operation_id"] != provider_operation
+                    or row["provider_cursor"] != cursor
+                ):
+                    raise ManagedSessionControlStateError(
+                        "protocol dispatch identity is already bound"
+                    )
+                return self._protocol_persistence_row(row)
+            if state != "reserved":
+                raise ManagedSessionControlStateError(
+                    "protocol action is not reservable for dispatch"
+                )
+            updated = conn.execute(
+                "UPDATE session_control_actions "
+                "SET state='dispatch_started', provider_operation_id=?, "
+                "provider_cursor=?, dispatch_started_at=?, updated_at=? "
+                "WHERE action_id=? AND state='reserved'",
+                (
+                    provider_operation,
+                    cursor,
+                    started_at,
+                    started_at,
+                    action,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ManagedSessionControlStateError(
+                    "protocol action changed during dispatch reservation"
+                )
+            row = conn.execute(
+                "SELECT * FROM session_control_actions WHERE action_id=?",
+                (action,),
+            ).fetchone()
+        return self._protocol_persistence_row(row)
+
+    def complete_protocol_action(
+        self,
+        action_id: str,
+        *,
+        state: str,
+        result_record: bytes,
+        result_digest: str | None = None,
+        now: float | None = None,
+    ) -> tuple[dict, bool]:
+        action = _validate_protocol_id("action", action_id)
+        target_state = str(state or "")
+        if target_state not in _PROTOCOL_ACTION_STATES - {
+            "reserved",
+            "dispatch_started",
+        }:
+            raise ManagedSessionControlStateError(
+                "protocol action result state is invalid"
+            )
+        result_json, calculated_result_digest = _protocol_record(
+            result_record,
+            expected_digest=result_digest,
+        )
+        completed_at = time.time() if now is None else _protocol_time("time", now)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM session_control_actions WHERE action_id=?",
+                (action,),
+            ).fetchone()
+            if row is None:
+                raise ManagedSessionControlStateError(
+                    "protocol action identity is unknown"
+                )
+            current_state = str(row["state"])
+            if (
+                current_state == target_state
+                and row["result_digest"] == calculated_result_digest
+            ):
+                return self._protocol_persistence_row(row), True
+            if target_state not in _PROTOCOL_ACTION_TRANSITIONS.get(
+                current_state,
+                frozenset(),
+            ):
+                raise ManagedSessionControlStateError(
+                    "protocol action state transition is invalid"
+                )
+            terminal_at = (
+                completed_at
+                if target_state in {"applied", "rejected"}
+                else None
+            )
+            updated = conn.execute(
+                "UPDATE session_control_actions "
+                "SET state=?, result_json=?, result_digest=?, "
+                "completed_at=?, updated_at=? "
+                "WHERE action_id=? AND state=?",
+                (
+                    target_state,
+                    result_json,
+                    calculated_result_digest,
+                    terminal_at,
+                    completed_at,
+                    action,
+                    current_state,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ManagedSessionControlStateError(
+                    "protocol action changed during result persistence"
+                )
+            row = conn.execute(
+                "SELECT * FROM session_control_actions WHERE action_id=?",
+                (action,),
+            ).fetchone()
+        return self._protocol_persistence_row(row), False
+
+    def interrupted_protocol_actions(
+        self,
+        *,
+        limit: int = 1000,
+    ) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM session_control_actions "
+                "WHERE state='dispatch_started' "
+                "ORDER BY dispatch_started_at, action_id LIMIT ?",
+                (max(1, min(int(limit), 1000)),),
+            ).fetchall()
+        return [
+            self._protocol_persistence_row(row)
+            for row in rows
+        ]
+
+    def issue_protocol_lease(
+        self,
+        *,
+        lease_id: str,
+        protocol_session_id: str,
+        context_id: str,
+        principal_id: str,
+        scope: str,
+        generation: int,
+        binding_digest: str,
+        epoch: int,
+        lease_record: bytes,
+        issued_at: float,
+        expires_at: float,
+        now: float | None = None,
+    ) -> tuple[dict, bool]:
+        lease = _validate_protocol_id("lease", lease_id)
+        session = _validate_protocol_session_id(protocol_session_id)
+        context = _validate_protocol_id("negotiation context", context_id)
+        principal = _protocol_text("principal identity", principal_id, limit=256)
+        lease_scope = str(scope or "")
+        if lease_scope not in {"input", "mutation", "approval"}:
+            raise ManagedSessionControlStateError(
+                "protocol lease scope is invalid"
+            )
+        capability_generation = int(generation)
+        ownership_epoch = int(epoch)
+        if capability_generation < 1 or ownership_epoch < 1:
+            raise ManagedSessionControlStateError(
+                "protocol lease generation or epoch is invalid"
+            )
+        binding = _validate_protocol_digest(binding_digest)
+        lease_json, lease_digest = _protocol_record(lease_record)
+        issued = _protocol_time("lease issue time", issued_at)
+        expiry = _protocol_time("lease expiry", expires_at)
+        observed_at = time.time() if now is None else _protocol_time("time", now)
+        if issued > observed_at or expiry <= observed_at:
+            raise ManagedSessionControlStateError(
+                "protocol lease is not currently valid"
+            )
+        with self._lock, self._connect() as conn:
+            negotiation = self._active_protocol_negotiation_locked(
+                conn,
+                context,
+                principal,
+                now=observed_at,
+            )
+            if expiry > float(negotiation["expires_at"]):
+                raise ManagedSessionControlStateError(
+                    "protocol lease outlives its negotiation context"
+                )
+            owner = conn.execute(
+                "SELECT capability_generation, protocol_ownership_epoch, "
+                "protocol_terminal FROM managed_provider_sessions "
+                "WHERE protocol_session_id=?",
+                (session,),
+            ).fetchone()
+            if (
+                owner is None
+                or int(owner["capability_generation"]) != capability_generation
+                or int(owner["protocol_ownership_epoch"]) != ownership_epoch
+                or bool(owner["protocol_terminal"])
+            ):
+                raise ManagedSessionControlStateError(
+                    "protocol lease session authority is stale"
+                )
+            existing = conn.execute(
+                "SELECT * FROM session_control_leases WHERE lease_id=?",
+                (lease,),
+            ).fetchone()
+            if existing is not None:
+                expected = {
+                    "protocol_session_id": session,
+                    "context_id": context,
+                    "principal_id": principal,
+                    "scope": lease_scope,
+                    "generation": capability_generation,
+                    "binding_digest": binding,
+                    "epoch": ownership_epoch,
+                    "lease_digest": lease_digest,
+                    "issued_at": issued,
+                    "expires_at": expiry,
+                }
+                if any(existing[key] != value for key, value in expected.items()):
+                    raise ManagedSessionControlStateError(
+                        "protocol lease identity is already bound"
+                    )
+                return self._protocol_persistence_row(existing), True
+            conflict = conn.execute(
+                "SELECT lease_id FROM session_control_leases "
+                "WHERE protocol_session_id=? AND scope=? "
+                "AND revoked_at IS NULL AND expires_at>?",
+                (session, lease_scope, observed_at),
+            ).fetchone()
+            if conflict is not None:
+                raise ManagedSessionControlStateError(
+                    "protocol lease scope already has an active holder"
+                )
+            conn.execute(
+                """
+                INSERT INTO session_control_leases(
+                    lease_id, protocol_session_id, context_id,
+                    principal_id, scope, generation, binding_digest,
+                    epoch, lease_json, lease_digest, issued_at,
+                    expires_at, revoked_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (
+                    lease,
+                    session,
+                    context,
+                    principal,
+                    lease_scope,
+                    capability_generation,
+                    binding,
+                    ownership_epoch,
+                    lease_json,
+                    lease_digest,
+                    issued,
+                    expiry,
+                    observed_at,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM session_control_leases WHERE lease_id=?",
+                (lease,),
+            ).fetchone()
+        return self._protocol_persistence_row(row), False
+
+    def active_protocol_leases(
+        self,
+        protocol_session_id: str,
+        *,
+        principal_id: str | None = None,
+        now: float | None = None,
+    ) -> list[dict]:
+        session = _validate_protocol_session_id(protocol_session_id)
+        observed_at = time.time() if now is None else _protocol_time("time", now)
+        parameters: list[Any] = [session, observed_at]
+        principal_clause = ""
+        if principal_id is not None:
+            principal_clause = " AND principal_id=?"
+            parameters.append(
+                _protocol_text("principal identity", principal_id, limit=256)
+            )
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM session_control_leases "
+                "WHERE protocol_session_id=? AND revoked_at IS NULL "
+                "AND expires_at>?" + principal_clause + " ORDER BY scope, lease_id",
+                parameters,
+            ).fetchall()
+        return [self._protocol_persistence_row(row) for row in rows]
+
+    def revoke_protocol_lease(
+        self,
+        lease_id: str,
+        *,
+        principal_id: str,
+        now: float | None = None,
+    ) -> None:
+        lease = _validate_protocol_id("lease", lease_id)
+        principal = _protocol_text("principal identity", principal_id, limit=256)
+        revoked_at = time.time() if now is None else _protocol_time("time", now)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT principal_id, revoked_at FROM session_control_leases "
+                "WHERE lease_id=?",
+                (lease,),
+            ).fetchone()
+            if row is None or str(row["principal_id"]) != principal:
+                raise ManagedSessionControlStateError(
+                    "protocol lease identity is unknown"
+                )
+            if row["revoked_at"] is None:
+                conn.execute(
+                    "UPDATE session_control_leases SET revoked_at=? "
+                    "WHERE lease_id=?",
+                    (revoked_at, lease),
+                )
+
+    def issue_protocol_confirmation(
+        self,
+        *,
+        confirmation_id: str,
+        protocol_session_id: str,
+        context_id: str,
+        principal_id: str,
+        snapshot_id: str,
+        generation: int,
+        binding_digest: str,
+        operation_id: str,
+        implementation_operation_id: str,
+        semantic_digest: str,
+        arguments_digest: str,
+        confirmation_record: bytes,
+        issued_at: float,
+        expires_at: float,
+        now: float | None = None,
+    ) -> tuple[dict, bool]:
+        confirmation = _validate_protocol_id("confirmation", confirmation_id)
+        session = _validate_protocol_session_id(protocol_session_id)
+        context = _validate_protocol_id("negotiation context", context_id)
+        principal = _protocol_text("principal identity", principal_id, limit=256)
+        snapshot = _validate_protocol_id("snapshot", snapshot_id)
+        capability_generation = int(generation)
+        if capability_generation < 1:
+            raise ManagedSessionControlStateError(
+                "protocol confirmation generation is invalid"
+            )
+        binding = _validate_protocol_digest(binding_digest)
+        operation = _protocol_text("operation identity", operation_id, limit=128)
+        implementation = _protocol_text(
+            "implementation operation identity",
+            implementation_operation_id,
+            limit=256,
+        )
+        semantic = _validate_protocol_digest(semantic_digest)
+        arguments = _validate_protocol_digest(arguments_digest)
+        confirmation_json, confirmation_digest = _protocol_record(
+            confirmation_record
+        )
+        issued = _protocol_time("confirmation issue time", issued_at)
+        expiry = _protocol_time("confirmation expiry", expires_at)
+        observed_at = time.time() if now is None else _protocol_time("time", now)
+        if issued > observed_at or expiry <= observed_at:
+            raise ManagedSessionControlStateError(
+                "protocol confirmation is not currently valid"
+            )
+        with self._lock, self._connect() as conn:
+            negotiation = self._active_protocol_negotiation_locked(
+                conn,
+                context,
+                principal,
+                now=observed_at,
+            )
+            snapshot_row = conn.execute(
+                "SELECT * FROM session_control_snapshots WHERE snapshot_id=?",
+                (snapshot,),
+            ).fetchone()
+            if (
+                snapshot_row is None
+                or str(snapshot_row["protocol_session_id"]) != session
+                or str(snapshot_row["context_id"]) != context
+                or str(snapshot_row["principal_id"]) != principal
+                or int(snapshot_row["generation"]) != capability_generation
+                or str(snapshot_row["binding_digest"]) != binding
+                or expiry > float(snapshot_row["expires_at"])
+                or expiry > float(negotiation["expires_at"])
+            ):
+                raise ManagedSessionControlStateError(
+                    "protocol confirmation snapshot authority is stale"
+                )
+            existing = conn.execute(
+                "SELECT * FROM session_control_confirmations "
+                "WHERE confirmation_id=?",
+                (confirmation,),
+            ).fetchone()
+            if existing is not None:
+                expected = {
+                    "protocol_session_id": session,
+                    "context_id": context,
+                    "principal_id": principal,
+                    "snapshot_id": snapshot,
+                    "generation": capability_generation,
+                    "binding_digest": binding,
+                    "operation_id": operation,
+                    "implementation_operation_id": implementation,
+                    "semantic_digest": semantic,
+                    "arguments_digest": arguments,
+                    "confirmation_digest": confirmation_digest,
+                    "issued_at": issued,
+                    "expires_at": expiry,
+                }
+                if any(existing[key] != value for key, value in expected.items()):
+                    raise ManagedSessionControlStateError(
+                        "protocol confirmation identity is already bound"
+                    )
+                return self._protocol_persistence_row(existing), True
+            conn.execute(
+                """
+                INSERT INTO session_control_confirmations(
+                    confirmation_id, protocol_session_id, context_id,
+                    principal_id, snapshot_id, generation,
+                    binding_digest, operation_id,
+                    implementation_operation_id, semantic_digest,
+                    arguments_digest, confirmation_json,
+                    confirmation_digest, issued_at, expires_at,
+                    revoked_at, consumed_action_id, consumed_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          NULL, NULL, NULL, ?)
+                """,
+                (
+                    confirmation,
+                    session,
+                    context,
+                    principal,
+                    snapshot,
+                    capability_generation,
+                    binding,
+                    operation,
+                    implementation,
+                    semantic,
+                    arguments,
+                    confirmation_json,
+                    confirmation_digest,
+                    issued,
+                    expiry,
+                    observed_at,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM session_control_confirmations "
+                "WHERE confirmation_id=?",
+                (confirmation,),
+            ).fetchone()
+        return self._protocol_persistence_row(row), False
+
+    def consume_protocol_confirmation(
+        self,
+        confirmation_id: str,
+        *,
+        action_id: str,
+        principal_id: str,
+        now: float | None = None,
+    ) -> dict:
+        confirmation = _validate_protocol_id("confirmation", confirmation_id)
+        action = _validate_protocol_id("action", action_id)
+        principal = _protocol_text("principal identity", principal_id, limit=256)
+        consumed_at = time.time() if now is None else _protocol_time("time", now)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM session_control_confirmations "
+                "WHERE confirmation_id=?",
+                (confirmation,),
+            ).fetchone()
+            action_row = conn.execute(
+                "SELECT * FROM session_control_actions WHERE action_id=?",
+                (action,),
+            ).fetchone()
+            if row is None or action_row is None:
+                raise ManagedSessionControlStateError(
+                    "protocol confirmation or action is unknown"
+                )
+            identity_fields = (
+                "protocol_session_id",
+                "context_id",
+                "principal_id",
+                "snapshot_id",
+                "generation",
+                "binding_digest",
+                "operation_id",
+                "implementation_operation_id",
+                "semantic_digest",
+                "arguments_digest",
+            )
+            if (
+                principal != str(row["principal_id"])
+                or row["revoked_at"] is not None
+                or consumed_at >= float(row["expires_at"])
+                or str(action_row["state"]) != "reserved"
+                or any(row[field] != action_row[field] for field in identity_fields)
+            ):
+                raise ManagedSessionControlStateError(
+                    "protocol confirmation does not authorize this action"
+                )
+            prior_action = row["consumed_action_id"]
+            if prior_action is not None:
+                if str(prior_action) != action:
+                    raise ManagedSessionControlStateError(
+                        "protocol confirmation was already consumed"
+                    )
+                return self._protocol_persistence_row(row)
+            conn.execute(
+                "UPDATE session_control_confirmations "
+                "SET consumed_action_id=?, consumed_at=? "
+                "WHERE confirmation_id=? AND consumed_action_id IS NULL",
+                (action, consumed_at, confirmation),
+            )
+            row = conn.execute(
+                "SELECT * FROM session_control_confirmations "
+                "WHERE confirmation_id=?",
+                (confirmation,),
+            ).fetchone()
+        return self._protocol_persistence_row(row)
+
+    def issue_protocol_recovery(
+        self,
+        *,
+        recovery_id: str,
+        action_id: str,
+        context_id: str,
+        principal_id: str,
+        strategy: str,
+        handle_record: bytes,
+        not_before: float,
+        expires_at: float,
+        now: float | None = None,
+    ) -> tuple[dict, bool]:
+        recovery = _validate_protocol_id("recovery", recovery_id)
+        action = _validate_protocol_id("action", action_id)
+        context = _validate_protocol_id("negotiation context", context_id)
+        principal = _protocol_text("principal identity", principal_id, limit=256)
+        recovery_strategy = str(strategy or "")
+        if recovery_strategy not in {
+            "provider_status",
+            "provider_event",
+            "manager_receipt",
+            "process_observation",
+            "unavailable",
+        }:
+            raise ManagedSessionControlStateError(
+                "protocol recovery strategy is invalid"
+            )
+        handle_json, handle_digest = _protocol_record(handle_record)
+        available_at = _protocol_time("recovery not-before", not_before)
+        expiry = _protocol_time("recovery expiry", expires_at)
+        created_at = time.time() if now is None else _protocol_time("time", now)
+        if expiry <= available_at or expiry <= created_at:
+            raise ManagedSessionControlStateError(
+                "protocol recovery window is invalid"
+            )
+        with self._lock, self._connect() as conn:
+            self._active_protocol_negotiation_locked(
+                conn,
+                context,
+                principal,
+                now=created_at,
+            )
+            action_row = conn.execute(
+                "SELECT * FROM session_control_actions WHERE action_id=?",
+                (action,),
+            ).fetchone()
+            if (
+                action_row is None
+                or str(action_row["principal_id"]) != principal
+                or str(action_row["state"])
+                not in {"in_progress", "outcome_unknown"}
+            ):
+                raise ManagedSessionControlStateError(
+                    "protocol recovery action is not recoverable"
+                )
+            existing = conn.execute(
+                "SELECT * FROM session_control_recovery "
+                "WHERE recovery_id=? OR action_id=?",
+                (recovery, action),
+            ).fetchone()
+            if existing is not None:
+                expected = {
+                    "recovery_id": recovery,
+                    "action_id": action,
+                    "protocol_session_id": action_row["protocol_session_id"],
+                    "principal_id": principal,
+                    "strategy": recovery_strategy,
+                    "handle_digest": handle_digest,
+                    "not_before": available_at,
+                    "expires_at": expiry,
+                }
+                if any(existing[key] != value for key, value in expected.items()):
+                    raise ManagedSessionControlStateError(
+                        "protocol recovery identity is already bound"
+                    )
+                return self._protocol_persistence_row(existing), True
+            conn.execute(
+                """
+                INSERT INTO session_control_recovery(
+                    recovery_id, action_id, protocol_session_id,
+                    context_id, principal_id, strategy, handle_json,
+                    handle_digest, not_before, expires_at, state,
+                    result_json, result_digest, created_at, resolved_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending',
+                          NULL, NULL, ?, NULL)
+                """,
+                (
+                    recovery,
+                    action,
+                    action_row["protocol_session_id"],
+                    context,
+                    principal,
+                    recovery_strategy,
+                    handle_json,
+                    handle_digest,
+                    available_at,
+                    expiry,
+                    created_at,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM session_control_recovery WHERE recovery_id=?",
+                (recovery,),
+            ).fetchone()
+        return self._protocol_persistence_row(row), False
+
+    def protocol_recovery(self, recovery_id: str) -> dict | None:
+        recovery = _validate_protocol_id("recovery", recovery_id)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM session_control_recovery WHERE recovery_id=?",
+                (recovery,),
+            ).fetchone()
+        return self._protocol_persistence_row(row)
+
+    def begin_protocol_recovery_attempt(
+        self,
+        recovery_id: str,
+        *,
+        context_id: str,
+        principal_id: str,
+        request_record: bytes,
+        now: float | None = None,
+    ) -> tuple[dict, bool]:
+
+        recovery = _validate_protocol_id("recovery", recovery_id)
+        context = _validate_protocol_id("negotiation context", context_id)
+        principal = _protocol_text("principal identity", principal_id, limit=256)
+        request_json, request_digest = _protocol_record(request_record)
+        started_at = time.time() if now is None else _protocol_time("time", now)
+        with self._lock, self._connect() as conn:
+            self._active_protocol_negotiation_locked(
+                conn,
+                context,
+                principal,
+                now=started_at,
+            )
+            handle = conn.execute(
+                "SELECT * FROM session_control_recovery WHERE recovery_id=?",
+                (recovery,),
+            ).fetchone()
+            if (
+                handle is None
+                or str(handle["principal_id"]) != principal
+                or started_at < float(handle["not_before"])
+                or started_at >= float(handle["expires_at"])
+            ):
+                raise ManagedSessionControlStateError(
+                    "protocol recovery handle is unavailable"
+                )
+            existing = conn.execute(
+                "SELECT * FROM session_control_recovery_attempts "
+                "WHERE recovery_id=? AND request_digest=?",
+                (recovery, request_digest),
+            ).fetchone()
+            if existing is not None:
+                return self._protocol_persistence_row(existing), True
+            if str(handle["state"]) != "pending":
+                raise ManagedSessionControlStateError(
+                    "protocol recovery handle is unavailable"
+                )
+            conn.execute(
+                """
+                INSERT INTO session_control_recovery_attempts(
+                    recovery_id, request_json, request_digest,
+                    response_json, response_digest, outcome,
+                    started_at, completed_at
+                ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, NULL)
+                """,
+                (recovery, request_json, request_digest, started_at),
+            )
+            row = conn.execute(
+                "SELECT * FROM session_control_recovery_attempts "
+                "WHERE recovery_id=? AND request_digest=?",
+                (recovery, request_digest),
+            ).fetchone()
+        return self._protocol_persistence_row(row), False
+
+    def complete_protocol_recovery_attempt(
+        self,
+        attempt_id: int,
+        *,
+        outcome: str,
+        response_record: bytes,
+        now: float | None = None,
+    ) -> tuple[dict, bool]:
+        attempt = int(attempt_id)
+        recovery_outcome = str(outcome or "")
+        if recovery_outcome not in {
+            "applied",
+            "rejected",
+            "in_progress",
+            "outcome_unknown",
+        }:
+            raise ManagedSessionControlStateError(
+                "protocol recovery outcome is invalid"
+            )
+        response_json, response_digest = _protocol_record(response_record)
+        completed_at = time.time() if now is None else _protocol_time("time", now)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM session_control_recovery_attempts "
+                "WHERE attempt_id=?",
+                (attempt,),
+            ).fetchone()
+            if row is None:
+                raise ManagedSessionControlStateError(
+                    "protocol recovery attempt is unknown"
+                )
+            if row["completed_at"] is not None:
+                if (
+                    str(row["outcome"]) != recovery_outcome
+                    or str(row["response_digest"]) != response_digest
+                ):
+                    raise ManagedSessionControlStateError(
+                        "protocol recovery attempt is already resolved"
+                    )
+                return self._protocol_persistence_row(row), True
+            conn.execute(
+                "UPDATE session_control_recovery_attempts "
+                "SET response_json=?, response_digest=?, outcome=?, "
+                "completed_at=? WHERE attempt_id=? AND completed_at IS NULL",
+                (
+                    response_json,
+                    response_digest,
+                    recovery_outcome,
+                    completed_at,
+                    attempt,
+                ),
+            )
+            if recovery_outcome in {"applied", "rejected"}:
+                conn.execute(
+                    "UPDATE session_control_recovery "
+                    "SET state='resolved', result_json=?, result_digest=?, "
+                    "resolved_at=? WHERE recovery_id=? AND state='pending'",
+                    (
+                        response_json,
+                        response_digest,
+                        completed_at,
+                        row["recovery_id"],
+                    ),
+                )
+            row = conn.execute(
+                "SELECT * FROM session_control_recovery_attempts "
+                "WHERE attempt_id=?",
+                (attempt,),
+            ).fetchone()
+        return self._protocol_persistence_row(row), False
+
+    def append_protocol_event(
+        self,
+        *,
+        event_id: str,
+        protocol_session_id: str,
+        generation: int,
+        stream_id: str,
+        sequence: int,
+        previous_event_digest: str | None,
+        event_type: str,
+        binding_digest: str,
+        before_state: str | None,
+        before_state_version: int | None,
+        after_state: str,
+        after_state_version: int,
+        terminal: bool,
+        event_record: bytes,
+        observed_at: float,
+        action_id: str | None = None,
+        owner_id: str | None = None,
+        ownership_epoch: int | None = None,
+        complete_action_state: str | None = None,
+        complete_action_record: bytes | None = None,
+        now: float | None = None,
+    ) -> tuple[dict, bool]:
+        event = _validate_protocol_id("event", event_id)
+        session = _validate_protocol_session_id(protocol_session_id)
+        capability_generation = int(generation)
+        event_sequence = int(sequence)
+        if capability_generation < 1 or event_sequence < 0:
+            raise ManagedSessionControlStateError(
+                "protocol event generation or sequence is invalid"
+            )
+        stream = _protocol_text("event stream identity", stream_id, limit=256)
+        predecessor = (
+            _validate_protocol_digest(previous_event_digest)
+            if previous_event_digest is not None
+            else None
+        )
+        event_kind = _protocol_text("event type", event_type, limit=64)
+        binding = _validate_protocol_digest(binding_digest)
+        prior_state = (
+            _protocol_text("event prior state", before_state, limit=64)
+            if before_state is not None
+            else None
+        )
+        prior_version = (
+            int(before_state_version)
+            if before_state_version is not None
+            else None
+        )
+        next_state = _protocol_text("event resulting state", after_state, limit=64)
+        next_version = int(after_state_version)
+        if (
+            next_version < 1
+            or not isinstance(terminal, bool)
+            or terminal != (next_state == "terminated")
+        ):
+            raise ManagedSessionControlStateError(
+                "protocol event resulting typestate is invalid"
+            )
+        event_json, event_digest = _protocol_record(event_record)
+        event_observed_at = _protocol_time("event observation time", observed_at)
+        created_at = time.time() if now is None else _protocol_time("time", now)
+        correlated_action = (
+            _validate_protocol_id("action", action_id)
+            if action_id is not None
+            else None
+        )
+        owner = (
+            _protocol_text("owner identity", owner_id, limit=256)
+            if owner_id is not None
+            else None
+        )
+        epoch = int(ownership_epoch) if ownership_epoch is not None else None
+        completion_state = (
+            str(complete_action_state)
+            if complete_action_state is not None
+            else None
+        )
+        if (completion_state is None) != (complete_action_record is None):
+            raise ManagedSessionControlStateError(
+                "protocol event action completion is incomplete"
+            )
+        completion_json = None
+        completion_digest = None
+        if completion_state is not None:
+            if (
+                correlated_action is None
+                or completion_state
+                not in _PROTOCOL_ACTION_STATES - {
+                    "reserved",
+                    "dispatch_started",
+                }
+            ):
+                raise ManagedSessionControlStateError(
+                    "protocol event action completion is invalid"
+                )
+            completion_json, completion_digest = _protocol_record(
+                complete_action_record
+            )
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM session_control_events WHERE event_id=?",
+                (event,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["protocol_session_id"]) != session
+                    or int(existing["generation"]) != capability_generation
+                    or int(existing["sequence"]) != event_sequence
+                    or str(existing["event_digest"]) != event_digest
+                ):
+                    raise ManagedSessionControlStateError(
+                        "protocol event identity is already bound"
+                    )
+                return self._protocol_persistence_row(existing), True
+            session_row = conn.execute(
+                "SELECT * FROM managed_provider_sessions "
+                "WHERE protocol_session_id=?",
+                (session,),
+            ).fetchone()
+            if (
+                session_row is None
+                or int(session_row["capability_generation"])
+                != capability_generation
+                or bool(session_row["protocol_terminal"])
+            ):
+                raise ManagedSessionControlStateError(
+                    "protocol event session authority is stale or terminal"
+                )
+            current_sequence = int(
+                session_row["protocol_last_event_sequence"]
+                if session_row["protocol_last_event_sequence"] is not None
+                else -1
+            )
+            current_digest = session_row["protocol_last_event_digest"]
+            current_state = session_row["protocol_state"]
+            current_version = int(session_row["protocol_state_version"] or 0)
+            current_stream = session_row["protocol_event_stream_id"]
+            if (
+                event_sequence != current_sequence + 1
+                or predecessor != current_digest
+                or (current_stream is not None and str(current_stream) != stream)
+            ):
+                raise ManagedSessionControlStateError(
+                    "protocol event cursor has a gap or wrong predecessor"
+                )
+            if current_state is None:
+                if prior_state is not None or prior_version is not None:
+                    raise ManagedSessionControlStateError(
+                        "first protocol event has a nonempty prior state"
+                    )
+            elif (
+                prior_state != str(current_state)
+                or prior_version != current_version
+            ):
+                raise ManagedSessionControlStateError(
+                    "protocol event prior typestate is stale"
+                )
+            if next_version != current_version + 1:
+                raise ManagedSessionControlStateError(
+                    "protocol event state version is not contiguous"
+                )
+            action_row = None
+            if correlated_action is not None:
+                action_row = conn.execute(
+                    "SELECT * FROM session_control_actions "
+                    "WHERE action_id=?",
+                    (correlated_action,),
+                ).fetchone()
+                if (
+                    action_row is None
+                    or str(action_row["protocol_session_id"]) != session
+                ):
+                    raise ManagedSessionControlStateError(
+                        "protocol event action correlation is invalid"
+                    )
+            if completion_state is not None:
+                current_action_state = str(action_row["state"])
+                if completion_state not in _PROTOCOL_ACTION_TRANSITIONS.get(
+                    current_action_state,
+                    frozenset(),
+                ):
+                    raise ManagedSessionControlStateError(
+                        "protocol event action state transition is invalid"
+                    )
+            current_epoch = int(
+                session_row["protocol_ownership_epoch"] or 0
+            )
+            next_owner = session_row["protocol_owner_id"]
+            next_epoch = current_epoch
+            if event_kind == "ownership.acquired":
+                if owner is None or epoch is None or epoch <= current_epoch:
+                    raise ManagedSessionControlStateError(
+                        "protocol ownership acquisition is invalid"
+                    )
+                next_owner = owner
+                next_epoch = epoch
+            elif event_kind == "ownership.lost":
+                if owner is not None or epoch != current_epoch:
+                    raise ManagedSessionControlStateError(
+                        "protocol ownership loss is invalid"
+                    )
+                next_owner = None
+            elif owner is not None or epoch is not None:
+                raise ManagedSessionControlStateError(
+                    "protocol ownership fields are unexpected"
+                )
+            conn.execute(
+                """
+                INSERT INTO session_control_events(
+                    event_id, protocol_session_id, action_id,
+                    generation, stream_id, sequence,
+                    previous_event_digest, event_digest, event_type,
+                    binding_digest, before_state, before_state_version,
+                    after_state, after_state_version, terminal,
+                    event_json, observed_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event,
+                    session,
+                    correlated_action,
+                    capability_generation,
+                    stream,
+                    event_sequence,
+                    predecessor,
+                    event_digest,
+                    event_kind,
+                    binding,
+                    prior_state,
+                    prior_version,
+                    next_state,
+                    next_version,
+                    1 if terminal else 0,
+                    event_json,
+                    event_observed_at,
+                    created_at,
+                ),
+            )
+            updated = conn.execute(
+                "UPDATE managed_provider_sessions "
+                "SET protocol_owner_id=?, protocol_ownership_epoch=?, "
+                "protocol_state=?, protocol_state_version=?, "
+                "protocol_event_stream_id=?, "
+                "protocol_last_event_sequence=?, "
+                "protocol_last_event_digest=?, protocol_terminal=?, "
+                "protocol_terminal_at=? WHERE protocol_session_id=? "
+                "AND protocol_last_event_sequence=? AND protocol_terminal=0",
+                (
+                    next_owner,
+                    next_epoch,
+                    next_state,
+                    next_version,
+                    stream,
+                    event_sequence,
+                    event_digest,
+                    1 if terminal else 0,
+                    created_at if terminal else None,
+                    session,
+                    current_sequence,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ManagedSessionControlStateError(
+                    "protocol typestate changed during event persistence"
+                )
+            if completion_state is not None:
+                terminal_at = (
+                    created_at
+                    if completion_state in {"applied", "rejected"}
+                    else None
+                )
+                completed = conn.execute(
+                    "UPDATE session_control_actions "
+                    "SET state=?, result_json=?, result_digest=?, "
+                    "completed_at=?, updated_at=? "
+                    "WHERE action_id=? AND state=?",
+                    (
+                        completion_state,
+                        completion_json,
+                        completion_digest,
+                        terminal_at,
+                        created_at,
+                        correlated_action,
+                        current_action_state,
+                    ),
+                )
+                if completed.rowcount != 1:
+                    raise ManagedSessionControlStateError(
+                        "protocol action changed during event persistence"
+                    )
+            if terminal:
+                conn.execute(
+                    "UPDATE session_control_leases SET revoked_at=? "
+                    "WHERE protocol_session_id=? AND revoked_at IS NULL",
+                    (created_at, session),
+                )
+                conn.execute(
+                    "UPDATE session_control_confirmations SET revoked_at=? "
+                    "WHERE protocol_session_id=? AND revoked_at IS NULL "
+                    "AND consumed_action_id IS NULL",
+                    (created_at, session),
+                )
+            row = conn.execute(
+                "SELECT * FROM session_control_events WHERE event_id=?",
+                (event,),
+            ).fetchone()
+        return self._protocol_persistence_row(row), False
+
+    def protocol_events(
+        self,
+        protocol_session_id: str,
+        *,
+        generation: int,
+        after_sequence: int,
+        predecessor_digest: str | None,
+        limit: int = 500,
+    ) -> list[dict]:
+        session = _validate_protocol_session_id(protocol_session_id)
+        capability_generation = int(generation)
+        sequence = int(after_sequence)
+        if capability_generation < 1 or sequence < -1:
+            raise ManagedSessionControlStateError(
+                "protocol event cursor is invalid"
+            )
+        predecessor = (
+            _validate_protocol_digest(predecessor_digest)
+            if predecessor_digest is not None
+            else None
+        )
+        with self._connect() as conn:
+            if sequence == -1:
+                if predecessor is not None:
+                    raise ManagedSessionControlStateError(
+                        "initial protocol event cursor has a predecessor"
+                    )
+            else:
+                prior = conn.execute(
+                    "SELECT event_digest FROM session_control_events "
+                    "WHERE protocol_session_id=? AND generation=? "
+                    "AND sequence=?",
+                    (session, capability_generation, sequence),
+                ).fetchone()
+                if prior is None or str(prior["event_digest"]) != predecessor:
+                    raise ManagedSessionControlStateError(
+                        "protocol event cursor predecessor is unknown"
+                    )
+            rows = conn.execute(
+                "SELECT * FROM session_control_events "
+                "WHERE protocol_session_id=? AND generation=? "
+                "AND sequence>? ORDER BY sequence LIMIT ?",
+                (
+                    session,
+                    capability_generation,
+                    sequence,
+                    max(1, min(int(limit), 1000)),
+                ),
+            ).fetchall()
+        return [self._protocol_persistence_row(row) for row in rows]
+
+    def protocol_typestate(self, protocol_session_id: str) -> dict:
+        session = _validate_protocol_session_id(protocol_session_id)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT protocol_owner_id, protocol_ownership_epoch, "
+                "protocol_state, protocol_state_version, "
+                "protocol_event_stream_id, protocol_last_event_sequence, "
+                "protocol_last_event_digest, protocol_terminal, "
+                "protocol_terminal_at FROM managed_provider_sessions "
+                "WHERE protocol_session_id=?",
+                (session,),
+            ).fetchone()
+        if row is None:
+            raise ManagedSessionControlStateError(
+                "protocol session identity is unknown"
+            )
+        return dict(row)
+
+    def register_protocol_authority_key(
+        self,
+        record: Mapping[str, Any],
+        *,
+        now: float | None = None,
+    ) -> tuple[dict, bool]:
+        if not isinstance(record, Mapping) or set(record) != {
+            "key_id",
+            "algorithm",
+            "public_key_format",
+            "public_key",
+            "hardware_backed",
+        }:
+            raise ManagedSessionControlStateError(
+                "protocol authority key record is invalid"
+            )
+        key_id = _protocol_text("authority key identity", record["key_id"], limit=256)
+        algorithm = _protocol_text(
+            "authority key algorithm",
+            record["algorithm"],
+            limit=64,
+        )
+        public_key_format = _protocol_text(
+            "authority public-key format",
+            record["public_key_format"],
+            limit=64,
+        )
+        public_key = _protocol_text(
+            "authority public key",
+            record["public_key"],
+            limit=512,
+        )
+        hardware_backed = record["hardware_backed"]
+        if (
+            not isinstance(hardware_backed, bool)
+            or algorithm != "p256-sha256"
+            or public_key_format != "x963-base64url"
+            or not key_id.startswith("pairling.control_authority.")
+        ):
+            raise ManagedSessionControlStateError(
+                "protocol authority key record is unsupported"
+            )
+        activated_at = time.time() if now is None else _protocol_time("time", now)
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM session_control_authority_keys WHERE key_id=?",
+                (key_id,),
+            ).fetchone()
+            if existing is not None:
+                expected = {
+                    "algorithm": algorithm,
+                    "public_key_format": public_key_format,
+                    "public_key": public_key,
+                    "hardware_backed": 1 if hardware_backed else 0,
+                }
+                if (
+                    existing["retired_at"] is not None
+                    or any(existing[key] != value for key, value in expected.items())
+                ):
+                    raise ManagedSessionControlStateError(
+                        "protocol authority key identity is already bound"
+                    )
+                return dict(existing), True
+            active = conn.execute(
+                "SELECT key_id FROM session_control_authority_keys "
+                "WHERE retired_at IS NULL"
+            ).fetchone()
+            if active is not None:
+                raise ManagedSessionControlStateError(
+                    "protocol authority key continuity would change"
+                )
+            conn.execute(
+                """
+                INSERT INTO session_control_authority_keys(
+                    key_id, algorithm, public_key_format, public_key,
+                    hardware_backed, activated_at, retired_at, verify_until
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
+                """,
+                (
+                    key_id,
+                    algorithm,
+                    public_key_format,
+                    public_key,
+                    1 if hardware_backed else 0,
+                    activated_at,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM session_control_authority_keys WHERE key_id=?",
+                (key_id,),
+            ).fetchone()
+        return dict(row), False
+
+    def current_protocol_authority_key(self) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM session_control_authority_keys "
+                "WHERE retired_at IS NULL"
+            ).fetchone()
+        return dict(row) if row is not None else None
+
 class ManagedProviderSessionManager:
     """In-process driver bindings around the durable owner store.
 
@@ -1782,6 +4131,7 @@ class ManagedProviderSessionManager:
         binding_id: str | None = None,
         launch_action_id: str | None = None,
         launch_body_hash: str | None = None,
+        before_first_prompt: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict:
         binding_id = str(binding_id or f"managed_{secrets.token_hex(16)}")
         driver = self._driver_factory(str(provider).lower(), binding_id)
@@ -1822,12 +4172,45 @@ class ManagedProviderSessionManager:
             raise ManagedProviderProfileStale(
                 f"{provider} managed launch profile is stale or unsupported"
             )
+        prompt = str(first_prompt or "")
+        deferred_prompt = bool(
+            prompt
+            and getattr(
+                driver,
+                "requires_post_registration_first_prompt",
+                False,
+            )
+            is True
+        )
+        if deferred_prompt and (
+            not launch_action_id
+            or not callable(before_first_prompt)
+            or not callable(
+                getattr(
+                    driver,
+                    "arm_operation_dispatch_boundary",
+                    None,
+                )
+            )
+        ):
+            raise ManagedProviderDriverUnavailable(
+                f"{provider} managed first prompt has no durable dispatch boundary"
+            )
+
+        row: dict | None = None
+        attached = False
+        prompt_boundary_crossed = False
+        prompt_rejected = False
         try:
             attach_launch = getattr(driver, "attach_managed_launch", None)
             if callable(attach_launch):
-                workspace_root = str(Path(project).expanduser().resolve(strict=True))
+                workspace_root = str(
+                    Path(project).expanduser().resolve(strict=True)
+                )
                 session_root = str(
-                    Path(self.store.db_path).parent.expanduser().resolve(strict=True)
+                    Path(self.store.db_path).parent.expanduser().resolve(
+                        strict=True
+                    )
                 )
                 attach_launch(
                     workspace_root=workspace_root,
@@ -1838,14 +4221,23 @@ class ManagedProviderSessionManager:
                         "source_install_id": str(source_install_id),
                     },
                 )
-            result = _object_dict(driver.launch_session(
-                project=str(project), title=str(title), first_prompt=str(first_prompt or "")
-            ))
+            result = _object_dict(
+                driver.launch_session(
+                    project=str(project),
+                    title=str(title),
+                    first_prompt="" if deferred_prompt else prompt,
+                )
+            )
             native_id = str(
-                result.get("native_session_id") or result.get("session_id") or ""
+                result.get("native_session_id")
+                or result.get("session_id")
+                or ""
             ).strip()
             generation = int(
-                result.get("capability_generation", result.get("generation", 0))
+                result.get(
+                    "capability_generation",
+                    result.get("generation", 0),
+                )
             )
             for key, expected in (
                 ("binding_id", binding_id),
@@ -1904,14 +4296,121 @@ class ManagedProviderSessionManager:
                 session_instance_id=result.get("session_instance_id"),
                 ambient_identity_exists=self._ambient_identity_exists,
             )
-        except Exception:
+            if deferred_prompt:
+                with self._lock:
+                    self._drivers[row["id"]] = driver
+                attached = True
+                truth = self.store.session_truth(row["id"])
+                if not isinstance(truth, dict):
+                    raise ManagedProviderDriverUnavailable(
+                        f"{provider} managed session truth is unavailable"
+                    )
+                identity = ProviderSessionIdentity(
+                    provider_id=provider_id,
+                    session_id=row["id"],
+                    binding_id=binding_id,
+                    capability_generation=generation,
+                )
+                correlate = getattr(driver, "operation_correlation", None)
+                if not callable(correlate):
+                    raise ManagedProviderDriverUnavailable(
+                        f"{provider} managed first prompt correlation is unavailable"
+                    )
+                correlation = correlate(
+                    operation_id="session.prompt.send",
+                    client_action_id=str(launch_action_id),
+                    capability_generation=generation,
+                    session_id=row["id"],
+                    session_truth=truth,
+                )
+                if not isinstance(
+                    correlation,
+                    ProviderOperationCorrelation,
+                ):
+                    raise ManagedProviderDriverUnavailable(
+                        f"{provider} managed first prompt correlation is invalid"
+                    )
+
+                def commit_prompt_boundary() -> None:
+                    nonlocal prompt_boundary_crossed
+                    before_first_prompt({
+                        "provider_id": provider_id,
+                        "provider_version": provider_version,
+                        "provider_channel": provider_channel,
+                        "operation_id": "session.prompt.send",
+                        "binding_id": binding_id,
+                        "capability_generation": generation,
+                        "provider_operation_id":
+                            correlation.provider_operation_id,
+                        "provider_cursor": correlation.provider_cursor,
+                        "session_id": row["id"],
+                    })
+                    prompt_boundary_crossed = True
+
+                driver.arm_operation_dispatch_boundary(
+                    operation_id="session.prompt.send",
+                    client_action_id=str(launch_action_id),
+                    session_id=row["id"],
+                    provider_correlation=correlation,
+                    before_write=commit_prompt_boundary,
+                )
+                prompt_result = execute_provider_operation(
+                    driver,
+                    operation_id="session.prompt.send",
+                    input_payload={
+                        "session": identity.to_payload(),
+                        "prompt": prompt,
+                    },
+                    binding_id=binding_id,
+                    capability_generation=generation,
+                    session_id=row["id"],
+                    session_truth=truth,
+                    client_action_id=str(launch_action_id),
+                    prepared_attachments=(),
+                    provider_correlation=correlation,
+                )
+                if prompt_result.status is not OperationResultStatus.APPLIED:
+                    prompt_rejected = True
+                    raise ManagedProviderDriverUnavailable(
+                        f"{provider} rejected the managed first prompt"
+                    )
+        except Exception as exc:
+            if row is not None and attached:
+                if prompt_boundary_crossed and not prompt_rejected:
+                    try:
+                        self.store.mark_driver_unavailable(
+                            row["id"],
+                            reason=(
+                                "managed first prompt outcome is unknown; "
+                                "inspect provider state before sending again"
+                            ),
+                        )
+                    except Exception:
+                        pass
+                    raise ManagedProviderFirstPromptOutcomeUnknown(
+                        (
+                            f"{provider} could not prove whether the managed "
+                            "first prompt started"
+                        ),
+                        session_id=row["id"],
+                    ) from exc
+                with self._lock:
+                    self._drivers.pop(row["id"], None)
+                try:
+                    self.store.mark_closed(
+                        row["id"],
+                        reason="managed first prompt was not accepted",
+                    )
+                except Exception:
+                    pass
             try:
                 driver.close()
             except Exception:
                 pass
             raise
-        with self._lock:
-            self._drivers[row["id"]] = driver
+        if not attached:
+            with self._lock:
+                self._drivers[row["id"]] = driver
         self.poll(row["id"])
         return self.store.get(row["id"]) or row
 
@@ -2039,6 +4538,20 @@ class ManagedProviderSessionManager:
         refreshed = _object_dict(
             driver.refresh_session_binding(self.store.session_truth(row["id"]))
         )
+        refreshed_generation = refreshed.get("capability_generation")
+        live_generation = getattr(driver, "capability_generation", None)
+        if callable(live_generation):
+            live_generation = live_generation()
+        if (
+            isinstance(refreshed_generation, bool)
+            or not isinstance(refreshed_generation, int)
+            or isinstance(live_generation, bool)
+        ):
+            return None
+        try:
+            live_generation = int(live_generation)
+        except (TypeError, ValueError):
+            return None
         if (
             str(refreshed.get("binding_id") or "") != str(row["binding_id"])
             or str(refreshed.get("session_id") or row["id"]) != str(row["id"])
@@ -2046,15 +4559,26 @@ class ManagedProviderSessionManager:
             != str(row["native_id"])
             or refreshed.get("driver_available") is not True
             or str(refreshed.get("lifecycle") or "") != "live"
-            or int(refreshed.get("capability_generation", -1))
-            != int(reported_generation)
+            or refreshed_generation <= expected_generation
+            or refreshed_generation < int(reported_generation)
+            or live_generation != refreshed_generation
+        ):
+            return None
+        generation_resume_cursor = refreshed.get(
+            "generation_resume_cursor",
+            row.get("provider_cursor"),
+        )
+        if (
+            generation_resume_cursor is not None
+            and not isinstance(generation_resume_cursor, str)
         ):
             return None
         updated = self.store.refresh_generation(
             row["id"],
             binding_id=row["binding_id"],
             expected_generation=expected_generation,
-            capability_generation=reported_generation,
+            capability_generation=refreshed_generation,
+            provider_cursor=generation_resume_cursor,
         )
         if updated is None:
             return None
@@ -2071,14 +4595,14 @@ class ManagedProviderSessionManager:
                 provider_channel=str(updated["provider_channel"]),
                 binding_id=str(updated["binding_id"]),
                 session_id=str(updated["id"]),
-                capability_generation=int(reported_generation),
+                capability_generation=refreshed_generation,
             )
         except ManagedProviderDriverUnavailable:
             return None
         return self.store.qualify_driver(
             updated["id"],
             binding_id=updated["binding_id"],
-            capability_generation=int(reported_generation),
+            capability_generation=refreshed_generation,
             provider_canary_attestation=attestation,
             missing_canaries=missing_canaries,
             provider_attestation_required=attestation_required,

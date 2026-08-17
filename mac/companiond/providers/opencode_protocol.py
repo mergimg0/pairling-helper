@@ -117,6 +117,10 @@ class OpenCodeAuthenticationError(OpenCodeError):
 class OpenCodeCapabilityError(OpenCodeError):
     code = "opencode_capability_unavailable"
 
+class OpenCodeEventCursorError(OpenCodeError):
+    code = "provider_event_cursor_invalid"
+
+
 
 class OpenCodeTransportError(OpenCodeError):
     code = "opencode_transport_failed"
@@ -945,9 +949,10 @@ class OpenCodeEventState:
         self.cwd = cwd.resolve(strict=False)
         self._lock = threading.RLock()
         self._seen: OrderedDict[str, None] = OrderedDict()
-        self._events: deque[dict[str, Any]] = deque(
+        self._events: deque[tuple[int, dict[str, Any]]] = deque(
             maxlen=MAX_PUBLIC_EVENTS
         )
+        self._dropped_event_cursor = 0
         self._pending_permissions: dict[str, dict[str, Any]] = {}
         self._pending_questions: dict[str, dict[str, Any]] = {}
         self._statuses: dict[str, dict[str, Any]] = {}
@@ -976,7 +981,38 @@ class OpenCodeEventState:
 
     def public_events(self) -> list[dict[str, Any]]:
         with self._lock:
-            return [dict(item) for item in self._events]
+            return [dict(item) for _, item in self._events]
+
+    def public_event_records(
+        self,
+        *,
+        after_cursor: int,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        with self._lock:
+            if (
+                isinstance(after_cursor, bool)
+                or not isinstance(after_cursor, int)
+                or after_cursor < 0
+                or after_cursor > self._cursor
+                or after_cursor < self._dropped_event_cursor
+            ):
+                raise OpenCodeEventCursorError(
+                    "OpenCode provider event cursor is invalid"
+                )
+            return [
+                (cursor, dict(item))
+                for cursor, item in self._events
+                if cursor > after_cursor
+            ]
+
+    def _append_public_event(self, event: dict[str, Any]) -> None:
+        if len(self._events) == MAX_PUBLIC_EVENTS:
+            self._dropped_event_cursor = max(
+                self._dropped_event_cursor,
+                self._events[0][0],
+            )
+        self._cursor += 1
+        self._events.append((self._cursor, event))
 
     def status_for(self, session_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -1027,8 +1063,7 @@ class OpenCodeEventState:
                         and isinstance(status, Mapping)
                     ):
                         self._statuses[session_id] = dict(status)
-            self._events.append(safe)
-            self._cursor += 1
+            self._append_public_event(safe)
             return True
 
     def reconcile(
@@ -1107,11 +1142,12 @@ class OpenCodeEventState:
                     continue
                 self._seen[digest] = None
                 self._seen.move_to_end(digest)
-                self._events.append(safe)
+                self._append_public_event(safe)
                 appended += 1
             while len(self._seen) > MAX_DEDUPLICATION_KEYS:
                 self._seen.popitem(last=False)
-            self._cursor += max(1, appended)
+            if appended == 0:
+                self._cursor += 1
             return True
 
     def resolve_permission(self, permission_id: str) -> bool:

@@ -1006,7 +1006,19 @@ class ClaudeAgentSDKDriver:
 
     def refresh_session_binding(self, session_truth: dict[str, Any] | None) -> dict[str, Any]:
         session_id = session_truth.get("session_id") if isinstance(session_truth, dict) else None
-        if not isinstance(session_id, str) or not self._owns_session(session_id, session_truth):
+        persisted_generation = (
+            session_truth.get("capability_generation")
+            if isinstance(session_truth, dict)
+            else None
+        )
+        if (
+            not isinstance(session_id, str)
+            or not self._session_identity_matches(session_id, session_truth)
+            or not isinstance(persisted_generation, int)
+            or isinstance(persisted_generation, bool)
+            or persisted_generation < 1
+            or persisted_generation > self.capability_generation
+        ):
             raise ClaudeStaleBinding("Claude SDK session binding cannot be refreshed")
         if self._terminated or not self.process.is_available or self.native_session_id is None:
             raise ClaudeSidecarUnavailable("Claude Agent SDK session is unavailable")
@@ -1473,7 +1485,11 @@ class ClaudeAgentSDKDriver:
         self._terminated = True
         self.process.close()
 
-    def _owns_session(self, session_id: str, truth: dict[str, Any] | None) -> bool:
+    def _session_identity_matches(
+        self,
+        session_id: str,
+        truth: dict[str, Any] | None,
+    ) -> bool:
         instance_id = truth.get("session_instance_id") if isinstance(truth, dict) else None
         return bool(
             self.session_id is not None
@@ -1487,11 +1503,16 @@ class ClaudeAgentSDKDriver:
             and truth.get("owner") == "provider_driver"
             and truth.get("terminal_backed") is False
             and truth.get("binding_id") == self.binding.binding_id
-            and truth.get("capability_generation") == self.capability_generation
             and truth.get("is_live") is True
             and truth.get("controllable") is True
             and isinstance(instance_id, str)
             and 0 < len(instance_id) <= 512
+        )
+
+    def _owns_session(self, session_id: str, truth: dict[str, Any] | None) -> bool:
+        return bool(
+            self._session_identity_matches(session_id, truth)
+            and truth.get("capability_generation") == self.capability_generation
         )
 
     def _blocked_snapshot(self, reason: str) -> ProviderControlSnapshot:
