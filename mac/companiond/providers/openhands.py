@@ -97,7 +97,7 @@ _MAX_JSON_BYTES = 8 * 1024 * 1024
 _MAX_WS_FRAME_BYTES = 8 * 1024 * 1024
 _MAX_ACTION_RESULTS = 256
 _MANAGED_CANARIES = (
-    "owned_loopback_exact_version",
+    "owned_loopback_runtime",
     "authenticated_api_boundary",
     "managed_workspace_profile",
     "manager_identity",
@@ -255,12 +255,8 @@ class OwnedOpenHandsAgentServer:
             if self.running and self.endpoint and self.session_api_key:
                 return UrllibOpenHandsTransport(self.endpoint, self.session_api_key)
             self._stop_locked()
-            if self.version != OPENHANDS_VERSION:
-                raise OpenHandsControlError("unsupported_provider_version")
             if not self.executable.is_file() or not os.access(self.executable, os.X_OK):
                 raise OpenHandsControlError("server_binary_missing")
-            if _installed_agent_server_version(self.executable) != OPENHANDS_VERSION:
-                raise OpenHandsControlError("unsupported_provider_version")
             if not self.workspace_root.is_dir():
                 raise OpenHandsControlError("workspace_root_unavailable")
 
@@ -403,24 +399,22 @@ class OpenHandsProviderAdapter(ProviderAdapter):
     def probe(self) -> ProviderProbeResult:
         resolved = self._resolve()
         version = _installed_agent_server_version(resolved.path) if resolved else None
-        exact = version == OPENHANDS_VERSION
+        installed = resolved is not None
         configured_root = os.environ.get("PAIRLING_OPENHANDS_WORKSPACE_ROOT", "").strip()
         workspace_root = (
             Path(configured_root).expanduser().resolve() if configured_root else None
         )
         root_ready = workspace_root is not None and workspace_root.is_dir()
         profile_ready = _configured_openhands_profile_id() is not None
-        ready = exact and root_ready and profile_ready
+        ready = installed and root_ready and profile_ready
         notes: tuple[str, ...]
         if resolved is None:
             notes = ("OpenHands Agent Server not found.",)
-        elif not exact:
-            notes = (f"Requires exact OpenHands Agent Server {OPENHANDS_VERSION}.",)
         elif not root_ready:
             notes = ("Set PAIRLING_OPENHANDS_WORKSPACE_ROOT to an allowed workspace directory.",)
         elif not profile_ready:
             notes = (
-                f"Set {OPENHANDS_PROFILE_ENV} to the reviewed OpenHands agent profile UUID.",
+                f"Set {OPENHANDS_PROFILE_ENV} to the OpenHands agent profile UUID.",
             )
         else:
             notes = ("Pairling launches an authenticated loopback-only owned server on demand.",)
@@ -428,15 +422,15 @@ class OpenHandsProviderAdapter(ProviderAdapter):
             provider_id=OPENHANDS_PROVIDER_ID,
             display_name=OPENHANDS_DESCRIPTOR.display_name,
             kind=OPENHANDS_DESCRIPTOR.kind,
-            installed=resolved is not None,
+            installed=installed,
             usable=ready,
             launchable=ready,
             auth_state="owned_session_key" if ready else "unavailable",
             config_state=(
-                "pinned" if ready
-                else "workspace_root_required" if exact and not root_ready
-                else "agent_profile_required" if exact and root_ready
-                else "unsupported_version"
+                "ready" if ready
+                else "workspace_root_required" if installed and not root_ready
+                else "agent_profile_required" if installed and root_ready
+                else "unavailable"
             ),
             readable_sessions=0,
             live_sessions=0,
@@ -448,9 +442,9 @@ class OpenHandsProviderAdapter(ProviderAdapter):
             ),
             setup_actions=(
                 () if ready
-                else ("configure_openhands_workspace_root",) if exact and not root_ready
-                else ("configure_openhands_agent_profile",) if exact and root_ready
-                else ("install_pinned_openhands_agent_server",)
+                else ("configure_openhands_workspace_root",) if installed and not root_ready
+                else ("configure_openhands_agent_profile",) if installed and root_ready
+                else ("install_openhands_agent_server",)
             ),
             notes=notes,
         )
@@ -469,14 +463,10 @@ class OpenHandsProviderAdapter(ProviderAdapter):
     def create_control_driver(
         self, binding: ProviderControlBinding
     ) -> OpenHandsControlDriver | None:
-        if (
-            binding.provider_id != OPENHANDS_PROVIDER_ID
-            or binding.provider_version != OPENHANDS_VERSION
-            or binding.provider_channel != OPENHANDS_CHANNEL
-        ):
+        if binding.provider_id != OPENHANDS_PROVIDER_ID:
             return None
         resolved = self._resolve()
-        if resolved is None or _installed_agent_server_version(resolved.path) != OPENHANDS_VERSION:
+        if resolved is None:
             return None
         configured_root = os.environ.get("PAIRLING_OPENHANDS_WORKSPACE_ROOT", "").strip()
         profile_id = _configured_openhands_profile_id()
@@ -490,7 +480,10 @@ class OpenHandsProviderAdapter(ProviderAdapter):
             if server is None:
                 server = OwnedOpenHandsAgentServer(
                     executable=resolved.path,
-                    version=OPENHANDS_VERSION,
+                    version=(
+                        _installed_agent_server_version(resolved.path)
+                        or binding.provider_version
+                    ),
                     binding_id=binding.binding_id,
                     workspace_root=workspace_root,
                     home=self.home,
@@ -560,8 +553,8 @@ class OpenHandsControlDriver:
             {
                 "reviewed": True,
                 "provider_id": OPENHANDS_PROVIDER_ID,
-                "provider_version": OPENHANDS_VERSION,
-                "provider_channel": OPENHANDS_CHANNEL,
+                "provider_version": binding.provider_version,
+                "provider_channel": binding.provider_channel,
                 "agent_profile_id": self._managed_profile_id,
                 "confirmation_policy": "AlwaysConfirm",
             }
@@ -754,6 +747,19 @@ class OpenHandsControlDriver:
             raise OpenHandsControlError("managed_workspace_mismatch")
         if self._instance_id in {"", "unknown-instance", "not-started"}:
             raise OpenHandsControlError("managed_instance_unproven")
+        resolved_model = str(conversation.get("current_model_id") or "").strip()
+        if not resolved_model:
+            raise OpenHandsControlError("managed_model_unresolved")
+        execution_status = str(
+            conversation.get("execution_status") or ""
+        ).strip()
+        if "waiting" in execution_status:
+            initial_turn_state = "waiting"
+        elif execution_status in {"idle", "stopped", "finished"}:
+            initial_turn_state = "idle"
+        else:
+            initial_turn_state = "working"
+        started_at = time.time()
         instance_id = f"{self.binding.binding_id}:{self._instance_id}:{native_id}"
         with self._action_lock:
             self._managed_public_session_id = public_id
@@ -807,6 +813,10 @@ class OpenHandsControlDriver:
             "workspace": str(workspace),
             "provider_cursor": None,
             "session_instance_id": instance_id,
+            "resolved_model": resolved_model,
+            "initial_turn_state": initial_turn_state,
+            "transcript_state": "created",
+            "started_at": started_at,
         }
 
     def _record_managed_canaries(self) -> None:
@@ -826,7 +836,7 @@ class OpenHandsControlDriver:
         ):
             raise OpenHandsControlError("managed_canary_identity_unproven")
         evidence = {
-            "owned_loopback_exact_version": {
+            "owned_loopback_runtime": {
                 "provider_version": self.binding.provider_version,
                 "provider_channel": self.binding.provider_channel,
                 "endpoint": _validate_loopback_endpoint(self.endpoint),
@@ -931,8 +941,6 @@ class OpenHandsControlDriver:
                 result.get("session_id") != native_id
                 or result.get("public_session_id") != public_id
                 or result.get("provider_id") != OPENHANDS_PROVIDER_ID
-                or result.get("provider_version") != self.binding.provider_version
-                or result.get("provider_channel") != self.binding.provider_channel
                 or result.get("binding_id") != self.binding.binding_id
                 or isinstance(generation, bool)
                 or not isinstance(generation, int)
@@ -942,6 +950,10 @@ class OpenHandsControlDriver:
                 != self._managed_session_instance_id
                 or result.get("workspace")
                 != str(self._managed_workspace)
+                or result.get("initial_turn_state")
+                not in {"idle", "working", "waiting"}
+                or result.get("transcript_state") != "created"
+                or float(result.get("started_at") or 0) <= 0
                 or native_id != self._managed_native_session_id
                 or public_id != self._managed_public_session_id
             ):
@@ -950,6 +962,10 @@ class OpenHandsControlDriver:
             if self._instance_id != self._managed_server_instance_id:
                 return False
             conversation = self._conversation(native_id)
+            if result.get("resolved_model") != str(
+                conversation.get("current_model_id") or ""
+            ).strip():
+                return False
             self._validated_launched_profile(
                 conversation,
                 str(self._managed_profile_id),
@@ -1131,10 +1147,6 @@ class OpenHandsControlDriver:
         self._authenticated = False
         if not self.owned:
             raise OpenHandsControlError("server_not_owned")
-        if self.binding.provider_version != OPENHANDS_VERSION:
-            raise OpenHandsControlError("unsupported_provider_version")
-        if self.binding.provider_channel != OPENHANDS_CHANNEL:
-            raise OpenHandsControlError("unsupported_provider_channel")
         if not self.workspace_root.is_dir():
             raise OpenHandsControlError("workspace_root_unavailable")
         transport = self._ensure_transport()
@@ -1149,8 +1161,6 @@ class OpenHandsControlDriver:
             raise OpenHandsControlError("server_info_invalid")
         if info.get("title") != "OpenHands Agent Server":
             raise OpenHandsControlError("server_capability_mismatch")
-        if info.get("version") != OPENHANDS_VERSION:
-            raise OpenHandsControlError("unsupported_provider_version")
         try:
             count = transport.request_json("GET", "/api/conversations/count")
         except OpenHandsHttpError as exc:

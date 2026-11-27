@@ -68,6 +68,15 @@ final class AutomationRequestHandler: @unchecked Sendable {
                 text: arguments.text,
                 bracketedPaste: arguments.bracketedPaste
             )
+        case .typeTerminalText:
+            guard case let .terminalType(arguments) = request.arguments else {
+                return invalidRequest(request)
+            }
+            return typeTerminalText(
+                request,
+                tty: arguments.tty,
+                text: arguments.text
+            )
         case .sendSpecialKey:
             guard case let .specialKey(arguments) = request.arguments else {
                 return invalidRequest(request)
@@ -180,6 +189,26 @@ final class AutomationRequestHandler: @unchecked Sendable {
                 text: text,
                 bracketedPaste: bracketedPaste
             )
+            return .success(
+                requestID: request.requestID,
+                helper: identity,
+                mutationOutcome: .confirmed
+            )
+        } catch let error {
+            return terminalFailure(request, error: error, mutationOutcome: .outcomeUnknown)
+        }
+    }
+
+    private func typeTerminalText(
+        _ request: AutomationRequest,
+        tty: String,
+        text: String
+    ) -> AutomationResponse {
+        if let readinessFailure = ensureTerminalControl(request) {
+            return readinessFailure
+        }
+        do {
+            try terminal.typeText(tty: tty, text: text)
             return .success(
                 requestID: request.requestID,
                 helper: identity,
@@ -357,6 +386,9 @@ final class AutomationRequestHandler: @unchecked Sendable {
         case .terminalTabNotFound:
             code = .terminalTabNotFound
             resolvedOutcome = .failedBeforeMutation
+        case .terminalTabAmbiguous:
+            code = .terminalTabAmbiguous
+            resolvedOutcome = .failedBeforeMutation
         case .ownershipMismatch:
             code = .ownershipMismatch
             resolvedOutcome = .failedBeforeMutation
@@ -397,9 +429,11 @@ final class AutomationRequestHandler: @unchecked Sendable {
 private extension AutomationOperation {
     var isMutation: Bool {
         switch self {
-        case .sendTerminalText, .sendSpecialKey, .startPairlingSession, .closePairlingSession:
+        case .sendTerminalText, .typeTerminalText, .sendSpecialKey,
+             .startPairlingSession, .closePairlingSession:
             true
-        case .status, .requestPermissions, .probeTerminal, .readTerminalTab, .inspectTerminalTab:
+        case .status, .requestPermissions, .probeTerminal, .readTerminalTab,
+             .inspectTerminalTab:
             false
         }
     }

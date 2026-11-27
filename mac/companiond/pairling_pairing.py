@@ -1046,7 +1046,6 @@ class PairingStore:
         ttl_seconds: int = DEFAULT_PAIR_TTL_SECONDS,
         purpose: str | None = None,
         scopes: Iterable[str] | None = None,
-        role: str | None = None,
         lease_ttl_seconds: int | None = None,
     ) -> PairStart:
         self._cleanup_pending_claims()
@@ -1059,12 +1058,6 @@ class PairingStore:
         if normalized_purpose:
             if normalized_purpose != SMOKE_DEVICE_PURPOSE:
                 raise PairingError("invalid_pair_purpose", 400, "unsupported pairing purpose")
-            if role is not None:
-                raise PairingError(
-                    "invalid_pair_role",
-                    400,
-                    "device roles are available only for interactive pairing",
-                )
             normalized_scopes = tuple(sorted(set(scopes or SMOKE_ALLOWED_SCOPES)))
             if not normalized_scopes or not set(normalized_scopes).issubset(SMOKE_ALLOWED_SCOPES):
                 raise PairingError(
@@ -1086,14 +1079,8 @@ class PairingStore:
                 "invalid_pair_purpose", 400, "scoped leases require runtime_truth_smoke"
             )
         else:
-            normalized_role = str(role or DEFAULT_DEVICE_ROLE).strip().lower()
-            if normalized_role not in PAIRABLE_DEVICE_ROLES:
-                raise PairingError(
-                    "invalid_pair_role",
-                    400,
-                    f"unsupported paired-device role: {normalized_role or '<empty>'}",
-                )
-            normalized_scopes = tuple(sorted(device_scopes_for_role(normalized_role)))
+            normalized_role = DEFAULT_DEVICE_ROLE
+            normalized_scopes = tuple(sorted(DEFAULT_DEVICE_SCOPES))
         ttl = max(MIN_PAIR_TTL_SECONDS, min(int(ttl_seconds), MAX_PAIR_TTL_SECONDS))
         pair_id = "pair_" + secrets.token_hex(8)
         secret = secrets.token_urlsafe(24)

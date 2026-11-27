@@ -23,52 +23,26 @@ func proveGatewayReady(store *Store) {
 	}
 }
 
-func TestFunnelRouteIsAdditiveAndGated(t *testing.T) {
-	s := NewStore("pairling-test")
-	s.SetListenerRunning(true)
-	s.SetUpstreamReachable(true)
-	proveGatewayReady(s)
-	s.SetTailnetIP("100.64.0.1")
-	s.SetAuthenticated()
+func TestRouteAvailabilityDependsOnlyOnTailnetState(t *testing.T) {
+	store := NewStore("pairling-inst-abcdef")
+	store.SetAuthenticated()
+	store.SetTailnetIP("100.64.0.10")
+	store.SetListenerRunning(true)
 
-	// Funnel disabled: only the tailnet route, and no funnel_hostname in the JSON.
-	snap := s.Snapshot()
-	if hasRouteKind(snap.AdvertisedRoutes, RouteKindFunnel) {
-		t.Error("funnel route present while funnel disabled")
+	if got := store.Snapshot().AdvertisedRoutes; len(got) != 1 {
+		t.Fatalf("authenticated listener should advertise one route: %+v", got)
 	}
-	js, _ := json.Marshal(snap)
-	if strings.Contains(string(js), "funnel_hostname") {
-		t.Error("funnel_hostname must be omitted when empty")
+	store.SetUpstreamReachable(false)
+	store.RecordGatewayEvent("GET", "/routez", http.StatusBadGateway, "upstream_error")
+	if got := store.Snapshot().AdvertisedRoutes; len(got) != 1 {
+		t.Fatalf("application failures must not hide tailnet route identity: %+v", got)
 	}
-
-	// Enable funnel: the route appears with an https base URL and a lower priority.
-	s.SetFunnelHostname("pairling-abc.tail1234.ts.net")
-	snap = s.Snapshot()
-	var funnel, tailnet *AdvertisedRoute
-	for i := range snap.AdvertisedRoutes {
-		switch snap.AdvertisedRoutes[i].Kind {
-		case RouteKindFunnel:
-			funnel = &snap.AdvertisedRoutes[i]
-		case RouteKindTailnet:
-			tailnet = &snap.AdvertisedRoutes[i]
-		}
-	}
-	if funnel == nil || tailnet == nil {
-		t.Fatalf("expected tailnet and funnel routes, got %+v", snap.AdvertisedRoutes)
-	}
-	if funnel.BaseURL != "https://pairling-abc.tail1234.ts.net" {
-		t.Errorf("funnel base_url = %q", funnel.BaseURL)
-	}
-	if funnel.Priority >= tailnet.Priority {
-		t.Errorf("funnel priority %d must be below tailnet priority %d", funnel.Priority, tailnet.Priority)
-	}
-
-	// Unhealthy node: no routes advertise, even with a funnel hostname set.
-	s.SetUpstreamReachable(false)
-	if len(s.Snapshot().AdvertisedRoutes) != 0 {
-		t.Error("no routes should advertise when the node is unhealthy")
+	store.SetTailnetIP("")
+	if got := store.Snapshot().AdvertisedRoutes; len(got) != 0 {
+		t.Fatalf("missing tailnet identity should remove route: %+v", got)
 	}
 }
+
 
 func TestStoreServesHelperReadableSnapshotWithoutSecrets(t *testing.T) {
 	store := NewStore("pairling-inst-abcdef")
@@ -224,165 +198,10 @@ func TestStoreAdvertisesRouteOnlyWhenReady(t *testing.T) {
 	}
 }
 
-func TestStoreStartsFailClosedUntilSemanticUpstreamReadiness(t *testing.T) {
-	store := NewStore("pairling-inst-abcdef")
-	store.SetAuthenticated()
-	store.SetTailnetIP("100.64.0.10")
-	store.SetListenerRunning(true)
 
-	snapshot := store.Snapshot()
-	if snapshot.GatewayHealthy {
-		t.Fatalf("fresh store must not assume gateway health: %+v", snapshot)
-	}
-	if len(snapshot.AdvertisedRoutes) != 0 {
-		t.Fatalf("fresh store advertised a route before semantic readiness: %+v", snapshot.AdvertisedRoutes)
-	}
 
-	store.SetUpstreamReachable(true)
-	snapshot = store.Snapshot()
-	if snapshot.GatewayHealthy || len(snapshot.AdvertisedRoutes) != 0 {
-		t.Fatalf("readyz reachability must not open the route without /routez proof: %+v", snapshot)
-	}
 
-	store.RecordGatewayEvent(http.MethodGet, "/routez", http.StatusOK, "route_verified")
-	snapshot = store.Snapshot()
-	if snapshot.GatewayHealthy || len(snapshot.AdvertisedRoutes) != 0 {
-		t.Fatalf("one /routez proof must not open the route: %+v", snapshot)
-	}
-	store.RecordGatewayEvent(http.MethodGet, "/routez", http.StatusOK, "route_verified")
-	snapshot = store.Snapshot()
-	if !snapshot.GatewayHealthy || len(snapshot.AdvertisedRoutes) != 1 || snapshot.LastRouteProofAt == "" {
-		t.Fatalf("two exact /routez proofs should open clean startup: %+v", snapshot)
-	}
-}
 
-func TestUpstreamOutageResetsRecoveryProofsAndNeedsTwoRoutezSuccesses(t *testing.T) {
-	store := NewStore("pairling-inst-abcdef")
-	store.SetAuthenticated()
-	store.SetTailnetIP("100.64.0.10")
-	store.SetListenerRunning(true)
-	store.SetUpstreamReachable(true)
-	proveGatewayReady(store)
-
-	store.SetUpstreamReachable(false)
-	store.SetUpstreamReachable(true)
-	snapshot := store.Snapshot()
-	if snapshot.GatewayHealthy || len(snapshot.AdvertisedRoutes) != 0 {
-		t.Fatalf("an upstream outage must close the route until fresh route proofs arrive: %+v", snapshot)
-	}
-
-	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
-	snapshot = store.Snapshot()
-	if snapshot.GatewayHealthy || len(snapshot.AdvertisedRoutes) != 0 {
-		t.Fatalf("one post-outage routez success must not recover the route: %+v", snapshot)
-	}
-
-	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
-	snapshot = store.Snapshot()
-	if !snapshot.GatewayHealthy || len(snapshot.AdvertisedRoutes) != 1 {
-		t.Fatalf("two consecutive post-outage proofs should recover the route: %+v", snapshot)
-	}
-}
-
-func TestStoreSuppressesAdvertisedRouteAfterRecentGatewayValidationFailure(t *testing.T) {
-	store := NewStore("pairling-inst-abcdef")
-	store.SetAuthenticated()
-	store.SetTailnetIP("100.64.0.10")
-	store.SetListenerRunning(true)
-	store.SetUpstreamReachable(true)
-	proveGatewayReady(store)
-
-	store.RecordGatewayEvent("GET", "/routez", 502, "upstream_error")
-	snapshot := store.Snapshot()
-	if snapshot.GatewayHealthy {
-		t.Fatalf("gateway should be unhealthy after route validation failure: %+v", snapshot)
-	}
-	if snapshot.LastGatewayFailure == "" {
-		t.Fatalf("gateway failure should be exposed as redacted diagnostic: %+v", snapshot)
-	}
-	if got := snapshot.AdvertisedRoutes; len(got) != 0 {
-		t.Fatalf("gateway failure advertised routes: %+v", got)
-	}
-
-	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
-	snapshot = store.Snapshot()
-	if snapshot.GatewayHealthy {
-		t.Fatalf("single routez success should not recover gateway health: %+v", snapshot)
-	}
-	if snapshot.LastGatewayFailure == "" || snapshot.LastGatewayFailureAt == "" {
-		t.Fatalf("unresolved gateway failure should remain visible after one success: %+v", snapshot)
-	}
-	if len(snapshot.AdvertisedRoutes) != 0 {
-		t.Fatalf("single routez success advertised a route: %+v", snapshot.AdvertisedRoutes)
-	}
-
-	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
-	snapshot = store.Snapshot()
-	if !snapshot.GatewayHealthy {
-		t.Fatalf("gateway should recover after consecutive successful routez proofs: %+v", snapshot)
-	}
-	if snapshot.LastGatewayFailure != "" || snapshot.LastGatewayFailureAt != "" {
-		t.Fatalf("recovered gateway should clear failure markers: %+v", snapshot)
-	}
-	if len(snapshot.AdvertisedRoutes) != 1 {
-		t.Fatalf("recovered gateway did not advertise route: %+v", snapshot.AdvertisedRoutes)
-	}
-}
-
-func TestStoreSuppressesAdvertisedRouteAfterProductEndpointFailure(t *testing.T) {
-	store := NewStore("pairling-inst-abcdef")
-	store.SetAuthenticated()
-	store.SetTailnetIP("100.64.0.10")
-	store.SetListenerRunning(true)
-	store.SetUpstreamReachable(true)
-	proveGatewayReady(store)
-
-	store.RecordGatewayEvent("GET", "/sessions-visible", 502, "upstream_error")
-	snapshot := store.Snapshot()
-	if snapshot.GatewayHealthy {
-		t.Fatalf("product endpoint upstream failure should mark gateway unhealthy: %+v", snapshot)
-	}
-	if snapshot.LastGatewayFailure == "" {
-		t.Fatalf("product endpoint failure should be stored as gateway failure: %+v", snapshot)
-	}
-	if len(snapshot.AdvertisedRoutes) != 0 {
-		t.Fatalf("product endpoint failure should suppress advertised routes: %+v", snapshot.AdvertisedRoutes)
-	}
-
-	store.RecordGatewayEvent("GET", "/sessions-visible", 200, "forwarded")
-	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
-	snapshot = store.Snapshot()
-	if snapshot.GatewayHealthy {
-		t.Fatalf("app success plus one routez proof should not recover gateway health: %+v", snapshot)
-	}
-
-	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
-	snapshot = store.Snapshot()
-	if !snapshot.GatewayHealthy {
-		t.Fatalf("two consecutive routez proofs should recover gateway health: %+v", snapshot)
-	}
-	if len(snapshot.AdvertisedRoutes) != 1 {
-		t.Fatalf("recovered gateway did not advertise route: %+v", snapshot.AdvertisedRoutes)
-	}
-}
-
-func TestStoreSuppressesAdvertisedRouteAfterValidationFailure(t *testing.T) {
-	store := NewStore("pairling-inst-abcdef")
-	store.SetAuthenticated()
-	store.SetTailnetIP("100.64.0.10")
-	store.SetListenerRunning(true)
-	store.SetUpstreamReachable(true)
-	proveGatewayReady(store)
-
-	store.RecordGatewayEvent("GET", "/sessions-visible", 422, "validation_failed")
-	snapshot := store.Snapshot()
-	if snapshot.GatewayHealthy {
-		t.Fatalf("validation failure should mark gateway unhealthy: %+v", snapshot)
-	}
-	if len(snapshot.AdvertisedRoutes) != 0 {
-		t.Fatalf("validation failure should suppress advertised routes: %+v", snapshot.AdvertisedRoutes)
-	}
-}
 
 func TestGatewayFailureClassification(t *testing.T) {
 	for _, test := range []struct {
@@ -454,33 +273,6 @@ func TestStoreGatewayFailureResetsRecoveryProofStreak(t *testing.T) {
 	}
 }
 
-func TestStoreNonSuccessRouteProbeResetsRecoveryProofStreak(t *testing.T) {
-	store := NewStore("pairling-inst-abcdef")
-	store.SetAuthenticated()
-	store.SetTailnetIP("100.64.0.10")
-	store.SetListenerRunning(true)
-	store.SetUpstreamReachable(true)
-	proveGatewayReady(store)
-
-	store.RecordGatewayEvent("GET", "/routez", 502, "upstream_error")
-	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
-	store.RecordGatewayEvent("GET", "/routez", 401, "forwarded")
-	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
-
-	snapshot := store.Snapshot()
-	if snapshot.GatewayHealthy {
-		t.Fatalf("non-success routez result between successes should reset recovery streak: %+v", snapshot)
-	}
-	if len(snapshot.AdvertisedRoutes) != 0 {
-		t.Fatalf("interrupted route proof sequence should not advertise a route: %+v", snapshot.AdvertisedRoutes)
-	}
-
-	store.RecordGatewayEvent("GET", "/routez", 200, "route_verified")
-	snapshot = store.Snapshot()
-	if !snapshot.GatewayHealthy {
-		t.Fatalf("two successes after the interrupted sequence should recover route health: %+v", snapshot)
-	}
-}
 
 func TestStoreKeepsRawAuthURLPrivateForLocalOpenOnly(t *testing.T) {
 	store := NewStore("pairling-inst-abcdef")
@@ -519,56 +311,6 @@ func TestStoreRejectsInvalidAuthURLForLocalOpen(t *testing.T) {
 	}
 }
 
-func TestStoreSuppressesAdvertisedRouteForDegradedStates(t *testing.T) {
-	cases := []struct {
-		name      string
-		configure func(*Store)
-	}{
-		{
-			name: "auth pending",
-			configure: func(store *Store) {
-				store.SetAuthPending("open https://login.tailscale.com/a/example")
-				store.SetTailnetIP("100.64.0.10")
-				store.SetListenerRunning(true)
-				store.SetUpstreamReachable(true)
-			},
-		},
-		{
-			name: "missing tailnet IP",
-			configure: func(store *Store) {
-				store.SetAuthenticated()
-				store.SetListenerRunning(true)
-				store.SetUpstreamReachable(true)
-			},
-		},
-		{
-			name: "listener down",
-			configure: func(store *Store) {
-				store.SetAuthenticated()
-				store.SetTailnetIP("100.64.0.10")
-				store.SetUpstreamReachable(true)
-			},
-		},
-		{
-			name: "upstream down",
-			configure: func(store *Store) {
-				store.SetAuthenticated()
-				store.SetTailnetIP("100.64.0.10")
-				store.SetListenerRunning(true)
-			},
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			store := NewStore("pairling-inst-abcdef")
-			tc.configure(store)
-			if got := store.Snapshot().AdvertisedRoutes; len(got) != 0 {
-				t.Fatalf("degraded state advertised routes: %+v", got)
-			}
-		})
-	}
-}
 
 func TestRedactRemovesAuthURLsAndBearerMaterial(t *testing.T) {
 	cases := map[string][]string{

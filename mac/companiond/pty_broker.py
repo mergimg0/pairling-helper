@@ -2126,23 +2126,27 @@ class PTYBrokerSession:
                 }
 
     def interrupt(self) -> dict:
-        """Interrupt an owned session after the daemon's identity gate.
+        """Interrupt one turn without terminating the owned provider session.
 
-        Interrupt intent is not tied to a rendered prompt. The authenticated
-        session-signal path calls this only after it verifies broker ownership.
+        OMP's TUI advertises Escape as its turn-cancel action; Ctrl+C exits the
+        process. Other broker-backed terminal providers retain Ctrl+C.
         """
+        data = b"\x1b" if self.provider == "omp" else b"\x03"
         with self._input_transaction_lock:
             with self._lock:
                 try:
-                    bytes_written = self._write_locked(b"\x03")
+                    bytes_written = self._write_locked(data)
                 except PTYWriteError as exc:
                     return _pty_write_failure_result(exc)
                 return {
                     "ok": True,
                     "pty_written": True,
                     "bytes_written": bytes_written,
-                    "bytes_expected": 1,
+                    "bytes_expected": len(data),
                     "write_outcome": "complete",
+                    "interrupt_key": (
+                        "escape" if self.provider == "omp" else "ctrl_c"
+                    ),
                 }
 
     def control(self, action: dict) -> dict:

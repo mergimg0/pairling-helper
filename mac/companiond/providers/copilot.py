@@ -202,8 +202,6 @@ def _version_from_output(value: str | None) -> str | None:
     return match.group(1) if match else None
 
 
-def is_compatible_copilot_cli_version(value: str | None) -> bool:
-    return _version_from_output(value) == _SUPPORTED_CLI_VERSION
 
 
 def _sdk_export_entrypoint(root: Path, manifest: Mapping[str, Any]) -> Path | None:
@@ -247,8 +245,8 @@ def resolve_copilot_sdk_package(candidates: Iterable[Path | str]) -> ResolvedCop
             failures.append(f"{root}: package identity mismatch")
             continue
         version = manifest.get("version")
-        if version != _SUPPORTED_SDK_VERSION:
-            failures.append(f"{root}: SDK version {version!r} is not reviewed")
+        if not isinstance(version, str) or not version.strip():
+            failures.append(f"{root}: SDK version missing")
             continue
         entrypoint = _sdk_export_entrypoint(root, manifest)
         if entrypoint is None:
@@ -257,7 +255,7 @@ def resolve_copilot_sdk_package(candidates: Iterable[Path | str]) -> ResolvedCop
         return ResolvedCopilotSDKPackage(root.resolve(), entrypoint, version)
     detail = "; ".join(failures[:4]) or "no SDK package candidates"
     raise CopilotSDKPackageUnavailable(
-        f"official {_SUPPORTED_SDK_PACKAGE}@{_SUPPORTED_SDK_VERSION} could not be resolved: {detail}"
+        f"official {_SUPPORTED_SDK_PACKAGE} could not be resolved: {detail}"
     )
 
 
@@ -299,7 +297,6 @@ class _CopilotSDKSidecarProcess:
         request_timeout: float = 15.0,
         provider_settings: Mapping[str, str] | None = None,
         handshake_timeout: float = 10.0,
-        expected_cli_version: str = _SUPPORTED_CLI_VERSION,
         max_line_bytes: int = _MAX_LINE_BYTES,
         require_pinned_node: bool = False,
     ):
@@ -307,8 +304,6 @@ class _CopilotSDKSidecarProcess:
             raise ValueError("Copilot SDK sidecar argv must contain non-empty strings")
         if request_timeout <= 0 or handshake_timeout <= 0:
             raise ValueError("Copilot SDK sidecar timeouts must be positive")
-        if expected_cli_version != _SUPPORTED_CLI_VERSION:
-            raise CopilotSDKUnavailable("Copilot CLI version has not been reviewed")
         self._argv = tuple(argv)
         self._env = managed_child_environment(
             source=env,
@@ -316,7 +311,6 @@ class _CopilotSDKSidecarProcess:
         )
         self._request_timeout = request_timeout
         self._handshake_timeout = handshake_timeout
-        self._expected_cli_version = expected_cli_version
         self._require_pinned_node = require_pinned_node
         self._max_line_bytes = max_line_bytes
         self._state_lock = threading.RLock()
@@ -405,9 +399,6 @@ class _CopilotSDKSidecarProcess:
                     {
                         "sidecar_protocol": _SIDECAR_PROTOCOL,
                         "expected_sdk_package": _SUPPORTED_SDK_PACKAGE,
-                        "expected_sdk_version": _SUPPORTED_SDK_VERSION,
-                        "expected_cli_version": self._expected_cli_version,
-                        "expected_cli_channel": _SUPPORTED_CLI_CHANNEL,
                         "expected_sdk_protocol": _SUPPORTED_SDK_PROTOCOL,
                     },
                     timeout=self._handshake_timeout,
@@ -425,9 +416,6 @@ class _CopilotSDKSidecarProcess:
         expected = {
             "sidecar_protocol": _SIDECAR_PROTOCOL,
             "sdk_package": _SUPPORTED_SDK_PACKAGE,
-            "sdk_version": _SUPPORTED_SDK_VERSION,
-            "cli_version": self._expected_cli_version,
-            "cli_channel": _SUPPORTED_CLI_CHANNEL,
             "sdk_protocol_version": _SUPPORTED_SDK_PROTOCOL,
             "transport": "stdio-jsonrpc",
         }
@@ -435,6 +423,11 @@ class _CopilotSDKSidecarProcess:
             if handshake.get(key) != value:
                 raise CopilotSidecarProtocolError(
                     f"Copilot SDK handshake {key} mismatch: {handshake.get(key)!r}"
+                )
+        for key in ("cli_version", "cli_channel"):
+            if not isinstance(handshake.get(key), str) or not handshake.get(key):
+                raise CopilotSidecarProtocolError(
+                    f"Copilot SDK handshake omitted {key}"
                 )
 
     def request(self, operation: str, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -753,10 +746,6 @@ class CopilotSDKDriver:
     def __init__(self, binding: ProviderControlBinding, *, process: _CopilotSDKSidecarProcess):
         if binding.provider_id != "copilot":
             raise CopilotSDKUnavailable("Copilot driver binding provider is invalid")
-        if binding.provider_version != _SUPPORTED_CLI_VERSION:
-            raise CopilotSDKUnavailable("Copilot CLI version has not been reviewed")
-        if binding.provider_channel != _SUPPORTED_CLI_CHANNEL:
-            raise CopilotSDKUnavailable("Copilot CLI preview or unknown channel is not supported")
         self.binding = binding
         self.process = process
         self._attached_sessions: dict[str, str] = {}
@@ -1653,9 +1642,6 @@ class CopilotSDKDriver:
         pairling_session_id: str | None,
     ) -> str | None:
         checks = (
-            (discovery.get("sdk_version") == _SUPPORTED_SDK_VERSION, "sdk_version_mismatch"),
-            (discovery.get("cli_version") == self.binding.provider_version, "cli_version_mismatch"),
-            (discovery.get("cli_channel") == self.binding.provider_channel, "cli_channel_mismatch"),
             (discovery.get("sdk_protocol_version") == _SUPPORTED_SDK_PROTOCOL, "sdk_protocol_mismatch"),
             (discovery.get("transport") == "stdio-jsonrpc", "transport_not_local_stdio"),
             (discovery.get("authenticated") is True, "copilot_not_authenticated"),
@@ -1973,7 +1959,6 @@ class CopilotProviderAdapter(ProviderAdapter):
         resolved = resolve_executable("copilot", self.candidates, env_var=env_var)
         version_output = cli_version(resolved.path) if resolved else None
         installed = resolved is not None
-        compatible_cli = is_compatible_copilot_cli_version(version_output)
         node = resolve_pinned_executable(
             "node",
             path_env_var="PAIRLING_NODE_BIN",
@@ -1984,8 +1969,6 @@ class CopilotProviderAdapter(ProviderAdapter):
         if not installed:
             notes.append("GitHub Copilot CLI not found")
             setup_actions.append("install_cli")
-        elif not compatible_cli:
-            notes.append(f"Copilot CLI must be exactly {_SUPPORTED_CLI_VERSION} stable for SDK control")
         try:
             sdk = resolve_copilot_sdk_package(self.sdk_candidates)
         except CopilotSDKPackageUnavailable as exc:
@@ -1993,7 +1976,7 @@ class CopilotProviderAdapter(ProviderAdapter):
             notes.append(str(exc))
         if node is None:
             notes.append("Node.js runtime required by the official Copilot SDK was not found")
-        control_ready = installed and compatible_cli and node is not None and sdk is not None
+        control_ready = installed and node is not None and sdk is not None
         capabilities = (
             "detect",
             "status",
@@ -2005,14 +1988,14 @@ class CopilotProviderAdapter(ProviderAdapter):
             "interrupt",
             "terminate",
             "terminal_output",
-        ) if control_ready else ("detect", "status")
+        ) if control_ready else ("detect", "status", "spawn") if installed else ("detect", "status")
         availability = ProviderAvailability(
             provider_id=self.descriptor.provider_id,
             display_name=self.descriptor.display_name,
             kind=self.descriptor.kind,
             installed=installed,
             usable=control_ready,
-            launchable=control_ready,
+            launchable=installed,
             auth_state="unknown" if installed else "missing_cli",
             config_state="sdk_resolved" if control_ready else "sdk_unavailable",
             readable_sessions=0,
@@ -2037,11 +2020,7 @@ class CopilotProviderAdapter(ProviderAdapter):
         )
 
     def create_control_driver(self, binding: ProviderControlBinding) -> CopilotSDKDriver | None:
-        if (
-            binding.provider_id != "copilot"
-            or binding.provider_version != _SUPPORTED_CLI_VERSION
-            or binding.provider_channel != _SUPPORTED_CLI_CHANNEL
-        ):
+        if binding.provider_id != "copilot":
             return None
         env_var = _ENTRY.env_override if _ENTRY is not None else "PAIRLING_COPILOT_BIN"
         cli = resolve_executable("copilot", self.candidates, env_var=env_var)
@@ -2050,7 +2029,7 @@ class CopilotProviderAdapter(ProviderAdapter):
             path_env_var="PAIRLING_NODE_BIN",
             sha256_env_var="PAIRLING_NODE_SHA256",
         )
-        if cli is None or node is None or not is_compatible_copilot_cli_version(cli_version(cli.path)):
+        if cli is None or node is None:
             return None
         try:
             sdk = resolve_copilot_sdk_package(self.sdk_candidates)
@@ -2068,15 +2047,12 @@ class CopilotProviderAdapter(ProviderAdapter):
             sdk.version,
             "--cli-path",
             str(cli.path),
-            "--expected-cli-version",
-            binding.provider_version,
             "--base-directory",
             str(self.home / ".copilot"),
         )
         process = _CopilotSDKSidecarProcess(
             require_pinned_node=True,
             argv=argv,
-            expected_cli_version=binding.provider_version,
         )
         return CopilotSDKDriver(binding, process=process)
 

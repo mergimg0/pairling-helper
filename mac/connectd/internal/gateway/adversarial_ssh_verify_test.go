@@ -67,7 +67,7 @@ func TestAdversarialSSHGatewayBypass(t *testing.T) {
 		{"null byte send-text smuggle", "POST", "/pair/start%00", false},
 
 		// Allowed post-pair surface WITH bearer — sanity that the pipe works.
-		{"sessions", "GET", "/sessions", true},
+		{"session catalog", "GET", "/sessions-catalog", true},
 		{"send-text", "POST", "/send-text", true},
 		{"terminal-input", "POST", "/terminal-input", true},
 		{"pairdrop upload", "POST", "/pairdrop/files", true},
@@ -154,7 +154,7 @@ func TestAdversarialSSHGatewayRateLimitsAllowedRequests(t *testing.T) {
 	}
 
 	for i, want := range []int{http.StatusOK, http.StatusTooManyRequests} {
-		req := httptest.NewRequest(http.MethodGet, "http://ssh.local/sessions", nil)
+		req := httptest.NewRequest(http.MethodGet, "http://ssh.local/sessions-catalog", nil)
 		req.RemoteAddr = "203.0.113.10:12345"
 		req.Header.Set("Authorization", "Bearer device-token")
 		rec := httptest.NewRecorder()
@@ -171,11 +171,11 @@ func TestAdversarialSSHGatewayRateLimitsAllowedRequests(t *testing.T) {
 func TestSSHRateLimiterNormalizesDynamicRouteIDs(t *testing.T) {
 	limiter := NewMemoryRateLimiter(1, time.Minute)
 	remote := "127.0.0.1:12345"
-	if !limiter.Allow(remote, http.MethodGet, "/postures/first") {
-		t.Fatal("first posture request was rejected")
+	if !limiter.Allow(remote, http.MethodGet, "/prompt-presets/first") {
+		t.Fatal("first Prompt Preset request was rejected")
 	}
-	if limiter.Allow(remote, http.MethodGet, "/postures/second") {
-		t.Fatal("a new posture ID bypassed the route-class limit")
+	if limiter.Allow(remote, http.MethodGet, "/prompt-presets/second") {
+		t.Fatal("a new Prompt Preset ID bypassed the route-class limit")
 	}
 }
 func TestSSHRateLimiterKeepsDistinctSessionRouteClassesIndependent(t *testing.T) {

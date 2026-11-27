@@ -24,16 +24,16 @@ func TestSSHModeAllowsPostPairSurfaceWithBearerOnly(t *testing.T) {
 
 	// No bearer: the post-pair surface does not exist.
 	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://ssh.local/sessions", nil))
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://ssh.local/sessions-catalog", nil))
 	if rec.Code == http.StatusOK {
-		t.Fatalf("bearer-less GET /sessions must be rejected, got %d", rec.Code)
+		t.Fatalf("bearer-less GET /sessions-catalog must be rejected, got %d", rec.Code)
 	}
 
 	// With bearer: allowlisted reads and writes flow.
 	for _, probe := range []struct {
 		method, path string
 	}{
-		{http.MethodGet, "/sessions"},
+		{http.MethodGet, "/sessions-catalog"},
 		{http.MethodPost, "/send-text"},
 	} {
 		req := httptest.NewRequest(probe.method, "http://ssh.local"+probe.path, strings.NewReader(`{}`))

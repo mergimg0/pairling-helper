@@ -11,8 +11,6 @@ import { pathToFileURL } from "node:url";
 
 const PROTOCOL_VERSION = 2;
 const SDK_PACKAGE = "@anthropic-ai/claude-agent-sdk";
-const SDK_VERSION = "0.3.220";
-const CLAUDE_CODE_VERSION = "2.1.220";
 const MAX_LINE_BYTES = 256 * 1024;
 const MAX_TEXT = 16_384;
 const SAFE_PERMISSION_MODES = new Set(["default", "plan"]);
@@ -145,12 +143,6 @@ async function loadSDK() {
       }
     }
     if (!manifest) throw new Error("Claude Agent SDK package metadata not found");
-    if (manifest.version !== SDK_VERSION) {
-      throw new Error(`Claude Agent SDK ${SDK_VERSION} required`);
-    }
-    if (manifest.claudeCodeVersion !== CLAUDE_CODE_VERSION) {
-      throw new Error(`Claude Code ${CLAUDE_CODE_VERSION} required`);
-    }
     sdkPackage = manifest;
     sdk = configuredEntry ? await import(pathToFileURL(configuredEntry).href) : await import(SDK_PACKAGE);
     if (typeof sdk.query !== "function") throw new Error("Claude Agent SDK query() is unavailable");
@@ -1154,8 +1146,8 @@ async function discovery() {
     status: {
       model: currentModel,
       permission_mode: currentPermissionMode,
-      sdk_version: SDK_VERSION,
-      claude_code_version: CLAUDE_CODE_VERSION,
+      sdk_version: sdkPackage.version,
+      claude_code_version: sdkPackage.claudeCodeVersion,
     },
   };
 }
@@ -1514,8 +1506,8 @@ async function handle(request) {
             permission_mode: currentPermissionMode,
             output_style: bounded(liveInitialization?.output_style || "", 256),
             fast_mode_state: liveInitialization?.fast_mode_state || null,
-            sdk_version: SDK_VERSION,
-            claude_code_version: CLAUDE_CODE_VERSION,
+            sdk_version: sdkPackage.version,
+            claude_code_version: sdkPackage.claudeCodeVersion,
           },
         });
         return;
@@ -1583,8 +1575,8 @@ async function handle(request) {
         reply(request, {
           diagnostics: {
             session_id: activeSessionId,
-            sdk_version: SDK_VERSION,
-            claude_code_version: CLAUDE_CODE_VERSION,
+            sdk_version: sdkPackage.version,
+            claude_code_version: sdkPackage.claudeCodeVersion,
             node_version: process.versions.node,
             sdk_capabilities: [...systemCapabilities].slice(0, 128),
           },

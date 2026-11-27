@@ -119,9 +119,6 @@ class ManagedProviderAuthUnavailable(ManagedProviderDriverUnavailable):
     code = "managed_provider_auth_unavailable"
 
 
-class ManagedProviderVersionUnavailable(ManagedProviderDriverUnavailable):
-    code = "managed_provider_version_unavailable"
-
 
 class ManagedProviderProfileStale(ManagedProviderDriverUnavailable):
     code = "managed_provider_profile_stale"
@@ -448,8 +445,6 @@ def _driver_launch_attestation(
         identity_matches = (
             attestation.get("schema_version") == 1
             and attestation.get("provider_id") == provider
-            and attestation.get("provider_version") == provider_version
-            and attestation.get("provider_channel") == provider_channel
             and attestation.get("binding_id") == binding_id
             and attestation.get("session_id") == session_id
             and attestation.get("capability_generation")
@@ -732,6 +727,10 @@ class ManagedProviderSessionStore:
                     project TEXT NOT NULL,
                     title TEXT NOT NULL,
                     source_install_id TEXT NOT NULL,
+                    resolved_model TEXT NOT NULL,
+                    first_prompt TEXT,
+                    transcript_state TEXT NOT NULL,
+                    process_identity_json TEXT NOT NULL,
                     lifecycle TEXT NOT NULL,
                     capabilities_json TEXT NOT NULL,
                     provider_cursor TEXT,
@@ -1065,6 +1064,12 @@ class ManagedProviderSessionStore:
                 "protocol_last_event_digest": "TEXT",
                 "protocol_terminal": "INTEGER NOT NULL DEFAULT 0",
                 "protocol_terminal_at": "REAL",
+                "resolved_model": "TEXT NOT NULL DEFAULT ''",
+                "first_prompt": "TEXT",
+                "transcript_state":
+                    "TEXT NOT NULL DEFAULT 'not_created'",
+                "process_identity_json":
+                    "TEXT NOT NULL DEFAULT '{}'",
             }
             for column, declaration in migrations.items():
                 if column not in session_columns:
@@ -1190,7 +1195,19 @@ class ManagedProviderSessionStore:
         closed_at = result.get("closed_at")
         result["closed_at"] = int(float(closed_at)) if closed_at is not None else None
         result["working_on"] = result.get("title") or None
-        result["first_prompt"] = None
+        result["first_prompt"] = result.get("first_prompt") or None
+        result["model"] = str(result.pop("resolved_model", "") or "")
+        raw_process_identity = result.pop("process_identity_json", "{}")
+        try:
+            process_identity = json.loads(raw_process_identity)
+            if not isinstance(process_identity, dict):
+                process_identity = {}
+        except (TypeError, ValueError):
+            process_identity = {}
+        result["process_identity"] = process_identity
+        result["transcript_state"] = str(
+            result.get("transcript_state") or "not_created"
+        )
         attestation_json = result.pop("provider_attestation_json", None)
         result.pop("missing_canaries_json", None)
         result.pop("fork_reservation_token", None)
@@ -1274,6 +1291,11 @@ class ManagedProviderSessionStore:
         source_install_id: str,
         capabilities: Iterable[str],
         provider_profile_id: str,
+        resolved_model: str,
+        first_prompt: str,
+        initial_turn_state: str,
+        transcript_state: str,
+        process_identity: Mapping[str, Any],
         provider_cursor: str | None = None,
         provider_version: str | None = None,
         provider_channel: str | None = None,
@@ -1303,6 +1325,27 @@ class ManagedProviderSessionStore:
             raise ManagedProviderProfileStale(
                 "managed provider profile identity is invalid"
             )
+        model = _bounded_text(resolved_model, 256)
+        if not model:
+            raise ValueError("resolved_model required")
+        turn_state = str(initial_turn_state or "").strip()
+        if turn_state not in {"idle", "working", "waiting"}:
+            raise ValueError("initial_turn_state is invalid")
+        transcript = str(transcript_state or "").strip()
+        if transcript not in {"not_created", "created"}:
+            raise ValueError("transcript_state is invalid")
+        try:
+            process_proof = json.loads(json.dumps(dict(process_identity)))
+        except (TypeError, ValueError):
+            process_proof = {}
+        if (
+            not isinstance(process_proof, dict)
+            or not any(
+                process_proof.get(key)
+                for key in ("pid", "broker_id", "binding_id")
+            )
+        ):
+            raise ValueError("process_identity is incomplete")
         now = time.time()
         missing_canary_values = [
             _bounded_text(item, 160)
@@ -1359,10 +1402,11 @@ class ManagedProviderSessionStore:
                     and int(existing["capability_generation"]) == generation
                     and str(existing["project"]) == project
                     and str(existing["provider_profile_id"]) == profile_id
-                    and str(existing["provider_version"] or "")
-                    == (_bounded_text(provider_version, 160) or "")
-                    and str(existing["provider_channel"] or "")
-                    == (_bounded_text(provider_channel, 80) or "")
+                    and str(existing["resolved_model"] or "") == model
+                    and str(existing["first_prompt"] or "")
+                    == str(first_prompt or "")
+                    and str(existing["turn_state"] or "") == turn_state
+                    and str(existing["transcript_state"] or "") == transcript
                 )
                 if not same:
                     raise ManagedProviderSessionCollision(
@@ -1376,6 +1420,8 @@ class ManagedProviderSessionStore:
                     session_id, protocol_session_id, provider, native_id,
                     binding_id,
                     capability_generation, project, title, source_install_id,
+                    resolved_model, first_prompt, transcript_state,
+                    process_identity_json,
                     lifecycle, capabilities_json, provider_cursor, turn_state,
                     blocked_reason, driver_available, provider_version,
                     provider_channel, provider_profile_id,
@@ -1384,16 +1430,29 @@ class ManagedProviderSessionStore:
                     provider_attestation_required,
                     provider_attestation_expires_at, created_at, updated_at,
                     closed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, 'running',
-                          NULL, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running',
+                          ?, ?, ?, NULL, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, NULL)
                 """,
                 (
                     session_id, protocol_session_id,
                     str(provider).lower(), str(native_id), binding_id,
                     generation, project,
                     _redact_value(title or "Managed session", text_limit=500),
-                    _bounded_text(source_install_id, 256), json.dumps(caps),
-                    _bounded_text(provider_cursor, 512) if provider_cursor is not None else None,
+                    _bounded_text(source_install_id, 256),
+                    model,
+                    _bounded_text(first_prompt, 200_000) or None,
+                    transcript,
+                    json.dumps(
+                        process_proof,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    json.dumps(caps),
+                    _bounded_text(provider_cursor, 512)
+                    if provider_cursor is not None else None,
+                    turn_state,
                     _bounded_text(provider_version, 160) or None,
                     _bounded_text(provider_channel, 80) or None,
                     profile_id,
@@ -1529,8 +1588,6 @@ class ManagedProviderSessionStore:
                 parent is None
                 or public_parent is None
                 or public_parent["control_state"] != "controllable"
-                or not parent["provider_version"]
-                or not parent["provider_channel"]
                 or not parent["provider_profile_id"]
                 or not parent["session_instance_id"]
             ):
@@ -1806,7 +1863,9 @@ class ManagedProviderSessionStore:
                         session_id, protocol_session_id, provider, native_id,
                         binding_id,
                         capability_generation, project, title,
-                        source_install_id, lifecycle, capabilities_json,
+                        source_install_id, resolved_model, first_prompt,
+                        transcript_state, process_identity_json,
+                        lifecycle, capabilities_json,
                         provider_cursor, turn_state, blocked_reason,
                         driver_available, provider_version, provider_channel,
                         provider_profile_id, session_instance_id,
@@ -1817,9 +1876,10 @@ class ManagedProviderSessionStore:
                         fork_parent_session_id, fork_action_id,
                         fork_reservation_token, fork_provider_operation_id,
                         created_at, updated_at, closed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'blocked', ?, ?,
-                              'blocked', ?, 0, ?, ?, ?, ?, NULL, NULL, NULL,
-                              ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?,
+                              'blocked', ?, ?, 'blocked', ?, 0, ?, ?, ?, ?,
+                              NULL, NULL, NULL, ?, ?, NULL, ?, ?, ?, ?, ?, ?,
+                              NULL)
                     """,
                     (
                         child_id,
@@ -1833,6 +1893,12 @@ class ManagedProviderSessionStore:
                             f"Fork of {parent['title']}", 500
                         ),
                         str(parent["source_install_id"]),
+                        str(parent["resolved_model"]),
+                        str(parent["transcript_state"]),
+                        json.dumps({
+                            "binding_id": child_binding,
+                            "session_instance_id": child_instance,
+                        }, separators=(",", ":"), sort_keys=True),
                         capabilities_json,
                         (
                             _bounded_text(provider_cursor, 512)
@@ -4153,14 +4219,6 @@ class ManagedProviderSessionManager:
             raise ManagedProviderBindingStale(
                 "provider launch driver has a stale provider binding"
             )
-        if not provider_version:
-            raise ManagedProviderVersionUnavailable(
-                f"{provider} managed launch has no exact provider version"
-            )
-        if not provider_channel:
-            raise ManagedProviderProfileStale(
-                f"{provider} managed launch has no exact provider channel"
-            )
         if getattr(driver, "safe_launch_profile", True) is False:
             raise ManagedProviderProfileStale(
                 f"{provider} managed launch profile is not reviewed"
@@ -4259,6 +4317,33 @@ class ManagedProviderSessionManager:
                 raise ManagedProviderDriverUnavailable(
                     f"{provider} driver did not return a native session id"
                 )
+            resolved_model = str(
+                result.get("resolved_model") or result.get("model") or ""
+            ).strip()
+            initial_turn_state = str(
+                result.get("initial_turn_state") or ""
+            ).strip()
+            transcript_state = str(
+                result.get("transcript_state") or ""
+            ).strip()
+            started_at = float(result.get("started_at") or 0)
+            session_instance_id = str(
+                result.get("session_instance_id")
+                or f"{binding_id}:{generation}:{native_id}"
+            )
+            process_identity = {
+                "binding_id": binding_id,
+                "session_instance_id": session_instance_id,
+            }
+            if (
+                not resolved_model
+                or initial_turn_state not in {"idle", "working", "waiting"}
+                or transcript_state not in {"not_created", "created"}
+                or started_at <= 0
+            ):
+                raise ManagedProviderDriverUnavailable(
+                    f"{provider} driver returned incomplete launch identity"
+                )
             session_id = _qualified_session_id(provider_id, native_id)
             (
                 attestation_required,
@@ -4284,6 +4369,11 @@ class ManagedProviderSessionManager:
                 source_install_id=str(source_install_id),
                 capabilities=capabilities,
                 provider_profile_id=expected_profile["id"],
+                resolved_model=resolved_model,
+                first_prompt=prompt,
+                initial_turn_state=initial_turn_state,
+                transcript_state=transcript_state,
+                process_identity=process_identity,
                 provider_cursor=result.get("provider_cursor"),
                 provider_version=provider_version,
                 provider_channel=provider_channel,
@@ -4293,7 +4383,7 @@ class ManagedProviderSessionManager:
                 missing_canaries=missing_canaries,
                 provider_attestation_required=attestation_required,
                 provider_attestation_expires_at=attestation_expiry,
-                session_instance_id=result.get("session_instance_id"),
+                session_instance_id=session_instance_id,
                 ambient_identity_exists=self._ambient_identity_exists,
             )
             if deferred_prompt:
@@ -4838,16 +4928,6 @@ class ManagedProviderSessionManager:
                     result.get("native_session_id") or row["native_id"]
                 )
                 != str(row["native_id"])
-                or str(
-                    result.get("provider_version")
-                    or row["provider_version"]
-                )
-                != str(row["provider_version"])
-                or str(
-                    result.get("provider_channel")
-                    or row["provider_channel"]
-                )
-                != str(row["provider_channel"])
                 or result.get("driver_available", True) is not True
             ):
                 raise ManagedProviderBindingStale(

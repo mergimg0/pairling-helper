@@ -104,6 +104,34 @@ struct TerminalScriptTemplate: Sendable {
         """
     )
 
+    static let selectTerminalTabForInput = TerminalScriptTemplate(
+        handler: "selectTerminalTabForInput",
+        source: """
+        on selectTerminalTabForInput(targetTTY)
+            tell application id "com.apple.Terminal"
+                set matchCount to 0
+                set targetWindow to missing value
+                set targetTab to missing value
+                repeat with w in windows
+                    repeat with t in tabs of w
+                        if (tty of t as text) is targetTTY then
+                            set matchCount to matchCount + 1
+                            set targetWindow to w
+                            set targetTab to t
+                        end if
+                    end repeat
+                end repeat
+                if matchCount is 0 then return {"no_window"}
+                if matchCount is greater than 1 then return {"ambiguous_window"}
+                activate
+                set index of targetWindow to 1
+                set selected tab of targetWindow to targetTab
+                return {"ok", (tty of targetTab as text)}
+            end tell
+        end selectTerminalTabForInput
+        """
+    )
+
     static let startPairlingSession = TerminalScriptTemplate(
         handler: "startPairlingSession",
         source: """

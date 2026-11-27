@@ -4,6 +4,7 @@ import Foundation
 
 enum AppleTerminalAdapterError: Error, Equatable {
     case terminalTabNotFound
+    case terminalTabAmbiguous
     case ownershipMismatch
     case malformedResponse
     case terminalProcessUnavailable
@@ -68,6 +69,10 @@ protocol TerminalKeyPosting {
     func post(_ key: TerminalSpecialKey, to processIdentifier: pid_t) throws
 }
 
+protocol TerminalTextPosting {
+    func post(_ text: String, to processIdentifier: pid_t) throws
+}
+
 struct SystemTerminalProcessFinder: TerminalProcessFinding {
     func terminalProcessIdentifier() -> pid_t? {
         NSRunningApplication
@@ -101,11 +106,44 @@ struct SystemTerminalKeyPoster: TerminalKeyPosting {
     }
 }
 
+struct SystemTerminalTextPoster: TerminalTextPosting {
+    func post(_ text: String, to processIdentifier: pid_t) throws {
+        guard !text.isEmpty,
+              let source = CGEventSource(stateID: .hidSystemState),
+              let keyDown = CGEvent(
+                  keyboardEventSource: source,
+                  virtualKey: 0,
+                  keyDown: true
+              ),
+              let keyUp = CGEvent(
+                  keyboardEventSource: source,
+                  virtualKey: 0,
+                  keyDown: false
+              ) else {
+            throw AppleTerminalAdapterError.keyboardEventUnavailable
+        }
+        let units = Array(text.utf16)
+        units.withUnsafeBufferPointer { buffer in
+            keyDown.keyboardSetUnicodeString(
+                stringLength: buffer.count,
+                unicodeString: buffer.baseAddress
+            )
+            keyUp.keyboardSetUnicodeString(
+                stringLength: buffer.count,
+                unicodeString: buffer.baseAddress
+            )
+        }
+        keyDown.postToPid(processIdentifier)
+        keyUp.postToPid(processIdentifier)
+    }
+}
+
 protocol TerminalControlling {
     func probe() throws
     func readTab(tty: String) throws -> TerminalTabSnapshot
     func inspectTab(tty: String) throws -> TerminalTabInspection
     func sendText(tty: String, text: String, bracketedPaste: Bool) throws
+    func typeText(tty: String, text: String) throws
     func sendSpecialKey(tty: String, key: String) throws
     func sendEscape(tty: String) throws
     func startPairlingSession(command: String, ownershipMarker: String) throws -> String
@@ -116,15 +154,18 @@ final class AppleTerminalAdapter: TerminalControlling {
     private let scriptExecutor: any TerminalScriptExecuting
     private let processFinder: any TerminalProcessFinding
     private let keyPoster: any TerminalKeyPosting
+    private let textPoster: any TerminalTextPosting
 
     init(
         scriptExecutor: any TerminalScriptExecuting = SystemTerminalScriptExecutor(),
         processFinder: any TerminalProcessFinding = SystemTerminalProcessFinder(),
-        keyPoster: any TerminalKeyPosting = SystemTerminalKeyPoster()
+        keyPoster: any TerminalKeyPosting = SystemTerminalKeyPoster(),
+        textPoster: any TerminalTextPosting = SystemTerminalTextPoster()
     ) {
         self.scriptExecutor = scriptExecutor
         self.processFinder = processFinder
         self.keyPoster = keyPoster
+        self.textPoster = textPoster
     }
 
     func probe() throws {
@@ -170,6 +211,48 @@ final class AppleTerminalAdapter: TerminalControlling {
             arguments: [tty, payload]
         )
         try requireOK(result)
+    }
+
+    func typeText(tty: String, text: String) throws {
+        let selection = try run(
+            TerminalScriptTemplate.selectTerminalTabForInput,
+            arguments: [tty]
+        )
+        guard let selected = selection.listValue,
+              selected.count == 2,
+              selected[0] == "ok",
+              selected[1] == tty else {
+            throw responseError(for: selection)
+        }
+        guard let processIdentifier = processFinder.terminalProcessIdentifier() else {
+            throw AppleTerminalAdapterError.terminalProcessUnavailable
+        }
+
+        var literal = ""
+        func flushLiteral() throws {
+            guard !literal.isEmpty else { return }
+            try textPoster.post(literal, to: processIdentifier)
+            literal = ""
+        }
+
+        for character in text {
+            switch character {
+            case "\r", "\n":
+                try flushLiteral()
+                try keyPoster.post(.enter, to: processIdentifier)
+            case "\t":
+                try flushLiteral()
+                try keyPoster.post(.tab, to: processIdentifier)
+            default:
+                if character.unicodeScalars.contains(where: {
+                    $0.value < 0x20 || $0.value == 0x7F
+                }) {
+                    throw AppleTerminalAdapterError.unsupportedSpecialKey
+                }
+                literal.append(character)
+            }
+        }
+        try flushLiteral()
     }
 
     func sendSpecialKey(tty: String, key: String) throws {
@@ -246,6 +329,10 @@ final class AppleTerminalAdapter: TerminalControlling {
     private func responseError(for result: TerminalScriptResult?) -> AppleTerminalAdapterError {
         if result?.stringValue == "no_window" || result?.listValue?.first == "no_window" {
             return .terminalTabNotFound
+        }
+        if result?.stringValue == "ambiguous_window"
+            || result?.listValue?.first == "ambiguous_window" {
+            return .terminalTabAmbiguous
         }
         return .malformedResponse
     }

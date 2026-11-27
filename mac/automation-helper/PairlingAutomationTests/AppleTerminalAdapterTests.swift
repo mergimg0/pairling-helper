@@ -32,11 +32,35 @@ private final class FakeTerminalProcessFinder: TerminalProcessFinding {
     }
 }
 
+private final class TerminalPostingRecorder {
+    var events: [String] = []
+}
+
 private final class FakeTerminalKeyPoster: TerminalKeyPosting {
+    private let recorder: TerminalPostingRecorder?
     private(set) var postedKeys: [(key: TerminalSpecialKey, processIdentifier: pid_t)] = []
+
+    init(recorder: TerminalPostingRecorder? = nil) {
+        self.recorder = recorder
+    }
 
     func post(_ key: TerminalSpecialKey, to processIdentifier: pid_t) throws {
         postedKeys.append((key, processIdentifier))
+        recorder?.events.append("key:\(key.rawValue)")
+    }
+}
+
+private final class FakeTerminalTextPoster: TerminalTextPosting {
+    private let recorder: TerminalPostingRecorder?
+    private(set) var postedTexts: [(text: String, processIdentifier: pid_t)] = []
+
+    init(recorder: TerminalPostingRecorder? = nil) {
+        self.recorder = recorder
+    }
+
+    func post(_ text: String, to processIdentifier: pid_t) throws {
+        postedTexts.append((text, processIdentifier))
+        recorder?.events.append("text:\(text)")
     }
 }
 
@@ -144,6 +168,80 @@ final class AppleTerminalAdapterTests: XCTestCase {
         XCTAssertEqual(keyPoster.postedKeys.first?.processIdentifier, 42)
     }
 
+    func testTypeTextTargetsUniqueTabAndPreservesLiteralOrdering() throws {
+        let executor = FakeTerminalScriptExecutor()
+        executor.results["selectTerminalTabForInput"] = .list([
+            "ok", "/dev/ttys001",
+        ])
+        let recorder = TerminalPostingRecorder()
+        let keyPoster = FakeTerminalKeyPoster(recorder: recorder)
+        let textPoster = FakeTerminalTextPoster(recorder: recorder)
+        let adapter = AppleTerminalAdapter(
+            scriptExecutor: executor,
+            processFinder: FakeTerminalProcessFinder(processIdentifier: 42),
+            keyPoster: keyPoster,
+            textPoster: textPoster
+        )
+
+        try adapter.typeText(tty: "/dev/ttys001", text: "hello\rworld\t")
+
+        XCTAssertEqual(executor.invocations, [
+            .init(
+                handler: "selectTerminalTabForInput",
+                arguments: ["/dev/ttys001"]
+            ),
+        ])
+        XCTAssertEqual(recorder.events, [
+            "text:hello",
+            "key:enter",
+            "text:world",
+            "key:tab",
+        ])
+    }
+
+    func testTypeTextRejectsAmbiguousTabBeforePosting() {
+        let executor = FakeTerminalScriptExecutor()
+        executor.results["selectTerminalTabForInput"] = .list(["ambiguous_window"])
+        let keyPoster = FakeTerminalKeyPoster()
+        let textPoster = FakeTerminalTextPoster()
+        let adapter = AppleTerminalAdapter(
+            scriptExecutor: executor,
+            processFinder: FakeTerminalProcessFinder(processIdentifier: 42),
+            keyPoster: keyPoster,
+            textPoster: textPoster
+        )
+
+        XCTAssertThrowsError(
+            try adapter.typeText(tty: "/dev/ttys001", text: "hello")
+        ) { error in
+            XCTAssertEqual(error as? AppleTerminalAdapterError, .terminalTabAmbiguous)
+        }
+        XCTAssertTrue(keyPoster.postedKeys.isEmpty)
+        XCTAssertTrue(textPoster.postedTexts.isEmpty)
+    }
+
+    func testTypeTextRejectsWrongSelectedTTYBeforePosting() {
+        let executor = FakeTerminalScriptExecutor()
+        executor.results["selectTerminalTabForInput"] = .list([
+            "ok", "/dev/ttys999",
+        ])
+        let keyPoster = FakeTerminalKeyPoster()
+        let textPoster = FakeTerminalTextPoster()
+        let adapter = AppleTerminalAdapter(
+            scriptExecutor: executor,
+            processFinder: FakeTerminalProcessFinder(processIdentifier: 42),
+            keyPoster: keyPoster,
+            textPoster: textPoster
+        )
+
+        XCTAssertThrowsError(
+            try adapter.typeText(tty: "/dev/ttys001", text: "hello")
+        ) { error in
+            XCTAssertEqual(error as? AppleTerminalAdapterError, .malformedResponse)
+        }
+        XCTAssertTrue(keyPoster.postedKeys.isEmpty)
+        XCTAssertTrue(textPoster.postedTexts.isEmpty)
+    }
     func testEscapeFailsBeforeMutationWhenExactTabIsGone() {
         let executor = FakeTerminalScriptExecutor()
         executor.results["selectTerminalTab"] = .string("no_window")

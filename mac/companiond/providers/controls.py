@@ -816,7 +816,7 @@ def validated_driver_snapshot(
         binding.provider_version,
         binding.provider_channel,
     ):
-        raise ControlContractError("provider control driver lacks exact release membership")
+        raise ControlContractError("provider control driver lacks release membership")
     _validate_session_truth(binding, session_id, session_truth)
     snapshot = driver.snapshot(session_id=session_id, session_truth=session_truth)
     if not isinstance(snapshot, ProviderControlSnapshot):
@@ -954,7 +954,7 @@ def recover_provider_operation(
         binding.provider_version,
         binding.provider_channel,
     ):
-        raise ControlContractError("provider recovery lacks exact release membership")
+        raise ControlContractError("provider recovery lacks release membership")
     if operation_id not in released_operation_ids_for_provider(binding.provider_id):
         raise ControlContractError("provider operation is not in release membership")
     _validate_generation(capability_generation)

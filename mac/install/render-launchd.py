@@ -287,8 +287,6 @@ def connectd_plist(current: Path, logs: Path, ssh_gateway: bool = False) -> dict
             "127.0.0.1:7774",
             "--control-socket",
             str(Path.home() / ".claude" / "companion" / "connectd-control.sock"),
-            "--pairling-control-socket",
-            str(Path.home() / ".claude" / "companion" / "control.sock"),
             "--state-dir",
             str(app_support / "connectd" / "tsnet-state"),
         ],

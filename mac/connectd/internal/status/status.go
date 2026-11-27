@@ -290,7 +290,9 @@ func (s *Store) update(fn func(*Snapshot)) {
 }
 
 func advertisedRoutes(snapshot Snapshot) []AdvertisedRoute {
-	if snapshot.AuthState != "authenticated" || snapshot.TailnetIP == "" || !snapshot.ListenerRunning || !snapshot.UpstreamReachable || !snapshot.GatewayHealthy {
+	if snapshot.AuthState != "authenticated" ||
+		snapshot.TailnetIP == "" ||
+		!snapshot.ListenerRunning {
 		return []AdvertisedRoute{}
 	}
 	port := snapshot.ListenPort

@@ -673,26 +673,12 @@ class ACPControlDriver:
     ) -> None:
         if profile.provider_id != binding.provider_id:
             raise AcpUnavailableError("ACP profile does not match provider binding")
-        if binding.provider_version not in profile.accepted_versions:
-            raise AcpUnavailableError("ACP profile does not match installed version")
-        if binding.provider_channel not in profile.allowed_channels:
-            raise AcpUnavailableError("ACP profile does not match provider channel")
         resolved = _resolved_executable(executable)
         self.binding = binding
         self.profile = profile
         self.executable = resolved
         self._request_timeout = max(0.1, min(float(request_timeout), 600.0))
-        self._version_command = tuple(version_command) if version_command is not None else None
-        if self._version_command is not None:
-            observed = _canonical_acp_version(
-                self.binding.provider_id,
-                cli_version(self.executable, list(self._version_command)),
-            )
-            if observed != self.binding.provider_version:
-                raise AcpUnavailableError(
-                    "resolved ACP executable does not match the exact provider binding version"
-                )
-        self._executable_identity = _file_identity(self.executable)
+        del version_command
         self._state_lock = threading.RLock()
         self._rpc: _AcpJsonRpcChild | None = None
         self._generation = 1
@@ -755,17 +741,9 @@ class ACPControlDriver:
             return bool(self._rpc and self._rpc.is_available and self._native_session_id and not self._blocked_reason)
 
     def _assert_executable_identity(self) -> None:
-        if _file_identity(self.executable) != self._executable_identity:
-            raise AcpUnavailableError("resolved ACP executable identity changed before launch")
-        if self._version_command is not None:
-            observed = _canonical_acp_version(
-                self.binding.provider_id,
-                cli_version(self.executable, list(self._version_command)),
-            )
-            if observed != self.binding.provider_version:
-                raise AcpUnavailableError(
-                    "resolved ACP executable version changed before launch"
-                )
+        # Provider upgrades may replace the executable between discovery and
+        # launch. Resolve the live path again; version and inode are diagnostic.
+        self.executable = _resolved_executable(self.executable)
 
     def attach_managed_launch(
         self,
@@ -2464,15 +2442,6 @@ class AcpProviderAdapter(ProviderAdapter):
         )
         if resolved is None:
             return _UnavailableACPDriver(binding, "reviewed ACP executable is not installed")
-        observed = _canonical_acp_version(
-            binding.provider_id,
-            cli_version(resolved.path, list(self.entry.version_command)),
-        )
-        if observed != binding.provider_version:
-            return _UnavailableACPDriver(
-                binding,
-                "ACP executable version changed after the provider binding was issued",
-            )
         try:
             return ACPControlDriver(
                 binding=binding,
@@ -2515,12 +2484,13 @@ class AcpProviderAdapter(ProviderAdapter):
             setup_actions = ("install_cli",)
         elif not reviewed:
             notes = (
-                "Detected version has no exact reviewed ACP launch profile; PTY fallback remains available.",
+                "This provider has no implemented ACP launch profile.",
             )
-            setup_actions = ("provider_review_required",)
+            setup_actions = ("provider_profile_required",)
         else:
             notes = (
-                "Exact ACP profile detected; managed launch and session-bound canary attestation remain required.",
+                "ACP profile detected; managed launch and live capability "
+                "attestation remain required.",
             )
             setup_actions = ()
         capabilities = (
@@ -2644,15 +2614,6 @@ def create_control_driver(binding: ProviderControlBinding):
     )
     if resolved is None:
         return _UnavailableACPDriver(binding, "reviewed ACP executable is not installed")
-    observed = _canonical_acp_version(
-        binding.provider_id,
-        cli_version(resolved.path, list(entry.version_command)),
-    )
-    if observed != binding.provider_version:
-        return _UnavailableACPDriver(
-            binding,
-            "ACP executable version changed after the provider binding was issued",
-        )
     try:
         return ACPControlDriver(
             binding=binding,
@@ -3234,6 +3195,9 @@ def _required_initialize_failures(profile: AcpLaunchProfile, result: Mapping[str
         if requirement == "protocolVersion=1":
             if result.get("protocolVersion") != 1:
                 failures.append(requirement)
+        elif requirement.startswith("agentInfo.version="):
+            # Provider versions are diagnostic and never gate live operations.
+            continue
         elif requirement.startswith("agentInfo.") and "=" in requirement:
             path, expected = requirement.split("=", 1)
             info = _plain_mapping(result.get("agentInfo"))

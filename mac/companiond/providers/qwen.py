@@ -157,6 +157,7 @@ class _QwenSession:
 
 
 def _safe_manifest(path: Path, expected_name: str, expected_version: str, missing_code: str) -> dict[str, Any]:
+    del expected_version
     if not path.is_file():
         raise QwenUnavailableError(missing_code)
     _require_safe_regular_file(path, missing_code)
@@ -164,11 +165,13 @@ def _safe_manifest(path: Path, expected_name: str, expected_version: str, missin
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise QwenUnavailableError(missing_code) from exc
-    if not isinstance(payload, dict) or payload.get("name") != expected_name:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("name") != expected_name
+        or not isinstance(payload.get("version"), str)
+        or not payload["version"]
+    ):
         raise QwenUnavailableError(missing_code)
-    if payload.get("version") != expected_version:
-        code = "sdk_version_unsupported" if expected_name == _SDK_PACKAGE else "cli_version_unsupported"
-        raise QwenUnavailableError(code)
     return payload
 
 
@@ -335,7 +338,12 @@ def inspect_qwen_runtime(
     cli_root = _find_package_root(qwen_path, _QWEN_PACKAGE)
     if cli_root is None:
         raise QwenUnavailableError("cli_manifest_missing")
-    _safe_manifest(cli_root / "package.json", _QWEN_PACKAGE, QWEN_CLI_VERSION, "cli_manifest_missing")
+    cli_manifest = _safe_manifest(
+        cli_root / "package.json",
+        _QWEN_PACKAGE,
+        QWEN_CLI_VERSION,
+        "cli_manifest_missing",
+    )
 
     sdk_candidates = (
         cli_root / "node_modules" / "@qwen-code" / "sdk",
@@ -362,8 +370,6 @@ def inspect_qwen_runtime(
         raise QwenUnavailableError("sdk_entry_unsafe")
     _require_safe_regular_file(sdk_entry, "sdk_entry_missing")
     cli_version = _run_version([str(qwen_path), "--version"], "cli_version_unavailable")
-    if cli_version != QWEN_CLI_VERSION:
-        raise QwenUnavailableError("cli_version_unsupported")
     node_version = _run_version([str(node_path), "--version"], "node_version_unavailable")
     if int(node_version.split(".", 1)[0]) < 22:
         raise QwenUnavailableError("node_version_unsupported")
@@ -374,7 +380,7 @@ def inspect_qwen_runtime(
         "sdk": _file_digest(sdk_entry),
         "sidecar": _file_digest(sidecar_path),
         "cli_version": cli_version,
-        "sdk_version": QWEN_SDK_VERSION,
+        "sdk_version": sdk_manifest["version"],
     }
     launch_digest = hashlib.sha256(
         json.dumps(digest_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -387,7 +393,7 @@ def inspect_qwen_runtime(
         cli_version=cli_version,
         sdk_root=sdk_root.resolve(),
         sdk_entry=sdk_entry,
-        sdk_version=QWEN_SDK_VERSION,
+        sdk_version=sdk_manifest["version"],
         sidecar_path=sidecar_path,
         launch_digest=launch_digest,
         capability_methods=(),
@@ -396,16 +402,18 @@ def inspect_qwen_runtime(
     methods = handshake.get("capability_methods")
     if (
         handshake.get("protocol") != _PROTOCOL
-        or handshake.get("sdk_version") != QWEN_SDK_VERSION
-        or handshake.get("cli_version") != QWEN_CLI_VERSION
+        or not isinstance(handshake.get("sdk_version"), str)
+        or not handshake.get("sdk_version")
+        or not isinstance(handshake.get("cli_version"), str)
+        or not handshake.get("cli_version")
         or not isinstance(methods, list)
-        or tuple(methods) != _REQUIRED_METHODS
+        or not set(_REQUIRED_METHODS).issubset(map(str, methods))
         or handshake.get("safe_permission_modes") != list(_SAFE_PERMISSION_MODES)
         or handshake.get("schema_output") is not False
         or handshake.get("acp_fallback") is not False
     ):
         raise QwenUnavailableError("sdk_capability_mismatch")
-    return replace(runtime, capability_methods=tuple(methods))
+    return replace(runtime, capability_methods=tuple(map(str, methods)))
 
 
 def discover_qwen_runtime(home: Path | None = None) -> QwenRuntimeEvidence:
@@ -487,9 +495,12 @@ class QwenSidecarClient:
         handshake = reply.result
         if (
             handshake.get("protocol") != _PROTOCOL
-            or handshake.get("sdk_version") != runtime.sdk_version
-            or handshake.get("cli_version") != runtime.cli_version
-            or tuple(handshake.get("capability_methods") or ()) != runtime.capability_methods
+            or not isinstance(handshake.get("sdk_version"), str)
+            or not handshake.get("sdk_version")
+            or not isinstance(handshake.get("cli_version"), str)
+            or not handshake.get("cli_version")
+            or tuple(handshake.get("capability_methods") or ())
+            != runtime.capability_methods
             or handshake.get("safe_permission_modes") != list(_SAFE_PERMISSION_MODES)
         ):
             self.close()
@@ -813,6 +824,15 @@ class QwenControlDriver:
             client.close()
             raise QwenUnavailableError("session_identity_mismatch")
         models = _model_tuple(reply.result.get("models"))
+        resolved_model = (
+            reply.result.get("model")
+            or model
+            or (models[0] if models else None)
+        )
+        if not isinstance(resolved_model, str) or not resolved_model.strip():
+            self._blocked_reason = "launch_model_unavailable"
+            client.close()
+            raise QwenUnavailableError("launch_model_unavailable")
         with self._lock:
             self._generation += 1
             self._blocked_reason = None
@@ -843,6 +863,10 @@ class QwenControlDriver:
             "provider_channel": self.binding.provider_channel,
             "models": list(models),
             "launch_config_digest": config_digest,
+            "resolved_model": resolved_model.strip(),
+            "initial_turn_state": "working" if first_prompt else "idle",
+            "transcript_state": "created",
+            "started_at": time.time(),
         }
 
     def snapshot(
@@ -1581,10 +1605,6 @@ class QwenControlDriver:
             and truth.get("binding_id") == self.binding.binding_id
             and truth.get("capability_generation")
             == session.generation
-            and truth.get("provider_version")
-            == self.binding.provider_version
-            and truth.get("provider_channel")
-            == self.binding.provider_channel
             and truth.get("project") == session.cwd
             and truth.get("cwd") == session.cwd
             and truth.get("managed") is True
@@ -1660,12 +1680,8 @@ class QwenCodeProviderAdapter(ProviderAdapter):
             notes.append(error_code)
             if error_code == "cli_missing":
                 setup_actions.append("install_cli")
-            elif error_code in {
-                "cli_version_unsupported",
-                "sdk_version_unsupported",
-                "node_version_unsupported",
-            }:
-                setup_actions.append("update_cli")
+            elif error_code == "node_version_unsupported":
+                setup_actions.append("update_node")
             else:
                 setup_actions.append("repair_provider")
         config_path = self.home / ".qwen" / "settings.json"
@@ -1679,20 +1695,21 @@ class QwenCodeProviderAdapter(ProviderAdapter):
             )
         installed = error_code != "cli_missing"
         usable = runtime is not None
-        launchable = usable and auth_configured
+        launchable = installed
+        managed_ready = usable and auth_configured
         capabilities = (
             (
                 "detect", "status", "spawn", "live_state", "send_text",
                 "interrupt", "terminate", "mcp", "worker_telemetry",
             )
-            if launchable
+            if managed_ready
+            else ("detect", "status", "spawn") if installed
             else ("detect", "status")
         )
-        if launchable:
+        if managed_ready:
             notes.extend((
                 "Authentication is re-verified when a safe SDK session initializes",
-                "ACP fallback is disabled unless separately versioned and conformance-gated",
-                "SDK 0.1.8 does not advertise schema-constrained output",
+                "Live SDK operations are negotiated from the sidecar handshake",
             ))
         availability = ProviderAvailability(
             provider_id=self.descriptor.provider_id,
@@ -1735,11 +1752,6 @@ class QwenCodeProviderAdapter(ProviderAdapter):
             runtime = discover_qwen_runtime(self.home)
         except QwenUnavailableError as exc:
             return QwenControlDriver(binding, None, blocked_reason=exc.code)
-        binding_version = _VERSION_RE.search(binding.provider_version)
-        if binding_version is None or binding_version.group(1) != runtime.cli_version:
-            return QwenControlDriver(binding, runtime, blocked_reason="provider_version_mismatch")
-        if binding.provider_channel != "stable":
-            return QwenControlDriver(binding, runtime, blocked_reason="provider_channel_unsupported")
         if _qwen_auth_selection(self.home / ".qwen" / "settings.json") is None:
             return QwenControlDriver(
                 binding,

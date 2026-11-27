@@ -404,6 +404,10 @@ class DeferredHermesManagedLaunchDriver:
                     "provider_channel": self.binding.provider_channel,
                     "capability_generation": runtime.capability_generation,
                     "provider_cursor": readiness.provider_cursor,
+                    "resolved_model": _MANAGED_MODEL_DEFAULT,
+                    "initial_turn_state": "idle",
+                    "transcript_state": "created",
+                    "started_at": time.time(),
                 }
             except BaseException:
                 stopped = runtime is None
@@ -440,6 +444,10 @@ class DeferredHermesManagedLaunchDriver:
             "provider_channel",
             "capability_generation",
             "provider_cursor",
+            "resolved_model",
+            "initial_turn_state",
+            "transcript_state",
+            "started_at",
         }
         try:
             with self._lock:
@@ -457,12 +465,13 @@ class DeferredHermesManagedLaunchDriver:
                 or set(launch_result) != expected_keys
                 or launch_result.get("native_session_id") != native_id
                 or launch_result.get("binding_id") != self.binding.binding_id
-                or launch_result.get("provider_version")
-                != self.binding.provider_version
-                or launch_result.get("provider_channel")
-                != self.binding.provider_channel
                 or launch_result.get("capability_generation")
                 != runtime.capability_generation
+                or launch_result.get("resolved_model")
+                != _MANAGED_MODEL_DEFAULT
+                or launch_result.get("initial_turn_state") != "idle"
+                or launch_result.get("transcript_state") != "created"
+                or float(launch_result.get("started_at") or 0) <= 0
             ):
                 return False
             config_path = profile_home / "config.yaml"
@@ -860,19 +869,12 @@ class HermesProviderAdapter:
         )
         raw_version = _hermes_cli_version(resolved.path) if resolved else None
         installed_version = parse_hermes_version(raw_version)
-        supported = (
-            installed_version is not None
-            and installed_version.version == SUPPORTED_HERMES_VERSION
-            and installed_version.channel == SUPPORTED_HERMES_CHANNEL
-        )
+        supported = resolved is not None
         notes: list[str] = []
         setup_actions: list[str] = []
         if resolved is None:
             notes.append("hermes_cli_not_found")
             setup_actions.append("install_cli")
-        elif not supported:
-            notes.append("hermes_exact_version_or_channel_unsupported")
-            setup_actions.append("upgrade_cli")
         capabilities = ("detect", "status", "spawn")
         if supported:
             capabilities += (
@@ -890,7 +892,7 @@ class HermesProviderAdapter:
             installed=resolved is not None,
             usable=supported,
             launchable=supported,
-            auth_state="owned_server_required" if supported else ("missing_cli" if resolved is None else "unsupported_version"),
+            auth_state="owned_server_required" if supported else "missing_cli",
             config_state="manual_approval_required" if supported else "unknown",
             readable_sessions=0,
             live_sessions=0,
@@ -929,10 +931,6 @@ def create_control_driver(
 ):
     if binding.provider_id != "hermes_agent":
         return None
-    if binding.provider_version != SUPPORTED_HERMES_VERSION:
-        return UnavailableHermesControlDriver(binding, "hermes_version_unsupported")
-    if binding.provider_channel != SUPPORTED_HERMES_CHANNEL:
-        return UnavailableHermesControlDriver(binding, "hermes_channel_unsupported")
     owned_store = store or HermesOwnedServerStore()
     try:
         record, bearer = owned_store.load(binding)
@@ -945,7 +943,7 @@ def create_control_driver(
         if executable is None:
             return UnavailableHermesControlDriver(
                 binding,
-                "hermes_exact_binary_unavailable",
+                "hermes_binary_unavailable",
             )
         return DeferredHermesManagedLaunchDriver(
             binding,
@@ -1028,10 +1026,6 @@ def launch_owned_server(
         hermes_home,
         managed_state,
     )
-    raw_version = _hermes_cli_version(executable, env=policy_env)
-    installed = parse_hermes_version(raw_version)
-    if installed is None or installed.version != binding.provider_version or installed.channel != binding.provider_channel:
-        raise HermesRunsUnavailable("Hermes executable does not match the exact control binding")
     model_provider = str(
         _config_get(str(executable), policy_env, "model.provider") or ""
     ).strip().lower()
@@ -1266,13 +1260,6 @@ def _resolve_reviewed_binary(
         executable is None
         or not executable.is_file()
         or not os.access(executable, os.X_OK)
-    ):
-        return None
-    installed = parse_hermes_version(_hermes_cli_version(executable))
-    if (
-        installed is None
-        or installed.version != binding.provider_version
-        or installed.channel != binding.provider_channel
     ):
         return None
     return executable

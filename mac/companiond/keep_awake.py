@@ -1,8 +1,8 @@
 """Session-scoped keep-awake (SPEC-p7): one managed caffeinate child.
 
 The Mac stays awake exactly while supervised work is running — a phone
-attached to a live stream, a registered session actively running, or an
-orchestration worker — and goes back to the user's own power policy after a
+attached to a live stream, a registered session actively running, or a
+worker — and goes back to the user's own power policy after a
 linger. The mechanism is deliberately a visible child process:
 
 - `pmset -g assertions` and Activity Monitor show it (disclosure test);

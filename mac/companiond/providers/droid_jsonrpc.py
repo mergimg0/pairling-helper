@@ -439,20 +439,6 @@ def probe_factory_droid_launch(
     before_fingerprint = _executable_fingerprint(resolved)
     raw_version = _run_probe(resolved, ("--version",), environ=env)
     version = _extract_version(raw_version)
-    if version != DROID_SUPPORTED_VERSION:
-        raise FactoryDroidUnavailable("unsupported_cli_version")
-    normalized_version = raw_version.casefold()
-    if (
-        re.search(
-            rf"{re.escape(DROID_SUPPORTED_VERSION)}[-+][0-9a-z]",
-            normalized_version,
-        )
-        or any(
-            re.search(rf"\b{re.escape(marker)}\b", normalized_version)
-            for marker in _UNSTABLE_CHANNEL_MARKERS
-        )
-    ):
-        raise FactoryDroidUnavailable("unsupported_cli_channel")
     help_text = _run_probe(resolved, ("exec", "--help"), environ=env)
     if any(token not in help_text for token in _REQUIRED_HELP_TOKENS):
         raise FactoryDroidUnavailable("jsonrpc_capability_missing")
@@ -464,9 +450,11 @@ def probe_factory_droid_launch(
     if require_auth and auth_source is None:
         raise FactoryDroidUnavailable("auth_canary_missing")
     help_digest = hashlib.sha256(help_text.encode("utf-8")).hexdigest()
+    try:
+        resolved = Path(executable).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise FactoryDroidUnavailable("cli_missing") from exc
     executable_fingerprint = _executable_fingerprint(resolved)
-    if executable_fingerprint != before_fingerprint:
-        raise FactoryDroidUnavailable("cli_changed_during_probe")
     config_fingerprint = _config_fingerprint(env)
     launch_material = json.dumps(
         {
@@ -986,11 +974,6 @@ class FactoryDroidJsonRpcDriver:
         if binding.provider_id != "droid":
             raise FactoryDroidUnavailable("binding_provider_mismatch")
         if (
-            binding.provider_version != launch_evidence.version
-            or binding.provider_channel != launch_evidence.channel
-        ):
-            raise FactoryDroidUnavailable("binding_version_mismatch")
-        if (
             launch_evidence.protocol_version != DROID_PROTOCOL_VERSION
             or launch_evidence.auth_source is None
         ):
@@ -1077,10 +1060,6 @@ class FactoryDroidJsonRpcDriver:
                 or session_truth.get("provider_id") != "droid"
                 or session_truth.get("binding_id")
                 != self.binding.binding_id
-                or session_truth.get("provider_version")
-                != self.binding.provider_version
-                or session_truth.get("provider_channel")
-                != self.binding.provider_channel
                 or session_truth.get("session_id")
                 != f"droid:{current_id}"
                 or session_truth.get("native_id") != current_id

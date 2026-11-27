@@ -5,8 +5,6 @@ import { createInterface } from "node:readline";
 
 const SIDECAR_PROTOCOL = 1;
 const SDK_PACKAGE = "@github/copilot-sdk";
-const SDK_VERSION = "1.0.8";
-const CLI_VERSION = "1.0.78";
 const SDK_PROTOCOL_VERSION = 3;
 const CLI_CHANNEL = "stable";
 const MAX_LINE_BYTES = 1024 * 1024;
@@ -38,9 +36,7 @@ const REVIEWED_OPERATIONS = new Set([
 function parseArgs(argv) {
   const allowed = new Set([
     "--sdk-entry",
-    "--sdk-version",
     "--cli-path",
-    "--expected-cli-version",
     "--base-directory",
   ]);
   const result = {};
@@ -59,14 +55,11 @@ function parseArgs(argv) {
 }
 
 const args = parseArgs(process.argv.slice(2));
-if (args["sdk-version"] !== SDK_VERSION || args["expected-cli-version"] !== CLI_VERSION) {
-  throw new Error("unreviewed Copilot SDK or CLI version");
-}
 
 const sdkEntry = resolve(args["sdk-entry"]);
 const sdkRoot = dirname(dirname(sdkEntry));
 const sdkManifest = JSON.parse(await readFile(resolve(sdkRoot, "package.json"), "utf8"));
-if (sdkManifest.name !== SDK_PACKAGE || sdkManifest.version !== SDK_VERSION) {
+if (sdkManifest.name !== SDK_PACKAGE) {
   throw new Error("Copilot SDK package identity mismatch");
 }
 const sdk = await import(pathToFileURL(sdkEntry).href);
@@ -430,8 +423,8 @@ async function liveCanaries() {
     client.getAuthStatus(),
     client.listModels(),
   ]);
-  if (status.version !== args["expected-cli-version"] || status.protocolVersion !== SDK_PROTOCOL_VERSION || ping.protocolVersion !== SDK_PROTOCOL_VERSION) {
-    throw new Error("Copilot CLI version or JSON-RPC protocol canary mismatch");
+  if (status.protocolVersion !== SDK_PROTOCOL_VERSION || ping.protocolVersion !== SDK_PROTOCOL_VERSION) {
+    throw new Error("Copilot JSON-RPC protocol canary mismatch");
   }
   if (auth.isAuthenticated !== true || !Array.isArray(models) || models.length === 0) {
     throw new Error("Copilot auth or model discovery canary failed");
@@ -630,15 +623,12 @@ async function handle(message) {
       if (
         message.sidecar_protocol !== SIDECAR_PROTOCOL ||
         message.expected_sdk_package !== SDK_PACKAGE ||
-        message.expected_sdk_version !== SDK_VERSION ||
-        message.expected_cli_version !== args["expected-cli-version"] ||
-        message.expected_cli_channel !== CLI_CHANNEL ||
         message.expected_sdk_protocol !== SDK_PROTOCOL_VERSION
       ) throw new Error("sidecar handshake expectation mismatch");
       return {
         sidecar_protocol: SIDECAR_PROTOCOL,
         sdk_package: SDK_PACKAGE,
-        sdk_version: SDK_VERSION,
+        sdk_version: sdkManifest.version,
         cli_version: live.status.version,
         cli_channel: CLI_CHANNEL,
         sdk_protocol_version: live.status.protocolVersion,
@@ -701,7 +691,7 @@ async function handle(message) {
       return {
         cli_version: live.status.version,
         cli_channel: CLI_CHANNEL,
-        sdk_version: SDK_VERSION,
+        sdk_version: sdkManifest.version,
         sdk_protocol_version: live.status.protocolVersion,
         transport: "stdio-jsonrpc",
         authenticated: live.auth.isAuthenticated === true,
@@ -788,7 +778,7 @@ async function handle(message) {
       requireProviderControlCanary(message);
       return {
         provider_operation_id: operationId(message, "diagnostics"),
-        sdk_version: SDK_VERSION,
+        sdk_version: sdkManifest.version,
         cli_version: live.status.version,
         sdk_protocol_version: live.status.protocolVersion,
         transport: "stdio-jsonrpc",

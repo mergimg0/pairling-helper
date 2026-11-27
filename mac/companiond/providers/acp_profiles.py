@@ -190,7 +190,7 @@ class AcpLaunchProfile:
             or not self.required_canaries
         ):
             raise ValueError(
-                "active ACP profiles require exact versions, channels, capabilities, and canaries"
+                "active ACP profiles require capabilities and canaries"
             )
         for argument in self.argv_template:
             if not isinstance(argument, str) or not argument or "\x00" in argument or "\n" in argument:
@@ -464,8 +464,6 @@ def validate_canary_attestation(
 
     identity_matches = (
         strings["provider_id"] == profile.provider_id
-        and strings["provider_version"] in profile.accepted_versions
-        and strings["provider_channel"] in profile.allowed_channels
         and strings["profile_digest"] == profile.safe_launch_digest
         and strings["managed_config_digest"] == profile.managed_config_digest
         and strings["binding_id"] == binding_id
@@ -992,12 +990,11 @@ def reviewed_acp_profile(
     installed_version: str,
     channel: str,
 ) -> AcpLaunchProfile | AcpProfileUnavailable:
-    """Return an executable profile bound to the exact installed build/channel."""
+    """Return the provider's executable profile for the observed runtime."""
 
     normalized = str(provider_id or "").strip().lower().replace("-", "_")
     normalized = _PROVIDER_ALIASES.get(normalized, normalized)
-    version = str(installed_version or "").strip()
-    normalized_channel = str(channel or "").strip().lower()
+    del installed_version, channel
 
     if normalized == "goose":
         return AcpProfileUnavailable(
@@ -1009,8 +1006,8 @@ def reviewed_acp_profile(
     if normalized == "cursor_agent":
         return AcpProfileUnavailable(
             normalized,
-            "Cursor's live ACP documentation does not publish an exact CLI build identity",
-            "version_not_reviewed",
+            "Cursor ACP support has no implemented launch profile",
+            "profile_not_reviewed",
         )
     deferred = DEFERRED_ACP_PROFILES.get(normalized)
     if deferred is not None:
@@ -1025,37 +1022,5 @@ def reviewed_acp_profile(
             normalized,
             "provider has no reviewed ACP launch profile",
             "profile_not_reviewed",
-        )
-    if normalized_channel not in profile.allowed_channels:
-        return AcpProfileUnavailable(
-            normalized,
-            f"provider channel is not reviewed: {normalized_channel or '<empty>'}",
-            "channel_not_reviewed",
-            profile.accepted_versions,
-        )
-    if normalized == "omp":
-        if re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", version) is None:
-            return AcpProfileUnavailable(
-                normalized,
-                f"installed provider version is not canonical: {version or '<empty>'}",
-                "version_not_reviewed",
-                profile.accepted_versions,
-            )
-        return replace(
-            profile,
-            accepted_versions=(version,),
-            required_capabilities=tuple(
-                f"agentInfo.version={version}"
-                if capability.startswith("agentInfo.version=")
-                else capability
-                for capability in profile.required_capabilities
-            ),
-        )
-    if version not in profile.accepted_versions:
-        return AcpProfileUnavailable(
-            normalized,
-            f"installed provider version is not reviewed: {version or '<empty>'}",
-            "version_not_reviewed",
-            profile.accepted_versions,
         )
     return profile

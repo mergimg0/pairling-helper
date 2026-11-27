@@ -52,6 +52,7 @@ targets:
           - "Frameworks/**"
           - "Resources/Fonts/*notch*"
       - path: PairlingShared
+      - path: Pairling/AppIcon.icon
     dependencies:
       - package: MarkdownUI
       - package: Splash
@@ -78,7 +79,7 @@ targets:
         CFBundleDisplayName: Pairling
         CFBundleIconName: AppIcon
         CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "267"
+        CFBundleVersion: "287"
         UIAppFonts:
           - stack-sans-headline-variable.ttf
         ITSAppUsesNonExemptEncryption: false
@@ -147,6 +148,9 @@ targets:
         com.apple.developer.associated-domains:
           - applinks:pairling.dev
         aps-environment: "$(PAIRLING_APNS_ENVIRONMENT)"
+        # A session waiting on its person is sent as time-sensitive. Without
+        # this iOS delivers it as an ordinary alert, which a Focus holds back.
+        com.apple.developer.usernotifications.time-sensitive: true
         com.apple.developer.devicecheck.appattest-environment: "$(PAIRLING_APP_ATTEST_ENVIRONMENT)"
         # Shared container for the share extension: it queues shared items
         # here and the app drains them into a session on next foreground.
@@ -157,6 +161,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: dev.pairling.ios
         PRODUCT_NAME: Pairling
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         TARGETED_DEVICE_FAMILY: "1"
         SWIFT_STRICT_CONCURRENCY: minimal
         DEVELOPMENT_TEAM: 965AVD34A3
@@ -207,7 +212,7 @@ targets:
       properties:
         CFBundleDisplayName: Pairling Widgets
         CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "267"
+        CFBundleVersion: "287"
         UIAppFonts:
           - stack-sans-headline-variable.ttf
         NSExtension:
@@ -244,7 +249,7 @@ targets:
       properties:
         CFBundleDisplayName: Send to Pairling
         CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "267"
+        CFBundleVersion: "287"
         BGTaskSchedulerPermittedIdentifiers:
           - dev.pairling.ios.pairdrop-transfer.*
         NSExtension:
@@ -290,7 +295,7 @@ targets:
         CFBundleDisplayName: Pairling
         CFBundleIconName: AppIcon
         CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "267"
+        CFBundleVersion: "287"
         WKApplication: true
         WKCompanionAppBundleIdentifier: dev.pairling.ios
     entitlements:
@@ -326,7 +331,7 @@ targets:
       properties:
         CFBundleDisplayName: Pairling Watch Widgets
         CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "267"
+        CFBundleVersion: "287"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     entitlements:
@@ -415,7 +420,7 @@ targets:
       properties:
         CFBundleDisplayName: Pairling Tests
         CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "267"
+        CFBundleVersion: "287"
     dependencies:
       - target: Pairling
       - package: SwiftNIOSSH

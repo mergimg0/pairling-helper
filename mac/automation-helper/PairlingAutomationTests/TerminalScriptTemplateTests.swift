@@ -44,4 +44,21 @@ final class TerminalScriptTemplateTests: XCTestCase {
         XCTAssertLessThan(frontmost.lowerBound, selection.lowerBound)
         XCTAssertLessThan(selection.lowerBound, success.lowerBound)
     }
+
+    func testTypeTemplateRequiresOneExactTTYBeforeSelection() {
+        let source = TerminalScriptTemplate.selectTerminalTabForInput.source
+
+        XCTAssertTrue(source.contains("set matchCount to matchCount + 1"))
+        XCTAssertTrue(source.contains("if matchCount is 0 then return {\"no_window\"}"))
+        XCTAssertTrue(
+            source.contains(
+                "if matchCount is greater than 1 then return {\"ambiguous_window\"}"
+            )
+        )
+        XCTAssertTrue(
+            source.contains(
+                "return {\"ok\", (tty of targetTab as text)}"
+            )
+        )
+    }
 }

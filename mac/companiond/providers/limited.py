@@ -1,9 +1,7 @@
 """Honest limited/map-only provider profiles.
 
-These profiles describe what Pairling may show after exact version and canary
-checks. They do not create a structured control driver. The existing PTY path
-remains the execution floor for Aider and Kiro, and experimental transports are
-never promoted by detection alone.
+These profiles describe implemented transports after live canary checks. Raw
+Terminal remains an independent user-selected surface and is never a fallback.
 """
 
 from __future__ import annotations
@@ -107,7 +105,7 @@ def limited_provider_profile(
     *,
     canaries: tuple[str, ...] = (),
 ) -> LimitedProviderProfile | LimitedProfileUnavailable:
-    """Return a limited profile only after exact version/canary qualification."""
+    """Return a limited profile after live canary qualification."""
 
     normalized = str(provider_id or "").strip().lower().replace("-", "_")
     normalized = _ALIASES.get(normalized, normalized)
@@ -117,14 +115,6 @@ def limited_provider_profile(
             normalized,
             "provider has no reviewed limited profile",
             "profile_not_reviewed",
-        )
-    version = str(installed_version or "").strip()
-    if version not in profile.accepted_versions:
-        return LimitedProfileUnavailable(
-            normalized,
-            f"installed provider version is not reviewed: {version or '<empty>'}",
-            "version_not_reviewed",
-            profile.accepted_versions,
         )
     supplied = frozenset(str(item) for item in canaries)
     missing = tuple(item for item in profile.required_canaries if item not in supplied)

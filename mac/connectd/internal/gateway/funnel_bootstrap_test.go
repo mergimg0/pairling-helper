@@ -60,7 +60,7 @@ func TestFunnelBootstrapAllowlist(t *testing.T) {
 		{http.MethodPost, "/internal/session-register", true},
 		{http.MethodPost, "/spawn-session", true},
 		{http.MethodPost, "/send-text", true},
-		{http.MethodGet, "/sessions", true},
+		{http.MethodGet, "/sessions-catalog", true},
 		{http.MethodPost, "/pairling-tools/run", true},
 		{http.MethodPost, "/pair/revoke", true},
 		{http.MethodPost, "/pair/rotate-token", true},

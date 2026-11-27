@@ -1263,7 +1263,7 @@ def validate_capability_graph(
             if membership is None or implementation is None:
                 continue
             release = implementation["release_membership"]
-            for field in ("runtime_provider_id", "provider_version", "provider_channel", "launch_config_digest", "physical_device_required"):
+            for field in ("runtime_provider_id", "launch_config_digest", "physical_device_required"):
                 if release.get(field) != membership.get(field):
                     errors.append(f"graph release identity differs for {provider_id}.{field}")
     return errors
@@ -1314,7 +1314,7 @@ class GraphOperationContract:
 
 
 class CapabilityGraphCatalog:
-    """Immutable lookup over exact released implementation-operation contracts."""
+    """Immutable provider-operation lookup over released semantic contracts."""
 
     def __init__(self, payload: Mapping[str, Any], *, operation_manifest: Any | None = None):
         errors = validate_capability_graph(payload, operation_manifest=operation_manifest)
@@ -1324,7 +1324,7 @@ class CapabilityGraphCatalog:
             str(row["implementation_id"]): row
             for row in payload["implementations"]
         }
-        by_runtime: dict[tuple[str, str, str, str], GraphOperationContract] = {}
+        by_provider_operation: dict[tuple[str, str], GraphOperationContract] = {}
         for binding in payload["operation_bindings"]:
             if (
                 binding["implementation_status"] != "implemented"
@@ -1337,8 +1337,6 @@ class CapabilityGraphCatalog:
                 continue
             key = (
                 str(release["runtime_provider_id"]),
-                str(release["provider_version"]),
-                str(release["provider_channel"]),
                 str(binding["operation_id"]),
             )
             contract = GraphOperationContract(
@@ -1359,11 +1357,13 @@ class CapabilityGraphCatalog:
                 retry_ambiguity=str(binding["retry"]["ambiguity"]),
                 retry_correlation=str(binding["retry"]["correlation"]),
             )
-            if key in by_runtime:
-                raise CapabilityGraphError(f"duplicate runtime operation contract: {key}")
-            by_runtime[key] = contract
+            if key in by_provider_operation:
+                raise CapabilityGraphError(
+                    f"duplicate provider operation contract: {key}"
+                )
+            by_provider_operation[key] = contract
         self._payload = json.loads(json.dumps(payload))
-        self._by_runtime = MappingProxyType(by_runtime)
+        self._by_provider_operation = MappingProxyType(by_provider_operation)
         self.graph_digest = capability_graph_digest(payload)
 
     @classmethod
@@ -1385,22 +1385,17 @@ class CapabilityGraphCatalog:
         provider_channel: str,
         operation_id: str,
     ) -> GraphOperationContract:
-        key = (provider_id, provider_version, provider_channel, operation_id)
-        contract = self._by_runtime.get(key)
+        key = (provider_id, operation_id)
+        contract = self._by_provider_operation.get(key)
         if contract is not None:
-            return contract
-        if (
-            provider_id == "omp"
-            and provider_channel == "stable"
-            and _STABLE_SEMVER_RE.fullmatch(provider_version) is not None
-        ):
-            policy_key = (provider_id, "semver:*", provider_channel, operation_id)
-            policy_contract = self._by_runtime.get(policy_key)
-            if policy_contract is not None:
-                return replace(policy_contract, provider_version=provider_version)
+            return replace(
+                contract,
+                provider_version=provider_version,
+                provider_channel=provider_channel,
+            )
         raise CapabilityGraphError(
-            "no exact released semantic contract for "
-            f"{provider_id} {provider_version} {provider_channel} {operation_id}"
+            "no released semantic contract for "
+            f"{provider_id} {operation_id}"
         )
 
     def attest_operations(

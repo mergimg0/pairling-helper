@@ -35,6 +35,7 @@ PACKAGED_SOURCE_PATHS=(
   "mac/packaging/bin/pairling"
   "mac/packaging/pairling_attach.py"
   "thoughts/shared/specs/coding-agent-remote-control-capability-map.json"
+  "thoughts/shared/specs/coding-agent-remote-control-capability-map.schema.json"
   "relay/app_attest_validator.py"
 )
 SOURCE_DIRTY="${PAIRLING_SOURCE_DIRTY:-$(read_source_stamp "$REPO_ROOT/mac/SOURCE_DIRTY")}"
@@ -3814,10 +3815,13 @@ stage_provider_runtime_assets() {
 stage_reviewed_provider_manifests() {
   local destination="$1"
   local capability_source="$REPO_ROOT/thoughts/shared/specs/coding-agent-remote-control-capability-map.json"
+  local schema_source="$REPO_ROOT/thoughts/shared/specs/coding-agent-remote-control-capability-map.schema.json"
   local operations_source="$REPO_ROOT/mac/companiond/providers/operations.py"
   local packaged_capability_source="$REPO_ROOT/mac/companiond/providers/provider-control-capability-map.json"
+  local packaged_schema_source="$REPO_ROOT/mac/companiond/providers/coding-agent-remote-control-capability-map.schema.json"
   local packaged_operations_source="$REPO_ROOT/mac/companiond/providers/reviewed-operation-manifest.json"
   local capability_destination="$destination/provider-control-capability-map.json"
+  local schema_destination="$destination/coding-agent-remote-control-capability-map.schema.json"
   local operations_destination="$destination/reviewed-operation-manifest.json"
   if [[ -L "$destination" || ! -d "$destination" ]]; then
     log "ERROR: reviewed provider manifest source or destination is unsafe." >&2
@@ -3825,18 +3829,23 @@ stage_reviewed_provider_manifests() {
     return 1
   fi
   if [[ -f "$capability_source" && ! -L "$capability_source" && \
+        -f "$schema_source" && ! -L "$schema_source" && \
         -f "$operations_source" && ! -L "$operations_source" ]]; then
     if [[ -e "$capability_destination" || -L "$capability_destination" || \
+          -e "$schema_destination" || -L "$schema_destination" || \
           -e "$operations_destination" || -L "$operations_destination" ]]; then
       log "ERROR: reviewed provider manifest source or destination is unsafe." >&2
       WIZARD_FATAL=1
       return 1
     fi
   elif [[ -f "$packaged_capability_source" && ! -L "$packaged_capability_source" && \
+          -f "$packaged_schema_source" && ! -L "$packaged_schema_source" && \
           -f "$packaged_operations_source" && ! -L "$packaged_operations_source" && \
           -f "$capability_destination" && ! -L "$capability_destination" && \
+          -f "$schema_destination" && ! -L "$schema_destination" && \
           -f "$operations_destination" && ! -L "$operations_destination" ]] && \
        /usr/bin/cmp -s "$packaged_capability_source" "$capability_destination" && \
+       /usr/bin/cmp -s "$packaged_schema_source" "$schema_destination" && \
        /usr/bin/cmp -s "$packaged_operations_source" "$operations_destination"; then
     # npm payload verification already authenticated these manifest-bound
     # generated files. The generic JSON copy staged the same bytes, so retain
@@ -3849,6 +3858,11 @@ stage_reviewed_provider_manifests() {
   fi
   if ! /bin/cp -p "$capability_source" "$capability_destination"; then
     log "ERROR: reviewed provider capability map could not be staged." >&2
+    WIZARD_FATAL=1
+    return 1
+  fi
+  if ! /bin/cp -p "$schema_source" "$schema_destination"; then
+    log "ERROR: reviewed provider capability schema could not be staged." >&2
     WIZARD_FATAL=1
     return 1
   fi
@@ -4043,6 +4057,7 @@ copy_release() {
   stage_automation_helper "$tmp/automation"
   stage_provider_sdks "$tmp/provider-sdks"
   cp "$REPO_ROOT/mac/companiond/pairlingd.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/agent_activity.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/pairling_automation.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/safe_filesystem.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/runtime_contract.py" "$tmp/companiond/"
@@ -4092,7 +4107,7 @@ copy_release() {
   cp "$REPO_ROOT/mac/companiond/substrate_status_contract.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/provider_setup.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/keep_awake.py" "$tmp/companiond/"
-  cp "$REPO_ROOT/mac/companiond/postures.py" "$tmp/companiond/"
+  cp "$REPO_ROOT/mac/companiond/prompt_presets.py" "$tmp/companiond/"
   cp "$REPO_ROOT/mac/companiond/app_attest_lan.py" "$tmp/companiond/"
   stage_app_attest_assets "$tmp/companiond"
   cp "$REPO_ROOT/mac/companiond/integrations/__init__.py" "$tmp/companiond/integrations/"
@@ -5695,8 +5710,8 @@ try:
                 raise RuntimeError("connectd /status source revision does not match the staged release")
             if connectd.get("source_dirty") is not expected_dirty:
                 raise RuntimeError("connectd /status source state does not match the staged release")
-            if connectd.get("upstream_reachable") is not True:
-                raise RuntimeError("connectd /status did not prove the runtime upstream reachable")
+            if connectd.get("listener_running") is not True:
+                raise RuntimeError("connectd /status did not prove its listener running")
             activation_ok = True
             break
         except Exception as exc:
@@ -6150,8 +6165,6 @@ pair_runtime() {
   local ttl="180"
   local show_qr="0"
   local json_requested="0"
-  local role="reader"
-  local role_explicit="0"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --json)
@@ -6164,59 +6177,24 @@ pair_runtime() {
         shift
         ttl="${1:-}"
         if [[ -z "$ttl" ]]; then
-          log "usage: pairling pair [--ttl seconds] [--role reader|operator] [--json] [--qr]" >&2
-          exit 2
-        fi
-        ;;
-      --role)
-        shift
-        role="${1:-}"
-        role_explicit="1"
-        if [[ -z "$role" ]]; then
-          log "usage: pairling pair [--ttl seconds] [--role reader|operator] [--json] [--qr]" >&2
+          log "usage: pairling pair [--ttl seconds] [--json] [--qr]" >&2
           exit 2
         fi
         ;;
       --help|-h)
-        log "usage: pairling pair [--ttl seconds] [--role reader|operator] [--json] [--qr]"
+        log "usage: pairling pair [--ttl seconds] [--json] [--qr]"
         return
         ;;
       *)
-        log "usage: pairling pair [--ttl seconds] [--role reader|operator] [--json] [--qr]" >&2
+        log "usage: pairling pair [--ttl seconds] [--json] [--qr]" >&2
         exit 2
         ;;
     esac
     shift
   done
-  if [[ "$role_explicit" == "1" ]]; then
-    case "$role" in
-      reader|operator) ;;
-      *)
-        log "Invalid pairing role. Choose reader or operator." >&2
-        exit 2
-        ;;
-    esac
-  fi
-  if [[ "$role_explicit" != "1" && "$json_requested" != "1" && "${GUIDED_TTY:-0}" == "1" && -t 0 ]]; then
-    printf '\n  Pairing role\n'
-    printf '  [r] Reader   Read sessions, transcripts, diagnostics, and files\n'
-    printf '  [o] Operator Reader access plus send, interrupt, approval, and control\n'
-    printf '  Choose r or o [r]: '
-    local role_choice=""
-    IFS= read -r role_choice </dev/tty || role_choice=""
-    role_choice="$(printf '%s' "$role_choice" | tr '[:upper:]' '[:lower:]')"
-    case "$role_choice" in
-      ""|r|reader) role="reader" ;;
-      o|operator) role="operator" ;;
-      *)
-        log "Pairing cancelled: choose reader or operator." >&2
-        exit 2
-        ;;
-    esac
-  fi
   local payload_file
   payload_file="$(mktemp)"
-  if "$PYTHON3_BIN" - "$PAIRLING_RUNTIME_PORT" "$ttl" "$role" "$REPO_ROOT" >"$payload_file" <<'PY'
+  if "$PYTHON3_BIN" - "$PAIRLING_RUNTIME_PORT" "$ttl" "$REPO_ROOT" >"$payload_file" <<'PY'
 import json
 import ipaddress
 import os
@@ -6225,7 +6203,7 @@ import sys
 import time
 import urllib.parse
 
-port, ttl_raw, role, repo_root = sys.argv[1:]
+port, ttl_raw, repo_root = sys.argv[1:]
 sys.path.insert(0, os.path.join(repo_root, "mac", "companiond"))
 from pairling_connectd_status import advertised_pairling_connect_routes, fetch_connectd_status
 from local_control_client import LocalControlClientError, control_socket_path, request_json
@@ -6239,7 +6217,7 @@ except ValueError:
     }, indent=2, sort_keys=True), file=sys.stderr)
     raise SystemExit(2)
 
-body_payload = {"ttl_seconds": ttl, "role": role}
+body_payload = {"ttl_seconds": ttl}
 try:
     status, payload = request_json(
         "/pair/start",
@@ -6270,8 +6248,8 @@ secret = str(
     or ""
 )
 invited_role = str(payload.get("role") or (payload.get("claim") or {}).get("role") or "")
-if invited_role != role:
-    raise RuntimeError("Pairling runtime returned a different invitation role")
+if invited_role != "operator":
+    raise RuntimeError("Pairling runtime did not return Full Control access")
 install_id = str(payload.get("install_id") or "")
 mac_name = str(((payload.get("pair_service") or {}).get("txt") or {}).get("mac_name") or socket.gethostname())
 # The Mac ephemeral ECDH public key from /pair/start is required in the QR or

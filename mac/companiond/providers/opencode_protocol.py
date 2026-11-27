@@ -24,7 +24,6 @@ from typing import Any, Iterable, Iterator, Mapping
 from .base import cli_version, managed_child_environment
 
 
-SUPPORTED_VERSIONS = frozenset({"1.15.10"})
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_SSE_EVENT_BYTES = 1024 * 1024
 MAX_PUBLIC_EVENTS = 256
@@ -151,10 +150,8 @@ class OpenCodeProtocolProfile:
         document: Mapping[str, Any],
         launch_digest: str,
     ) -> "OpenCodeProtocolProfile":
-        if version not in SUPPORTED_VERSIONS:
-            raise OpenCodeCapabilityError(
-                f"unsupported exact OpenCode version: {version}"
-            )
+        if not isinstance(version, str) or not version:
+            raise OpenCodeCapabilityError("OpenCode runtime version is missing")
         paths = document.get("paths") if isinstance(document, Mapping) else None
         if not isinstance(paths, Mapping):
             raise OpenCodeCapabilityError(
@@ -333,10 +330,8 @@ class OpenCodeHTTPTransport:
         if not isinstance(health, Mapping) or health.get("healthy") is not True:
             raise OpenCodeCapabilityError("OpenCode health canary failed")
         version = health.get("version")
-        if version != expected_version or version not in SUPPORTED_VERSIONS:
-            raise OpenCodeCapabilityError(
-                "OpenCode runtime version differs from the pinned executable"
-            )
+        if not isinstance(version, str) or not version:
+            raise OpenCodeCapabilityError("OpenCode health omitted its version")
         document = self._request_json("GET", "/doc")
         if self._status("GET", "/global/health", authenticated=False) != 401:
             raise OpenCodeAuthenticationError(
@@ -812,10 +807,6 @@ class OpenCodeOwnedServer:
                 "OpenCode workspace is not a directory"
             )
         version = cli_version(resolved_executable, timeout=3)
-        if version != expected_version or version not in SUPPORTED_VERSIONS:
-            raise OpenCodeCapabilityError(
-                "OpenCode executable version is not pinned and supported"
-            )
         args = (
             str(resolved_executable),
             "serve",
@@ -913,10 +904,6 @@ class OpenCodeOwnedServer:
         try:
             return (
                 self.process.poll() is None
-                and self.executable.resolve(strict=True)
-                == self.executable
-                and file_sha256(self.executable)
-                == self.executable_digest
                 and self.verify_config_inputs()
             )
         except (OSError, OpenCodeError):

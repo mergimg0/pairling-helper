@@ -6,7 +6,6 @@ from pathlib import Path
 from . import registry_data
 from .codex_app_server import (
     CodexAppServerDriver,
-    is_compatible_codex_app_server_version,
     normalized_codex_app_server_version,
 )
 from .controls import ProviderControlBinding
@@ -59,9 +58,7 @@ class CodexProviderAdapter(ProviderAdapter):
         if resolved is None:
             return None
         observed = cli_version(resolved.path)
-        if not is_compatible_codex_app_server_version(observed):
-            return None
-        return normalized_codex_app_server_version(observed)
+        return normalized_codex_app_server_version(observed) or observed
 
 
     def create_control_driver(
@@ -73,17 +70,9 @@ class CodexProviderAdapter(ProviderAdapter):
             or not provider_has_release_membership(binding.provider_id)
         ):
             return None
-        expected = normalized_codex_app_server_version(binding.provider_version)
-        if expected is None or not is_compatible_codex_app_server_version(
-            binding.provider_version
-        ):
-            return None
         env_var = _ENTRY.env_override if _ENTRY is not None else "PAIRLING_CODEX_BIN"
         resolved = resolve_executable("codex", self.candidates, env_var=env_var)
         if resolved is None:
-            return None
-        observed_version = cli_version(resolved.path)
-        if normalized_codex_app_server_version(observed_version) != expected:
             return None
         return CodexAppServerDriver(
             binding=binding,
@@ -116,7 +105,6 @@ class CodexProviderAdapter(ProviderAdapter):
             "mcp",
             "export",
             "upload",
-            "orchestration_launch",
             "worker_telemetry",
         }
 
@@ -154,7 +142,6 @@ class CodexProviderAdapter(ProviderAdapter):
             "mcp",
             "export",
             "upload",
-            "orchestration_launch",
             "worker_telemetry",
         ) if installed else ("detect", "status")
         availability = ProviderAvailability(

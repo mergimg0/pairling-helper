@@ -20,12 +20,14 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import shutil
 import sqlite3
 import stat
 import threading
 from contextlib import contextmanager
+from html.parser import HTMLParser
 from pathlib import Path
 
 PARTIAL_TEXT_KIND = "partial_text"
@@ -138,6 +140,429 @@ def _redact_inline_binary(value):
     return result
 
 
+# An edit's diff rides with its result up to this size; a larger one is left out.
+TOOL_DIFF_MAX_CHARS = 32 * 1024
+
+
+def _claude_edit_diff(result) -> str | None:
+    """Claude Code's own record of an edit as numbered lines, in the shape OMP
+    records one: ` 12|kept`, `-13|old`, `+13|new`, a blank line between hunks.
+    A removed line keeps its old number; every other line has the number it
+    has in the file now."""
+    hunks = result.get("structuredPatch") if isinstance(result, dict) else None
+    if not isinstance(hunks, list):
+        return None
+    lines: list[str] = []
+    try:
+        for hunk in hunks:
+            old, new = int(hunk["oldStart"]), int(hunk["newStart"])
+            if lines:
+                lines.append("")
+            for line in hunk["lines"]:
+                sign, text = line[:1], line[1:]
+                if sign == "+":
+                    lines.append(f"+{new}|{text}")
+                    new += 1
+                elif sign == "-":
+                    lines.append(f"-{old}|{text}")
+                    old += 1
+                elif sign == " ":
+                    lines.append(f" {new}|{text}")
+                    old += 1
+                    new += 1
+                # "\ No newline at end of file" is not a line of the file.
+    except (KeyError, TypeError, ValueError):
+        return None
+    diff = "\n".join(lines)
+    return diff if 0 < len(diff) <= TOOL_DIFF_MAX_CHARS else None
+
+
+# ----- what a tool call asks the person ------------------------------------
+# Each provider's question tool is read into the same rows here, so the phone
+# draws one card and never parses a form. A row is a note, or a question of
+# kind single, multiple or text with the options it offers, or a hidden field
+# the form carries for the agent. A row also keeps what OMP's own dialog would
+# answer with (what starts chosen, what is required), so an answer given from
+# the phone can be the one that dialog would have produced.
+_QUESTION_TOOLS = frozenset({"ask", "askuserquestion", "request_user_input"})
+_QUESTION_KINDS = frozenset({"note", "single", "multiple", "text", "hidden"})
+_QUESTION_ROWS_MAX = 40
+_QUESTION_OPTIONS_MAX = 24
+_QUESTION_TEXT_MAX = 400
+# ponytail: a text field's own starting text is cut here, on the phone and in
+# the answer alike. Raise it if agents start proposing long drafts in forms.
+_QUESTION_VALUE_MAX = 8000
+_QUESTION_TEXT_TAGS = frozenset({"p", "li", "pre", "legend", "td", "th", "option"})
+# Input types OMP's dialog leaves out. Every other type is typed as text.
+_QUESTION_UNASKED_INPUTS = frozenset({"button", "file", "image", "reset", "submit"})
+_QUESTION_LIMITS = ("min", "max", "minlength", "maxlength")
+# A group of choices takes a typed answer too, unless it offers its own.
+_QUESTION_OWN_OTHER = re.compile(r"\s*other\b", re.IGNORECASE)
+
+
+def _question_text(value) -> str:
+    return " ".join(str(value or "").split())[:_QUESTION_TEXT_MAX]
+
+
+def _question_number(value) -> int | float | None:
+    try:
+        number = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return int(number) if number.is_integer() else number
+
+
+_ERROR_LINE_MAX_CHARS = 140
+_ERROR_MESSAGE = re.compile(r'"message"\s*:\s*"((?:[^"\\]|\\.)+)"')
+
+
+def error_line(value) -> str:
+    """Why a provider stopped a turn, as one line a person can read. An API
+    error arrives as a status and a JSON body, and its own message says it."""
+    text = value if isinstance(value, str) else ""
+    stated = _ERROR_MESSAGE.search(text)
+    if stated:
+        try:
+            text = str(json.loads(f'"{stated.group(1)}"'))
+        except ValueError:
+            text = stated.group(1)
+    line = next((part.strip() for part in text.splitlines() if part.strip()), "")
+    return line[:_ERROR_LINE_MAX_CHARS] or "The turn stopped on an error."
+
+
+class _QuestionFormReader(HTMLParser):
+    """Reads the plain HTML form OMP's ask tool takes, in the order the person
+    sees it, with the fields, values and starting choices OMP's dialog uses."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: list[dict] = []
+        self._text: list[str] | None = None   # the open paragraph, legend, cell or option
+        self._label: list[str] | None = None  # the open label's own words
+        self._control: dict | None = None     # what the open label wraps
+        self._fieldset: dict | None = None
+        self._select: dict | None = None
+        self._textarea: dict | None = None
+        self._cells: list[str] | None = None
+        self._groups: dict[tuple[str, str], dict] = {}
+
+    def _prompt_before(self) -> str:
+        # A paragraph right before a group is that group's question.
+        if self.rows and self.rows[-1]["kind"] == "note":
+            return self.rows.pop()["question"]
+        return ""
+
+    def _prompt(self, label: str) -> str:
+        return label or (self._fieldset or {}).get("question") or self._prompt_before()
+
+    def _add(self, control: dict, label: str) -> None:
+        kind = control["type"]
+        if control["tag"] == "select":
+            options = control["options"][:_QUESTION_OPTIONS_MAX]
+            if not control["multiple"] and not any(option.get("checked") for option in options):
+                # A list that takes one answer starts on its first choice.
+                first = next((option for option in options if not option.get("disabled")), None)
+                if first is not None:
+                    first["checked"] = True
+            row = {
+                "name": control["name"],
+                "question": self._prompt(label),
+                "kind": "multiple" if control["multiple"] else "single",
+                "options": options,
+            }
+        elif kind in ("radio", "checkbox"):
+            # Boxes that share a name are one question, wherever they sit.
+            key = (kind, control["name"])
+            row = self._groups.get(key)
+            if row is None:
+                if self._fieldset is not None and not self._fieldset["kind"]:
+                    row = self._fieldset
+                else:
+                    row = {"name": "", "question": self._prompt_before(), "kind": "",
+                           "options": [], "custom": True}
+                    self.rows.append(row)
+                row["name"] = control["name"]
+                row["kind"] = "single" if kind == "radio" else "multiple"
+                self._groups[key] = row
+            value = str(control["value"] if control["value"] is not None else "on")
+            option = {"value": value, "label": label or value}
+            for flag in ("checked", "disabled"):
+                if control[flag]:
+                    option[flag] = True
+            if len(row["options"]) < _QUESTION_OPTIONS_MAX:
+                row["options"].append(option)
+            if control["required"]:
+                row["required"] = True
+            return
+        elif kind == "hidden":
+            if control["name"]:
+                self.rows.append({"kind": "hidden", "name": control["name"],
+                                  "value": str(control["value"] or "")})
+            return
+        elif kind in _QUESTION_UNASKED_INPUTS:
+            return
+        else:
+            row = {
+                "name": control["name"],
+                "question": self._prompt(label) or re.sub(r"[_-]+", " ", control["name"]),
+                "kind": "text",
+            }
+            placeholder = _question_text(control["placeholder"])
+            if placeholder:
+                row["placeholder"] = placeholder
+            starts_as = str(control["value"] or "")[:_QUESTION_VALUE_MAX]
+            if starts_as:
+                row["value"] = starts_as
+            typed = "textarea" if control["tag"] == "textarea" else kind
+            if typed not in ("", "text"):
+                row["input"] = typed
+            for limit in _QUESTION_LIMITS:
+                number = _question_number(control[limit])
+                if number is not None:
+                    row[limit] = number
+            if control["pattern"]:
+                row["pattern"] = str(control["pattern"])[:_QUESTION_TEXT_MAX]
+        if control["required"]:
+            row["required"] = True
+        self.rows.append(row)
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag in _QUESTION_TEXT_TAGS:
+            self._text = []
+            if tag == "option" and self._select is not None:
+                self._select["option"] = attrs
+        elif tag == "tr":
+            self._cells = []
+        elif tag == "fieldset":
+            self._fieldset = {"name": "", "question": "", "kind": "", "options": [], "custom": True}
+            self.rows.append(self._fieldset)
+        elif tag == "label":
+            self._label, self._control = [], None
+        elif tag in ("select", "input", "textarea"):
+            control = {
+                "tag": tag, "type": str(attrs.get("type") or "").lower(),
+                "name": attrs.get("name") or "", "value": attrs.get("value"),
+                "placeholder": attrs.get("placeholder"), "pattern": attrs.get("pattern"),
+                "multiple": "multiple" in attrs, "options": [], "text": [],
+                **{flag: flag in attrs for flag in ("checked", "disabled", "required")},
+                **{limit: attrs.get(limit) for limit in _QUESTION_LIMITS},
+            }
+            if tag == "select":
+                self._select = control
+            elif tag == "textarea":
+                self._textarea = control
+            elif self._label is None:
+                self._add(control, "")
+            else:
+                self._control = control
+
+    def handle_data(self, data):
+        if self._textarea is not None:
+            self._textarea["text"].append(data)
+        elif self._text is not None:
+            self._text.append(data)
+        elif self._label is not None:
+            self._label.append(data)
+
+    def handle_endtag(self, tag):
+        if tag in _QUESTION_TEXT_TAGS:
+            text, self._text = _question_text("".join(self._text or [])), None
+            if tag == "legend":
+                if self._fieldset is not None:
+                    self._fieldset["question"] = text
+            elif tag == "option":
+                if self._select is not None:
+                    attrs = self._select.pop("option", {})
+                    value = attrs.get("value")
+                    option = {"value": str(value if value is not None else text),
+                              "label": text or str(value or "")}
+                    if "selected" in attrs:
+                        option["checked"] = True
+                    if "disabled" in attrs:
+                        option["disabled"] = True
+                    self._select["options"].append(option)
+            elif tag in ("td", "th"):
+                if self._cells is not None:
+                    self._cells.append(text)
+            elif text:
+                self.rows.append({"kind": "note", "question": text})
+        elif tag == "tr" and self._cells is not None:
+            line, self._cells = " | ".join(cell for cell in self._cells if cell), None
+            if line:
+                self.rows.append({"kind": "note", "question": line})
+        elif tag in ("select", "textarea"):
+            control = self._select if tag == "select" else self._textarea
+            if control is None:
+                return
+            if tag == "select":
+                self._select = None
+            else:
+                self._textarea = None
+                # What a text area holds is where its answer starts.
+                control["value"] = re.sub(r"^\r?\n", "", "".join(control["text"]))
+            if self._label is None:
+                self._add(control, "")
+            else:
+                self._control = control
+        elif tag == "label" and self._label is not None:
+            label, control = _question_text("".join(self._label)), self._control
+            self._label = self._control = None
+            if control is not None:
+                self._add(control, label)
+            elif label:
+                self.rows.append({"kind": "note", "question": label})
+        elif tag == "fieldset" and self._fieldset is not None:
+            group, self._fieldset = self._fieldset, None
+            if group["options"]:
+                return
+            # Its fields are rows of their own. The legend stays as a note
+            # unless one of them took it as its question.
+            index = next(i for i, row in enumerate(self.rows) if row is group)
+            legend = group["question"]
+            if legend and all(row.get("question") != legend for row in self.rows[index + 1:]):
+                self.rows[index] = {"kind": "note", "question": legend}
+            else:
+                del self.rows[index]
+
+
+def _listed_question(item) -> dict | None:
+    """One question of Claude Code's AskUserQuestion or Codex's
+    request_user_input, which list their questions instead of drawing a form."""
+    if not isinstance(item, dict):
+        return None
+    options = []
+    listed = item.get("options")
+    for option in listed if isinstance(listed, list) else []:
+        described = isinstance(option, dict)
+        label = _question_text(option.get("label") if described else option)
+        detail = _question_text(option.get("description")) if described else ""
+        if label:
+            options.append({"value": label, "label": f"{label}: {detail}" if detail else label})
+    return {
+        "name": str(item.get("id") or item.get("header") or ""),
+        "question": _question_text(item.get("question") or item.get("header")),
+        "kind": "text" if not options else (
+            "multiple" if item.get("multiSelect") or item.get("multiple") else "single"
+        ),
+        "options": options[:_QUESTION_OPTIONS_MAX],
+    }
+
+
+def agent_questions(name, tool_input) -> list[dict] | None:
+    """What a tool call asks the person: notes and questions in the order
+    shown, in one shape for every provider. None when it asks nothing."""
+    if str(name or "").lower() not in _QUESTION_TOOLS or not isinstance(tool_input, dict):
+        return None
+    form = tool_input.get("html")
+    if isinstance(form, str):
+        reader = _QuestionFormReader()
+        try:
+            reader.feed(form)
+            reader.close()
+        except Exception:
+            return None
+        rows = reader.rows
+    else:
+        listed = tool_input.get("questions")
+        rows = [_listed_question(item) for item in listed] if isinstance(listed, list) else []
+    rows = [
+        row for row in rows
+        if row and row.get("kind") in _QUESTION_KINDS
+        and (row.get("question") or row.get("options") or row["kind"] == "hidden")
+    ][:_QUESTION_ROWS_MAX]
+    for row in rows:
+        if "custom" in row and (
+            len(row["options"]) < 2
+            or any(_QUESTION_OWN_OTHER.match(option["label"]) for option in row["options"])
+        ):
+            del row["custom"]
+    asks = any(row["kind"] in ("single", "multiple", "text") for row in rows)
+    return rows if asks else None
+
+
+def _question_answers(value) -> list[dict] | None:
+    """The answers OMP records beside an ask's result, one row per question."""
+    if not isinstance(value, list):
+        return None
+    rows = []
+    for item in value[:_QUESTION_ROWS_MAX]:
+        if not isinstance(item, dict):
+            continue
+        answer = item.get("answer")
+        if isinstance(answer, list):
+            answer = ", ".join(str(part) for part in answer)
+        rows.append({
+            "name": str(item.get("name") or ""),
+            "question": _question_text(item.get("question")),
+            "answer": _question_text(answer),
+        })
+    return rows or None
+
+
+_PLAN_ROWS_MAX = 40
+# A phase longer than this shows what is left, and what is done as one line.
+_PLAN_ROWS_WHOLE = 8
+_PLAN_STATUSES = {"completed": "completed", "in_progress": "in_progress",
+                  "pending": "pending", "blocked": "pending"}
+
+
+def _plan_rows(value) -> list[dict] | None:
+    """The list an OMP todo call left behind, as the rows a reader checks: the
+    tasks of the phase being worked on, each done, under way or still to do.
+    Finished phases are left to the result's own text."""
+    phases = [
+        [task for task in phase.get("tasks") or []
+         if isinstance(task, dict) and isinstance(task.get("status"), str)
+         and task["status"] in _PLAN_STATUSES]
+        for phase in (value if isinstance(value, list) else [])
+        if isinstance(phase, dict)
+    ]
+
+    def has(status: str):
+        return lambda tasks: any(task["status"] == status for task in tasks)
+
+    current = (
+        next(filter(has("in_progress"), phases), None)
+        or next(filter(has("pending"), phases), None)
+        or next((tasks for tasks in reversed(phases) if tasks), None)
+    )
+    rows = [
+        {"title": title, "status": _PLAN_STATUSES[task["status"]]}
+        for task in current or []
+        if (title := _question_text(task.get("content")))
+    ]
+    if len(rows) > _PLAN_ROWS_WHOLE:
+        left = [row for row in rows if row["status"] != "completed"]
+        done = len(rows) - len(left)
+        rows = ([{"title": f"{done} done", "status": "completed"}] if done else []) + left
+    return rows[:_PLAN_ROWS_MAX] or None
+
+
+def _tool_result_text(content) -> str:
+    """Text of a tool result. Text blocks read as their text and an image as
+    a labelled attachment. Any other shape stays compact JSON, so nothing in
+    it is hidden."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list) and content:
+        parts: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                break
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+            elif block.get("type") == "image":
+                parts.append(_attachment_label("Image", block))
+            else:
+                break
+        else:
+            return "\n".join(parts)
+    return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+
+
 def parse_claude_transcript_line(line: str) -> list[dict]:
     """Map one provider JSONL line to neutral events. Never raises: anything
     unparseable becomes an explicit lifecycle event carrying the raw line."""
@@ -161,7 +586,9 @@ def parse_claude_transcript_line(line: str) -> list[dict]:
     ts = entry.get("timestamp")
     message = entry.get("message") if isinstance(entry.get("message"), dict) else None
 
-    if message is None:
+    # Claude Code logs each API request beside the conversation. Those rows carry a
+    # message with a user or system role, but they are not transcript turns.
+    if message is None or entry_type.startswith("api-request"):
         return [{
             "kind": "lifecycle",
             "subtype": entry_type,
@@ -195,22 +622,33 @@ def parse_claude_transcript_line(line: str) -> list[dict]:
                 events.append({**_base(), "kind": "block_thinking", "block_index": block_index,
                                "text": str(block.get("thinking") or block.get("text") or "")})
             elif block_type == "tool_use":
-                events.append({**_base(), "kind": "tool_call", "block_index": block_index,
-                               "call_id": block.get("id"),
-                               "name": block.get("name"),
-                               "input": block.get("input")})
+                call = {**_base(), "kind": "tool_call", "block_index": block_index,
+                        "call_id": block.get("id"),
+                        "name": block.get("name"),
+                        "input": block.get("input")}
+                questions = agent_questions(block.get("name"), block.get("input"))
+                if questions:
+                    call["questions"] = questions
+                events.append(call)
             elif block_type == "tool_result":
-                block_content = _redact_inline_binary(block.get("content"))
-                if not isinstance(block_content, str):
-                    block_content = json.dumps(
-                        block_content,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                events.append({**_base(), "kind": "tool_result", "block_index": block_index,
-                               "call_id": block.get("tool_use_id"),
-                               "content": block_content,
-                               "is_error": bool(block.get("is_error"))})
+                block_content = _tool_result_text(_redact_inline_binary(block.get("content")))
+                event = {**_base(), "kind": "tool_result", "block_index": block_index,
+                         "call_id": block.get("tool_use_id"),
+                         "content": block_content,
+                         "is_error": bool(block.get("is_error"))}
+                diff = block.get("diff")
+                if not isinstance(diff, str) and len(content) == 1:
+                    # Claude Code records an edit beside the one result it belongs to.
+                    diff = _claude_edit_diff(entry.get("toolUseResult"))
+                if isinstance(diff, str):
+                    event["diff"] = diff
+                answers = _question_answers(block.get("answers"))
+                if answers:
+                    event["answers"] = answers
+                plan = _plan_rows(block.get("plan"))
+                if plan:
+                    event["plan"] = plan
+                events.append(event)
             elif block_type == "image":
                 events.append({**_base(), "kind": "block_text", "block_index": block_index,
                                "text": _attachment_label("Image", block)})
@@ -322,12 +760,21 @@ class SessionEventLog:
                 " sha256 TEXT NOT NULL,"
                 " PRIMARY KEY (session_key, generation, seq))"
             )
+            # Every append and every reset keeps this table in step inside its
+            # own transaction. Recounting it reads every stored event, which on
+            # a 3 GB log held the first session opened after a restart for
+            # seven seconds, so only a log written before the table is counted.
+            usage_tracked = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='session_event_storage_usage'"
+            ).fetchone() is not None
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS session_event_storage_usage ("
                 " session_key TEXT PRIMARY KEY,"
                 " byte_count INTEGER NOT NULL)"
             )
-            self._rebuild_storage_usage(conn)
+            if not usage_tracked:
+                self._rebuild_storage_usage(conn)
         self._prune_orphaned_blobs()
 
     @staticmethod

@@ -111,6 +111,29 @@ final class AutomationProtocolTests: XCTestCase {
         XCTAssertTrue(arguments.bracketedPaste)
     }
 
+    func testTypeTerminalTextAcceptsOnlyTTYAndLiteralText() throws {
+        let validated = try makeValidator().validate(
+            request(
+                operation: "typeTerminalText",
+                arguments: "{\"tty\":\"/dev/ttys4\",\"text\":\"hello\\r\"}"
+            ),
+            peerUID: ownerUID
+        )
+        guard case let .terminalType(arguments) = validated.arguments else {
+            return XCTFail("Expected literal Terminal typing arguments.")
+        }
+        XCTAssertEqual(arguments.tty, "/dev/ttys4")
+        XCTAssertEqual(arguments.text, "hello\r")
+
+        assertValidationError(
+            .invalidRequest,
+            request: request(
+                operation: "typeTerminalText",
+                arguments: "{\"tty\":\"/dev/ttys4\",\"text\":\"hello\",\"bracketedPaste\":false}"
+            )
+        )
+    }
+
     func testRejectsOversizedPayloadArgumentsAndInvalidTimeouts() {
         let oversizedText = String(repeating: "a", count: 16 * 1024 + 1)
         assertValidationError(

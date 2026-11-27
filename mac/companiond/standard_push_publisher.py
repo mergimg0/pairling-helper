@@ -178,7 +178,32 @@ class TurnStateAlertPublisher:
             events.append(self._event_payload("action_required" if raw_state == "attention" else "turn_failed", item))
         return events
 
-    def _event_payload(self, kind: str, item: dict[str, Any], *, duration_seconds: float | None = None) -> dict[str, Any]:
+    def publish_waiting(self, session_id: str, *, waiting_on: str, project: str,
+                        observed_at: float,
+                        title: str = "A session is waiting on you") -> list[dict[str, Any]]:
+        """Alert each phone that takes alerts that a session has started
+        waiting on its person: a question, a prompt only they can answer, or
+        a turn that stopped on an error. The alert is named by the session and
+        the moment the wait began, so one wait alerts once."""
+        payload = self._event_payload(
+            "action_required",
+            {"session_id": session_id, "visible": {
+                "raw_state": "attention", "last_update": observed_at,
+            }},
+            waiting_on=waiting_on,
+            project=project,
+        )
+        payload["title"] = title
+        results: list[dict[str, Any]] = []
+        for device in self._standard_push_devices():
+            authorized = self._event_for_device(device, payload)
+            result = self._publish(device["device_id"], authorized) if authorized else None
+            if result is not None:
+                results.append(result)
+        return results
+
+    def _event_payload(self, kind: str, item: dict[str, Any], *, duration_seconds: float | None = None,
+                       waiting_on: str | None = None, project: str | None = None) -> dict[str, Any]:
         visible = item["visible"]
         session_id = self._route_session_id_for_event(item["session_id"])
         digest = _stable_hash({
@@ -194,7 +219,10 @@ class TurnStateAlertPublisher:
             risk_summary = None
         else:
             result_summary = None
-            required_action = "A session is waiting for your decision." if kind == "action_required" else "Open the failed turn."
+            required_action = (
+                (waiting_on or "A session is waiting for your decision.")
+                if kind == "action_required" else "Open the failed turn."
+            )
             risk_summary = "The session reported failure." if kind == "turn_failed" else None
         provider, native_id = _parse_session_ref(session_id)
         event = build_push_event(
@@ -203,6 +231,7 @@ class TurnStateAlertPublisher:
             source="turn-state",
             provider=provider,
             session_id=session_id,
+            project=project,
             observed_at=float(visible.get("last_update") or self.now_fn()),
             phase="done" if kind == "turn_result" else ("failed" if kind == "turn_failed" else "attention"),
             current_step=visible.get("tool"),
@@ -349,7 +378,7 @@ class TurnStateAlertPublisher:
 
 
 class MacHealthAlertPublisher:
-    """Publish a bounded Mac-health alert when coordinator posture becomes unsafe."""
+    """Publish a bounded Mac-health alert when coordinator readiness becomes unsafe."""
 
     def __init__(
         self,
@@ -402,13 +431,13 @@ class MacHealthAlertPublisher:
             return []
         health = self.health_snapshot_fn()
         coordinator = health.get("coordinator") if isinstance(health.get("coordinator"), dict) else {}
-        posture = str(coordinator.get("posture") or "unknown")[:40]
-        severity = str(coordinator.get("severity") or posture)[:40]
+        readiness = str(coordinator.get("readiness") or "unknown")[:40]
+        severity = str(coordinator.get("severity") or readiness)[:40]
         summary = str(coordinator.get("summary") or "The paired Mac helper needs attention.")[:180]
-        unsafe = not bool(health.get("ok")) or posture not in {"ready", "warning"}
+        unsafe = not bool(health.get("ok")) or readiness not in {"ready", "warning"}
         observed_at = float(self.now_fn())
         signature, payload = self._alert_payload(
-            posture=posture,
+            readiness=readiness,
             severity=severity,
             summary=summary,
             observed_at=observed_at,
@@ -433,13 +462,13 @@ class MacHealthAlertPublisher:
     @staticmethod
     def _alert_payload(
         *,
-        posture: str,
+        readiness: str,
         severity: str,
         summary: str,
         observed_at: float,
     ) -> tuple[str, dict[str, Any]]:
         state_signature = _stable_hash({
-            "posture": posture,
+            "readiness": readiness,
             "severity": severity,
             "summary": summary,
         })
@@ -455,14 +484,15 @@ class MacHealthAlertPublisher:
                 phase="stale",
                 risk_level="critical" if severity == "critical" else "warning",
                 risk_summary=summary,
-                route_health=posture,
+                route_health=readiness,
                 action_route="pairling://health",
                 dedupe_key=dedupe_key,
                 collapse_id=collapse_id,
             )
             payload = standard_alert_payload(event)
             payload.update({
-                "health_posture": posture,
+                # The relay's name for it; see ALERT_PAIRLING_EXTRA_KEYS.
+                "health_posture": readiness,
                 "health_severity": severity,
                 "health_summary": summary,
                 "phase": "risk",
@@ -596,7 +626,7 @@ def _parse_session_ref(session_id: str) -> tuple[str, str]:
     text = str(session_id or "").strip()
     if ":" in text:
         provider, native_id = text.split(":", 1)
-        if provider in {"claude", "codex"} and _safe_stem(native_id):
+        if provider in {"claude", "codex", "omp"} and _safe_stem(native_id):
             return provider, native_id
     if _safe_stem(text):
         return "claude", text

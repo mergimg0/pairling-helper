@@ -25,11 +25,9 @@ from runtime_contract import (
     DEVICE_ROLE_CUSTOM,
     DEVICE_ROLE_INTERNAL,
     DEVICE_ROLE_OPERATOR,
-    DEVICE_ROLE_READER,
     LOCAL_MCP_DISPATCH_SCOPE,
     MIGRATABLE_OPERATOR_DEVICE_SCOPES,
     OPERATOR_DEVICE_SCOPES,
-    READER_DEVICE_SCOPES,
     device_scopes_for_role,
 )
 from runtime_paths import app_support_root, audit_log_path, devices_db_path
@@ -62,14 +60,12 @@ def _device_role_for_scopes(
     normalized_scopes = frozenset(scopes)
     if normalized_role:
         if normalized_role not in {
-            DEVICE_ROLE_READER,
             DEVICE_ROLE_OPERATOR,
             DEVICE_ROLE_INTERNAL,
             DEVICE_ROLE_CUSTOM,
         }:
             raise ValueError(f"unsupported device role: {normalized_role}")
         expected = {
-            DEVICE_ROLE_READER: READER_DEVICE_SCOPES,
             DEVICE_ROLE_OPERATOR: OPERATOR_DEVICE_SCOPES,
         }.get(normalized_role)
         if expected is not None and normalized_scopes != expected:
@@ -77,8 +73,6 @@ def _device_role_for_scopes(
         return normalized_role
     if str(purpose or "").strip() in INTERNAL_DEVICE_PURPOSES:
         return DEVICE_ROLE_INTERNAL
-    if normalized_scopes == READER_DEVICE_SCOPES:
-        return DEVICE_ROLE_READER
     if normalized_scopes in MIGRATABLE_OPERATOR_DEVICE_SCOPES:
         return DEVICE_ROLE_OPERATOR
     return DEVICE_ROLE_CUSTOM
@@ -887,17 +881,20 @@ class DeviceRegistry:
                 saved_role == DEVICE_ROLE_OPERATOR
                 or saved_scopes in MIGRATABLE_OPERATOR_DEVICE_SCOPES
             ):
-                # Preserve the exact authority that the local Mac previously
-                # granted. A role migration may classify historical human
-                # pairings, but it must never add scopes as new controls ship.
-                # Fresh Operator scopes require a new explicit local pairing.
+                # Preserve historical Operator authority exactly; migrations
+                # never add scopes.
                 migrated_role = DEVICE_ROLE_OPERATOR
-            elif saved_role:
-                migrated_role = saved_role
-            elif saved_scopes == READER_DEVICE_SCOPES:
-                migrated_role = DEVICE_ROLE_READER
-            else:
+            elif saved_role == DEVICE_ROLE_CUSTOM:
                 migrated_role = DEVICE_ROLE_CUSTOM
+            else:
+                # Retired interactive roles are never elevated. Revoke their
+                # credentials and require a new Operator pairing.
+                conn.execute(
+                    "UPDATE devices SET role = ?, revoked_at = COALESCE(revoked_at, ?) "
+                    "WHERE device_id = ?",
+                    (DEVICE_ROLE_CUSTOM, utc_epoch(), row["device_id"]),
+                )
+                continue
             if role_was_added or migrated_role != saved_role:
                 conn.execute(
                     "UPDATE devices SET role = ? WHERE device_id = ?",
@@ -960,10 +957,7 @@ class DeviceRegistry:
         lease_expires_at: float | None = None,
     ) -> CreatedDevice:
         requested_role = str(role or "").strip().lower()
-        if scopes is None and requested_role in {
-            DEVICE_ROLE_READER,
-            DEVICE_ROLE_OPERATOR,
-        }:
+        if scopes is None and requested_role == DEVICE_ROLE_OPERATOR:
             selected_scopes = device_scopes_for_role(requested_role)
         else:
             selected_scopes = DEFAULT_DEVICE_SCOPES if scopes is None else scopes
@@ -2049,6 +2043,38 @@ class DeviceRegistry:
                     device_id=device_id,
                     outcome="ok",
                     detail={"tailnet_node_id": node_id},
+                    conn=conn,
+                )
+            return changed
+
+    def tailnet_node_binding(self, device_id: str, node_id: str) -> str:
+        expected = self.tailnet_node_id(device_id)
+        presented = str(node_id or "").strip()
+        if not expected:
+            return "unbound"
+        if not presented:
+            return "missing"
+        return "matched" if secrets.compare_digest(expected, presented) else "mismatch"
+
+    def clear_tailnet_node_id(self, device_id: str) -> bool:
+        with self.connect(immediate=True) as conn:
+            cursor = conn.execute(
+                """
+                UPDATE devices
+                SET tailnet_node_id = NULL
+                WHERE device_id = ?
+                  AND revoked_at IS NULL
+                  AND superseded_by_device_id IS NULL
+                  AND COALESCE(activation_state, 'active') = 'active'
+                """,
+                (device_id,),
+            )
+            changed = bool(cursor.rowcount)
+            if changed:
+                self.record_audit(
+                    "device.tailnet_node_id.cleared",
+                    device_id=device_id,
+                    outcome="ok",
                     conn=conn,
                 )
             return changed

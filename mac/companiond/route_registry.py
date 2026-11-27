@@ -8,13 +8,15 @@ copies in proxy.go were deleted when generation landed. Add a route here,
 rerun the generator, and rebuild connectd. The parity contract test fails
 when the generated file drifts from this registry.
 
-Dynamic path families (prefix-matched routes like /orchestrations/<id>/...)
+Dynamic path families (prefix-matched routes like /pairdrop/files/<id>/...)
 stay in proxy.go's dynamic*Path functions; this registry covers the exact
 match allowlists only.
 """
 
 GET_ROUTES = [
     "/activity",
+    "/agent-activity",
+    "/agent-activity-stream",
     "/fleet/digest",
     "/activity-stream",
     "/aperture-cli/launch-contexts",
@@ -26,7 +28,6 @@ GET_ROUTES = [
     "/device-events",
     "/filesystem/directories",
     "/health",
-    "/health-stream",
     "/healthz",
     "/invocations",
     "/invocations-stream",
@@ -35,7 +36,6 @@ GET_ROUTES = [
     "/mirror/projects",
     "/mirror/status",
     "/model-status",
-    "/orchestrations",
     "/pairdrop/events",
     "/pairdrop/files",
     "/phone-tools/activity",
@@ -46,7 +46,7 @@ GET_ROUTES = [
     "/pickers/permissions",
     "/pickers/resume",
     "/pickers/resume/preview",
-    "/postures",
+    "/prompt-presets",
     "/power-state",
     "/provider-status",
     "/provider-controls/snapshot",
@@ -72,16 +72,12 @@ GET_ROUTES = [
     "/session-runtime-truth",
     "/session-runtime-truth-stream",
     "/session-source-diagnostics",
-    "/sessions",
-    "/sessions-stream",
-    "/sessions-visible",
+    "/sessions-catalog",
     "/status",
     "/substrate-feed",
     "/substrate-status",
     "/terminal-stream",
     "/terminal-stream-diagnostics",
-    "/terminal-surface",
-    "/terminal-surface-stream",
     "/terminal-surface-stream-v2",
     "/terminal-surface-v2",
     "/terminal-workspace",
@@ -96,6 +92,7 @@ GET_ROUTES = [
 ]
 
 POST_ROUTES = [
+    "/answer-question",
     "/aperture-cli/open",
     "/compose/recordings/sync",
     "/llm-route",
@@ -103,7 +100,6 @@ POST_ROUTES = [
     "/mirror/flush",
     "/mirror/resume",
     "/open",
-    "/orchestrations",
     "/pair/bind-node",
     "/pair/psk-activate",
     "/pair/psk-claim-v2",
@@ -119,7 +115,7 @@ POST_ROUTES = [
     "/phone-tools/availability",
     "/phone-tools/next",
     "/phone-tools/result",
-    "/postures",
+    "/prompt-presets",
     "/provider-controls/execute",
     "/providers/visibility",
     "/push/live-activity-test",

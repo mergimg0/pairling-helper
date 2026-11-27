@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import re
 import stat
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from . import registry_data
@@ -38,6 +41,8 @@ _SUPPORTED_SESSION_VERSIONS = {3}
 _MAX_TERMINAL_RECORDS = 512
 _MAX_SESSION_METADATA_LINE_BYTES = 65536
 _MAX_SESSION_METADATA_CACHE_ENTRIES = 512
+_SESSION_TURN_STATE_CHUNK_BYTES = 262144
+_MAX_SESSION_TURN_STATE_SCAN_BYTES = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -52,6 +57,8 @@ class _SessionMetadataCacheEntry:
 
 
 _SESSION_METADATA_CACHE: dict[str, _SessionMetadataCacheEntry] = {}
+# Canonical path -> ((device, inode, size, mtime_ns), state or None).
+_SESSION_TURN_STATE_CACHE: dict[str, tuple[tuple[int, int, int, int], dict | None]] = {}
 
 
 @dataclass(frozen=True)
@@ -234,6 +241,134 @@ def session_runtime_metadata(path: Path) -> dict[str, str | None]:
             os.close(descriptor)
 
 
+def _message_turn_state(raw_line: bytes) -> dict | None:
+    """Turn state stated by one JSONL line; None when it is not a message entry."""
+    if b'"type":"message"' not in raw_line and b'"type": "message"' not in raw_line:
+        return None
+    try:
+        entry = json.loads(raw_line)
+    except ValueError:
+        return None
+    if not isinstance(entry, dict) or entry.get("type") != "message":
+        return None
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return None
+    role = message.get("role")
+    tool = None
+    if role in ("user", "toolResult"):
+        state = "thinking"
+    elif role != "assistant":
+        return None
+    elif message.get("stopReason") == "toolUse":
+        state = "tool"
+        content = message.get("content")
+        for block in reversed(content if isinstance(content, list) else []):
+            if isinstance(block, dict) and block.get("type") == "toolCall":
+                name = block.get("name")
+                if isinstance(name, str) and name.strip():
+                    tool = name.strip()[:128]
+                break
+    else:
+        state = "idle"
+    last_update = None
+    timestamp = entry.get("timestamp")
+    if isinstance(timestamp, str):
+        try:
+            last_update = datetime.fromisoformat(
+                timestamp.replace("Z", "+00:00")
+            ).timestamp()
+        except (ValueError, OverflowError):
+            last_update = None
+    return {"state": state, "tool": tool, "last_update": last_update}
+
+
+def _last_message_turn_state(descriptor: int, size: int) -> dict | None:
+    """Scan complete lines backwards from the end, up to the scan cap."""
+    floor = max(0, size - _MAX_SESSION_TURN_STATE_SCAN_BYTES)
+    position = size
+    # `tail` is the start-unknown line that ends where the scanned region begins.
+    # Bytes after the file's last newline are a line still being written.
+    tail = b""
+    tail_terminated = False
+    while position > floor:
+        start = max(floor, position - _SESSION_TURN_STATE_CHUNK_BYTES)
+        chunk = os.pread(descriptor, position - start, start)
+        if len(chunk) != position - start:
+            return None
+        position = start
+        head, newline, rest = chunk.partition(b"\n")
+        if not newline:
+            tail = chunk + tail
+            continue
+        lines = rest.split(b"\n")
+        lines[-1] += tail
+        if not tail_terminated:
+            lines.pop()
+        for line in reversed(lines):
+            state = _message_turn_state(line)
+            if state is not None:
+                return state
+        tail, tail_terminated = head, True
+    if floor == 0 and tail_terminated:
+        return _message_turn_state(tail)
+    return None
+
+
+def session_turn_state(path: Path) -> dict | None:
+    """Read the turn state from the last message of an append-only OMP JSONL.
+
+    `tool` while the assistant waits on tool calls, `thinking` after a user
+    message or tool result, `idle` once the assistant stopped. None when the
+    file is unreadable or no message lies within the scan cap.
+    """
+    canonical_path = _canonical_existing_path(path)
+    if canonical_path is None:
+        return None
+
+    cache_key = str(canonical_path)
+    descriptor = -1
+    try:
+        metadata = os.lstat(canonical_path)
+        if not stat.S_ISREG(metadata.st_mode):
+            return None
+        cached = _SESSION_TURN_STATE_CACHE.get(cache_key)
+        if cached is not None and cached[0] == (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+        ):
+            return dict(cached[1]) if cached[1] is not None else None
+
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(canonical_path, flags)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            return None
+        state = _last_message_turn_state(descriptor, metadata.st_size)
+        if state is not None and state["last_update"] is None:
+            state["last_update"] = metadata.st_mtime
+
+        if len(_SESSION_TURN_STATE_CACHE) >= _MAX_SESSION_METADATA_CACHE_ENTRIES:
+            _SESSION_TURN_STATE_CACHE.clear()
+        _SESSION_TURN_STATE_CACHE[cache_key] = (
+            (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            ),
+            state,
+        )
+        return dict(state) if state is not None else None
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def read_terminal_record(path: Path, *, home: Path | None = None) -> OmpTerminalRecord | None:
     home = home or Path.home()
     if not _TERMINAL_RECORD_NAME.fullmatch(path.name):
@@ -263,10 +398,29 @@ def read_terminal_record(path: Path, *, home: Path | None = None) -> OmpTerminal
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-    if len(lines) not in {2, 3} or not all(line.strip() for line in lines[:2]):
+    if len(lines) < 2 or not all(line.strip() for line in lines[:2]):
         return None
-    if len(lines) == 3 and lines[2].strip().lower() != "fresh":
-        return None
+    # After the two paths OMP may add `fresh` and, in newer releases, its own
+    # stamp of the working directory as `cwdstat <dev> <ino>`. The stamp is not
+    # compared: the device number changes across restarts, and the path, header
+    # and process checks already bind the record. Any other line is a format
+    # this reader does not know, so the record is refused.
+    fresh = False
+    stamped = False
+    for annotation in lines[2:]:
+        fields = annotation.split()
+        if annotation.strip().lower() == "fresh" and not fresh:
+            fresh = True
+        elif (
+            not stamped
+            and len(fields) == 3
+            and fields[0] == "cwdstat"
+            and fields[1].isdigit()
+            and fields[2].isdigit()
+        ):
+            stamped = True
+        else:
+            return None
 
     project = _canonical_existing_path(Path(lines[0]))
     session_path = _canonical_existing_path(Path(lines[1]))
@@ -308,7 +462,7 @@ def read_terminal_record(path: Path, *, home: Path | None = None) -> OmpTerminal
         terminal_tty=f"/dev/{path.name}",
         title=title,
         record_mtime=record_mtime,
-        fresh=len(lines) == 3,
+        fresh=fresh,
     )
 
 
@@ -425,6 +579,231 @@ def saved_sessions(
         if len(unique) >= result_limit:
             break
     return unique
+
+# While a question's form is open in a terminal, the Pairling ask extension
+# (omp_ask_extension.mjs) keeps `<session id>.<call key>.pending` here, holding
+# the id of the OMP process that shows the form. An answer renamed into place
+# beside it as `<session id>.<call key>.answer.json` is the one the agent
+# gets, and the extension removes both when the form closes. The call key is
+# a digest of the call's id, which is the model provider's and may hold any
+# character.
+_ASKS_DIRECTORY = (".claude", "companion", "omp-asks")
+_ASK_SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+ASK_ANSWER_TEXT_MAX = 8000
+# How long the extension is given to take an answer. It reads on the file
+# event, so this is slack for a busy terminal, not a wait anyone sees.
+ASK_ANSWER_TAKEN_SECONDS = 3.0
+
+
+def asks_directory(*, home: Path | None = None) -> Path:
+    return (home or Path.home()).joinpath(*_ASKS_DIRECTORY)
+
+
+def _ask_file(session_id, call_id, suffix: str, *, home: Path | None = None) -> Path | None:
+    if (
+        not isinstance(session_id, str) or not _ASK_SESSION_ID.fullmatch(session_id)
+        or not isinstance(call_id, str) or not call_id
+    ):
+        return None
+    call_key = hashlib.sha256(call_id.encode("utf-8")).hexdigest()[:32]
+    return asks_directory(home=home) / f"{session_id}.{call_key}{suffix}"
+
+
+def ask_can_be_answered(session_id, call_id, *, home: Path | None = None) -> bool:
+    """Whether a live OMP process holds this question's form open through the
+    extension. Only then does an answer written for it reach the agent."""
+    marker = _ask_file(session_id, call_id, ".pending", home=home)
+    if marker is None:
+        return False
+    try:
+        descriptor = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return False
+        holder = int(os.read(descriptor, 32))
+        if holder <= 1:
+            return False
+        # A process that was killed leaves its marker behind.
+        os.kill(holder, 0)
+    except (OSError, ValueError):
+        return False
+    finally:
+        os.close(descriptor)
+    return True
+
+
+def _ask_choice(row: dict, answered: bool, given) -> tuple[object, str | None]:
+    """A choice field's value, and what is wrong with it if anything, by the
+    rules of OMP's own dialog: one value, or a list when several boxes can be
+    ticked, with a typed answer taking the place of or joining the choices."""
+    options = [option for option in row.get("options") or [] if isinstance(option, dict)]
+    offered = [option["value"] for option in options if not option.get("disabled")]
+    several = row["kind"] == "multiple" and len(options) > 1
+    typed = ""
+    if not answered:
+        chosen = {option["value"] for option in options if option.get("checked")}
+    else:
+        chosen = set()
+        for item in given if isinstance(given, list) else [given]:
+            if item is None:
+                continue
+            if not isinstance(item, str) or len(item) > ASK_ANSWER_TEXT_MAX:
+                return None, "An answer must be text"
+            if item in offered:
+                chosen.add(item)
+            elif not item.strip():
+                continue
+            elif row.get("custom") and not typed:
+                typed = item.strip()
+            else:
+                return None, f"{item[:80]!r} is not one of the choices"
+    picked = [value for value in dict.fromkeys(offered) if value in chosen]
+    if several:
+        value = picked + [typed] if typed else picked
+    else:
+        value = typed or (picked[0] if picked else None)
+    if row.get("required") and (value is None or value == []):
+        return value, "Select at least one" if several else "Required"
+    return value, None
+
+
+def _ask_text(row: dict, answered: bool, given) -> tuple[object, str | None]:
+    """A typed field's value, and what is wrong with it if anything, by the
+    rules of OMP's own dialog."""
+    given = given if answered else row.get("value")
+    if given is None:
+        given = ""
+    if isinstance(given, bool) or not isinstance(given, (str, int, float)):
+        return None, "An answer must be text"
+    text = str(given)
+    if len(text) > ASK_ANSWER_TEXT_MAX:
+        return None, f"At most {ASK_ANSWER_TEXT_MAX} characters"
+    if not text.strip():
+        return text, "Required" if row.get("required") else None
+    value: object = text
+    if row.get("input") in ("number", "range"):
+        try:
+            number = float(text) if "_" not in text else math.nan
+        except ValueError:
+            number = math.nan
+        if not math.isfinite(number):
+            return text, "Enter a number"
+        value = int(number) if number.is_integer() else number
+        if row.get("min") is not None and value < row["min"]:
+            return value, f"Must be at least {row['min']}"
+        if row.get("max") is not None and value > row["max"]:
+            return value, f"Must be at most {row['max']}"
+    if row.get("minlength") is not None and len(text) < row["minlength"]:
+        return value, f"Needs at least {row['minlength']} characters"
+    if row.get("maxlength") is not None and len(text) > row["maxlength"]:
+        return value, f"At most {row['maxlength']} characters"
+    if row.get("input") == "email" and not re.fullmatch(r"[^\s@]+@[^\s@]+", text):
+        return value, "Enter an email address"
+    if row.get("input") == "url" and not re.match(r"[A-Za-z][A-Za-z0-9+.-]*:.", text):
+        return value, "Enter a full URL"
+    if row.get("pattern"):
+        try:
+            fits = re.fullmatch(row["pattern"], text) is not None
+        except re.error:
+            fits = True
+        if not fits:
+            return value, f"Must match {row['pattern'][:40]}"
+    return value, None
+
+
+def _ask_said(row: dict, value) -> str:
+    """How an answer reads beside its question in the session's own record."""
+    if value is None:
+        return ""
+    if row["kind"] == "text":
+        return str(value)
+
+    def said(item) -> str:
+        for option in row.get("options") or []:
+            if isinstance(option, dict) and option.get("value") == item:
+                return option.get("label") or item
+        return f"Other: {item}" if row.get("custom") else item
+
+    return ", ".join(said(item) for item in value) if isinstance(value, list) else said(value)
+
+
+def ask_answer(rows, values) -> dict:
+    """The answer OMP's own form would give for what a person chose:
+    `data` keyed by field name, and `answers` saying each in words.
+
+    `rows` are the form's rows as `agent_questions` reads them. `values` holds
+    the person's choice for a field by its name: text for a typed field or one
+    choice, a list for boxes. A field left out keeps what the form started
+    with. Raises ValueError, naming the question, for an answer the form does
+    not take."""
+    if not isinstance(values, dict):
+        raise ValueError("answers must be keyed by field name")
+    rows = [row for row in rows or [] if isinstance(row, dict) and row.get("name")]
+    fields = [row for row in rows if row.get("kind") in ("single", "multiple", "text")]
+    if not fields:
+        raise ValueError("the form asks nothing")
+    unknown = sorted(str(name) for name in values if name not in {row["name"] for row in fields})
+    if unknown:
+        raise ValueError(f"the form has no field named {unknown[0]!r}")
+    data: dict = {
+        row["name"]: str(row.get("value") or "") for row in rows if row.get("kind") == "hidden"
+    }
+    answers: list[dict] = []
+    for row in fields:
+        name, options = row["name"], row.get("options") or []
+        # A lone box with no question of its own is asked by its label.
+        lone = options[0].get("label") if len(options) == 1 and isinstance(options[0], dict) else ""
+        question = row.get("question") or lone or name
+        read = _ask_text if row["kind"] == "text" else _ask_choice
+        value, fault = read(row, name in values, values.get(name))
+        if fault:
+            raise ValueError(f"{question}: {fault}")
+        if value is None:
+            data.pop(name, None)
+        else:
+            data[name] = value
+        answers.append({"name": name, "question": question, "answer": _ask_said(row, value)})
+    return {"data": data, "answers": answers}
+
+
+def give_ask_answer(
+    session_id, call_id, answer: dict, *,
+    home: Path | None = None, patience: float = ASK_ANSWER_TAKEN_SECONDS,
+) -> str:
+    """Hand an answer to the extension holding the question's form open, and
+    wait for the form to close on it.
+
+    "taken": the form closed with the answer in place.
+    "closed": no live form is open for the question, and nothing was written.
+    "ignored": the form stayed open, and the answer was withdrawn so that it
+    cannot land later."""
+    if not ask_can_be_answered(session_id, call_id, home=home):
+        return "closed"
+    marker = _ask_file(session_id, call_id, ".pending", home=home)
+    target = _ask_file(session_id, call_id, ".answer.json", home=home)
+    scratch = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(answer, handle, ensure_ascii=False)
+        # A whole file renamed into place: the extension reads on the event.
+        os.replace(scratch, target)
+        deadline = time.monotonic() + patience
+        while os.path.lexists(marker):
+            if time.monotonic() >= deadline:
+                os.unlink(target)
+                return "ignored"
+            time.sleep(0.02)
+    except OSError:
+        for left in (scratch, target):
+            try:
+                os.unlink(left)
+            except OSError:
+                pass
+        return "ignored"
+    return "taken"
 
 
 class OmpProviderAdapter(ProviderAdapter):

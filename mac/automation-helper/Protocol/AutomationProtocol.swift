@@ -23,6 +23,7 @@ enum AutomationOperation: String, Codable, CaseIterable, Sendable {
     case probeTerminal
     case readTerminalTab
     case sendTerminalText
+    case typeTerminalText
     case sendSpecialKey
     case startPairlingSession
     case inspectTerminalTab
@@ -68,6 +69,7 @@ enum AutomationErrorCode: String, Codable, Equatable, Sendable {
     case setupCapabilityUsed = "setup_capability_used"
     case operationUnavailable = "operation_unavailable"
     case terminalTabNotFound = "terminal_tab_not_found"
+    case terminalTabAmbiguous = "terminal_tab_ambiguous"
     case ownershipMismatch = "ownership_mismatch"
     case helperUnavailable = "helper_unavailable"
     case macPermissionsNeeded = "mac_permissions_needed"
@@ -88,6 +90,8 @@ enum AutomationErrorCode: String, Codable, Equatable, Sendable {
             return "The requested helper operation is unavailable."
         case .terminalTabNotFound:
             return "The requested Terminal tab is no longer available."
+        case .terminalTabAmbiguous:
+            return "More than one Terminal tab matched the requested identity."
         case .ownershipMismatch:
             return "The requested Terminal tab is not owned by Pairling."
         case .invalidTTY:
@@ -288,6 +292,7 @@ enum AutomationArguments: Equatable, Sendable {
     case permissionRequest(PermissionRequestArguments)
     case terminalTTY(TerminalTTYArguments)
     case terminalText(TerminalTextArguments)
+    case terminalType(TerminalTypeArguments)
     case specialKey(SpecialKeyArguments)
     case startSession(StartPairlingSessionArguments)
     case closeSession(ClosePairlingSessionArguments)
@@ -312,6 +317,12 @@ enum AutomationArguments: Equatable, Sendable {
                 tty: try requiredString(values, key: "tty"),
                 text: try requiredString(values, key: "text"),
                 bracketedPaste: try requiredBoolean(values, key: "bracketedPaste")
+            ))
+        case .typeTerminalText:
+            try requireOnly(values, keys: ["tty", "text"])
+            return .terminalType(TerminalTypeArguments(
+                tty: try requiredString(values, key: "tty"),
+                text: try requiredString(values, key: "text")
             ))
         case .sendSpecialKey:
             try requireOnly(values, keys: ["tty", "key"])
@@ -351,6 +362,11 @@ enum AutomationArguments: Equatable, Sendable {
                 "tty": .string(arguments.tty),
                 "text": .string(arguments.text),
                 "bracketedPaste": .bool(arguments.bracketedPaste),
+            ])
+        case .terminalType(let arguments):
+            return .object([
+                "tty": .string(arguments.tty),
+                "text": .string(arguments.text),
             ])
         case .specialKey(let arguments):
             return .object(["tty": .string(arguments.tty), "key": .string(arguments.key)])
@@ -417,6 +433,11 @@ struct TerminalTextArguments: Equatable, Sendable {
     let tty: String
     let text: String
     let bracketedPaste: Bool
+}
+
+struct TerminalTypeArguments: Equatable, Sendable {
+    let tty: String
+    let text: String
 }
 
 struct SpecialKeyArguments: Equatable, Sendable {

@@ -32,7 +32,6 @@ from .controls import (
 )
 from .opencode_protocol import (
     PAIRLING_PERMISSION_RULESET,
-    SUPPORTED_VERSIONS,
     OpenCodeAuthenticationError,
     OpenCodeCapabilityError,
     OpenCodeEndpointDenied,
@@ -174,13 +173,9 @@ class OpenCodeControlDriver:
                 expected_version=self.binding.provider_version,
                 launch_digest=server.launch_digest,
             )
-            if (
-                self.binding.provider_channel != "stable"
-                or fresh.version != self.binding.provider_version
-                or fresh.launch_digest != server.launch_digest
-                or fresh.capability_digest != original.capability_digest
-            ):
+            if fresh.launch_digest != server.launch_digest:
                 return False
+            server.profile = fresh
             native_id = resource_id(
                 str(
                     launch_result.get("native_session_id")
@@ -321,10 +316,6 @@ class OpenCodeControlDriver:
                 or session_truth.get("provider_id") != "opencode"
                 or session_truth.get("binding_id")
                 != self.binding.binding_id
-                or session_truth.get("provider_version")
-                != self.binding.provider_version
-                or session_truth.get("provider_channel")
-                != self.binding.provider_channel
                 or session_truth.get("driver_available") is not True
                 or session_truth.get("lifecycle")
                 not in {"running", "waiting"}
@@ -360,15 +351,11 @@ class OpenCodeControlDriver:
                 expected_version=self.binding.provider_version,
                 launch_digest=server.launch_digest,
             )
-            if (
-                fresh.version != self.binding.provider_version
-                or fresh.launch_digest != server.launch_digest
-                or fresh.capability_digest
-                != server.profile.capability_digest
-            ):
+            if fresh.launch_digest != server.launch_digest:
                 raise OpenCodeControlError(
-                    "OpenCode session binding refresh capabilities changed"
+                    "OpenCode session binding refresh launch identity changed"
                 )
+            server.profile = fresh
             session = server.transport.get_session(native_id)
             if (
                 not session_matches_directory(session, server.cwd)
@@ -1012,11 +999,6 @@ class OpenCodeControlDriver:
                 "OpenCode owned child server is unavailable"
             )
         server = self._server_factory(resolved)
-        if server.profile.version != self.binding.provider_version:
-            server.close()
-            raise OpenCodeCapabilityError(
-                "OpenCode child version differs from its binding"
-            )
         verify_inputs = getattr(server, "verify_launch_inputs", None)
         if not callable(verify_inputs) or not verify_inputs():
             server.close()
@@ -1908,9 +1890,7 @@ class OpenCodeProviderAdapter(ProviderAdapter):
             "opencode", self.candidates, env_var=env_var
         )
         version = cli_version(resolved.path) if resolved else None
-        supported = (
-            resolved is not None and version in SUPPORTED_VERSIONS
-        )
+        supported = resolved is not None
         config_candidates = (
             registry_data.config_file_paths(
                 _ENTRY, home=self.home
@@ -1933,14 +1913,9 @@ class OpenCodeProviderAdapter(ProviderAdapter):
                 "OpenCode CLI not found in configured, known, or daemon PATH locations"
             )
             setup_actions.append("install_cli")
-        elif not supported:
-            notes.append(
-                "Installed OpenCode version is outside the exact native-driver table"
-            )
-            setup_actions.append("install_supported_version")
         else:
             notes.append(
-                "Native control starts only in a Pairling-owned authenticated child"
+                "Native control starts in a Pairling-owned authenticated child"
             )
         capabilities = (
             (
@@ -2031,18 +2006,12 @@ class OpenCodeProviderAdapter(ProviderAdapter):
             factory = None
             if resolved is None:
                 blocked_reason = "opencode_cli_missing"
-            elif binding.provider_version != observed_version:
-                blocked_reason = "opencode_binding_version_mismatch"
-            elif observed_version not in SUPPORTED_VERSIONS:
-                blocked_reason = "opencode_version_unsupported"
-            elif binding.provider_channel != "stable":
-                blocked_reason = "opencode_channel_unsupported"
             else:
                 executable = resolved.path
                 factory = lambda cwd: OpenCodeOwnedServer.start(
                     executable,
                     cwd=cwd,
-                    expected_version=observed_version,
+                    expected_version=observed_version or binding.provider_version,
                 )
             driver = OpenCodeControlDriver(
                 binding,

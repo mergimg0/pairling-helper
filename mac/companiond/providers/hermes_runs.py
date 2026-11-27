@@ -130,10 +130,10 @@ class HermesOwnedServerRecord:
             raise HermesRunsProtocolError("unknown owned server record schema")
         if not self.binding_id or len(self.binding_id) > 256:
             raise HermesRunsProtocolError("invalid owned server binding")
-        if self.provider_version != SUPPORTED_HERMES_VERSION:
-            raise HermesRunsProtocolError("unsupported Hermes version")
-        if self.provider_channel != SUPPORTED_HERMES_CHANNEL:
-            raise HermesRunsProtocolError("unsupported Hermes channel")
+        if not self.provider_version or not self.provider_channel:
+            raise HermesRunsProtocolError(
+                "owned Hermes version diagnostics are missing"
+            )
         if not isinstance(self.capability_generation, int) or self.capability_generation < 1:
             raise HermesRunsProtocolError("invalid Hermes capability generation")
         if not isinstance(self.pid, int) or self.pid < 2:
@@ -1278,14 +1278,8 @@ class HermesRunsControlDriver:
         if (
             self.binding.provider_id != "hermes_agent"
             or self._record.binding_id != self.binding.binding_id
-            or self._record.provider_version != self.binding.provider_version
-            or self._record.provider_channel != self.binding.provider_channel
         ):
             return _ProbeResult("hermes_owned_binding_stale", {}, (), {})
-        if self.binding.provider_version != SUPPORTED_HERMES_VERSION:
-            return _ProbeResult("hermes_version_unsupported", {}, (), {})
-        if self.binding.provider_channel != SUPPORTED_HERMES_CHANNEL:
-            return _ProbeResult("hermes_channel_unsupported", {}, (), {})
         if not isinstance(self._bearer, str) or len(self._bearer.encode("utf-8")) < 32:
             return _ProbeResult("hermes_internal_bearer_unavailable", {}, (), {})
         try:
@@ -1312,7 +1306,6 @@ class HermesRunsControlDriver:
             status = health.body
             if (
                 status.get("platform") != "hermes-agent"
-                or status.get("version") != self.binding.provider_version
                 or status.get("pid") != self._record.pid
             ):
                 return _ProbeResult("hermes_owned_process_identity_mismatch", {}, (), status)

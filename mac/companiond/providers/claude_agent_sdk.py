@@ -1,7 +1,7 @@
 """Managed Claude Agent SDK driver over a local bounded JSONL sidecar.
 
-This module only controls sessions whose SDK process it launched. Ambient Claude
-TUI processes remain outside this driver and keep the raw PTY fallback.
+This module only controls sessions whose SDK process it launched. Raw Terminal
+remains an independent user-selected view for every visible terminal.
 """
 
 from __future__ import annotations
@@ -40,11 +40,6 @@ CLAUDE_AGENT_SDK_VERSION = "0.3.220"
 CLAUDE_CODE_VERSION = "2.1.220"
 
 
-def _is_reviewed_claude_code_version(value: str) -> bool:
-    return value in {
-        CLAUDE_CODE_VERSION,
-        f"{CLAUDE_CODE_VERSION} (Claude Code)",
-    }
 
 
 CLAUDE_AGENT_SDK_PACKAGE = "@anthropic-ai/claude-agent-sdk"
@@ -892,17 +887,23 @@ class _ClaudeAgentSidecarProcess:
         expected = {
             "protocol_version": CLAUDE_SIDECAR_PROTOCOL_VERSION,
             "sdk_package": CLAUDE_AGENT_SDK_PACKAGE,
-            "sdk_version": CLAUDE_AGENT_SDK_VERSION,
-            "claude_code_version": CLAUDE_CODE_VERSION,
         }
         for key, value in expected.items():
             if result.get(key) != value:
-                raise ClaudeSidecarProtocolError(f"Claude sidecar {key} is incompatible")
+                raise ClaudeSidecarProtocolError(
+                    f"Claude sidecar {key} is incompatible"
+                )
+        sdk_version = result.get("sdk_version")
+        claude_code_version = result.get("claude_code_version")
         node_version = result.get("node_version")
+        if not isinstance(sdk_version, str) or not sdk_version:
+            raise ClaudeSidecarProtocolError("Claude sidecar omitted SDK metadata")
+        if not isinstance(claude_code_version, str) or not claude_code_version:
+            raise ClaudeSidecarProtocolError("Claude sidecar omitted runtime metadata")
         if not isinstance(node_version, str) or _major_version(node_version) < 18:
             raise ClaudeSidecarProtocolError("Claude sidecar requires Node 18 or newer")
-        self.sdk_version = CLAUDE_AGENT_SDK_VERSION
-        self.claude_code_version = CLAUDE_CODE_VERSION
+        self.sdk_version = sdk_version
+        self.claude_code_version = claude_code_version
         self.node_version = node_version
 
     def _invalidate(self, error: BaseException) -> None:
@@ -942,13 +943,9 @@ class ClaudeAgentSDKDriver:
         process: _ClaudeAgentSidecarProcess | None = None,
         sidecar_command: tuple[str, ...] | None = None,
     ):
-        if (
-            binding.provider_id != "claude"
-            or not _is_reviewed_claude_code_version(binding.provider_version)
-            or binding.provider_channel != "agent-sdk"
-        ):
+        if binding.provider_id != "claude":
             raise ValueError(
-                "Claude Agent SDK driver requires the exact reviewed Claude binding"
+                "Claude Agent SDK driver requires a Claude binding"
             )
         self.binding = binding
         if process is None:
@@ -988,11 +985,31 @@ class ClaudeAgentSDKDriver:
         self.session_id = f"claude:{self.native_session_id}"
         self.project = str(Path(project).expanduser().resolve())
         self._discovery = self.process.discover()
+        status = self._discovery.get("status")
+        resolved_model = (
+            status.get("model")
+            if isinstance(status, Mapping)
+            else None
+        )
+        if not isinstance(resolved_model, str) or not resolved_model.strip():
+            raise ClaudeSidecarProtocolError(
+                "Claude sidecar did not resolve the launch model"
+            )
         return {
             "native_session_id": self.native_session_id,
             "binding_id": self.binding.binding_id,
             "capability_generation": self.capability_generation,
-            "provider_cursor": str(self.process.poll_events(0)[-1]["cursor"] if self.process.poll_events(0) else 0),
+            "provider_cursor": str(
+                self.process.poll_events(0)[-1]["cursor"]
+                if self.process.poll_events(0)
+                else 0
+            ),
+            "resolved_model": resolved_model.strip(),
+            "initial_turn_state": (
+                "working" if first_prompt.strip() else "idle"
+            ),
+            "transcript_state": "not_created",
+            "started_at": time.time(),
         }
     def verify_managed_launch(self, result: Mapping[str, Any]) -> bool:
         return bool(

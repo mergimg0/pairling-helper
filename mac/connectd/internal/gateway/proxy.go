@@ -751,11 +751,11 @@ func localUpstream(upstream *url.URL) bool {
 }
 
 func dynamicGETPath(path string) bool {
-	return sessionExportPath(path) || orchestrationItemPath(path) || orchestrationStreamPath(path) || pairDropFileContentPath(path) || pairDropFileItemPath(path) || pairDropUploadItemPath(path) || postureItemPath(path) || raceItemPath(path)
+	return sessionExportPath(path) || pairDropFileContentPath(path) || pairDropFileItemPath(path) || pairDropUploadItemPath(path) || promptPresetItemPath(path) || raceItemPath(path)
 }
 
 func dynamicPOSTPath(path string) bool {
-	return orchestrationStopPath(path) || pairDropAttachPath(path) || pairDropUploadCompletePath(path) || raceFinishPath(path)
+	return pairDropAttachPath(path) || pairDropUploadCompletePath(path) || raceFinishPath(path)
 }
 
 func dynamicPUTPath(path string) bool {
@@ -763,7 +763,7 @@ func dynamicPUTPath(path string) bool {
 }
 
 func dynamicDELETEPath(path string) bool {
-	return pairDropFileItemPath(path) || pairDropUploadItemPath(path) || postureItemPath(path)
+	return pairDropFileItemPath(path) || pairDropUploadItemPath(path) || promptPresetItemPath(path)
 }
 
 // raceItemPath matches /sessions/race/{id}: one segment, no nesting.
@@ -785,13 +785,12 @@ func raceFinishPath(path string) bool {
 	return inner != "" && !strings.Contains(inner, "/")
 }
 
-// postureItemPath matches /postures/{slug} (SPEC-p6 §2.2): one segment,
-// no nesting.
-func postureItemPath(path string) bool {
-	if !strings.HasPrefix(path, "/postures/") {
+// promptPresetItemPath matches /prompt-presets/{slug}: one segment, no nesting.
+func promptPresetItemPath(path string) bool {
+	if !strings.HasPrefix(path, "/prompt-presets/") {
 		return false
 	}
-	suffix := strings.TrimPrefix(path, "/postures/")
+	suffix := strings.TrimPrefix(path, "/prompt-presets/")
 	return suffix != "" && !strings.Contains(suffix, "/")
 }
 
@@ -849,30 +848,6 @@ func pairDropUploadCompletePath(path string) bool {
 	inner := strings.TrimSuffix(strings.TrimPrefix(path, "/pairdrop/uploads/"), "/complete")
 	inner = strings.Trim(inner, "/")
 	return inner != "" && !strings.Contains(inner, "/")
-}
-
-func orchestrationItemPath(path string) bool {
-	if !strings.HasPrefix(path, "/orchestrations/") {
-		return false
-	}
-	suffix := strings.TrimPrefix(path, "/orchestrations/")
-	return suffix != "" && !strings.Contains(suffix, "/")
-}
-
-func orchestrationStopPath(path string) bool {
-	if !strings.HasPrefix(path, "/orchestrations/") {
-		return false
-	}
-	parts := strings.Split(strings.TrimPrefix(path, "/orchestrations/"), "/")
-	return len(parts) == 2 && parts[0] != "" && parts[1] == "stop"
-}
-
-func orchestrationStreamPath(path string) bool {
-	if !strings.HasPrefix(path, "/orchestrations/") {
-		return false
-	}
-	parts := strings.Split(strings.TrimPrefix(path, "/orchestrations/"), "/")
-	return len(parts) == 2 && parts[0] != "" && parts[1] == "stream"
 }
 
 // getPaths moved to routes_generated.go (source: mac/companiond/route_registry.py).
@@ -999,14 +974,8 @@ func rateLimitRouteClass(path string) string {
 		return "/pairdrop/uploads/*/complete"
 	case pairDropUploadItemPath(path):
 		return "/pairdrop/uploads/*"
-	case orchestrationStopPath(path):
-		return "/orchestrations/*/stop"
-	case orchestrationStreamPath(path):
-		return "/orchestrations/*/stream"
-	case orchestrationItemPath(path):
-		return "/orchestrations/*"
-	case postureItemPath(path):
-		return "/postures/*"
+	case promptPresetItemPath(path):
+		return "/prompt-presets/*"
 	default:
 		return path
 	}

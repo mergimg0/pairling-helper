@@ -1777,112 +1777,6 @@ class PairlingPushDispatcher:
             "updated_at": payload.get("updated_at"),
         }
 
-    def health_axis(self, *, device_id: str | None = None) -> dict[str, Any]:
-        """The push-plane axis for /health: can this Mac deliver pushes, and
-        how did the recent deliveries go?
-
-        Provider health is Mac-wide. Credentials, attempts, and registration
-        counts are limited to device_id when an authenticated phone asks.
-
-        Exists because the APNs provider died silently for weeks (credentials
-        stripped from re-rendered launchd env, then an FD-exhausted daemon)
-        and no surface anywhere could say so. The phone renders a banner from
-        this axis, which is the dead-man's switch for the whole class: any
-        future cause of dead push delivery becomes visible at the next
-        health read instead of never."""
-        try:
-            provider = self._provider_status()
-        except Exception as exc:  # noqa: BLE001 - a broken provider read IS the finding
-            return {
-                "contract_version": PUSH_HEALTH_CONTRACT_VERSION,
-                "provider_configured": False,
-                "provider_mode": "unknown",
-                "degraded": True,
-                "reason": f"provider_status_failed:{type(exc).__name__}",
-                "last_delivery_outcome": None,
-                "last_delivery_at": None,
-                "registered_devices": 0,
-            }
-        configured = bool(provider.get("configured"))
-        data = self._read()
-        try:
-            secret_devices = self._read_secrets().get("devices", {})
-        except PushDispatcherError:
-            secret_devices = {}
-        devices = [
-            device
-            for device in data.get("devices", [])
-            if isinstance(device, dict)
-            and (not device_id or device.get("device_id") == device_id)
-        ]
-        attempts = [
-            event
-            for event in data.get("events", [])
-            if isinstance(event, dict)
-            and isinstance(event.get("sent"), bool)
-            and event.get("outcome")
-            and event.get("outcome") not in PUSH_HEALTH_NEUTRAL_OUTCOMES
-            and (not device_id or event.get("device_id") == device_id)
-        ][-10:]
-        last = attempts[-1] if attempts else None
-        degraded = False
-        reason = None
-        relay_credentials_missing = (
-            provider.get("mode") == "relay"
-            and any(
-                isinstance(device, dict)
-                and (
-                    bool(device.get("standard_push_enabled"))
-                    or bool(device.get("live_activity_enabled"))
-                )
-                and (
-                    not str(
-                        device.get("relay_device_id")
-                        or secret_devices.get(str(device.get("device_id") or ""), {}).get("relay_device_id")
-                        or ""
-                    ).strip()
-                    or not str(
-                        secret_devices.get(str(device.get("device_id") or ""), {}).get("relay_pair_secret")
-                        or ""
-                    ).strip()
-                    or not str(
-                        secret_devices.get(str(device.get("device_id") or ""), {}).get("relay_pair_secret_ref")
-                        or ""
-                    ).strip()
-                    or not str(
-                        secret_devices.get(str(device.get("device_id") or ""), {}).get("mac_install_id")
-                        or device.get("mac_install_id")
-                        or ""
-                    ).strip()
-                )
-                for device in devices
-            )
-        )
-        if not configured:
-            degraded = True
-            reason = "provider_not_configured"
-        elif relay_credentials_missing:
-            degraded = True
-            reason = "relay_credentials_missing"
-        elif last is not None and last.get("outcome") not in PUSH_HEALTH_OK_OUTCOMES:
-            degraded = True
-            reason = "deliveries_failing"
-        registered = [
-            device
-            for device in devices
-            if device.get("apns_token_hash")
-        ]
-        return {
-            "contract_version": PUSH_HEALTH_CONTRACT_VERSION,
-            "provider_configured": configured,
-            "provider_mode": str(provider.get("mode") or "not_configured"),
-            "degraded": degraded,
-            "reason": reason,
-            "last_delivery_outcome": (last or {}).get("outcome"),
-            "last_delivery_at": (last or {}).get("ts"),
-            "registered_devices": len(registered),
-        }
-
     def drop_device(self, *, device_id: str, reason: str = "revoked") -> dict[str, Any]:
         """Remove a device's push registration and secrets entirely.
 
@@ -4156,48 +4050,54 @@ def _alert_enabled_for_device(device: dict[str, Any], kind: str) -> bool:
     return True
 
 
+# The keys an alert may carry beside its words. The relay refuses an alert with
+# any key it does not list (`PAIRLING_EXTRA_ALLOWED_KEYS` in
+# relay/pairling_relay.py), so a key renamed here alone is an alert that never
+# arrives: `health_posture` was sent as `health_readiness` and refused.
+ALERT_PAIRLING_EXTRA_KEYS = frozenset({
+    "session_id",
+    "provider",
+    "source",
+    "phase",
+    "project",
+    "observed_at",
+    "collapse_id",
+    "dedupe_key",
+    "result_summary",
+    "required_action",
+    "risk_summary",
+    "route_health",
+    "worker_summary",
+    "build_label",
+    "sentinel_event_id",
+    "sentinel_level",
+    "sentinel_key",
+    "health_posture",
+    "health_severity",
+    "health_summary",
+    "mac_install_id",
+    "request_nonce",
+    "authorization_contract",
+    "authorization_control",
+    "authorization_device_id",
+    "authorization_install_id",
+    "authorization_issued_at",
+    "authorization_expires_at",
+    "notification_action_nonce",
+    "notification_action_contract",
+    "notification_action_control",
+    "notification_action_device_id",
+    "notification_action_install_id",
+    "notification_action_session_id",
+    "notification_action_action",
+    "notification_action_issued_at",
+    "notification_action_expires_at",
+})
+
+
 def _alert_pairling_extra(payload: dict[str, Any]) -> dict[str, Any]:
-    allowed = {
-        "session_id",
-        "provider",
-        "source",
-        "phase",
-        "project",
-        "observed_at",
-        "collapse_id",
-        "dedupe_key",
-        "result_summary",
-        "required_action",
-        "risk_summary",
-        "route_health",
-        "worker_summary",
-        "build_label",
-        "sentinel_event_id",
-        "sentinel_level",
-        "sentinel_key",
-        "health_posture",
-        "health_severity",
-        "health_summary",
-        "mac_install_id",
-        "request_nonce",
-        "authorization_contract",
-        "authorization_control",
-        "authorization_device_id",
-        "authorization_install_id",
-        "authorization_issued_at",
-        "authorization_expires_at",
-        "notification_action_nonce",
-        "notification_action_contract",
-        "notification_action_control",
-        "notification_action_device_id",
-        "notification_action_install_id",
-        "notification_action_session_id",
-        "notification_action_action",
-        "notification_action_issued_at",
-        "notification_action_expires_at",
-    }
     out: dict[str, Any] = {}
-    for key in allowed:
+    for key in ALERT_PAIRLING_EXTRA_KEYS:
         if key not in payload:
             continue
         value = payload[key]

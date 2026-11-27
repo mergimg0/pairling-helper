@@ -507,12 +507,13 @@ def _title_for_event(event: PushEvent, default: str) -> str:
 
 
 def _join_sentence(left: str | None, right: str | None) -> str:
-    if left and right:
-        left = left.strip()
+    # A question that ends "Fix first:" would read "Fix first:. Pairling."
+    ended = (left or "").strip().rstrip(":;,").rstrip()
+    if ended and right:
         right = right.strip()
-        separator = " " if left.endswith((".", "!", "?")) else ". "
+        separator = " " if ended.endswith((".", "!", "?")) else ". "
         suffix = "" if right.endswith((".", "!", "?")) else "."
-        return f"{left}{separator}{right}{suffix}"
+        return f"{ended}{separator}{right}{suffix}"
     return left or right or ""
 
 

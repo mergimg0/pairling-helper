@@ -32,13 +32,13 @@ PAIRING_CONTRACTS = {
     "activation_result": PAIR_ACTIVATION_RESULT_CONTRACT,
 }
 
-DEVICE_ROLE_READER = "reader"
 DEVICE_ROLE_OPERATOR = "operator"
 DEVICE_ROLE_INTERNAL = "internal"
 DEVICE_ROLE_CUSTOM = "custom"
-PAIRABLE_DEVICE_ROLES = frozenset({DEVICE_ROLE_READER, DEVICE_ROLE_OPERATOR})
+PAIRABLE_DEVICE_ROLES = frozenset({DEVICE_ROLE_OPERATOR})
 
-READER_DEVICE_SCOPES = frozenset({
+
+OPERATOR_DEVICE_SCOPES = frozenset({
     "health:read",
     "manifest:read",
     "sessions:read",
@@ -46,9 +46,6 @@ READER_DEVICE_SCOPES = frozenset({
     "transcript:read",
     "worker:read",
     "files:read",
-})
-
-OPERATOR_DEVICE_SCOPES = READER_DEVICE_SCOPES | frozenset({
     "approval:decide",
     "session:send",
     "session:spawn",
@@ -77,16 +74,13 @@ MIGRATABLE_OPERATOR_DEVICE_SCOPES = frozenset({
     OPERATOR_DEVICE_SCOPES - frozenset({"push:manage"}),
     OPERATOR_DEVICE_SCOPES,
 })
-# Ordinary human invitations are Reader unless the local Mac operator
-# explicitly selects Operator before minting the invitation.
-DEFAULT_DEVICE_ROLE = DEVICE_ROLE_READER
-DEFAULT_DEVICE_SCOPES = READER_DEVICE_SCOPES
+# Interactive pairing always grants the control surface Pairling promises.
+DEFAULT_DEVICE_ROLE = DEVICE_ROLE_OPERATOR
+DEFAULT_DEVICE_SCOPES = OPERATOR_DEVICE_SCOPES
 
 
 def device_scopes_for_role(role: str) -> frozenset[str]:
     normalized = str(role or "").strip().lower()
-    if normalized == DEVICE_ROLE_READER:
-        return READER_DEVICE_SCOPES
     if normalized == DEVICE_ROLE_OPERATOR:
         return OPERATOR_DEVICE_SCOPES
     raise ValueError(f"unsupported paired-device role: {normalized or '<empty>'}")

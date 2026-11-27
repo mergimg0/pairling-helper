@@ -187,40 +187,6 @@ func TestAllowedApertureCLIRoutesStayPairlingScoped(t *testing.T) {
 	}
 }
 
-func TestAllowedOrchestrationRoutesAreMethodScoped(t *testing.T) {
-	allowed := []struct {
-		method string
-		path   string
-	}{
-		{http.MethodGet, "/orchestrations"},
-		{http.MethodPost, "/orchestrations"},
-		{http.MethodGet, "/orchestrations/orchestration-abc123"},
-		{http.MethodGet, "/orchestrations/orchestration-abc123/stream"},
-		{http.MethodPost, "/orchestrations/orchestration-abc123/stop"},
-	}
-	for _, tc := range allowed {
-		if !Allowed(tc.method, tc.path) {
-			t.Fatalf("%s %s should be allowed", tc.method, tc.path)
-		}
-	}
-
-	disallowed := []struct {
-		method string
-		path   string
-	}{
-		{http.MethodGet, "/orchestrations/orchestration-abc123/stop"},
-		{http.MethodPost, "/orchestrations/orchestration-abc123/stream"},
-		{http.MethodPost, "/orchestrations/orchestration-abc123"},
-		{http.MethodGet, "/orchestrations/orchestration-abc123/nested/stream"},
-		{http.MethodPost, "/orchestrations/orchestration-abc123/nested/stop"},
-	}
-	for _, tc := range disallowed {
-		if Allowed(tc.method, tc.path) {
-			t.Fatalf("%s %s should not be allowed", tc.method, tc.path)
-		}
-	}
-}
-
 func TestAllowedSessionSourceDiagnosticsIsGetOnly(t *testing.T) {
 	if !Allowed(http.MethodGet, "/session-source-diagnostics") {
 		t.Fatal("GET /session-source-diagnostics should be allowed")
@@ -341,7 +307,7 @@ func TestProxyErrorClassifiesClientCancellationWithoutFailingRouteHealth(t *test
 	handler := &Handler{logger: logger}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	req := httptest.NewRequest(http.MethodGet, "http://pairling-connect.local/sessions-visible", nil).WithContext(ctx)
+	req := httptest.NewRequest(http.MethodGet, "http://pairling-connect.local/sessions-catalog", nil).WithContext(ctx)
 	rec := httptest.NewRecorder()
 
 	handler.proxyError(rec, req, context.Canceled)
@@ -433,8 +399,8 @@ func TestPrePairModeOnlyAllowsHealthManifestRoutezAndV2Pairing(t *testing.T) {
 		{http.MethodPost, "/pair/claim", http.StatusNotFound},
 		{http.MethodPost, "/pair/psk-claim", http.StatusNotFound},
 		{http.MethodPost, "/pair/start", http.StatusNotFound},
-		{http.MethodGet, "/sessions", http.StatusNotFound},
-		{http.MethodGet, "/sessions-stream", http.StatusNotFound},
+		{http.MethodGet, "/sessions-catalog", http.StatusNotFound},
+		{http.MethodGet, "/device-events", http.StatusNotFound},
 		{http.MethodPost, "/send-text", http.StatusNotFound},
 		{http.MethodPost, "/terminal-control", http.StatusNotFound},
 		{http.MethodPost, "/worker-kill", http.StatusNotFound},

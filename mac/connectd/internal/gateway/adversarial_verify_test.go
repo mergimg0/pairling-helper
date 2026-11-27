@@ -46,7 +46,7 @@ func TestAdversarialPairlingConnectBypass(t *testing.T) {
 		{"spawn-session", "POST", "/spawn-session", false},
 		{"internal arbitrary", "GET", "/internal/secrets", false},
 		{"send-text no bearer", "POST", "/send-text", false},
-		{"sessions no bearer", "GET", "/sessions", false},
+		{"session catalog no bearer", "GET", "/sessions-catalog", false},
 
 		// Path tricks aiming to smuggle /pair/start or /mint past the allowlist
 		// while decoding to a dangerous path upstream.

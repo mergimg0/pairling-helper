@@ -665,7 +665,7 @@ def build_runtime_info(
 ) -> dict[str, Any]:
     script = Path(script_path).resolve()
     manifest, manifest_path, manifest_error = load_manifest_for(script)
-    runtime_version = os.environ.get("COMPANION_RUNTIME_VERSION", "legacy")
+    runtime_version = os.environ.get("COMPANION_RUNTIME_VERSION", "unpackaged")
     source_revision = os.environ.get("COMPANION_SOURCE_REVISION", "unknown")
     source_branch = os.environ.get("COMPANION_SOURCE_BRANCH", "unknown")
     source_dirty = None
@@ -805,8 +805,7 @@ def build_manifest_payload(
             "public": ["/health", "/manifest", "/pair/start", "/pair/psk-activate", "/pair/psk-claim-v2"],
             "authenticated": [
                 "/manifest",
-                "/sessions",
-                "/sessions-stream",
+                "/sessions-catalog",
                 "/sessions/remove",
                 "/sessions/delete-transcript",
                 "/compose/recordings/sync",

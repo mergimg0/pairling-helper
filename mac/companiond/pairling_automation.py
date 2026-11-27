@@ -198,6 +198,28 @@ class AutomationHelperClient:
             fresh_identity=True,
         )
 
+    def type_text(
+        self,
+        tty: str,
+        text: str,
+        *,
+        timeout_ms: int,
+    ) -> dict[str, Any]:
+        if not isinstance(text, str) or not text:
+            raise ValueError("text must be a non-empty string")
+        if (blocked := self._fresh_mutation_capability(timeout_ms=timeout_ms)) is not None:
+            return blocked
+        return self._request(
+            "typeTerminalText",
+            {
+                "tty": tty,
+                "text": text,
+            },
+            mutation=True,
+            timeout_ms=timeout_ms,
+            fresh_identity=True,
+        )
+
     def send_escape(self, tty: str, *, timeout_ms: int) -> dict[str, Any]:
         if (blocked := self._fresh_mutation_capability(timeout_ms=timeout_ms)) is not None:
             return blocked

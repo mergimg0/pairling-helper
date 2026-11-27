@@ -9,19 +9,23 @@ from pathlib import Path
 PROVIDER_RUNTIME_ASSETS = (
     (
         "claude_agent_sidecar.mjs",
-        "4c27ae18ff7553b4587562e24ce7c7ada3c80c8e382c0363953b71a60f1846fc",
+        "b954174325421c182fb961af57109facb929b76fc3ce51010ab05f87695e22f9",
     ),
     (
         "copilot_sdk_sidecar.mjs",
-        "46336ebe88a38f9b29d88175d61e4ac8f68bd6fc6c3a9ae8c9ca9ad9a5186275",
+        "56a172ac502c7d160c0b3b5c042db2187ed6a1e04aa80501f285bf554c92ce27",
     ),
     (
         "qwen_sdk_sidecar.mjs",
-        "2027f817fcf2774fd50a7fa753895dc92049ce9e63c47aebd6d7a95ddbbae924",
+        "342a99ddba666f0f227d46885d47c0f0e1c2d1256de193d7706d7b8dcb5db2bc",
     ),
     (
         "gemini-seatbelt.sb",
         "c7e33f2d243ec3d1579488aff4e7e437449322e4750aa0f53abf78f33b197425",
+    ),
+    (
+        "omp_ask_extension.mjs",
+        "e823e6a71f16bd66e32b387bf03de39b1f8940c8f9d4ace966a7811345485dfb",
     ),
 )
 PROVIDER_RUNTIME_ASSET_DIGESTS = dict(PROVIDER_RUNTIME_ASSETS)

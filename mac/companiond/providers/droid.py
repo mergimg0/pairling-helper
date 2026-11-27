@@ -118,8 +118,7 @@ class FactoryDroidProviderAdapter:
             if self.supports(capability)
         )
         notes: list[str] = [
-            "Public Factory stream-jsonrpc; reviewed structured sessions are auto/off.",
-            f"Structured controls require the exact supported Droid CLI {DROID_SUPPORTED_VERSION}.",
+            "Public Factory stream-jsonrpc; live operations are negotiated.",
         ]
         if failure:
             notes.append(f"Structured control unavailable: {failure}.")
@@ -133,7 +132,7 @@ class FactoryDroidProviderAdapter:
             usable=installed and compatible and auth,
             launchable=installed,
             auth_state="configured" if auth else ("missing_cli" if not installed else "missing"),
-            config_state="compatible" if compatible else "unsupported",
+            config_state="ready" if compatible else "unavailable",
             readable_sessions=0,
             live_sessions=0,
             controllable_sessions=0,
@@ -157,11 +156,7 @@ class FactoryDroidProviderAdapter:
         self,
         binding: ProviderControlBinding,
     ) -> ProviderControlDriver | None:
-        if (
-            binding.provider_id != "droid"
-            or binding.provider_version != DROID_SUPPORTED_VERSION
-            or binding.provider_channel != "stable"
-        ):
+        if binding.provider_id != "droid":
             return None
         resolved = self._resolved()
         if resolved is None:

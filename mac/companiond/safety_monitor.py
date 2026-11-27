@@ -440,7 +440,6 @@ class SafetyMonitorBridge:
             "session_id": _safe_string(raw.get("session_id"), "safety-monitor") or "safety-monitor",
             "project": _redact_path(raw.get("project"), self.home) or "Pairling Safety Monitor",
             "project_root": project_root,
-            "orchestration_id": _safe_string(raw.get("orchestration_id")) or None,
             "worker_id": _safe_string(raw.get("worker_id")) or None,
             "provider_id": _safe_string(raw.get("provider_id")) or None,
             "pid": _safe_int(raw.get("pid")),

@@ -391,9 +391,9 @@ def _validate_definition(definition: PairlingOperationDefinition) -> None:
     is_read = definition.risk is Risk.READ
     if is_read:
         if definition.receipt_required or definition.confirmation_requirement is not ConfirmationRequirement.NONE:
-            raise OperationCatalogError(f"read-only operation has mutation posture: {definition.operation_id}")
+            raise OperationCatalogError(f"read-only operation has mutation readiness: {definition.operation_id}")
     elif not definition.receipt_required or definition.confirmation_requirement is ConfirmationRequirement.NONE:
-        raise OperationCatalogError(f"unsafe operation posture: {definition.operation_id}")
+        raise OperationCatalogError(f"unsafe operation readiness: {definition.operation_id}")
     if definition.risk in {Risk.DESTRUCTIVE, Risk.CREDENTIAL} and (
         definition.confirmation_requirement is not ConfirmationRequirement.POINT_OF_RISK
     ):
@@ -752,11 +752,16 @@ REVIEWED_OPERATION_CATALOG = OperationCatalog(
 
 CODEX_APP_SERVER_SAFE_LAUNCH_PROFILE = {
     "provider_id": "codex",
-    "provider_version": "0.147.0",
+    "provider_version": "0.149.1",
     "provider_channel": "app-server-stdio",
     "argv_suffix": ("app-server", "--listen", "stdio://"),
     "client_version": "2026.08.03",
 }
+_CODEX_REVIEWED_APP_SERVER_VERSIONS = frozenset({
+    "0.147.0",
+    "0.149.1",
+})
+
 
 _COMMON_RELEASE_SOURCE_PATHS = (
     "mac/companiond/providers/operations.py",
@@ -1076,7 +1081,7 @@ _DIRECT_RELEASE_DRIVER_PROFILES = MappingProxyType(
     {
         "codex": {
             "map_provider_id": "codex",
-            "provider_version": "0.147.0",
+            "provider_version": "0.149.1",
             "provider_channel": "app-server-stdio",
             "driver_contract": CODEX_APP_SERVER_SAFE_LAUNCH_PROFILE,
             "source_paths": (
@@ -1398,24 +1403,14 @@ def provider_binding_has_release_membership(
     provider_version: str,
     provider_channel: str,
 ) -> bool:
-    """Return whether an exact runtime provider binding belongs to this release."""
+    """Return whether a runtime provider belongs to this release.
+
+    Provider version and channel are retained on bindings as diagnostics. They
+    never decide whether a live or newly launched session is controllable.
+    """
+    del provider_version, provider_channel
     runtime_provider_id = _release_runtime_provider_id(provider_id)
-    if runtime_provider_id is None or runtime_provider_id != provider_id:
-        return False
-    if runtime_provider_id == "omp":
-        return (
-            provider_channel == "stable"
-            and re.fullmatch(
-                r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)",
-                provider_version,
-            ) is not None
-        )
-    return any(
-        spec["runtime_provider_id"] == runtime_provider_id
-        and spec["provider_version"] == provider_version
-        and spec["provider_channel"] == provider_channel
-        for spec in _RELEASE_MEMBERSHIP_SPECS
-    )
+    return runtime_provider_id is not None and runtime_provider_id == provider_id
 
 
 def released_operation_ids_for_provider(provider_id: str) -> frozenset[str]:

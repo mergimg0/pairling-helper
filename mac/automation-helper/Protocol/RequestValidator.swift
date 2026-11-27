@@ -67,6 +67,14 @@ final class RequestValidator {
             guard arguments.text.utf8.count <= PairlingAutomationConstants.maximumTextBytes else {
                 throw AutomationValidationError(code: .textTooLarge)
             }
+        case .terminalType(let arguments):
+            try validateTTY(arguments.tty)
+            guard !arguments.text.isEmpty else {
+                throw AutomationValidationError(code: .invalidRequest)
+            }
+            guard arguments.text.utf8.count <= PairlingAutomationConstants.maximumTextBytes else {
+                throw AutomationValidationError(code: .textTooLarge)
+            }
         case .specialKey(let arguments):
             try validateTTY(arguments.tty)
             guard TerminalSpecialKey(rawValue: arguments.key) != nil else {

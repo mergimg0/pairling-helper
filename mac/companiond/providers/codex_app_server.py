@@ -31,7 +31,6 @@ from .operations import (
     released_operation_ids_for_provider,
 )
 
-_SUPPORTED_VERSION = (0, 147, 0)
 _MAX_REQUEST_BYTES = 256 * 1024
 _MAX_RESPONSE_LINE_BYTES = 1024 * 1024
 _MAX_TEXT_FIELD_BYTES = 64 * 1024
@@ -329,8 +328,6 @@ def _version_tuple(value: str | None) -> tuple[int, int, int] | None:
     return tuple(int(part) for part in match.groups())
 
 
-def is_compatible_codex_app_server_version(value: str | None) -> bool:
-    return _version_tuple(value) == _SUPPORTED_VERSION
 
 def normalized_codex_app_server_version(value: str | None) -> str | None:
     parsed = _version_tuple(value)
@@ -571,10 +568,6 @@ class _CodexAppServerProcess:
                             f"initialize result omitted {required}"
                         )
                 user_agent = response["userAgent"]
-                if not is_compatible_codex_app_server_version(user_agent):
-                    raise CodexAppServerProtocolError(
-                        "Codex app-server requires the reviewed 0.147.0 protocol"
-                    )
                 self._write_message({"method": "initialized", "params": {}})
                 with self._state_lock:
                     if self._process is not process:
@@ -1801,20 +1794,14 @@ class CodexAppServerDriver:
         request_timeout: float = 15.0,
         internal_diagnostics: bool = False,
     ):
-        if (
-            binding.provider_id != "codex"
-            or binding.provider_channel != "app-server-stdio"
-        ):
-            raise ValueError("Codex driver requires an exact app-server binding")
-        if not is_compatible_codex_app_server_version(binding.provider_version):
-            raise CodexUnsupportedOperation(
-                "Codex driver requires the reviewed 0.147.0 app-server protocol"
-            )
+        if binding.provider_id != "codex":
+            raise ValueError("Codex driver requires a Codex binding")
         self.binding = binding
         self._safe_launch_profile = {
             "provider_id": "codex",
-            "provider_version": normalized_codex_app_server_version(
-                binding.provider_version
+            "provider_version": (
+                normalized_codex_app_server_version(binding.provider_version)
+                or binding.provider_version
             ),
             "provider_channel": binding.provider_channel,
             "argv_suffix": tuple(argv[1:]),
@@ -1931,17 +1918,6 @@ class CodexAppServerDriver:
 
     def _ensure_started(self) -> None:
         self._process.start()
-        actual = normalized_codex_app_server_version(
-            self._process.provider_version
-        )
-        expected = normalized_codex_app_server_version(
-            self.binding.provider_version
-        )
-        if actual != expected:
-            self.close()
-            raise CodexAppServerProtocolError(
-                "Codex app-server version does not match the provider binding"
-            )
 
     def launch_session(
         self,
@@ -1959,14 +1935,23 @@ class CodexAppServerDriver:
                 )
         self._ensure_started()
         try:
-            result = self._process.start_thread(cwd=resolved_project)
+            resolved_model = self._default_model()
+            result = self._process.start_thread(
+                cwd=resolved_project,
+                model=resolved_model,
+            )
             thread = result["thread"]
             thread_id = str(thread["id"])
+            observed_model = _safe_identifier(
+                result.get("model") or thread.get("model")
+            )
+            if observed_model is not None:
+                resolved_model = observed_model
             with self._owned_lock:
                 self._owned_thread_id = thread_id
                 self._owned_project = resolved_project
                 self._owned_threads[thread_id] = resolved_project
-                self._current_model = _safe_identifier(result.get("model"))
+                self._current_model = resolved_model
                 self._selected_collaboration_mode = None
             self._refresh_collaboration_modes()
             if title.strip():
@@ -1983,6 +1968,15 @@ class CodexAppServerDriver:
                 "capability_generation": self.capability_generation,
                 "provider_cursor": "0",
                 "turn_id": turn_id,
+                "resolved_model": resolved_model,
+                "initial_turn_state": "working" if turn_id else "idle",
+                "transcript_state": "created",
+                "started_at": time.time(),
+                "binding_id": self.binding.binding_id,
+                "provider_id": self.binding.provider_id,
+                "provider_version": self.binding.provider_version,
+                "provider_channel": self.binding.provider_channel,
+                "provider_operation_id": f"thread/start:{thread_id}",
             }
         except BaseException:
             with self._owned_lock:
@@ -2016,6 +2010,21 @@ class CodexAppServerDriver:
             "capability_generation": self.capability_generation,
             "provider_cursor": self.provider_cursor,
         }
+
+    def release_owned_session_writer(self) -> None:
+        with self._owned_lock:
+            if self._owned_thread_id is None:
+                raise CodexUnsupportedOperation(
+                    "Codex driver has no reserved thread writer to release"
+                )
+        self._process.close()
+
+    def archive_owned_session(self) -> None:
+        with self._owned_lock:
+            thread_id = self._owned_thread_id
+        if thread_id is not None:
+            self._ensure_started()
+            self._process.archive_thread(thread_id)
 
     def close(self) -> None:
         self._process.close()

@@ -28,6 +28,7 @@ import (
 	runtimecfg "dev.pairling/connectd/internal/runtime"
 	"dev.pairling/connectd/internal/status"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 )
@@ -69,16 +70,11 @@ func run(args []string) int {
 	if defaultControlSocket == "" {
 		defaultControlSocket = filepath.Join(home, ".claude", "companion", "connectd-control.sock")
 	}
-	defaultPairlingControlSocket := strings.TrimSpace(os.Getenv("PAIRLING_CONTROL_SOCKET"))
-	if defaultPairlingControlSocket == "" {
-		defaultPairlingControlSocket = filepath.Join(home, ".claude", "companion", "control.sock")
-	}
 
 	upstreamRaw := fs.String("upstream", "http://127.0.0.1:7773", "Pairling daemon upstream URL")
 	listenAddr := fs.String("listen", ":7773", "tailnet-only service listen address")
 	statusAddr := fs.String("status-addr", "127.0.0.1:7774", "loopback status server address")
 	controlSocket := fs.String("control-socket", defaultControlSocket, "same-UID Unix status/control socket path")
-	pairlingControlSocket := fs.String("pairling-control-socket", defaultPairlingControlSocket, "pairlingd same-UID Unix control socket path")
 	stateDir := fs.String("state-dir", defaultStateDir, "tsnet state directory")
 	hostname := fs.String("hostname", defaultHostname, "tailnet hostname for this Pairling Connect node")
 	controlURL := fs.String("control-url", "", "advanced: custom Tailscale-compatible control server URL")
@@ -87,7 +83,7 @@ func run(args []string) int {
 	// WS1: a tagged auth key (minted from an OAuth client scoped to
 	// tag:pairling-connect) registers this node pre-authorized AND with key
 	// expiry disabled — no 180-day re-auth cliff, no per-node REST call.
-	// Empty keeps the legacy interactive browser-auth path (back-compat).
+	// Empty uses the current interactive browser-approval fallback.
 	authKeyTag := fs.String("auth-key-tag", defaultAuthKeyTag(), "tag applied to this node when registering with an auth key")
 	funnelDefault := false
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("PAIRLING_CONNECT_FUNNEL"))) {
@@ -184,9 +180,6 @@ func run(args []string) int {
 		log.Printf("cannot create gateway: %v", err)
 		return 1
 	}
-	go monitorUpstream(ctx, upstream, statusStore, func(probeContext context.Context) bool {
-		return probePairlingRoute(probeContext, *pairlingControlSocket, statusStore)
-	})
 
 	ln, err := srv.Listen("tcp", *listenAddr)
 	if err != nil {
@@ -196,7 +189,7 @@ func run(args []string) int {
 	}
 	defer srv.Close()
 	statusStore.SetListenerRunning(true)
-	go monitorTailnetIPs(ctx, srv, statusStore)
+	go monitorTailnetState(ctx, srv, statusStore)
 
 	// Optional public Funnel listener for the pre-pair bootstrap claim, off by
 	// default. A SEPARATE handler in ExposureModeFunnelBootstrap,
@@ -348,7 +341,7 @@ func defaultAuthKeyTag() string {
 
 // loadTailscaleAuthKey resolves a tagged auth key, preferring the environment
 // (PAIRLING_TS_AUTHKEY) over a mode-600 credential file under Application
-// Support. Returns "" when neither is present (legacy interactive auth).
+// Support. Returns "" when neither is present, selecting interactive auth.
 func loadTailscaleAuthKey(appSupport string) string {
 	if key := strings.TrimSpace(os.Getenv("PAIRLING_TS_AUTHKEY")); key != "" {
 		return key
@@ -640,57 +633,6 @@ func shutdownHTTPServer(server *http.Server) {
 	_ = server.Shutdown(ctx)
 }
 
-func monitorUpstream(
-	ctx context.Context,
-	upstream *url.URL,
-	store *status.Store,
-	routeProbe func(context.Context) bool,
-) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	check := func() {
-		refreshUpstreamStatus(ctx, upstream, store, routeProbe)
-	}
-	check()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			check()
-		}
-	}
-}
-
-func refreshUpstreamStatus(
-	ctx context.Context,
-	upstream *url.URL,
-	store *status.Store,
-	routeProbe func(context.Context) bool,
-) {
-	reachable := checkUpstream(upstream)
-	store.SetUpstreamReachable(reachable)
-	if !reachable || routeProbe == nil {
-		return
-	}
-	proofs := status.GatewayRecoveryProofs
-	if store.Snapshot().GatewayHealthy {
-		proofs = 1
-	}
-	for range proofs {
-		probeContext, cancel := context.WithTimeout(ctx, 3*time.Second)
-		verified := routeProbe(probeContext)
-		cancel()
-		if !verified {
-			// The Unix route probe records verified successes. Record a
-			// fail-closed result for transport, peer-auth, and validation
-			// failures that never produce a trusted route proof.
-			store.RecordGatewayEvent(http.MethodGet, "/routez", 0, "validation_failed")
-			return
-		}
-	}
-}
-
 type internalHookTokenCache struct {
 	mu        sync.Mutex
 	home      string
@@ -736,70 +678,115 @@ func loadInternalHookToken(home string) string {
 	return token
 }
 
-func checkUpstream(upstream *url.URL) bool {
-	if upstream == nil {
-		return false
-	}
-	healthURL := *upstream
-	healthURL.Path = strings.TrimRight(healthURL.Path, "/") + "/readyz"
-	healthURL.RawQuery = ""
-	client := http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(healthURL.String())
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		return false
-	}
-	var payload struct {
-		OK              bool   `json:"ok"`
-		ContractVersion string `json:"contract_version"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&payload); err != nil {
-		return false
-	}
-	return payload.OK && payload.ContractVersion == "pairling-runtime-v1"
-}
-
-func monitorTailnetIPs(ctx context.Context, srv *tsnet.Server, store *status.Store) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	update := func() {
-		identity := NodeIdentity{}
-		if lc, err := srv.LocalClient(); err == nil {
-			if lock, err := lc.NetworkLockStatus(ctx); err == nil {
-				store.SetTailnetLockEnabled(lock.Enabled)
-			}
-			if st, err := lc.StatusWithoutPeers(ctx); err == nil {
-				identity = nodeIdentityFromStatus(st)
-				store.SetTailnetIdentity(identity.NodeID, identity.Tags, identity.TailnetIPs)
-			}
-		}
-		if len(identity.TailnetIPs) > 0 {
-			store.SetTailnetIP(identity.TailnetIPs[0])
-			store.SetAuthenticated()
-			return
-		}
-		ip4, _ := srv.TailscaleIPs()
-		if ip4.IsValid() {
-			store.SetTailnetIP(ip4.String())
-			store.SetAuthenticated()
-			return
-		}
-		store.SetTailnetIdentity("", nil, nil)
-		store.SetAuthPending("")
-	}
-	update()
+func monitorTailnetState(
+	ctx context.Context,
+	srv *tsnet.Server,
+	store *status.Store,
+) {
 	for {
+		if ctx.Err() != nil {
+			return
+		}
+		localClient, err := srv.LocalClient()
+		if err != nil {
+			store.SetTailnetIP("")
+			store.SetTailnetIdentity("", nil, nil)
+			store.SetAuthPending("")
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+				continue
+			}
+		}
+		watcher, err := localClient.WatchIPNBus(
+			ctx,
+			ipn.NotifyInitialState|
+				ipn.NotifyInitialNetMap|
+				ipn.NotifyInitialHealthState,
+		)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+				continue
+			}
+		}
+		refreshTailnetStatus(ctx, srv, store)
+		for {
+			notification, err := watcher.Next()
+			if err != nil {
+				_ = watcher.Close()
+				break
+			}
+			if notification.ErrMessage != nil {
+				store.SetTailnetIP("")
+				store.SetTailnetIdentity("", nil, nil)
+				store.SetAuthPending(*notification.ErrMessage)
+			}
+			if notification.State != nil {
+				switch *notification.State {
+				case ipn.Running:
+					refreshTailnetStatus(ctx, srv, store)
+				case ipn.NeedsLogin, ipn.NeedsMachineAuth,
+					ipn.Stopped, ipn.NoState:
+					store.SetTailnetIP("")
+					store.SetTailnetIdentity("", nil, nil)
+					store.SetAuthPending("")
+				case ipn.Starting, ipn.InUseOtherUser:
+					store.SetTailnetIP("")
+					store.SetTailnetIdentity("", nil, nil)
+				}
+			}
+			if notification.NetMap != nil ||
+				notification.SelfChange != nil ||
+				notification.LoginFinished != nil {
+				refreshTailnetStatus(ctx, srv, store)
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			update()
+		case <-time.After(time.Second):
 		}
 	}
+}
+
+func refreshTailnetStatus(
+	ctx context.Context,
+	srv *tsnet.Server,
+	store *status.Store,
+) {
+	localClient, err := srv.LocalClient()
+	if err != nil {
+		return
+	}
+	if lock, err := localClient.NetworkLockStatus(ctx); err == nil {
+		store.SetTailnetLockEnabled(lock.Enabled)
+	}
+	identity := NodeIdentity{}
+	if current, err := localClient.StatusWithoutPeers(ctx); err == nil {
+		identity = nodeIdentityFromStatus(current)
+		store.SetTailnetIdentity(
+			identity.NodeID,
+			identity.Tags,
+			identity.TailnetIPs,
+		)
+	}
+	if len(identity.TailnetIPs) > 0 {
+		store.SetTailnetIP(identity.TailnetIPs[0])
+		store.SetAuthenticated()
+		return
+	}
+	ipv4, _ := srv.TailscaleIPs()
+	if ipv4.IsValid() {
+		store.SetTailnetIP(ipv4.String())
+		store.SetAuthenticated()
+		return
+	}
+	store.SetTailnetIP("")
+	store.SetTailnetIdentity("", nil, nil)
 }
 
 type NodeIdentity struct {

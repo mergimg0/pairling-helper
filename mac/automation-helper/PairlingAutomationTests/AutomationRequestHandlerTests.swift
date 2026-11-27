@@ -34,8 +34,10 @@ private final class HandlerPermissionService: TerminalPermissionServicing {
 private final class HandlerTerminal: TerminalControlling {
     var probeError: Error?
     var readError: Error?
+    var typeError: Error?
     private(set) var probeCalls = 0
     private(set) var sentTexts: [(tty: String, text: String, bracketedPaste: Bool)] = []
+    private(set) var typedTexts: [(tty: String, text: String)] = []
     func probe() throws {
         probeCalls += 1
         if let probeError {
@@ -56,6 +58,13 @@ private final class HandlerTerminal: TerminalControlling {
 
     func sendText(tty: String, text: String, bracketedPaste: Bool) throws {
         sentTexts.append((tty, text, bracketedPaste))
+    }
+
+    func typeText(tty: String, text: String) throws {
+        if let typeError {
+            throw typeError
+        }
+        typedTexts.append((tty, text))
     }
 
     func sendSpecialKey(tty _: String, key _: String) throws {}
@@ -190,6 +199,57 @@ final class AutomationRequestHandlerTests: XCTestCase {
         XCTAssertEqual(terminal.sentTexts.count, 1)
         XCTAssertEqual(terminal.sentTexts.first?.bracketedPaste, true)
         XCTAssertEqual(probeStore.evidence?.state, .granted)
+    }
+
+    func testTypeTerminalTextPreservesLiteralInputAndConfirmsMutation() throws {
+        let permissions = HandlerPermissionService(readiness: makeReadiness(granted: true))
+        let terminal = HandlerTerminal()
+        let handler = makeHandler(
+            capabilities: .missing,
+            permissions: permissions,
+            terminal: terminal,
+            probeStore: HandlerProbeEvidenceStore()
+        )
+        let request = try request(
+            operation: .typeTerminalText,
+            arguments: .terminalType(TerminalTypeArguments(
+                tty: "/dev/ttys8",
+                text: "hello\r"
+            ))
+        )
+
+        let response = handler.handle(data: request, peerUID: ownerUID)
+
+        XCTAssertTrue(response.ok)
+        XCTAssertEqual(response.mutationOutcome, .confirmed)
+        XCTAssertEqual(terminal.typedTexts.first?.tty, "/dev/ttys8")
+        XCTAssertEqual(terminal.typedTexts.first?.text, "hello\r")
+        XCTAssertTrue(terminal.sentTexts.isEmpty)
+    }
+
+    func testAmbiguousTypeTerminalTargetFailsBeforeMutation() throws {
+        let permissions = HandlerPermissionService(readiness: makeReadiness(granted: true))
+        let terminal = HandlerTerminal()
+        terminal.typeError = AppleTerminalAdapterError.terminalTabAmbiguous
+        let handler = makeHandler(
+            capabilities: .missing,
+            permissions: permissions,
+            terminal: terminal,
+            probeStore: HandlerProbeEvidenceStore()
+        )
+        let request = try request(
+            operation: .typeTerminalText,
+            arguments: .terminalType(TerminalTypeArguments(
+                tty: "/dev/ttys8",
+                text: "hello"
+            ))
+        )
+
+        let response = handler.handle(data: request, peerUID: ownerUID)
+
+        XCTAssertFalse(response.ok)
+        XCTAssertEqual(response.error?.code, .terminalTabAmbiguous)
+        XCTAssertEqual(response.mutationOutcome, .failedBeforeMutation)
     }
 
     func testPermissionRequestRequiresCapabilityAndReturnsProbeFailure() throws {

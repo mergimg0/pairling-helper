@@ -4,8 +4,6 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const PROTOCOL = "pairling-qwen-sdk-v1";
-const CLI_VERSION = "0.21.4";
-const SDK_VERSION = "0.1.8";
 const MAX_INPUT_BYTES = 256 * 1024;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 const MAX_SESSIONS = 16;
@@ -160,8 +158,6 @@ const cliEntry = realpathSync(args[2]);
 if (!isAbsolute(sdkEntry) || !isAbsolute(cliEntry)) throw new ProtocolError("invalid_launch");
 const sdkPackage = manifestForEntry(sdkEntry, "@qwen-code/sdk");
 const cliPackage = manifestForEntry(cliEntry, "@qwen-code/qwen-code");
-if (sdkPackage.manifest.version !== SDK_VERSION) throw new ProtocolError("sdk_version_unsupported");
-if (cliPackage.manifest.version !== CLI_VERSION) throw new ProtocolError("cli_version_unsupported");
 if (Number(process.versions.node.split(".")[0]) < 22) throw new ProtocolError("node_version_unsupported");
 
 const sdk = await import(pathToFileURL(sdkEntry).href);
@@ -341,8 +337,8 @@ async function handleOperation(operation, payload) {
     exactObject(payload, [], []);
     return {
       protocol: PROTOCOL,
-      sdk_version: SDK_VERSION,
-      cli_version: CLI_VERSION,
+      sdk_version: sdkPackage.manifest.version,
+      cli_version: cliPackage.manifest.version,
       node_version: process.versions.node,
       capability_methods: capabilityMethods,
       safe_permission_modes: [...SAFE_PERMISSION_MODES],

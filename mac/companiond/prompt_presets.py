@@ -1,4 +1,4 @@
-"""User-authored prompt postures stored as markdown files on the Mac.
+"""User-authored prompt presets stored as markdown files on the Mac.
 
 The daemon is not the only possible writer. A user may edit these files in an
 editor, so every mutating API can compare a content revision before changing a
@@ -22,22 +22,22 @@ import uuid
 from pathlib import Path
 from typing import Callable, Iterator
 
-POSTURE_MAX_BYTES = 8 * 1024
+PROMPT_PRESET_MAX_BYTES = 8 * 1024
 _SLUG_RE = re.compile(r"^[a-z0-9-]{1,64}$")
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
 _PROCESS_LOCK = threading.RLock()
 _RENAME_SWAP = 0x00000002
 _RENAME_EXCL = 0x00000004
-_TRANSACTION_DIR_NAME = ".posture-transactions"
-_CONFLICT_DIR_NAME = "Pairling Posture Conflicts"
+_TRANSACTION_DIR_NAME = ".prompt-preset-transactions"
+_CONFLICT_DIR_NAME = "Pairling Prompt Preset Conflicts"
 
 
-class PostureTooLarge(ValueError):
-    """The posture body exceeds POSTURE_MAX_BYTES."""
+class PromptPresetTooLarge(ValueError):
+    """The prompt preset instructions exceeds PROMPT_PRESET_MAX_BYTES."""
 
 
-class PostureConflict(ValueError):
-    """A mutation was based on stale state or would replace another posture."""
+class PromptPresetConflict(ValueError):
+    """A mutation was based on stale state or would replace another prompt preset."""
 
     def __init__(
         self,
@@ -51,28 +51,28 @@ class PostureConflict(ValueError):
         self.conflict_copies = list(conflict_copies or [])
 
 
-class PostureNotFound(PostureConflict):
-    """A versioned mutation targeted a posture that was removed elsewhere."""
+class PromptPresetNotFound(PromptPresetConflict):
+    """A versioned mutation targeted a prompt preset that was removed elsewhere."""
 
 
-class PostureIOError(OSError):
-    """A posture path exists but could not be read or written safely."""
+class PromptPresetIOError(OSError):
+    """A prompt preset path exists but could not be read or written safely."""
 
-    code = "posture_io_failed"
-
-
-class PostureInvalidEncoding(PostureIOError):
-    """A posture file is not valid UTF-8."""
-
-    code = "posture_invalid_encoding"
+    code = "prompt_preset_io_failed"
 
 
-class PostureCrashSimulation(BaseException):
+class PromptPresetInvalidEncoding(PromptPresetIOError):
+    """A prompt preset file is not valid UTF-8."""
+
+    code = "prompt_preset_invalid_encoding"
+
+
+class PromptPresetCrashSimulation(BaseException):
     """Test-only process-stop checkpoint that deliberately skips cleanup."""
 
 
 def default_root() -> Path:
-    return Path(os.path.expanduser("~")) / ".pairling" / "postures"
+    return Path(os.path.expanduser("~")) / ".pairling" / "prompt-presets"
 
 
 def valid_slug(slug: str) -> bool:
@@ -109,12 +109,12 @@ def _read_path(path: Path, slug: str, *, include_source: bool) -> dict | None:
     except FileNotFoundError:
         return None
     except OSError as exc:
-        raise PostureIOError(f"could not read posture file {path.name}") from exc
+        raise PromptPresetIOError(f"could not read prompt preset file {path.name}") from exc
     try:
         source = source_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise PostureInvalidEncoding(f"posture file {path.name} is not valid UTF-8") from exc
-    fields, body = _parse_frontmatter(source)
+        raise PromptPresetInvalidEncoding(f"prompt preset file {path.name} is not valid UTF-8") from exc
+    fields, instructions = _parse_frontmatter(source)
     row = {
         "slug": slug,
         "name": fields.get("name") or slug,
@@ -123,7 +123,7 @@ def _read_path(path: Path, slug: str, *, include_source: bool) -> dict | None:
         "revision": _revision(source_bytes),
     }
     if include_source:
-        row.update({"body": body.strip(), "source": source})
+        row.update({"instructions": instructions.strip(), "source": source})
     return row
 
 
@@ -131,7 +131,7 @@ def _read_path(path: Path, slug: str, *, include_source: bool) -> dict | None:
 def _store_lock(root: Path) -> Iterator[None]:
     try:
         root.mkdir(parents=True, exist_ok=True)
-        lock_path = root / ".postures.lock"
+        lock_path = root / ".prompt-presets.lock"
         with _PROCESS_LOCK:
             descriptor = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
             try:
@@ -141,10 +141,10 @@ def _store_lock(root: Path) -> Iterator[None]:
             finally:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
                 os.close(descriptor)
-    except PostureIOError:
+    except PromptPresetIOError:
         raise
     except OSError as exc:
-        raise PostureIOError("could not lock the posture store") from exc
+        raise PromptPresetIOError("could not lock the prompt preset store") from exc
 
 
 def _fsync_directory(root: Path) -> None:
@@ -161,21 +161,21 @@ def _path_revision(path: Path) -> str | None:
     except FileNotFoundError:
         return None
     except OSError as exc:
-        raise PostureIOError(f"could not read posture transaction file {path.name}") from exc
+        raise PromptPresetIOError(f"could not read prompt preset transaction file {path.name}") from exc
 
 
 def _atomic_swap(first: Path, second: Path) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     renamex_np = getattr(libc, "renamex_np", None)
     if renamex_np is None:
-        raise PostureIOError("this Mac does not provide atomic posture swaps")
+        raise PromptPresetIOError("this Mac does not provide atomic prompt preset swaps")
     renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
     renamex_np.restype = ctypes.c_int
     result = renamex_np(os.fsencode(first), os.fsencode(second), _RENAME_SWAP)
     if result != 0:
         error_number = ctypes.get_errno()
-        raise PostureIOError(
-            f"atomic posture swap failed: {os.strerror(error_number)}"
+        raise PromptPresetIOError(
+            f"atomic prompt preset swap failed: {os.strerror(error_number)}"
         ) from OSError(error_number, os.strerror(error_number))
 
 
@@ -185,7 +185,7 @@ def _atomic_move_exclusive(source: Path, destination: Path) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     renamex_np = getattr(libc, "renamex_np", None)
     if renamex_np is None:
-        raise PostureIOError("this Mac does not provide exclusive posture renames")
+        raise PromptPresetIOError("this Mac does not provide exclusive prompt preset renames")
     renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
     renamex_np.restype = ctypes.c_int
     result = renamex_np(
@@ -208,8 +208,8 @@ def _atomic_move_exclusive(source: Path, destination: Path) -> None:
             os.strerror(error_number),
             str(source),
         )
-    raise PostureIOError(
-        f"atomic posture rename failed: {os.strerror(error_number)}"
+    raise PromptPresetIOError(
+        f"atomic prompt preset rename failed: {os.strerror(error_number)}"
     ) from OSError(error_number, os.strerror(error_number))
 
 
@@ -259,7 +259,7 @@ def _preserve_conflict_copy(root: Path, slug: str, source: Path, label: str) -> 
         _fsync_directory(directory)
         _fsync_directory(root)
     except OSError as exc:
-        raise PostureIOError("could not preserve a concurrent posture edit") from exc
+        raise PromptPresetIOError("could not preserve a concurrent prompt preset edit") from exc
     return str(destination.relative_to(root))
 
 
@@ -277,22 +277,22 @@ def _recover_transactions(root: Path) -> None:
     try:
         markers = sorted(directory.glob("*.json"))
     except OSError as exc:
-        raise PostureIOError("could not inspect posture recovery records") from exc
+        raise PromptPresetIOError("could not inspect prompt preset recovery records") from exc
     for marker in markers:
         try:
             transaction = json.loads(marker.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise PostureIOError(f"posture recovery record {marker.name} is unreadable") from exc
+            raise PromptPresetIOError(f"prompt preset recovery record {marker.name} is unreadable") from exc
         if not isinstance(transaction, dict) or transaction.get("version") != 1:
-            raise PostureIOError(f"posture recovery record {marker.name} is invalid")
+            raise PromptPresetIOError(f"prompt preset recovery record {marker.name} is invalid")
         original = _safe_transaction_path(root, transaction.get("original"))
         target = _safe_transaction_path(root, transaction.get("target"))
         swap = _safe_transaction_path(root, transaction.get("swap"))
-        slug = str(transaction.get("slug") or "posture")
+        slug = str(transaction.get("slug") or "prompt_preset")
         expected_revision = str(transaction.get("expected_revision") or "")
         new_revision = str(transaction.get("new_revision") or "")
         if original is None or target is None or swap is None:
-            raise PostureIOError(f"posture recovery record {marker.name} has unsafe paths")
+            raise PromptPresetIOError(f"prompt preset recovery record {marker.name} has unsafe paths")
 
         original_revision = _path_revision(original)
         target_revision = _path_revision(target)
@@ -364,12 +364,12 @@ def _frontmatter_value(value: str) -> str:
     return " ".join((value or "").strip().splitlines())
 
 
-def _encoded_source(*, name: str, description: str, body: str) -> bytes:
+def _encoded_source(*, name: str, description: str, instructions: str) -> bytes:
     normalized_name = _frontmatter_value(name)
     normalized_description = _frontmatter_value(description)
-    normalized_body = (body or "").strip()
-    if len(normalized_body.encode("utf-8")) > POSTURE_MAX_BYTES:
-        raise PostureTooLarge(f"posture body exceeds {POSTURE_MAX_BYTES} bytes")
+    normalized_body = (instructions or "").strip()
+    if len(normalized_body.encode("utf-8")) > PROMPT_PRESET_MAX_BYTES:
+        raise PromptPresetTooLarge(f"prompt preset instructions exceeds {PROMPT_PRESET_MAX_BYTES} bytes")
     return (
         f"---\nname: {normalized_name}\ndescription: {normalized_description}\n---\n"
         f"{normalized_body}\n"
@@ -398,7 +398,7 @@ def _write_unique_temp(root: Path, target_slug: str, source: bytes) -> Path:
         raise
 
 
-def list_postures(root: Path) -> list[dict]:
+def list_prompt_presets(root: Path) -> list[dict]:
     rows: list[dict] = []
     if not root.exists():
         return rows
@@ -406,7 +406,7 @@ def list_postures(root: Path) -> list[dict]:
         try:
             paths = sorted(root.glob("*.md"))
         except OSError as exc:
-            raise PostureIOError("could not list posture files") from exc
+            raise PromptPresetIOError("could not list prompt preset files") from exc
         for path in paths:
             slug = path.stem
             if not valid_slug(slug):
@@ -417,7 +417,7 @@ def list_postures(root: Path) -> list[dict]:
     return rows
 
 
-def read_posture(root: Path, slug: str) -> dict | None:
+def read_prompt_preset(root: Path, slug: str) -> dict | None:
     if not valid_slug(slug):
         return None
     if not root.exists():
@@ -426,18 +426,18 @@ def read_posture(root: Path, slug: str) -> dict | None:
         return _read_path(root / f"{slug}.md", slug, include_source=True)
 
 
-def mutate_posture(
+def mutate_prompt_preset(
     root: Path,
     *,
     name: str,
     description: str,
-    body: str,
+    instructions: str,
     original_slug: str | None = None,
     expected_revision: str | None = None,
     create_only: bool = False,
     checkpoint: Callable[[str, Path], None] | None = None,
 ) -> dict:
-    """Create, edit, or rename a posture as one checked server operation.
+    """Create, edit, or rename a prompt preset as one checked server operation.
 
     Creation requires ``create_only``. Edits provide ``original_slug`` and
     ``expected_revision`` so an external Mac edit cannot be overwritten.
@@ -445,15 +445,15 @@ def mutate_posture(
 
     target_slug = slug_for_name(name)
     if not valid_slug(target_slug):
-        raise ValueError("posture name yields no usable slug")
+        raise ValueError("prompt_preset name yields no usable slug")
     if original_slug is not None and not valid_slug(original_slug):
-        raise ValueError("original posture slug is invalid")
+        raise ValueError("original prompt_preset slug is invalid")
     if original_slug is not None and not expected_revision:
-        raise ValueError("expected_revision is required when editing a posture")
+        raise ValueError("expected_revision is required when editing a prompt preset")
     if original_slug is None and not create_only:
-        raise ValueError("create_only is required when creating a posture")
+        raise ValueError("create_only is required when creating a prompt preset")
 
-    source = _encoded_source(name=name, description=description, body=body)
+    source = _encoded_source(name=name, description=description, instructions=instructions)
     target_path = root / f"{target_slug}.md"
     original_path = root / f"{original_slug}.md" if original_slug else None
 
@@ -462,25 +462,25 @@ def mutate_posture(
         if original_path is not None and original_slug is not None:
             current = _read_path(original_path, original_slug, include_source=True)
             if current is None:
-                raise PostureNotFound("This posture was removed from your Mac. Reload the posture list.")
+                raise PromptPresetNotFound("This prompt_preset was removed from your Mac. Reload the prompt preset list.")
             if current["revision"] != expected_revision:
-                raise PostureConflict(
-                    "This posture changed on your Mac. Reload it before saving.",
+                raise PromptPresetConflict(
+                    "This prompt_preset changed on your Mac. Reload it before saving.",
                     current=current,
                 )
 
         if create_only and target_path.exists():
             existing = _read_path(target_path, target_slug, include_source=False)
-            raise PostureConflict(
-                "A posture with this name already exists. Choose another name or edit the existing posture.",
+            raise PromptPresetConflict(
+                "A prompt_preset with this name already exists. Choose another name or edit the existing prompt_preset.",
                 current=existing,
             )
 
         renaming = original_path is not None and original_path != target_path
         if renaming and target_path.exists():
             existing = _read_path(target_path, target_slug, include_source=False)
-            raise PostureConflict(
-                "Another posture already uses this name. Choose another name.",
+            raise PromptPresetConflict(
+                "Another prompt_preset already uses this name. Choose another name.",
                 current=existing,
             )
 
@@ -497,8 +497,8 @@ def mutate_posture(
                     os.link(temp_path, target_path)
                 except FileExistsError as exc:
                     existing = _read_path(target_path, target_slug, include_source=False)
-                    raise PostureConflict(
-                        "A posture with this name already exists. Choose another name or edit the existing posture.",
+                    raise PromptPresetConflict(
+                        "A prompt_preset with this name already exists. Choose another name or edit the existing prompt_preset.",
                         current=existing,
                     ) from exc
                 temp_path.unlink()
@@ -508,16 +508,16 @@ def mutate_posture(
                     checkpoint("before_revalidate", original_path)
                 revalidated = _read_path(original_path, original_slug, include_source=True)
                 if revalidated is None:
-                    raise PostureNotFound("This posture was removed from your Mac. Reload the posture list.")
+                    raise PromptPresetNotFound("This prompt_preset was removed from your Mac. Reload the prompt preset list.")
                 if revalidated["revision"] != expected_revision:
-                    raise PostureConflict(
-                        "This posture changed on your Mac. Reload it before saving.",
+                    raise PromptPresetConflict(
+                        "This prompt_preset changed on your Mac. Reload it before saving.",
                         current=revalidated,
                     )
                 if renaming and target_path.exists():
                     existing = _read_path(target_path, target_slug, include_source=False)
-                    raise PostureConflict(
-                        "Another posture already uses this name. Choose another name.",
+                    raise PromptPresetConflict(
+                        "Another prompt_preset already uses this name. Choose another name.",
                         current=existing,
                     )
 
@@ -541,14 +541,14 @@ def mutate_posture(
                 try:
                     if checkpoint is not None:
                         checkpoint("after_first_swap", original_path)
-                except PostureCrashSimulation:
+                except PromptPresetCrashSimulation:
                     preserve_transaction = True
                     raise
 
                 swapped_out = _read_path(temp_path, original_slug, include_source=True)
                 if swapped_out is None:
                     preserve_transaction = True
-                    raise PostureIOError("the atomic posture swap lost its prior file")
+                    raise PromptPresetIOError("the atomic prompt preset swap lost its prior file")
                 if swapped_out["revision"] != expected_revision:
                     conflict_copies = [
                         _preserve_conflict_copy(root, original_slug, temp_path, "editor-write")
@@ -563,8 +563,8 @@ def mutate_posture(
                     _remove_transaction_marker(root, marker)
                     marker = None
                     transaction_finished = True
-                    raise PostureConflict(
-                        "This posture changed during save. Pairling restored the Mac copy and preserved the concurrent edit.",
+                    raise PromptPresetConflict(
+                        "This prompt_preset changed during save. Pairling restored the Mac copy and preserved the concurrent edit.",
                         current=swapped_out,
                         conflict_copies=conflict_copies,
                     )
@@ -588,8 +588,8 @@ def mutate_posture(
                         marker = None
                         transaction_finished = True
                         existing = _read_path(target_path, target_slug, include_source=False)
-                        raise PostureConflict(
-                            "Another posture already uses this name. Choose another name.",
+                        raise PromptPresetConflict(
+                            "Another prompt_preset already uses this name. Choose another name.",
                             current=existing,
                         ) from exc
                     except FileNotFoundError as exc:
@@ -606,8 +606,8 @@ def mutate_posture(
                             original_slug,
                             include_source=False,
                         )
-                        raise PostureConflict(
-                            "This posture changed during rename. Pairling did not remove the newer Mac copy.",
+                        raise PromptPresetConflict(
+                            "This prompt_preset changed during rename. Pairling did not remove the newer Mac copy.",
                             current=current_after_move,
                         ) from exc
                     if checkpoint is not None:
@@ -640,8 +640,8 @@ def mutate_posture(
                         original_slug if renaming else target_slug,
                         include_source=False,
                     )
-                    raise PostureConflict(
-                        "This posture changed during save. Pairling did not accept the write as successful.",
+                    raise PromptPresetConflict(
+                        "This prompt_preset changed during save. Pairling did not accept the write as successful.",
                         current=current_after_publish,
                         conflict_copies=conflict_copies,
                     )
@@ -652,9 +652,9 @@ def mutate_posture(
                 temp_path.unlink(missing_ok=True)
                 swap_started = False
             else:
-                raise ValueError("current posture mutations require an explicit create or edit mode")
+                raise ValueError("current prompt_preset mutations require an explicit create or edit mode")
             _fsync_directory(root)
-        except PostureCrashSimulation:
+        except PromptPresetCrashSimulation:
             preserve_transaction = True
             raise
         except Exception:
@@ -669,7 +669,7 @@ def mutate_posture(
 
         written = _read_path(target_path, target_slug, include_source=False)
         if written is None:
-            raise PostureIOError("posture write could not be verified")
+            raise PromptPresetIOError("prompt_preset write could not be verified")
         return {
             **written,
             "overwrote": overwrote,
@@ -677,7 +677,7 @@ def mutate_posture(
         }
 
 
-def delete_posture(
+def delete_prompt_preset(
     root: Path,
     slug: str,
     *,
@@ -687,15 +687,15 @@ def delete_posture(
     if not valid_slug(slug):
         return False
     if not expected_revision:
-        raise ValueError("expected_revision is required when deleting a posture")
+        raise ValueError("expected_revision is required when deleting a prompt preset")
     path = root / f"{slug}.md"
     with _store_lock(root):
         current = _read_path(path, slug, include_source=True)
         if current is None:
-            raise PostureNotFound("This posture was removed from your Mac. Reload the posture list.")
+            raise PromptPresetNotFound("This prompt_preset was removed from your Mac. Reload the prompt preset list.")
         if current["revision"] != expected_revision:
-            raise PostureConflict(
-                "This posture changed on your Mac. Reload it before deleting.",
+            raise PromptPresetConflict(
+                "This prompt_preset changed on your Mac. Reload it before deleting.",
                 current=current,
             )
 
@@ -703,10 +703,10 @@ def delete_posture(
             checkpoint("before_revalidate", path)
         revalidated = _read_path(path, slug, include_source=True)
         if revalidated is None:
-            raise PostureNotFound("This posture was removed from your Mac. Reload the posture list.")
+            raise PromptPresetNotFound("This prompt_preset was removed from your Mac. Reload the prompt preset list.")
         if revalidated["revision"] != expected_revision:
-            raise PostureConflict(
-                "This posture changed on your Mac. Reload it before deleting.",
+            raise PromptPresetConflict(
+                "This prompt_preset changed on your Mac. Reload it before deleting.",
                 current=revalidated,
             )
 
@@ -731,21 +731,21 @@ def delete_posture(
             try:
                 if checkpoint is not None:
                     checkpoint("after_first_swap", path)
-            except PostureCrashSimulation:
+            except PromptPresetCrashSimulation:
                 preserve_transaction = True
                 raise
             removed = _read_path(tombstone, slug, include_source=True)
             if removed is None:
                 preserve_transaction = True
-                raise PostureIOError("the posture delete transaction lost its file")
+                raise PromptPresetIOError("the prompt preset delete transaction lost its file")
             if removed["revision"] != expected_revision:
                 conflict_copy = _preserve_conflict_copy(root, slug, tombstone, "editor-write")
                 if not path.exists():
                     os.replace(tombstone, path)
                 _remove_transaction_marker(root, marker)
                 marker = None
-                raise PostureConflict(
-                    "This posture changed during delete. Pairling kept the Mac copy.",
+                raise PromptPresetConflict(
+                    "This prompt_preset changed during delete. Pairling kept the Mac copy.",
                     current=removed,
                     conflict_copies=[conflict_copy],
                 )
@@ -755,8 +755,8 @@ def delete_posture(
                 tombstone.unlink(missing_ok=True)
                 _remove_transaction_marker(root, marker)
                 marker = None
-                raise PostureConflict(
-                    "This posture was recreated during delete. Pairling left the new Mac copy in place.",
+                raise PromptPresetConflict(
+                    "This prompt_preset was recreated during delete. Pairling left the new Mac copy in place.",
                     current=current_after_move,
                     conflict_copies=[conflict_copy],
                 )
@@ -765,7 +765,7 @@ def delete_posture(
             marker = None
             _fsync_directory(root)
             return True
-        except PostureCrashSimulation:
+        except PromptPresetCrashSimulation:
             preserve_transaction = True
             raise
         except Exception:

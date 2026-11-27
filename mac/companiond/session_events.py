@@ -175,6 +175,7 @@ class FileWatcher:
         self._lock = threading.RLock()
         self._watches: dict[str, _Watch] = {}
         self._fd_map: dict[int, _Watch] = {}
+        self._pid_topics: dict[int, set[str]] = {}
         self._closed = False
         if kqueue_factory is None:
             kqueue_factory = getattr(select, "kqueue", None)
@@ -215,6 +216,30 @@ class FileWatcher:
             watch.topic_counts[topic] = watch.topic_counts.get(topic, 0) + 1
         self._wake()
         return WatchHandle(self, key, topic)
+
+    def watch_process(self, pid: int, topic: str) -> bool:
+        """Publish {"type": "process_exited", "pid": pid} on `topic` once, when
+        the process ends. False when it cannot be watched: kqueue is
+        unavailable, or the process has already gone."""
+        pid = int(pid or 0)
+        if pid <= 0 or self._kq is None:
+            return False
+        with self._lock:
+            topics = self._pid_topics.get(pid)
+            if topics is not None:
+                topics.add(topic)
+                return True
+            try:
+                self._kq.control([select.kevent(
+                    pid,
+                    filter=select.KQ_FILTER_PROC,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                    fflags=select.KQ_NOTE_EXIT,
+                )], 0, 0)
+            except OSError:
+                return False
+            self._pid_topics[pid] = {topic}
+        return True
 
     def active_watch_count(self) -> int:
         with self._lock:
@@ -328,6 +353,12 @@ class FileWatcher:
             except OSError:
                 return
             for ev in events:
+                if ev.filter == select.KQ_FILTER_PROC:
+                    with self._lock:
+                        topics = self._pid_topics.pop(ev.ident, ())
+                    for topic in topics:
+                        self._hub.publish(topic, {"type": "process_exited", "pid": ev.ident})
+                    continue
                 if ev.ident == self._wake_r:
                     try:
                         os.read(self._wake_r, 4096)

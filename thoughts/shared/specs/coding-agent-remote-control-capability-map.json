@@ -1044,7 +1044,7 @@
         "runtime_provider_id": "codex",
         "provider_version": "0.147.0",
         "provider_channel": "app-server-stdio",
-        "launch_config_digest": "sha256:d42873de2a459ad6c36640c3358576f24230f263185f5571edd8024417b502c3",
+        "launch_config_digest": "sha256:2e7d3736c6b3c09005b45e29fdecead2411b25d9496455d9d1fd9cef493446c0",
         "physical_device_required": false
       }
     },

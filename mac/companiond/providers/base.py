@@ -177,19 +177,13 @@ class ManagedLaunchContract:
         *,
         version: str | None,
     ) -> ManagedLaunchSetupDiagnostic | None:
+        del version
         actions = tuple(getattr(availability, "setup_actions", ()) or ())
         if not bool(getattr(availability, "installed", False)):
             return ManagedLaunchSetupDiagnostic(
                 "managed_provider_not_installed",
                 "installation",
-                "The reviewed provider executable is not installed.",
-                actions,
-            )
-        if not isinstance(version, str) or not version.strip():
-            return ManagedLaunchSetupDiagnostic(
-                "managed_provider_version_unverified",
-                "version",
-                "The installed provider version could not be verified.",
+                "The provider executable is not installed.",
                 actions,
             )
         config_state = str(getattr(availability, "config_state", "") or "")
@@ -197,7 +191,7 @@ class ManagedLaunchContract:
             return ManagedLaunchSetupDiagnostic(
                 "managed_provider_config_unavailable",
                 "configuration",
-                "The provider does not satisfy its reviewed managed-launch configuration.",
+                "The provider managed-launch configuration is unavailable.",
                 actions,
             )
         auth_state = str(getattr(availability, "auth_state", "") or "")
@@ -205,7 +199,7 @@ class ManagedLaunchContract:
             return ManagedLaunchSetupDiagnostic(
                 "managed_provider_auth_unavailable",
                 "authentication",
-                "The provider does not satisfy its reviewed authentication posture.",
+                "The provider does not satisfy its reviewed authentication readiness.",
                 actions,
             )
         if not bool(getattr(availability, "usable", False)) or not bool(

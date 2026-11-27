@@ -18,13 +18,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shlex
 import threading
 import time
 from pathlib import Path
 
 from session_event_log import (
+    TOOL_DIFF_MAX_CHARS,
     VISIBLE_BLOCK_TEXT_MAX,
     SessionEventLog,
+    error_line,
     parse_claude_transcript_line,
     source_file_version,
 )
@@ -32,12 +36,50 @@ from session_event_log import (
 INGEST_TOPIC = "log-ingest"
 MAX_LINE_BYTES = 32 * 1024 * 1024
 READ_CHUNK = 1024 * 1024
-CLAUDE_PARSER_VERSION = 3
-CODEX_PARSER_VERSION = 4
-OMP_PARSER_VERSION = 1
+CLAUDE_PARSER_VERSION = 5
+CODEX_PARSER_VERSION = 6
+OMP_PARSER_VERSION = 5
 SUPPORTED_TRANSCRIPT_PROVIDERS = frozenset({"claude", "codex", "omp"})
 
 _CODEX_TEXT_BLOCK_TYPES = {"text", "output_text", "input_text"}
+
+# A command's own record of its output is not cut the way the text Codex hands
+# the model is (about 40,000 characters). A longer one keeps the model's text.
+CODEX_COMMAND_OUTPUT_MAX_CHARS = 64 * 1024
+# An API error can carry a whole response body. Its first part says what failed.
+FAILED_REQUEST_MAX_CHARS = 2_000
+
+_JS_STRING = re.compile(r'"[^"\\\r\n]*(?:\\.[^"\\\r\n]*)*"')
+_JS_NAME = r"[A-Za-z_]\w*"
+_JS_VALUE = r'(?:""|-?\d+(?:\.\d+)?|true|false|null)'
+_JS_PAIR = re.compile(rf'(""|{_JS_NAME}):({_JS_VALUE})')
+_JS_EXEC_COMMAND = (
+    r"await tools\.exec_command\((?P<args>\{"
+    rf'(?:""|{_JS_NAME}):{_JS_VALUE}(?:,(?:""|{_JS_NAME}):{_JS_VALUE})*,?'
+    r"\})\)"
+)
+# The whole program, with every string literal read as "" and no spacing
+# beside punctuation. These are the only programs shown as what they run.
+_CODEX_EXEC_COMMAND_JS = (
+    re.compile(rf"text\({_JS_EXEC_COMMAND}\);?"),
+    re.compile(
+        rf"(?:const|let|var) (?P<result>{_JS_NAME})={_JS_EXEC_COMMAND};?"
+        r"text\((?:(?P=result)(?:\.output)?|JSON\.stringify\((?P=result)\))\);?"
+    ),
+)
+_CODEX_APPLY_PATCH_JS = (
+    re.compile(r'text\(await tools\.apply_patch\(""\)\);?'),
+    re.compile(
+        rf'(?:const|let|var) (?P<patch>{_JS_NAME})="";?'
+        r"text\(await tools\.apply_patch\((?P=patch)\)\);?"
+    ),
+    re.compile(
+        rf'(?:const|let|var) (?P<patch>{_JS_NAME})="";?'
+        rf"(?:const|let|var) (?P<result>{_JS_NAME})=await tools\.apply_patch\((?P=patch)\);?"
+        r"text\((?P=result)\);?"
+    ),
+)
+_UNIFIED_HUNK = re.compile(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
 
 class UnsupportedTranscriptProviderError(ValueError):
@@ -194,8 +236,236 @@ def _sanitized_image_generation_events(line: str, obj: dict, payload: dict) -> l
     return parse_claude_transcript_line(source)
 
 
-def parse_codex_transcript_line(line: str, native_id: str, normalize_codex) -> list[dict]:
-    """Preserve Codex records the shared normalizer cannot safely express."""
+def codex_exec_call(source: str) -> tuple[str, dict] | None:
+    """The tool name and input to show for an `exec` call whose JavaScript is
+    exactly one command or one patch. None for every other program, and for
+    any string literal that JSON does not read the way JavaScript does."""
+    literals = _JS_STRING.findall(source)
+    code = " ".join(_JS_STRING.sub('""', source).split())
+    code = re.sub(r" (?=\W)|(?<=\W) ", "", code)
+    try:
+        for pattern in _CODEX_EXEC_COMMAND_JS:
+            match = pattern.fullmatch(code)
+            if match is None:
+                continue
+            # Every literal of these programs is inside the argument object.
+            values = iter(literals)
+            args: dict = {}
+            for key, value in _JS_PAIR.findall(match["args"]):
+                if key == '""':
+                    key = json.loads(next(values))
+                if key in args:
+                    return None
+                args[key] = json.loads(next(values)) if value == '""' else None
+            command = args.get("cmd")
+            if not isinstance(command, str) or not command.strip():
+                return None
+            command.encode("utf-8")
+            return "exec", {"command": command}
+        if len(literals) == 1 and any(
+            pattern.fullmatch(code) for pattern in _CODEX_APPLY_PATCH_JS
+        ):
+            patch = json.loads(literals[0])
+            patch.encode("utf-8")
+            if patch.startswith("*** Begin Patch"):
+                return "apply_patch", {"input": patch}
+    except ValueError:  # Not a JSON string, or text that cannot be stored.
+        pass
+    return None
+
+
+def _codex_numbered_change(path, change) -> list[str] | None:
+    """One changed file as a header and numbered lines. None when the record
+    is not in a known shape."""
+    kind = change.get("type") if isinstance(change, dict) else None
+    if kind in ("add", "delete"):
+        content = change.get("content")
+        if not isinstance(content, str):
+            return None
+        sign, title = ("+", "Add") if kind == "add" else ("-", "Delete")
+        body = content.removesuffix("\n").split("\n") if content else []
+        return [f"*** {title} File: {path}"] + [
+            f"{sign}{number}|{text}" for number, text in enumerate(body, 1)
+        ]
+    unified = change.get("unified_diff") if kind == "update" else None
+    if not isinstance(unified, str):
+        return None
+    lines = [f"*** Update File: {change.get('move_path') or path}"]
+    old = new = None
+    for line in unified.removesuffix("\n").split("\n"):
+        header = _UNIFIED_HUNK.match(line)
+        if header:
+            if old is not None:
+                lines.append("")
+            old, new = int(header[1]), int(header[2])
+            continue
+        if old is None:
+            continue  # File header lines before the first hunk.
+        sign, text = line[:1], line[1:]
+        if sign == "+":
+            lines.append(f"+{new}|{text}")
+            new += 1
+        elif sign == "-":
+            lines.append(f"-{old}|{text}")
+            old += 1
+        elif sign == " ":
+            lines.append(f" {new}|{text}")
+            old += 1
+            new += 1
+        elif sign != "\\":  # "\ No newline at end of file" is not a line.
+            return None
+    if old is None and unified.strip():
+        return None  # Text with no hunk header this parser can read.
+    return lines
+
+
+def _codex_file_change_diff(items: list[dict]) -> str | None:
+    """Every file the call changed, in the numbered shape an edit's diff has
+    for the other providers, each file under a `*** ... File:` header."""
+    files: list[str] = []
+    for item in items:
+        if item.get("type") != "FileChange" or item.get("status") != "completed":
+            continue
+        changes = item.get("changes")
+        if not isinstance(changes, dict):
+            return None
+        for path, change in changes.items():
+            lines = _codex_numbered_change(path, change)
+            if lines is None:
+                return None
+            files.append("\n".join(lines))
+    diff = "\n\n".join(files)
+    return diff if 0 < len(diff) <= TOOL_DIFF_MAX_CHARS else None
+
+
+def _codex_command_script(item: dict) -> str:
+    argv = item.get("command")
+    if isinstance(argv, str):
+        return argv
+    if not isinstance(argv, list):
+        return ""
+    argv = [str(part) for part in argv]
+    return argv[2] if len(argv) == 3 and argv[1] == "-lc" else shlex.join(argv)
+
+
+def _codex_output_has_running_command(output) -> bool:
+    """True when the result names a command that had not finished. Its text
+    so far and its session number are only in the result Codex wrote."""
+    for part in output if isinstance(output, list) else []:
+        text = part.get("text") if isinstance(part, dict) else None
+        if not isinstance(text, str) or not text.startswith("{"):
+            continue
+        try:
+            chunk = json.loads(text)
+        except ValueError:
+            continue
+        if (isinstance(chunk, dict) and "chunk_id" in chunk
+                and "session_id" in chunk and "exit_code" not in chunk):
+            return True
+    return False
+
+
+def _codex_item_text(items: list[dict], shown_command) -> tuple[str, bool]:
+    """What the call's commands and patches printed, and whether a command
+    failed. A command is named on a `$` line unless it is the only item and
+    the call already shows exactly that command."""
+    alone = (len(items) == 1 and items[0].get("type") == "CommandExecution"
+             and _codex_command_script(items[0]) == shown_command)
+    parts: list[str] = []
+    failed = False
+    for item in items:
+        output = None
+        code = None
+        if item.get("type") == "CommandExecution":
+            if not alone:
+                parts.append(f"$ {_codex_command_script(item)}")
+            output = item.get("aggregated_output")
+            code = item.get("exit_code")
+        if not isinstance(output, str):
+            output = "".join(
+                value for value in (item.get("stdout"), item.get("stderr"))
+                if isinstance(value, str)
+            )
+        output = output.rstrip("\n")
+        if output:
+            parts.append(output)
+        if isinstance(code, int) and not isinstance(code, bool) and code != 0:
+            parts.append(f"exit code {code}")
+            failed = True
+    return "\n".join(parts), failed
+
+
+def _codex_track_call(obj: dict, events: list[dict], state: dict) -> None:
+    """Codex records what a call ran and changed on lines of their own,
+    between the call and its result and without the call's id. Keep those
+    for the open call, then show the result as the other providers do."""
+    payload = obj.get("payload")
+    if not isinstance(payload, dict):
+        return
+    kind = (obj.get("type"), payload.get("type"))
+    if kind == ("event_msg", "item_completed"):
+        item = payload.get("item")
+        if ("items" in state and isinstance(item, dict)
+                and item.get("type") in ("CommandExecution", "FileChange")):
+            # Keyed by id so a chunk that is read again adds nothing twice.
+            key = item.get("id")
+            if not isinstance(key, str):
+                key = len(state["items"])
+            state["items"].setdefault(key, item)
+    elif kind == ("response_item", "custom_tool_call"):
+        state.clear()
+        state["call_id"] = payload.get("call_id")
+        state["items"] = {}
+        source = payload.get("input")
+        calls = [event for event in events if event.get("kind") == "tool_call"]
+        if payload.get("name") == "exec" and isinstance(source, str) and len(calls) == 1:
+            shown = codex_exec_call(source)
+            if shown is not None:
+                calls[0]["name"], calls[0]["input"] = shown
+                state["command"] = shown[1].get("command")
+    elif kind == ("response_item", "custom_tool_call_output"):
+        items = []
+        if "items" in state and state.get("call_id") == payload.get("call_id"):
+            items = list(state["items"].values())
+        shown_command = state.get("command")
+        state.clear()
+        results = [event for event in events if event.get("kind") == "tool_result"]
+        if not items or len(results) != 1:
+            return
+        diff = _codex_file_change_diff(items)
+        if diff is not None:
+            results[0]["diff"] = diff
+        if _codex_output_has_running_command(payload.get("output")):
+            return
+        text, failed = _codex_item_text(items, shown_command)
+        if len(text) <= CODEX_COMMAND_OUTPUT_MAX_CHARS and not text.startswith("data:"):
+            results[0]["content"] = text
+            if failed:
+                results[0]["is_error"] = True
+
+
+def _failed_request_block(message) -> dict | None:
+    """Why a model request failed, in the provider's own words and set apart
+    from what the agent wrote. OMP and Codex record it beside the turn, where
+    no reader of the transcript would otherwise see it."""
+    raw = str(message or "").strip()
+    if not raw:
+        return None
+    line = error_line(raw)
+    text = f"**The model request failed.** {line}"
+    if line != raw:
+        # A status, a response body, or more lines than the one above.
+        text += f"\n\n````\n{raw[:FAILED_REQUEST_MAX_CHARS]}\n````"
+    return {"type": "text", "text": text}
+
+
+def parse_codex_transcript_line(line: str, native_id: str, normalize_codex, *,
+                                state: dict | None = None) -> list[dict]:
+    """Preserve Codex records the shared normalizer cannot safely express.
+
+    With `state`, one dict kept for the session and passed with every line in
+    file order, a command or patch call shows what it ran and what it printed
+    or changed. Without it each line stands alone."""
     try:
         obj = json.loads(line)
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -209,12 +479,39 @@ def parse_codex_transcript_line(line: str, native_id: str, normalize_codex) -> l
             return _sanitized_image_generation_events(line, obj, payload)
         if item_type == "message" and _codex_message_needs_sanitized_path(payload.get("content")):
             return _sanitized_codex_message_events(obj, payload)
+    if isinstance(obj, dict) and obj.get("type") == "event_msg":
+        payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+        failed = _failed_request_block(payload.get("message")) if payload.get("type") == "error" else None
+        if failed:
+            stable = hashlib.sha256(line.encode("utf-8", errors="replace")).hexdigest()[:16]
+            return parse_claude_transcript_line(json.dumps({
+                "type": "assistant",
+                "uuid": f"codex-error-{stable}",
+                "timestamp": obj.get("timestamp"),
+                "message": {"role": "assistant", "content": [failed]},
+            }, ensure_ascii=False, separators=(",", ":")))
     normalized = normalize_codex((line + "\n").encode("utf-8"), native_id)
     events: list[dict] = []
     for normalized_line in normalized.splitlines():
         if normalized_line.strip():
             events.extend(parse_claude_transcript_line(normalized_line))
+    if state is not None and isinstance(obj, dict):
+        _codex_track_call(obj, events, state)
     return events
+
+
+def _omp_shown_reply(block: dict) -> str | None:
+    """What an OMP agent wrote to its person in the middle of its work. OMP
+    shows a `write` to an `out://` address as a reply, pictures included, and
+    records it as a tool call."""
+    arguments = block.get("arguments")
+    if block.get("name") != "write" or not isinstance(arguments, dict):
+        return None
+    path, content = arguments.get("path"), arguments.get("content")
+    if (isinstance(path, str) and path.startswith("out://")
+            and isinstance(content, str) and content.strip()):
+        return content
+    return None
 
 
 def parse_omp_transcript_line(line: str) -> list[dict]:
@@ -236,24 +533,43 @@ def parse_omp_transcript_line(line: str) -> list[dict]:
         return parse_claude_transcript_line(json.dumps(normalized))
 
     role = str(message.get("role") or "")
+    details = message.get("details")
+    if (role == "toolResult" and message.get("toolName") == "write"
+            and message.get("useless") is True and not message.get("isError")
+            and isinstance(details, dict) and details.get("touchesNoFiles") is True):
+        # The result of a reply written mid-turn says only that it was shown,
+        # and OMP marks it useless. The reply itself is the row. A write to an
+        # agent or a process touches no files either, but its result is not
+        # marked useless and stays.
+        return parse_claude_transcript_line(json.dumps(normalized))
     if role == "toolResult":
-        normalized["type"] = "user"
-        normalized["message"] = {
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": message.get("toolCallId"),
-                "content": message.get("content"),
-                "is_error": bool(message.get("isError")),
-            }],
+        tool_result = {
+            "type": "tool_result",
+            "tool_use_id": message.get("toolCallId"),
+            "content": message.get("content"),
+            "is_error": bool(message.get("isError")),
         }
+        # An edit records the change it made as a line-numbered diff, which
+        # says more than the text it returned to the model.
+        diff = details.get("diff") if isinstance(details, dict) else None
+        if isinstance(diff, str) and 0 < len(diff) <= TOOL_DIFF_MAX_CHARS:
+            tool_result["diff"] = diff
+        # An ask records each question beside the answer the person gave.
+        if isinstance(details, dict) and isinstance(details.get("answers"), list):
+            tool_result["answers"] = details["answers"]
+        # A todo call records the whole list as it stood afterwards.
+        if isinstance(details, dict) and isinstance(details.get("phases"), list):
+            tool_result["plan"] = details["phases"]
+        normalized["type"] = "user"
+        normalized["message"] = {"role": "user", "content": [tool_result]}
     else:
         blocks = []
         for block in message.get("content") or []:
             if not isinstance(block, dict):
                 blocks.append(block)
             elif block.get("type") == "toolCall":
-                blocks.append({
+                reply = _omp_shown_reply(block)
+                blocks.append({"type": "text", "text": reply} if reply else {
                     "type": "tool_use",
                     "id": block.get("id"),
                     "name": block.get("name"),
@@ -261,6 +577,12 @@ def parse_omp_transcript_line(line: str) -> list[dict]:
                 })
             else:
                 blocks.append(block)
+        failed = (
+            _failed_request_block(message.get("errorMessage"))
+            if role == "assistant" and message.get("stopReason") == "error" else None
+        )
+        if failed:
+            blocks.append(failed)
         normalized["type"] = role if role in {"user", "assistant"} else "unknown"
         normalized["message"] = {"role": role or "unknown", "content": blocks}
     return parse_claude_transcript_line(
@@ -761,7 +1083,8 @@ class SessionLogIngestor:
                     if line.strip():
                         if provider == "codex":
                             events.extend(parse_codex_transcript_line(
-                                line, entry["native_id"], self._normalize_codex
+                                line, entry["native_id"], self._normalize_codex,
+                                state=entry.setdefault("codex_state", {}),
                             ))
                         elif provider == "claude":
                             events.extend(parse_claude_transcript_line(line))
