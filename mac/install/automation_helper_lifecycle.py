@@ -41,6 +41,19 @@ AUTOMATION_SOCKET_NAME = "automation.sock"
 AUTOMATION_SETUP_CAPABILITY_NAME = "setup-capability.json"
 AUTOMATION_PROBE_EVIDENCE_NAME = "last-terminal-probe.json"
 AUTOMATION_MIGRATION_NAME = "legacy-migration.json"
+# The first eight bytes of a 64-bit Mach-O file: its magic number and CPU type.
+MACH_O_HEADERS = {
+    bytes.fromhex("cffaedfe0c000001"): "arm64",
+    bytes.fromhex("cffaedfe07000001"): "x86_64",
+}
+# Run by launchd to delete a bundle that a terminal is not allowed to change.
+_REMOVE_BUNDLE_SOURCE = """\
+import os, shutil, stat, sys
+for parent, _directories, _files in os.walk(sys.argv[1]):
+    os.chmod(parent, stat.S_IMODE(os.lstat(parent).st_mode) | stat.S_IWUSR)
+shutil.rmtree(sys.argv[1])
+"""
+_LAUNCHD_REMOVE_WAIT_SECONDS = 10.0
 KNOWN_LEGACY_BUNDLE_ID = "com.mghome.ClaudeInjector"
 KNOWN_LEGACY_EXECUTABLE_SHA256 = "ca7005538f4b44adc0e17a06a595c3fa97299b2dc9094a97eef4bf48ae4fee82"
 
@@ -444,8 +457,14 @@ def verify_signed_bundle(bundle: Path, *, architecture: str) -> None:
         raise HelperLifecycleError("Pairling automation helper entitlement is invalid.") from exc
     if entitlements.get("com.apple.security.automation.apple-events") is not True:
         raise HelperLifecycleError("Pairling automation helper entitlement is invalid.")
-    architectures = _run_checked(["/usr/bin/lipo", "-archs", str(executable)]).split()
-    if architectures != [architecture]:
+    # Read from the file's own header: lipo comes with the Xcode Command Line
+    # Tools, which a Mac need not have.
+    try:
+        with executable.open("rb") as handle:
+            header = handle.read(8)
+    except OSError as exc:
+        raise HelperLifecycleError("Pairling automation helper architecture is invalid.") from exc
+    if MACH_O_HEADERS.get(header) != architecture:
         raise HelperLifecycleError("Pairling automation helper architecture is invalid.")
     assessment = _run_checked(["/usr/sbin/spctl", "--assess", "--type", "execute", "--verbose=4", str(bundle)])
     if "Notarized Developer ID" not in assessment:
@@ -471,10 +490,7 @@ def verify_install_bundle(
     verify_signed_bundle(bundle, architecture=architecture)
 
 
-def _remove_owned_bundle(path: Path) -> None:
-    if not path.exists() and not path.is_symlink():
-        return
-    _require_real_bundle_tree(path)
+def _delete_bundle_tree(path: Path) -> None:
     for parent, _directories, _filenames in os.walk(path, followlinks=False):
         descriptor = -1
         try:
@@ -486,12 +502,53 @@ def _remove_owned_bundle(path: Path) -> None:
             if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
                 raise HelperLifecycleError("Pairling automation helper bundle is invalid.")
             os.fchmod(descriptor, stat.S_IMODE(metadata.st_mode) | stat.S_IWUSR)
+        except PermissionError:
+            raise
         except OSError as exc:
             raise HelperLifecycleError("Pairling automation helper bundle is unavailable.") from exc
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
     shutil.rmtree(path)
+
+
+def _delete_bundle_through_launchd(path: Path) -> None:
+    label = f"dev.pairling.automation-remove.{os.getpid()}"
+    submitted = _launchctl((
+        "/bin/launchctl", "submit", "-l", label, "--",
+        sys.executable, "-c", _REMOVE_BUNDLE_SOURCE, str(path),
+    ))
+    if submitted.returncode != 0:
+        return
+    try:
+        deadline = time.monotonic() + _LAUNCHD_REMOVE_WAIT_SECONDS
+        while path.exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+    finally:
+        _launchctl(("/bin/launchctl", "remove", label))
+
+
+def _remove_owned_bundle(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    _require_real_bundle_tree(path)
+    # macOS App Management refuses any change inside an app that has run when
+    # setup was started from a terminal without that permission, and tells the
+    # person "Terminal was prevented from modifying apps". Renaming the whole
+    # bundle is still allowed, and so is any change by Pairling's own signed
+    # Python once launchd has started it (measured on macOS 26.4). So launchd
+    # is asked first, and this process deletes only what launchd did not.
+    _delete_bundle_through_launchd(path)
+    if not path.exists():
+        return
+    try:
+        _delete_bundle_tree(path)
+    except PermissionError as exc:
+        raise HelperLifecycleError(
+            "macOS would not let Pairling remove its previous automation helper. "
+            "Allow your terminal under System Settings > Privacy & Security > "
+            "App Management, then run setup again."
+        ) from exc
 
 
 def _fsync_directory(path: Path) -> None:

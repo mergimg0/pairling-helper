@@ -119,6 +119,7 @@ verify_package_snapshot_before_execution() {
   local payload_manifest="$(dirname "$REPO_ROOT")/payload-manifest.json"
   local snapshot_mode="${PAIRLING_PACKAGE_SNAPSHOT:-}"
   local snapshot_root resolved_repo resolved_runtime expected_payload expected_runtime actual_payload actual_runtime owner mode
+  local architecture platforms bound_runtime
   if [[ -z "$snapshot_mode" ]]; then
     if [[ -n "$package_root" && -f "$payload_manifest" ]]; then
       printf 'ERROR: npm package setup must enter through the verified Pairling shim snapshot.\n' >&2
@@ -175,31 +176,18 @@ verify_package_snapshot_before_execution() {
     printf 'ERROR: verified npm snapshot manifest digest changed before installer execution.\n' >&2
     return 1
   fi
-  if ! /usr/bin/python3 - "$payload_manifest" "$package_root/manifest.json" "$expected_runtime" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-payload_path = Path(sys.argv[1])
-runtime_path = Path(sys.argv[2])
-expected_runtime_digest = sys.argv[3]
-try:
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
-    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
-except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-    raise SystemExit(f"verified npm snapshot manifest could not be parsed: {exc}") from exc
-
-architecture = runtime.get("architecture")
-if architecture not in ("arm64", "x64"):
-    raise SystemExit("verified npm runtime architecture is missing or unsupported")
-runtime_manifests = payload.get("runtime_manifests")
-if not isinstance(runtime_manifests, dict) or set(runtime_manifests) != {"darwin-arm64", "darwin-x64"}:
-    raise SystemExit("verified npm payload runtime manifest identities are incomplete")
-platform_key = f"darwin-{architecture}"
-if runtime_manifests.get(platform_key) != expected_runtime_digest:
-    raise SystemExit("verified npm runtime manifest is not bound to the selected payload platform")
-PY
-  then
+  # plutil is part of macOS. /usr/bin/python3 is a stub that asks for the Xcode
+  # Command Line Tools on a Mac without them, and the package's own Python has
+  # not been verified yet.
+  architecture="$(/usr/bin/plutil -extract architecture raw -o - "$package_root/manifest.json" 2>/dev/null)" || true
+  platforms="$(/usr/bin/plutil -extract runtime_manifests raw -o - "$payload_manifest" 2>/dev/null | /usr/bin/sort | /usr/bin/tr '\n' ' ')" || true
+  bound_runtime=""
+  case "$architecture" in
+    arm64|x64)
+      bound_runtime="$(/usr/bin/plutil -extract "runtime_manifests.darwin-$architecture" raw -o - "$payload_manifest" 2>/dev/null)" || true
+      ;;
+  esac
+  if [[ "$platforms" != "darwin-arm64 darwin-x64 " || "$bound_runtime" != "$expected_runtime" ]]; then
     printf 'ERROR: verified npm snapshot platform binding failed.\n' >&2
     return 1
   fi
@@ -4776,16 +4764,19 @@ PY
 automation_helper_architecture() {
   local app="$1"
   local executable="$app/Contents/MacOS/PairlingAutomation"
-  local architecture
 
   if [[ -L "$app" || ! -d "$app" || -L "$executable" || ! -f "$executable" ]]; then
     log "ERROR: Pairling automation helper bundle is missing or linked." >&2
     return 1
   fi
-  architecture="$(/usr/bin/lipo -archs "$executable" 2>/dev/null || true)"
-  case "$architecture" in
-    arm64|x86_64)
-      printf '%s\n' "$architecture"
+  # Read from the file's own header: lipo comes with the Xcode Command Line
+  # Tools, which a Mac need not have.
+  case "$(/usr/bin/od -An -tx1 -N8 "$executable" 2>/dev/null | /usr/bin/tr -d ' \n')" in
+    cffaedfe0c000001)
+      printf 'arm64\n'
+      ;;
+    cffaedfe07000001)
+      printf 'x86_64\n'
       ;;
     *)
       log "ERROR: Pairling automation helper has an unsupported architecture." >&2
@@ -6714,115 +6705,53 @@ PY
 
 render_pair_qr() {
   local pair_url="$1"
-  if ! command -v swift >/dev/null 2>&1; then
-    return 1
-  fi
-  (
-    umask 077
-    local source_dir=""
-    local source_file=""
-    cleanup_pair_qr_source() {
-      if [[ -n "$source_file" ]]; then
-        rm -f "$source_file"
-      fi
-      if [[ -n "$source_dir" ]]; then
-        rmdir "$source_dir" 2>/dev/null || true
-      fi
+  # CoreImage draws the code through JavaScript for Automation, which is part of
+  # macOS. A Swift script would need the Xcode Command Line Tools. The pairing
+  # URL goes in on standard input, so it never shows in the process list.
+  #
+  # Half-block rendering: one column per module, and the upper half block packs
+  # two module rows into one terminal row, so a long pairing URL fits an
+  # 80-column terminal instead of overflowing at about 180 columns. The
+  # foreground colors the top module and the background the bottom module. A
+  # dark module is black (foreground 30, background 40) and a light module is
+  # white (foreground 37, background 47). This is the standard scannable
+  # qrencode ANSIUTF8 format. The quiet zone is 2 modules and the error
+  # correction is L, the smaller settings that keep the code under 80 columns.
+  printf '%s' "$pair_url" | /usr/bin/osascript -l JavaScript -e '
+    ObjC.import("AppKit");
+    ObjC.import("CoreImage");
+    function run() {
+      const message = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+      const filter = $.CIFilter.filterWithName("CIQRCodeGenerator");
+      if (message.length === 0 || filter.isNil()) {
+        throw new Error("the pairing code could not be drawn");
+      }
+      filter.setValueForKey(message, "inputMessage");
+      filter.setValueForKey("L", "inputCorrectionLevel");
+      const image = $.NSBitmapImageRep.alloc.initWithCIImage(filter.outputImage);
+      const width = Number(image.pixelsWide);
+      const height = Number(image.pixelsHigh);
+      const rgb = $.NSColorSpace.deviceRGBColorSpace;
+      const dark = [];
+      for (let y = 0; y < height; y++) {
+        dark.push([]);
+        for (let x = 0; x < width; x++) {
+          dark[y].push(image.colorAtXY(x, y).colorUsingColorSpace(rgb).redComponent < 0.5);
+        }
+      }
+      const quietZone = 2;
+      const isDark = (x, y) => x >= 0 && y >= 0 && x < width && y < height && dark[y][x];
+      const lines = [];
+      for (let y = -quietZone; y < height + quietZone; y += 2) {
+        let line = "";
+        for (let x = -quietZone; x < width + quietZone; x++) {
+          line += "\u001b[" + (isDark(x, y) ? "30" : "37") + ";" + (isDark(x, y + 1) ? "40" : "47") + "m\u2580";
+        }
+        lines.push(line + "\u001b[0m");
+      }
+      return lines.join("\n");
     }
-    trap cleanup_pair_qr_source EXIT
-    trap 'exit 129' HUP
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-
-    source_dir="$(mktemp -d "/tmp/pairling-qr.XXXXXXXX")" || exit 1
-    chmod 700 "$source_dir" || exit 1
-    source_file="$source_dir/render.swift"
-    cat >"$source_file" <<'SWIFT'
-import CoreGraphics
-import CoreImage
-import Foundation
-
-let message = FileHandle.standardInput.readDataToEndOfFile()
-guard !message.isEmpty,
-      let filter = CIFilter(name: "CIQRCodeGenerator") else {
-    exit(2)
-}
-
-filter.setValue(message, forKey: "inputMessage")
-filter.setValue("L", forKey: "inputCorrectionLevel")
-
-guard let output = filter.outputImage else {
-    exit(2)
-}
-
-let extent = output.extent.integral
-let ciContext = CIContext(options: nil)
-guard let cgImage = ciContext.createCGImage(output, from: extent) else {
-    exit(2)
-}
-
-let width = cgImage.width
-let height = cgImage.height
-let bytesPerRow = width * 4
-var raw = [UInt8](repeating: 255, count: height * bytesPerRow)
-let colorSpace = CGColorSpaceCreateDeviceRGB()
-let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
-
-guard let bitmapContext = CGContext(
-    data: &raw,
-    width: width,
-    height: height,
-    bitsPerComponent: 8,
-    bytesPerRow: bytesPerRow,
-    space: colorSpace,
-    bitmapInfo: bitmapInfo
-) else {
-    exit(2)
-}
-
-bitmapContext.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
-bitmapContext.fill(CGRect(x: 0, y: 0, width: width, height: height))
-bitmapContext.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-
-func isDark(_ x: Int, _ y: Int) -> Bool {
-    let index = y * bytesPerRow + x * 4
-    return raw[index] < 128 && raw[index + 1] < 128 && raw[index + 2] < 128
-}
-
-// Half-block rendering: one column per module, and the upper half block packs two
-// module rows into one terminal row, so a long pairing URL fits an 80-column
-// terminal instead of overflowing at about 180 columns. The foreground colors the
-// top module and the background colors the bottom module. A dark module is black
-// (foreground 30, background 40) and a light module is white (foreground 37,
-// background 47). This is the standard scannable qrencode ANSIUTF8 format. The quiet
-// zone is 2 modules and the error correction is "L", the smaller settings that keep
-// the QR under 80 columns.
-let quietZone = 2
-let reset = "\u{001B}[0m"
-
-func moduleDark(_ x: Int, _ y: Int) -> Bool {
-    return x >= 0 && y >= 0 && x < width && y < height && isDark(x, y)
-}
-
-func cell(_ topDark: Bool, _ bottomDark: Bool) -> String {
-    let foreground = topDark ? "30" : "37"
-    let background = bottomDark ? "40" : "47"
-    return "\u{001B}[\(foreground);\(background)m\u{2580}"
-}
-
-var y = -quietZone
-while y < height + quietZone {
-    var line = ""
-    for x in (-quietZone)..<(width + quietZone) {
-        line += cell(moduleDark(x, y), moduleDark(x, y + 1))
-    }
-    print(line + reset)
-    y += 2
-}
-SWIFT
-    chmod 600 "$source_file" || exit 1
-    printf '%s' "$pair_url" | swift "$source_file"
-  )
+  '
 }
 
 diagnose_runtime() {

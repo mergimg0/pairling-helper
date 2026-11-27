@@ -103,6 +103,13 @@ def _verify_signed_helper(app_path: Path) -> None:
         raise _unavailable("automation_helper_invalid")
 
 
+def _terminal_is_not_running(blocked: dict[str, Any]) -> bool:
+    result = blocked.get("result")
+    capability = result.get("terminal_capability") if isinstance(result, dict) else None
+    automation = capability.get("terminal_automation") if isinstance(capability, dict) else None
+    return isinstance(automation, dict) and automation.get("state") == "target_missing"
+
+
 class AutomationHelperClient:
     """Typed, owner-only caller for the signed Pairling helper socket."""
 
@@ -249,7 +256,23 @@ class AutomationHelperClient:
         *,
         timeout_ms: int,
     ) -> dict[str, Any]:
-        if (blocked := self._fresh_mutation_capability(timeout_ms=timeout_ms)) is not None:
+        blocked = self._fresh_mutation_capability(timeout_ms=timeout_ms)
+        if blocked is not None and _terminal_is_not_running(blocked):
+            # The helper cannot hold permission over an app that is not running,
+            # so with Terminal quit it reports Terminal as not permitted. A
+            # start opens Terminal and asks again: the helper answered ready
+            # half a second later when this was measured.
+            subprocess.run(
+                ["/usr/bin/open", "-g", "-a", "Terminal"],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+            deadline = time.monotonic() + 5.0
+            while blocked is not None and time.monotonic() < deadline:
+                time.sleep(0.25)
+                blocked = self._fresh_mutation_capability(timeout_ms=timeout_ms)
+        if blocked is not None:
             return blocked
         return self._request(
             "startPairlingSession",

@@ -11,6 +11,10 @@ JSON_MODE="false"
 PLAN_ONLY="false"
 SKIP_PAIR_WINDOW="false"
 
+# The npm launcher names the package's own Python. A bare python3 is a stub that
+# asks for the Xcode Command Line Tools on a Mac without them.
+python3() { command "${PAIRLING_DAEMON_PYTHON:-python3}" "$@"; }
+
 usage() {
   cat <<EOF
 usage: bootstrap-first-run.sh [--json] [--plan-only] [--ttl seconds] [--skip-pairing-invitation]

@@ -14,12 +14,15 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   rmSync,
   writeFileSync,
@@ -691,6 +694,9 @@ function developerIdRequirement(teamId) {
   );
 }
 
+// The first eight bytes of a 64-bit Mach-O file: its magic number and CPU type.
+const MACH_O_HEADERS = { arm64: "cffaedfe0c000001", x64: "cffaedfe07000001" };
+
 function verifyMachOIdentity(path, expected, architecture, label) {
   commandResult(
     "/usr/bin/codesign",
@@ -715,16 +721,16 @@ function verifyMachOIdentity(path, expected, architecture, label) {
   ) {
     throw new Error(`${label} code identity does not match its runtime manifest`);
   }
-  const expectedMachArch = architecture === "x64" ? "x86_64" : architecture;
-  const actualArchitectures = commandResult(
-    "/usr/bin/lipo",
-    ["-archs", path],
-    `${label} architecture inspection`,
-  )
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
-  if (actualArchitectures.length !== 1 || actualArchitectures[0] !== expectedMachArch) {
+  // The architecture is read from the file's own header. `lipo` comes with the
+  // Xcode Command Line Tools, which a Mac need not have.
+  const header = Buffer.alloc(8);
+  const descriptor = openSync(path, "r");
+  try {
+    readSync(descriptor, header, 0, 8, 0);
+  } finally {
+    closeSync(descriptor);
+  }
+  if (header.toString("hex") !== MACH_O_HEADERS[architecture]) {
     throw new Error(`${label} architecture does not match its runtime package`);
   }
 }

@@ -1946,22 +1946,20 @@ def _reviewed_provider_launch_command(
         # interactive zsh, where `exec omp` runs their own `omp` function if
         # they have one, and OMP refuses -e beside --trusted-extension. Their
         # own command loads the ask extension (CLAUDE.md, section 7).
+        # Both commands resume a session file Pairling made first. OMP writes
+        # a new session's file only at its first message, so a bare `omp`
+        # leaves nothing to read the session's identity from.
         model_arg = (
             f" --model {shlex.quote(str(resolved_model))}"
             if resolved_model
             else ""
         )
-        if backend == "terminal_app":
-            return (
-                f"cd {shlex.quote(project)} && exec omp{model_arg}",
-                True,
-            )
         native_id = str(native_id or "").strip()
         if (
             not _safe_agent_native_id(native_id)
             or native_id.startswith(("pending-", "launch-"))
         ):
-            raise ValueError("reviewed OMP broker launch requires a final session ID")
+            raise ValueError("reviewed OMP launch requires a final session ID")
         session_dir = shlex.quote(str(_omp_pairling_reservation_root()))
         resume = (
             f"omp --cwd {shlex.quote(project)}"
@@ -1969,6 +1967,8 @@ def _reviewed_provider_launch_command(
             f" --resume {shlex.quote(native_id)}"
             f"{model_arg}"
         )
+        if backend == "terminal_app":
+            return f"cd {shlex.quote(project)} && exec {resume}", True
         return f"exec {resume}", False
     raise ValueError("provider launch profile is not implemented")
 
@@ -11993,11 +11993,30 @@ def _clear_health_probe_caches_for_tests() -> None:
         _health_payload_cache.clear()
 
 
+_DEVELOPER_TOOLS_PRESENT = False
+
+
+def _git_usable() -> bool:
+    """False on a Mac without developer tools.
+
+    There /usr/bin/git is a stub that opens Apple's "install the command line
+    developer tools" dialog every time it is run.
+    """
+    global _DEVELOPER_TOOLS_PRESENT
+    if not _DEVELOPER_TOOLS_PRESENT:
+        _DEVELOPER_TOOLS_PRESENT, _out, _err = _run_text(
+            ["/usr/bin/xcode-select", "-p"]
+        )
+    return _DEVELOPER_TOOLS_PRESENT
+
+
 def _run_text(
     cmd: list[str],
     timeout: float = 3.0,
     env: dict[str, str] | None = None,
 ) -> tuple[bool, str, str]:
+    if cmd and cmd[0] == "git" and not _git_usable():
+        return False, "", "git needs developer tools, which this Mac does not have"
     try:
         run_kwargs = {"env": env} if env is not None else {}
         proc = subprocess.run(
@@ -41699,10 +41718,8 @@ class Handler(BaseHTTPRequestHandler):
         if (
             not managed_spawn
             and launch_strategy == "direct_pairling"
-            and not (
-                provider == "omp"
-                and spawn_backend == "broker"
-            )
+            # An OMP command names a session reserved just before its launch.
+            and provider != "omp"
         ):
             try:
                 (
@@ -41976,6 +41993,34 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        omp_reservation_path: str | None = None
+        omp_reserved_native_id: str | None = None
+        if provider == "omp":
+            try:
+                reservation = _reserve_omp_terminal_session(project)
+                omp_reservation_path = str(reservation["session_path"])
+                omp_reserved_native_id = str(reservation["native_session_id"])
+                (
+                    reviewed_terminal_command,
+                    reviewed_terminal_interactive_shell,
+                ) = _reviewed_provider_launch_command(
+                    provider,
+                    project,
+                    spawn_backend,
+                    native_id=omp_reserved_native_id,
+                    resolved_model=resolved_model,
+                )
+            except (OSError, ValueError) as error:
+                _discard_omp_terminal_reservation(omp_reservation_path)
+                reject_spawn(
+                    503,
+                    "omp_session_reservation_failed",
+                    str(error)[:200]
+                    or "OMP could not reserve a final session identity.",
+                    state="failed",
+                )
+                return
+
         capture_id = hashlib.sha256(
             f"{device_id}\0{client_action_id}\0{provider}".encode()
         ).hexdigest()[:24]
@@ -41993,6 +42038,9 @@ class Handler(BaseHTTPRequestHandler):
         basename = os.path.basename(project.rstrip("/")) or provider
         title = f"{provider}:{basename}" if provider == "codex" else basename
         result = _start_pairling_terminal_session(shell_cmd, title)
+        if not result.get("ok") and not result.get("outcome_indeterminate"):
+            # Nothing was started, so nothing holds the reserved file.
+            _discard_omp_terminal_reservation(omp_reservation_path)
         tty = str(result.get("tty") or "").strip() if result.get("ok") else ""
         pid = 0
         terminal_identity: dict | None = None
@@ -42058,6 +42106,7 @@ class Handler(BaseHTTPRequestHandler):
                 omp_session_identity = _wait_for_omp_spawn_terminal_identity(
                     terminal_identity,
                     canonical_project=project,
+                    expected_native_id=omp_reserved_native_id,
                 )
                 identity_probe_state = str(
                     (omp_session_identity or {}).get("identity_probe_state") or ""
@@ -46986,7 +47035,7 @@ class Handler(BaseHTTPRequestHandler):
 
             branch = None
             dirty_count = None
-            if cwd and os.path.isdir(cwd):
+            if cwd and os.path.isdir(cwd) and _git_usable():
                 try:
                     bp = subprocess.run(
                         ["git", "-C", cwd, "branch", "--show-current"],
@@ -47066,7 +47115,7 @@ class Handler(BaseHTTPRequestHandler):
 
         branch = None
         dirty_count = None
-        if cwd and os.path.isdir(cwd):
+        if cwd and os.path.isdir(cwd) and _git_usable():
             try:
                 bp = subprocess.run(
                     ["git", "-C", cwd, "branch", "--show-current"],
