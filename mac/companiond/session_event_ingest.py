@@ -38,7 +38,7 @@ MAX_LINE_BYTES = 32 * 1024 * 1024
 READ_CHUNK = 1024 * 1024
 CLAUDE_PARSER_VERSION = 5
 CODEX_PARSER_VERSION = 6
-OMP_PARSER_VERSION = 5
+OMP_PARSER_VERSION = 6
 SUPPORTED_TRANSCRIPT_PROVIDERS = frozenset({"claude", "codex", "omp"})
 
 _CODEX_TEXT_BLOCK_TYPES = {"text", "output_text", "input_text"}
@@ -514,6 +514,23 @@ def _omp_shown_reply(block: dict) -> str | None:
     return None
 
 
+# OMP keeps a picture a tool returned outside the session file, under its
+# SHA-256, and names it here.
+_OMP_BLOB_IMAGE = re.compile(r"blob:sha256:[0-9a-f]{64}")
+
+
+def _omp_result_images(content) -> list[dict]:
+    """The pictures in an OMP tool result, in the order they appear. The phone
+    asks the Mac for one by the `src` given here."""
+    return [
+        {"src": block["data"],
+         "mime": block["mimeType"] if isinstance(block.get("mimeType"), str) else ""}
+        for block in (content if isinstance(content, list) else [])
+        if isinstance(block, dict) and block.get("type") == "image"
+        and isinstance(block.get("data"), str) and _OMP_BLOB_IMAGE.fullmatch(block["data"])
+    ]
+
+
 def parse_omp_transcript_line(line: str) -> list[dict]:
     """Normalize one OMP v3 JSONL record into the shared transcript shape."""
     try:
@@ -534,6 +551,7 @@ def parse_omp_transcript_line(line: str) -> list[dict]:
 
     role = str(message.get("role") or "")
     details = message.get("details")
+    images: list[dict] = []
     if (role == "toolResult" and message.get("toolName") == "write"
             and message.get("useless") is True and not message.get("isError")
             and isinstance(details, dict) and details.get("touchesNoFiles") is True):
@@ -560,6 +578,7 @@ def parse_omp_transcript_line(line: str) -> list[dict]:
         # A todo call records the whole list as it stood afterwards.
         if isinstance(details, dict) and isinstance(details.get("phases"), list):
             tool_result["plan"] = details["phases"]
+        images = _omp_result_images(message.get("content"))
         normalized["type"] = "user"
         normalized["message"] = {"role": "user", "content": [tool_result]}
     else:
@@ -575,6 +594,10 @@ def parse_omp_transcript_line(line: str) -> list[dict]:
                     "name": block.get("name"),
                     "input": block.get("arguments"),
                 })
+            elif block.get("type") == "thinking" and block.get("narration") is True:
+                # A note the agent wrote to its person while working. OMP
+                # records it as reasoning with this mark and shows it as a reply.
+                blocks.append({"type": "text", "text": block.get("thinking")})
             else:
                 blocks.append(block)
         failed = (
@@ -585,9 +608,16 @@ def parse_omp_transcript_line(line: str) -> list[dict]:
             blocks.append(failed)
         normalized["type"] = role if role in {"user", "assistant"} else "unknown"
         normalized["message"] = {"role": role or "unknown", "content": blocks}
-    return parse_claude_transcript_line(
+    events = parse_claude_transcript_line(
         json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
     )
+    # The shared parser turns a result into text, where a picture is only a
+    # label. What the phone needs to ask for each one rides beside that text.
+    if images:
+        for event in events:
+            if event.get("kind") == "tool_result":
+                event["images"] = images
+    return events
 
 
 class SessionLogIngestor:

@@ -37,7 +37,7 @@ private final class HandlerTerminal: TerminalControlling {
     var typeError: Error?
     private(set) var probeCalls = 0
     private(set) var sentTexts: [(tty: String, text: String, bracketedPaste: Bool)] = []
-    private(set) var typedTexts: [(tty: String, text: String)] = []
+    private(set) var typedSegments: [(tty: String, segments: [TerminalInputSegment])] = []
     func probe() throws {
         probeCalls += 1
         if let probeError {
@@ -60,11 +60,11 @@ private final class HandlerTerminal: TerminalControlling {
         sentTexts.append((tty, text, bracketedPaste))
     }
 
-    func typeText(tty: String, text: String) throws {
+    func typeSegments(tty: String, segments: [TerminalInputSegment]) throws {
         if let typeError {
             throw typeError
         }
-        typedTexts.append((tty, text))
+        typedSegments.append((tty, segments))
     }
 
     func sendSpecialKey(tty _: String, key _: String) throws {}
@@ -201,7 +201,7 @@ final class AutomationRequestHandlerTests: XCTestCase {
         XCTAssertEqual(probeStore.evidence?.state, .granted)
     }
 
-    func testTypeTerminalTextPreservesLiteralInputAndConfirmsMutation() throws {
+    func testTypeTerminalSegmentsProbesOnceAndConfirmsEverySegment() throws {
         let permissions = HandlerPermissionService(readiness: makeReadiness(granted: true))
         let terminal = HandlerTerminal()
         let handler = makeHandler(
@@ -210,11 +210,12 @@ final class AutomationRequestHandlerTests: XCTestCase {
             terminal: terminal,
             probeStore: HandlerProbeEvidenceStore()
         )
+        let segments: [TerminalInputSegment] = [.key("down"), .text("hello\r")]
         let request = try request(
-            operation: .typeTerminalText,
-            arguments: .terminalType(TerminalTypeArguments(
+            operation: .typeTerminalSegments,
+            arguments: .terminalSegments(TerminalSegmentsArguments(
                 tty: "/dev/ttys8",
-                text: "hello\r"
+                segments: segments
             ))
         )
 
@@ -222,8 +223,11 @@ final class AutomationRequestHandlerTests: XCTestCase {
 
         XCTAssertTrue(response.ok)
         XCTAssertEqual(response.mutationOutcome, .confirmed)
-        XCTAssertEqual(terminal.typedTexts.first?.tty, "/dev/ttys8")
-        XCTAssertEqual(terminal.typedTexts.first?.text, "hello\r")
+        XCTAssertEqual(response.result?["completed_segments"], .number(2))
+        XCTAssertEqual(terminal.probeCalls, 1)
+        XCTAssertEqual(terminal.typedSegments.count, 1)
+        XCTAssertEqual(terminal.typedSegments.first?.tty, "/dev/ttys8")
+        XCTAssertEqual(terminal.typedSegments.first?.segments, segments)
         XCTAssertTrue(terminal.sentTexts.isEmpty)
     }
 
@@ -238,10 +242,10 @@ final class AutomationRequestHandlerTests: XCTestCase {
             probeStore: HandlerProbeEvidenceStore()
         )
         let request = try request(
-            operation: .typeTerminalText,
-            arguments: .terminalType(TerminalTypeArguments(
+            operation: .typeTerminalSegments,
+            arguments: .terminalSegments(TerminalSegmentsArguments(
                 tty: "/dev/ttys8",
-                text: "hello"
+                segments: [.text("hello")]
             ))
         )
 
@@ -250,6 +254,72 @@ final class AutomationRequestHandlerTests: XCTestCase {
         XCTAssertFalse(response.ok)
         XCTAssertEqual(response.error?.code, .terminalTabAmbiguous)
         XCTAssertEqual(response.mutationOutcome, .failedBeforeMutation)
+        XCTAssertEqual(response.result?["completed_segments"], .number(0))
+    }
+
+    func testTypeTerminalSegmentsReportsAPartialFailureAsUnknownWithItsCount() throws {
+        let permissions = HandlerPermissionService(readiness: makeReadiness(granted: true))
+        let terminal = HandlerTerminal()
+        terminal.typeError = TerminalSegmentsFailure(completedSegments: 2)
+        let handler = makeHandler(
+            capabilities: .missing,
+            permissions: permissions,
+            terminal: terminal,
+            probeStore: HandlerProbeEvidenceStore()
+        )
+        let request = try request(
+            operation: .typeTerminalSegments,
+            arguments: .terminalSegments(TerminalSegmentsArguments(
+                tty: "/dev/ttys8",
+                segments: [.key("down"), .key("down"), .key("down"), .text("\r")]
+            ))
+        )
+
+        let response = handler.handle(data: request, peerUID: ownerUID)
+
+        XCTAssertFalse(response.ok)
+        XCTAssertEqual(response.error?.code, .operationUnavailable)
+        XCTAssertEqual(response.mutationOutcome, .outcomeUnknown)
+        XCTAssertEqual(response.result?["completed_segments"], .number(2))
+    }
+
+    func testInvalidTypeTerminalSegmentsAreRefusedBeforeTerminalIsTouched() throws {
+        let oversizedText = String(
+            repeating: "a",
+            count: PairlingAutomationConstants.maximumTextBytes
+        )
+        let refused: [(AutomationErrorCode, String, [TerminalInputSegment])] = [
+            (.invalidTTY, "/dev/pts/4", [.text("hello")]),
+            (.unsupportedSpecialKey, "/dev/ttys8", [.text("hello"), .key("return")]),
+            (.textTooLarge, "/dev/ttys8", [.text(oversizedText), .key("down"), .text("a")]),
+            (.invalidRequest, "/dev/ttys8", []),
+            (.invalidRequest, "/dev/ttys8", [.key("down"), .text("")]),
+        ]
+        for (code, tty, segments) in refused {
+            let permissions = HandlerPermissionService(readiness: makeReadiness(granted: true))
+            let terminal = HandlerTerminal()
+            let handler = makeHandler(
+                capabilities: .missing,
+                permissions: permissions,
+                terminal: terminal,
+                probeStore: HandlerProbeEvidenceStore()
+            )
+            let request = try request(
+                operation: .typeTerminalSegments,
+                arguments: .terminalSegments(TerminalSegmentsArguments(
+                    tty: tty,
+                    segments: segments
+                ))
+            )
+
+            let response = handler.handle(data: request, peerUID: ownerUID)
+
+            XCTAssertFalse(response.ok)
+            XCTAssertEqual(response.error?.code, code)
+            XCTAssertEqual(permissions.statusCalls, 0)
+            XCTAssertEqual(terminal.probeCalls, 0)
+            XCTAssertTrue(terminal.typedSegments.isEmpty)
+        }
     }
 
     func testPermissionRequestRequiresCapabilityAndReturnsProbeFailure() throws {

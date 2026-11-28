@@ -39,12 +39,17 @@ private final class TerminalPostingRecorder {
 private final class FakeTerminalKeyPoster: TerminalKeyPosting {
     private let recorder: TerminalPostingRecorder?
     private(set) var postedKeys: [(key: TerminalSpecialKey, processIdentifier: pid_t)] = []
+    /// The post, counted from one, that fails before posting anything.
+    var failsOnPost: Int?
 
     init(recorder: TerminalPostingRecorder? = nil) {
         self.recorder = recorder
     }
 
     func post(_ key: TerminalSpecialKey, to processIdentifier: pid_t) throws {
+        if failsOnPost == postedKeys.count + 1 {
+            throw AppleTerminalAdapterError.keyboardEventUnavailable
+        }
         postedKeys.append((key, processIdentifier))
         recorder?.events.append("key:\(key.rawValue)")
     }
@@ -168,7 +173,7 @@ final class AppleTerminalAdapterTests: XCTestCase {
         XCTAssertEqual(keyPoster.postedKeys.first?.processIdentifier, 42)
     }
 
-    func testTypeTextTargetsUniqueTabAndPreservesLiteralOrdering() throws {
+    func testTypeSegmentsSelectsTheTabOnceAndPostsEverySegmentInOrder() throws {
         let executor = FakeTerminalScriptExecutor()
         executor.results["selectTerminalTabForInput"] = .list([
             "ok", "/dev/ttys001",
@@ -183,7 +188,13 @@ final class AppleTerminalAdapterTests: XCTestCase {
             textPoster: textPoster
         )
 
-        try adapter.typeText(tty: "/dev/ttys001", text: "hello\rworld\t")
+        try adapter.typeSegments(tty: "/dev/ttys001", segments: [
+            .key("down"),
+            .key("down"),
+            .text("hello\rworld\t"),
+            .key("ctrl_c"),
+            .text("\r"),
+        ])
 
         XCTAssertEqual(executor.invocations, [
             .init(
@@ -192,14 +203,78 @@ final class AppleTerminalAdapterTests: XCTestCase {
             ),
         ])
         XCTAssertEqual(recorder.events, [
+            "key:down",
+            "key:down",
             "text:hello",
             "key:enter",
             "text:world",
             "key:tab",
+            "key:ctrl_c",
+            "key:enter",
         ])
+        XCTAssertTrue(keyPoster.postedKeys.allSatisfy { $0.processIdentifier == 42 })
     }
 
-    func testTypeTextRejectsAmbiguousTabBeforePosting() {
+    func testTypeSegmentsStopsAtAFailedSegmentAndReportsHowManyCompleted() {
+        let executor = FakeTerminalScriptExecutor()
+        executor.results["selectTerminalTabForInput"] = .list([
+            "ok", "/dev/ttys001",
+        ])
+        let recorder = TerminalPostingRecorder()
+        let keyPoster = FakeTerminalKeyPoster(recorder: recorder)
+        keyPoster.failsOnPost = 2
+        let adapter = AppleTerminalAdapter(
+            scriptExecutor: executor,
+            processFinder: FakeTerminalProcessFinder(processIdentifier: 42),
+            keyPoster: keyPoster,
+            textPoster: FakeTerminalTextPoster(recorder: recorder)
+        )
+
+        XCTAssertThrowsError(
+            try adapter.typeSegments(tty: "/dev/ttys001", segments: [
+                .text("a"),
+                .key("down"),
+                .key("up"),
+                .text("b"),
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? TerminalSegmentsFailure,
+                TerminalSegmentsFailure(completedSegments: 2)
+            )
+        }
+        XCTAssertEqual(recorder.events, ["text:a", "key:down"])
+        XCTAssertEqual(executor.invocations.count, 1)
+    }
+
+    func testTypeSegmentsRefusesAnUnsupportedSegmentBeforeTouchingTheTab() {
+        let refused: [[TerminalInputSegment]] = [
+            [.text("ok"), .key("return")],
+            [.text("ok"), .text("a\u{01}")],
+        ]
+        for segments in refused {
+            let executor = FakeTerminalScriptExecutor()
+            let keyPoster = FakeTerminalKeyPoster()
+            let textPoster = FakeTerminalTextPoster()
+            let adapter = AppleTerminalAdapter(
+                scriptExecutor: executor,
+                processFinder: FakeTerminalProcessFinder(processIdentifier: 42),
+                keyPoster: keyPoster,
+                textPoster: textPoster
+            )
+
+            XCTAssertThrowsError(
+                try adapter.typeSegments(tty: "/dev/ttys001", segments: segments)
+            ) { error in
+                XCTAssertEqual(error as? AppleTerminalAdapterError, .unsupportedSpecialKey)
+            }
+            XCTAssertTrue(executor.invocations.isEmpty)
+            XCTAssertTrue(keyPoster.postedKeys.isEmpty)
+            XCTAssertTrue(textPoster.postedTexts.isEmpty)
+        }
+    }
+
+    func testTypeSegmentsRejectsAmbiguousTabBeforePosting() {
         let executor = FakeTerminalScriptExecutor()
         executor.results["selectTerminalTabForInput"] = .list(["ambiguous_window"])
         let keyPoster = FakeTerminalKeyPoster()
@@ -212,7 +287,7 @@ final class AppleTerminalAdapterTests: XCTestCase {
         )
 
         XCTAssertThrowsError(
-            try adapter.typeText(tty: "/dev/ttys001", text: "hello")
+            try adapter.typeSegments(tty: "/dev/ttys001", segments: [.text("hello")])
         ) { error in
             XCTAssertEqual(error as? AppleTerminalAdapterError, .terminalTabAmbiguous)
         }
@@ -220,7 +295,7 @@ final class AppleTerminalAdapterTests: XCTestCase {
         XCTAssertTrue(textPoster.postedTexts.isEmpty)
     }
 
-    func testTypeTextRejectsWrongSelectedTTYBeforePosting() {
+    func testTypeSegmentsRejectsWrongSelectedTTYBeforePosting() {
         let executor = FakeTerminalScriptExecutor()
         executor.results["selectTerminalTabForInput"] = .list([
             "ok", "/dev/ttys999",
@@ -235,7 +310,7 @@ final class AppleTerminalAdapterTests: XCTestCase {
         )
 
         XCTAssertThrowsError(
-            try adapter.typeText(tty: "/dev/ttys001", text: "hello")
+            try adapter.typeSegments(tty: "/dev/ttys001", segments: [.text("hello")])
         ) { error in
             XCTAssertEqual(error as? AppleTerminalAdapterError, .malformedResponse)
         }

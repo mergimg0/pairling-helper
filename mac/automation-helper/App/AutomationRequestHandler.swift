@@ -68,14 +68,14 @@ final class AutomationRequestHandler: @unchecked Sendable {
                 text: arguments.text,
                 bracketedPaste: arguments.bracketedPaste
             )
-        case .typeTerminalText:
-            guard case let .terminalType(arguments) = request.arguments else {
+        case .typeTerminalSegments:
+            guard case let .terminalSegments(arguments) = request.arguments else {
                 return invalidRequest(request)
             }
-            return typeTerminalText(
+            return typeTerminalSegments(
                 request,
                 tty: arguments.tty,
-                text: arguments.text
+                segments: arguments.segments
             )
         case .sendSpecialKey:
             guard case let .specialKey(arguments) = request.arguments else {
@@ -199,23 +199,38 @@ final class AutomationRequestHandler: @unchecked Sendable {
         }
     }
 
-    private func typeTerminalText(
+    private func typeTerminalSegments(
         _ request: AutomationRequest,
         tty: String,
-        text: String
+        segments: [TerminalInputSegment]
     ) -> AutomationResponse {
         if let readinessFailure = ensureTerminalControl(request) {
             return readinessFailure
         }
         do {
-            try terminal.typeText(tty: tty, text: text)
+            try terminal.typeSegments(tty: tty, segments: segments)
             return .success(
                 requestID: request.requestID,
                 helper: identity,
+                result: ["completed_segments": .number(Double(segments.count))],
                 mutationOutcome: .confirmed
             )
+        } catch let failure as TerminalSegmentsFailure {
+            // Posting had begun, so some of the input may be in the tab.
+            return .failure(
+                requestID: request.requestID,
+                helper: identity,
+                code: .operationUnavailable,
+                mutationOutcome: .outcomeUnknown,
+                result: ["completed_segments": .number(Double(failure.completedSegments))]
+            )
         } catch let error {
-            return terminalFailure(request, error: error, mutationOutcome: .outcomeUnknown)
+            return terminalFailure(
+                request,
+                error: error,
+                mutationOutcome: .outcomeUnknown,
+                result: ["completed_segments": .number(0)]
+            )
         }
     }
 
@@ -377,7 +392,8 @@ final class AutomationRequestHandler: @unchecked Sendable {
     private func terminalFailure(
         _ request: AutomationRequest,
         error: Error,
-        mutationOutcome: MutationOutcome?
+        mutationOutcome: MutationOutcome?,
+        result: [String: JSONValue]? = nil
     ) -> AutomationResponse {
         let typedError = error as? AppleTerminalAdapterError
         let code: AutomationErrorCode
@@ -403,7 +419,8 @@ final class AutomationRequestHandler: @unchecked Sendable {
             requestID: request.requestID,
             helper: identity,
             code: code,
-            mutationOutcome: resolvedOutcome
+            mutationOutcome: resolvedOutcome,
+            result: result
         )
     }
 
@@ -429,7 +446,7 @@ final class AutomationRequestHandler: @unchecked Sendable {
 private extension AutomationOperation {
     var isMutation: Bool {
         switch self {
-        case .sendTerminalText, .typeTerminalText, .sendSpecialKey,
+        case .sendTerminalText, .typeTerminalSegments, .sendSpecialKey,
              .startPairlingSession, .closePairlingSession:
             true
         case .status, .requestPermissions, .probeTerminal, .readTerminalTab,

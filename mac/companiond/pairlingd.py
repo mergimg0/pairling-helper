@@ -2511,6 +2511,9 @@ _REPLY_IMAGE_LINE = re.compile(
     r'^[ \t]*<img\s[^>\n]*?\bsrc="([^"\n]+)"[^>\n]*>[ \t]*$', re.MULTILINE
 )
 _URL_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
+# A picture a tool returned to an OMP agent. OMP keeps it outside the session
+# file, in a file named for its SHA-256.
+_TOOL_IMAGE_BLOB = re.compile(r"blob:sha256:([0-9a-f]{64})")
 # A larger file is not read, and a picture goes out no longer than this edge.
 REPLY_IMAGE_SOURCE_MAX_BYTES = 32 * 1024 * 1024
 REPLY_IMAGE_MAX_EDGE = 1600
@@ -2527,21 +2530,37 @@ def _sips(*arguments: str) -> str | None:
 
 
 def _session_event_image_bytes(row: dict, src: str, cwd: str) -> tuple[bytes, str] | None:
-    """A picture one reply names, as a JPEG. The phone asks by event and by the
+    """A picture one event names, as a JPEG. The phone asks by event and by the
     `src` it read there, so only a file the transcript itself names is read.
     A web address is never fetched: reply text is untrusted and must not make
     the Mac call out. `sips` decides what a picture is, not the file's name."""
     payload = row.get("payload")
-    text = payload.get("text") if isinstance(payload, dict) else None
-    if row.get("kind") != "block_text" or not isinstance(text, str):
+    if not isinstance(payload, dict):
         return None
-    if src not in _REPLY_IMAGE_LINE.findall(text) or _URL_SCHEME.match(src):
-        return None
-    # A path is relative to the directory the session runs in.
-    path = os.path.join(cwd, os.path.expanduser(src))
-    if not os.path.isabs(path):
-        return None
-    path = os.path.realpath(path)
+    if row.get("kind") == "tool_result":
+        # The path is made from the digest alone, never from text in the
+        # transcript, and a link that leads out of OMP's store is not followed.
+        blob = _TOOL_IMAGE_BLOB.fullmatch(src)
+        images = payload.get("images")
+        if not blob or not isinstance(images, list) or not any(
+            isinstance(image, dict) and image.get("src") == src for image in images
+        ):
+            return None
+        blobs = os.path.realpath(HOME / ".omp" / "agent" / "blobs")
+        path = os.path.realpath(os.path.join(blobs, blob.group(1)))
+        if os.path.dirname(path) != blobs:
+            return None
+    else:
+        text = payload.get("text")
+        if row.get("kind") != "block_text" or not isinstance(text, str):
+            return None
+        if src not in _REPLY_IMAGE_LINE.findall(text) or _URL_SCHEME.match(src):
+            return None
+        # A path is relative to the directory the session runs in.
+        path = os.path.join(cwd, os.path.expanduser(src))
+        if not os.path.isabs(path):
+            return None
+        path = os.path.realpath(path)
     try:
         if not os.path.isfile(path) or os.path.getsize(path) > REPLY_IMAGE_SOURCE_MAX_BYTES:
             return None
@@ -7929,39 +7948,6 @@ def _send_terminal_app_text_exact(tty: str, text: str) -> dict:
         return _automation_helper_failure(exc, mutation=True)
     return _automation_helper_response(response, mutation=True)
 
-def _type_terminal_app_text_exact(tty: str, text: str) -> dict:
-    """Type literal text into one exact Terminal tab without submitting it."""
-    if not re.fullmatch(r"/dev/ttys[0-9]{3,}", str(tty or "")):
-        return {
-            "ok": False,
-            "reason": "invalid terminal tty",
-            "error_code": "invalid_tty",
-            "status": 400,
-            "mutation_outcome": "failed_before_mutation",
-            "outcome_indeterminate": False,
-        }
-    if not isinstance(text, str) or not text or len(text.encode("utf-8")) > 1024:
-        return {
-            "ok": False,
-            "reason": "terminal input must be 1..1024 UTF-8 bytes",
-            "error_code": "input_size",
-            "status": 400,
-            "mutation_outcome": "failed_before_mutation",
-            "outcome_indeterminate": False,
-        }
-    try:
-        response = _automation_helper_client().type_text(
-            tty,
-            text,
-            timeout_ms=3_000,
-        )
-    except (
-        AutomationHelperMutationIndeterminate,
-        AutomationHelperUnavailableError,
-    ) as exc:
-        return _automation_helper_failure(exc, mutation=True)
-    return _automation_helper_response(response, mutation=True)
-
 # What the phone's key bar types into a Terminal tab: the bytes a terminal
 # sends for the key, and the helper's name for it. Longest first.
 _TERMINAL_APP_TYPED_KEYS = (
@@ -8006,12 +7992,39 @@ def _terminal_app_type_segments(text: str) -> list[tuple[str, str]] | None:
     return segments
 
 
-def _press_terminal_app_key_exact(tty: str, key: str) -> dict:
-    """Press one named key in one exact Terminal tab."""
+def _type_terminal_app_segments_exact(
+    tty: str,
+    segments: list[tuple[str, str]],
+) -> dict:
+    """Deliver typed text and named keys to one Terminal tab, in order.
+
+    One helper request carries them all, so the tab is found and raised once.
+    """
+    refusal = {
+        "ok": False,
+        "status": 400,
+        "mutation_outcome": "failed_before_mutation",
+        "outcome_indeterminate": False,
+    }
+    if not re.fullmatch(r"/dev/ttys[0-9]{3,}", str(tty or "")):
+        return {
+            **refusal,
+            "reason": "invalid terminal tty",
+            "error_code": "invalid_tty",
+        }
+    typed_bytes = sum(
+        len(value.encode("utf-8")) for kind, value in segments if kind == "text"
+    )
+    if not segments or typed_bytes > 1024:
+        return {
+            **refusal,
+            "reason": "terminal input must be 1..1024 UTF-8 bytes",
+            "error_code": "input_size",
+        }
     try:
-        response = _automation_helper_client().send_special_key(
+        response = _automation_helper_client().type_segments(
             tty,
-            key,
+            segments,
             timeout_ms=3_000,
         )
     except (
@@ -8019,37 +8032,25 @@ def _press_terminal_app_key_exact(tty: str, key: str) -> dict:
         AutomationHelperUnavailableError,
     ) as exc:
         return _automation_helper_failure(exc, mutation=True)
-    return _automation_helper_response(response, mutation=True)
-
-
-def _type_terminal_app_segments_exact(
-    tty: str,
-    segments: list[tuple[str, str]],
-) -> dict:
-    """Deliver typed text and named keys to one Terminal tab, in order."""
-    delivery: dict = {
-        "ok": False,
-        "reason": "terminal input is empty",
-        "error_code": "input_size",
-        "status": 400,
-        "mutation_outcome": "failed_before_mutation",
-        "outcome_indeterminate": False,
-    }
-    for index, (kind, value) in enumerate(segments):
-        delivery = (
-            _type_terminal_app_text_exact(tty, value)
-            if kind == "text"
-            else _press_terminal_app_key_exact(tty, value)
+    delivery = _automation_helper_response(response, mutation=True)
+    result = response.get("result")
+    completed = result.get("completed_segments") if isinstance(result, dict) else None
+    if delivery.get("ok"):
+        settled = completed == len(segments)
+    else:
+        # Refused with nothing posted: the same input may be sent again.
+        settled = (
+            delivery.get("mutation_outcome") == "failed_before_mutation"
+            and not completed
         )
-        if not delivery.get("ok"):
-            if index:
-                # Earlier parts reached the tab; a retry would type them twice.
-                delivery = {
-                    **delivery,
-                    "mutation_outcome": "outcome_unknown",
-                    "outcome_indeterminate": True,
-                }
-            return delivery
+    if not settled:
+        # Part of the input may be in the tab; a retry would type it twice.
+        delivery = {
+            **delivery,
+            "ok": False,
+            "mutation_outcome": "outcome_unknown",
+            "outcome_indeterminate": True,
+        }
     return delivery
 
 
@@ -21535,6 +21536,7 @@ def _receipt_duplicate_response(
     *,
     action_kind: str = "control_action",
     recover_uncertain=None,
+    settle_indeterminate=None,
     reserve_missing: bool = True,
     defer_running: bool = False,
 ) -> tuple[dict | None, dict | None]:
@@ -21856,6 +21858,84 @@ def _receipt_duplicate_response(
             recovery_only=True,
         )
         return indeterminate, None
+
+    if execution_state == "indeterminate" and settle_indeterminate and reserve_missing:
+        # The phone keeps one action id until it hears a conclusive answer, so
+        # a replayed "outcome unknown" would refuse this action for ever. The
+        # caller may prove that nothing the earlier attempt started is still
+        # running; the proof scans processes, so no transaction is held here.
+        try:
+            settled = settle_indeterminate({
+                "created_at": existing["created_at"],
+                "updated_at": existing["updated_at"],
+                "receipt": dict(stored_receipt),
+            }) is True
+        except Exception:
+            settled = False
+        if settled:
+            taken_at = _time.time()
+            try:
+                with _control_receipt_conn() as conn:
+                    taken = conn.execute(
+                        "UPDATE control_action_receipts "
+                        "SET state='in_progress', execution_state='queued', "
+                        "receipt_json=?, owner_instance=?, created_at=?, "
+                        "updated_at=? WHERE device_id=? AND session_id=? "
+                        "AND client_action_id=? AND body_hash=? "
+                        "AND action_kind=? AND execution_state='indeterminate' "
+                        "AND updated_at=?",
+                        (
+                            queued_receipt_json,
+                            _CONTROL_RECEIPT_INSTANCE_ID,
+                            taken_at,
+                            taken_at,
+                            normalized_device_id,
+                            session_id,
+                            client_action_id,
+                            body_hash,
+                            action_kind,
+                            existing["updated_at"],
+                        ),
+                    ).rowcount
+            except (OSError, sqlite3.Error):
+                taken = 0
+            if taken != 1:
+                # Another request changed the row first: answer with what is
+                # stored now.
+                return _receipt_duplicate_response(
+                    device_id,
+                    session_id,
+                    client_action_id,
+                    body_hash,
+                    action_kind=action_kind,
+                    recover_uncertain=recover_uncertain,
+                    defer_running=defer_running,
+                )
+            _append_control_receipt_audit({
+                "ts": taken_at,
+                "device_id": normalized_device_id,
+                "session_id": session_id,
+                "client_action_id": client_action_id,
+                "action_kind": action_kind,
+                "body_hash": body_hash,
+                "action": {
+                    "type": "indeterminate_action_run_again",
+                    "previous_created_at": existing["created_at"],
+                    "previous_updated_at": existing["updated_at"],
+                },
+                "persisted": True,
+                "receipt": stored_receipt,
+            })
+            _track_request_receipt_reservation({
+                "reservation_key": reservation_key,
+                "device_id": device_id,
+                "session_id": session_id,
+                "client_action_id": client_action_id,
+                "body_hash": body_hash,
+                "action_kind": action_kind,
+                "execution_state": "queued",
+            })
+            return None, None
 
     stored_receipt["execution_state"] = execution_state
     stored_receipt["deduped"] = True
@@ -22264,6 +22344,7 @@ def _begin_receipted_mutation(
     material,
     action_label: str,
     recover_uncertain=None,
+    settle_indeterminate=None,
 ) -> dict | None:
     """Reserve one durable mutation before any external side effect."""
     headers = getattr(handler, "headers", {}) or {}
@@ -22296,6 +22377,7 @@ def _begin_receipted_mutation(
         body_hash,
         action_kind=action_kind,
         recover_uncertain=recover_uncertain,
+        settle_indeterminate=settle_indeterminate,
     )
     if _send_receipted_mutation_duplicate(
         handler,
@@ -41275,6 +41357,36 @@ class Handler(BaseHTTPRequestHandler):
             )
             if q.get(key)
         }
+        aperture_payload = payload.get("aperture") if isinstance(payload.get("aperture"), dict) else {}
+        body_provider = str(payload.get("provider") or "").strip().lower()
+        body_provider_id = str(
+            payload.get("provider_id") or ""
+        ).strip().lower()
+        provider = (
+            body_provider_id
+            or body_provider
+            or str(aperture_payload.get("client_id") or "").lower()
+            or str(q.get("provider", ["claude"])[0]).lower()
+        )
+
+        def earlier_start_left_nothing_running(earlier: dict) -> bool:
+            # Proof for a start whose outcome was never learned: no live
+            # process of this provider began inside that attempt's window.
+            if earlier["receipt"].get("backend") not in {
+                "terminal_app", "pty_broker",
+            }:
+                return False
+            scan_ok, rows = _scan_provider_process_rows(provider)
+            if not scan_ok:
+                return False
+            window_start = float(earlier["created_at"]) - 5
+            window_end = float(earlier["updated_at"]) + 30
+            for row in rows:
+                started_at = float(row.get("started_at") or 0)
+                if started_at <= 0 or window_start <= started_at <= window_end:
+                    return False
+            return True
+
         mutation = _begin_receipted_mutation(
             self,
             receipt_scope="spawn_session",
@@ -41284,11 +41396,11 @@ class Handler(BaseHTTPRequestHandler):
                 "query": query_material,
             },
             action_label="session launch",
+            settle_indeterminate=earlier_start_left_nothing_running,
         )
         if mutation is None:
             return
 
-        aperture_payload = payload.get("aperture") if isinstance(payload.get("aperture"), dict) else {}
         launch_strategy = str(payload.get("launch_strategy") or q.get("launch_strategy", ["direct_pairling"])[0] or "direct_pairling").strip().lower()
         session_mode = str(
             payload.get("session_mode")
@@ -41305,16 +41417,6 @@ class Handler(BaseHTTPRequestHandler):
         project = str(
             payload.get("project") or q.get("project", [""])[0]
         ).strip()
-        body_provider = str(payload.get("provider") or "").strip().lower()
-        body_provider_id = str(
-            payload.get("provider_id") or ""
-        ).strip().lower()
-        provider = (
-            body_provider_id
-            or body_provider
-            or str(aperture_payload.get("client_id") or "").lower()
-            or str(q.get("provider", ["claude"])[0]).lower()
-        )
         client_action_id = mutation["client_action_id"]
         spawn_body_hash = mutation["body_hash"]
         device_id = str(mutation["device_id"])

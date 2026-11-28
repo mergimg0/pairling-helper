@@ -205,22 +205,29 @@ class AutomationHelperClient:
             fresh_identity=True,
         )
 
-    def type_text(
+    def type_segments(
         self,
         tty: str,
-        text: str,
+        segments: list[tuple[str, str]],
         *,
         timeout_ms: int,
     ) -> dict[str, Any]:
-        if not isinstance(text, str) or not text:
-            raise ValueError("text must be a non-empty string")
+        """Type ("text", literal) and ("key", name) pairs in order, in one request.
+
+        The helper's `result.completed_segments` says how many it posted.
+        """
+        if not segments or any(
+            kind not in ("text", "key") or not isinstance(value, str) or not value
+            for kind, value in segments
+        ):
+            raise ValueError("segments must be non-empty text or key pairs")
         if (blocked := self._fresh_mutation_capability(timeout_ms=timeout_ms)) is not None:
             return blocked
         return self._request(
-            "typeTerminalText",
+            "typeTerminalSegments",
             {
                 "tty": tty,
-                "text": text,
+                "segments": [{kind: value} for kind, value in segments],
             },
             mutation=True,
             timeout_ms=timeout_ms,

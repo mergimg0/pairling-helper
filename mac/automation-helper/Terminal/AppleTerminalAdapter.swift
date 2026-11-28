@@ -13,6 +13,11 @@ enum AppleTerminalAdapterError: Error, Equatable {
     case terminalOperationFailed
 }
 
+/// Typed input stopped part-way: this many whole segments were posted first.
+struct TerminalSegmentsFailure: Error, Equatable {
+    let completedSegments: Int
+}
+
 enum TerminalSpecialKey: String, CaseIterable, Sendable {
     case enter
     case escape
@@ -143,7 +148,7 @@ protocol TerminalControlling {
     func readTab(tty: String) throws -> TerminalTabSnapshot
     func inspectTab(tty: String) throws -> TerminalTabInspection
     func sendText(tty: String, text: String, bracketedPaste: Bool) throws
-    func typeText(tty: String, text: String) throws
+    func typeSegments(tty: String, segments: [TerminalInputSegment]) throws
     func sendSpecialKey(tty: String, key: String) throws
     func sendEscape(tty: String) throws
     func startPairlingSession(command: String, ownershipMarker: String) throws -> String
@@ -213,7 +218,11 @@ final class AppleTerminalAdapter: TerminalControlling {
         try requireOK(result)
     }
 
-    func typeText(tty: String, text: String) throws {
+    /// Finds and raises the tab once, then posts every segment in order.
+    /// Throws `TerminalSegmentsFailure` once posting has begun.
+    func typeSegments(tty: String, segments: [TerminalInputSegment]) throws {
+        // Every segment is checked before the tab is touched.
+        let posts = try segments.map(Self.posts(for:))
         let selection = try run(
             TerminalScriptTemplate.selectTerminalTabForInput,
             arguments: [tty]
@@ -228,31 +237,62 @@ final class AppleTerminalAdapter: TerminalControlling {
             throw AppleTerminalAdapterError.terminalProcessUnavailable
         }
 
-        var literal = ""
-        func flushLiteral() throws {
-            guard !literal.isEmpty else { return }
-            try textPoster.post(literal, to: processIdentifier)
-            literal = ""
-        }
-
-        for character in text {
-            switch character {
-            case "\r", "\n":
-                try flushLiteral()
-                try keyPoster.post(.enter, to: processIdentifier)
-            case "\t":
-                try flushLiteral()
-                try keyPoster.post(.tab, to: processIdentifier)
-            default:
-                if character.unicodeScalars.contains(where: {
-                    $0.value < 0x20 || $0.value == 0x7F
-                }) {
-                    throw AppleTerminalAdapterError.unsupportedSpecialKey
+        for (completedSegments, segmentPosts) in posts.enumerated() {
+            do {
+                for post in segmentPosts {
+                    switch post {
+                    case .text(let text):
+                        try textPoster.post(text, to: processIdentifier)
+                    case .key(let key):
+                        try keyPoster.post(key, to: processIdentifier)
+                    }
                 }
-                literal.append(character)
+            } catch {
+                throw TerminalSegmentsFailure(completedSegments: completedSegments)
             }
         }
-        try flushLiteral()
+    }
+
+    private enum TerminalPost {
+        case text(String)
+        case key(TerminalSpecialKey)
+    }
+
+    private static func posts(for segment: TerminalInputSegment) throws -> [TerminalPost] {
+        switch segment {
+        case .key(let name):
+            guard let key = TerminalSpecialKey(rawValue: name) else {
+                throw AppleTerminalAdapterError.unsupportedSpecialKey
+            }
+            return [.key(key)]
+        case .text(let text):
+            var posts: [TerminalPost] = []
+            var literal = ""
+            func flushLiteral() {
+                guard !literal.isEmpty else { return }
+                posts.append(.text(literal))
+                literal = ""
+            }
+            for character in text {
+                switch character {
+                case "\r", "\n":
+                    flushLiteral()
+                    posts.append(.key(.enter))
+                case "\t":
+                    flushLiteral()
+                    posts.append(.key(.tab))
+                default:
+                    if character.unicodeScalars.contains(where: {
+                        $0.value < 0x20 || $0.value == 0x7F
+                    }) {
+                        throw AppleTerminalAdapterError.unsupportedSpecialKey
+                    }
+                    literal.append(character)
+                }
+            }
+            flushLiteral()
+            return posts
+        }
     }
 
     func sendSpecialKey(tty: String, key: String) throws {

@@ -23,7 +23,7 @@ enum AutomationOperation: String, Codable, CaseIterable, Sendable {
     case probeTerminal
     case readTerminalTab
     case sendTerminalText
-    case typeTerminalText
+    case typeTerminalSegments
     case sendSpecialKey
     case startPairlingSession
     case inspectTerminalTab
@@ -292,7 +292,7 @@ enum AutomationArguments: Equatable, Sendable {
     case permissionRequest(PermissionRequestArguments)
     case terminalTTY(TerminalTTYArguments)
     case terminalText(TerminalTextArguments)
-    case terminalType(TerminalTypeArguments)
+    case terminalSegments(TerminalSegmentsArguments)
     case specialKey(SpecialKeyArguments)
     case startSession(StartPairlingSessionArguments)
     case closeSession(ClosePairlingSessionArguments)
@@ -318,11 +318,14 @@ enum AutomationArguments: Equatable, Sendable {
                 text: try requiredString(values, key: "text"),
                 bracketedPaste: try requiredBoolean(values, key: "bracketedPaste")
             ))
-        case .typeTerminalText:
-            try requireOnly(values, keys: ["tty", "text"])
-            return .terminalType(TerminalTypeArguments(
+        case .typeTerminalSegments:
+            try requireOnly(values, keys: ["tty", "segments"])
+            guard case let .array(segments)? = values["segments"] else {
+                throw AutomationValidationError(code: .invalidRequest)
+            }
+            return .terminalSegments(TerminalSegmentsArguments(
                 tty: try requiredString(values, key: "tty"),
-                text: try requiredString(values, key: "text")
+                segments: try segments.map(TerminalInputSegment.init(jsonValue:))
             ))
         case .sendSpecialKey:
             try requireOnly(values, keys: ["tty", "key"])
@@ -363,10 +366,10 @@ enum AutomationArguments: Equatable, Sendable {
                 "text": .string(arguments.text),
                 "bracketedPaste": .bool(arguments.bracketedPaste),
             ])
-        case .terminalType(let arguments):
+        case .terminalSegments(let arguments):
             return .object([
                 "tty": .string(arguments.tty),
-                "text": .string(arguments.text),
+                "segments": .array(arguments.segments.map(\.jsonValue)),
             ])
         case .specialKey(let arguments):
             return .object(["tty": .string(arguments.tty), "key": .string(arguments.key)])
@@ -435,9 +438,37 @@ struct TerminalTextArguments: Equatable, Sendable {
     let bracketedPaste: Bool
 }
 
-struct TerminalTypeArguments: Equatable, Sendable {
+/// One part of typed input: literal text, or one named `TerminalSpecialKey`.
+enum TerminalInputSegment: Equatable, Sendable {
+    case text(String)
+    case key(String)
+
+    init(jsonValue: JSONValue) throws {
+        guard case let .object(values) = jsonValue, values.count == 1 else {
+            throw AutomationValidationError(code: .invalidRequest)
+        }
+        if case let .string(text)? = values["text"] {
+            self = .text(text)
+        } else if case let .string(key)? = values["key"] {
+            self = .key(key)
+        } else {
+            throw AutomationValidationError(code: .invalidRequest)
+        }
+    }
+
+    var jsonValue: JSONValue {
+        switch self {
+        case .text(let text):
+            .object(["text": .string(text)])
+        case .key(let key):
+            .object(["key": .string(key)])
+        }
+    }
+}
+
+struct TerminalSegmentsArguments: Equatable, Sendable {
     let tty: String
-    let text: String
+    let segments: [TerminalInputSegment]
 }
 
 struct SpecialKeyArguments: Equatable, Sendable {

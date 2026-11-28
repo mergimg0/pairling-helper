@@ -67,13 +67,27 @@ final class RequestValidator {
             guard arguments.text.utf8.count <= PairlingAutomationConstants.maximumTextBytes else {
                 throw AutomationValidationError(code: .textTooLarge)
             }
-        case .terminalType(let arguments):
+        case .terminalSegments(let arguments):
             try validateTTY(arguments.tty)
-            guard !arguments.text.isEmpty else {
+            guard !arguments.segments.isEmpty else {
                 throw AutomationValidationError(code: .invalidRequest)
             }
-            guard arguments.text.utf8.count <= PairlingAutomationConstants.maximumTextBytes else {
-                throw AutomationValidationError(code: .textTooLarge)
+            var textBytes = 0
+            for segment in arguments.segments {
+                switch segment {
+                case .text(let text):
+                    guard !text.isEmpty else {
+                        throw AutomationValidationError(code: .invalidRequest)
+                    }
+                    textBytes += text.utf8.count
+                    guard textBytes <= PairlingAutomationConstants.maximumTextBytes else {
+                        throw AutomationValidationError(code: .textTooLarge)
+                    }
+                case .key(let key):
+                    guard TerminalSpecialKey(rawValue: key) != nil else {
+                        throw AutomationValidationError(code: .unsupportedSpecialKey)
+                    }
+                }
             }
         case .specialKey(let arguments):
             try validateTTY(arguments.tty)

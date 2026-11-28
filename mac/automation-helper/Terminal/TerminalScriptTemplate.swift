@@ -16,6 +16,10 @@ struct TerminalScriptTemplate: Sendable {
         """
     )
 
+    // A tab whose shell has exited ("[Process completed]") keeps its tty, and
+    // macOS gives that tty to the next tab that opens. So a tab is a session's
+    // only while a process runs in it. Measured on macOS 26.4: the finished
+    // tab reports no processes, the live one four.
     static let readTerminalTab = TerminalScriptTemplate(
         handler: "readTerminalTab",
         source: """
@@ -23,7 +27,7 @@ struct TerminalScriptTemplate: Sendable {
             tell application id "com.apple.Terminal"
                 repeat with w in windows
                     repeat with t in tabs of w
-                        if (tty of t as text) is targetTTY then
+                        if (tty of t as text) is targetTTY and (count of (processes of t)) is greater than 0 then
                             set terminalHistory to (history of t as text)
                             set wasTruncated to false
                             if (length of terminalHistory) > 65536 then
@@ -47,7 +51,7 @@ struct TerminalScriptTemplate: Sendable {
             tell application id "com.apple.Terminal"
                 repeat with w in windows
                     repeat with t in tabs of w
-                        if (tty of t as text) is targetTTY then
+                        if (tty of t as text) is targetTTY and (count of (processes of t)) is greater than 0 then
                             return {"ok", (tty of t as text), (custom title of t as text)}
                         end if
                     end repeat
@@ -66,7 +70,7 @@ struct TerminalScriptTemplate: Sendable {
                 set targetTab to missing value
                 repeat with w in windows
                     repeat with t in tabs of w
-                        if (tty of t as text) is targetTTY then
+                        if (tty of t as text) is targetTTY and (count of (processes of t)) is greater than 0 then
                             set targetTab to t
                             exit repeat
                         end if
@@ -90,7 +94,7 @@ struct TerminalScriptTemplate: Sendable {
             tell application id "com.apple.Terminal"
                 repeat with w in windows
                     repeat with t in tabs of w
-                        if (tty of t as text) is targetTTY then
+                        if (tty of t as text) is targetTTY and (count of (processes of t)) is greater than 0 then
                             activate
                             set index of w to 1
                             set selected tab of w to t
@@ -114,7 +118,7 @@ struct TerminalScriptTemplate: Sendable {
                 set targetTab to missing value
                 repeat with w in windows
                     repeat with t in tabs of w
-                        if (tty of t as text) is targetTTY then
+                        if (tty of t as text) is targetTTY and (count of (processes of t)) is greater than 0 then
                             set matchCount to matchCount + 1
                             set targetWindow to w
                             set targetTab to t

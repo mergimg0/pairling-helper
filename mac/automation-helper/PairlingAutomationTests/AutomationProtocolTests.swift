@@ -111,27 +111,36 @@ final class AutomationProtocolTests: XCTestCase {
         XCTAssertTrue(arguments.bracketedPaste)
     }
 
-    func testTypeTerminalTextAcceptsOnlyTTYAndLiteralText() throws {
+    func testTypeTerminalSegmentsAcceptsOnlyTTYAndOrderedTextOrKeySegments() throws {
         let validated = try makeValidator().validate(
             request(
-                operation: "typeTerminalText",
-                arguments: "{\"tty\":\"/dev/ttys4\",\"text\":\"hello\\r\"}"
+                operation: "typeTerminalSegments",
+                arguments: "{\"tty\":\"/dev/ttys4\",\"segments\":[{\"key\":\"down\"},{\"text\":\"hello\\r\"},{\"key\":\"enter\"}]}"
             ),
             peerUID: ownerUID
         )
-        guard case let .terminalType(arguments) = validated.arguments else {
-            return XCTFail("Expected literal Terminal typing arguments.")
+        guard case let .terminalSegments(arguments) = validated.arguments else {
+            return XCTFail("Expected Terminal typing segments.")
         }
         XCTAssertEqual(arguments.tty, "/dev/ttys4")
-        XCTAssertEqual(arguments.text, "hello\r")
+        XCTAssertEqual(arguments.segments, [.key("down"), .text("hello\r"), .key("enter")])
 
-        assertValidationError(
-            .invalidRequest,
-            request: request(
-                operation: "typeTerminalText",
-                arguments: "{\"tty\":\"/dev/ttys4\",\"text\":\"hello\",\"bracketedPaste\":false}"
+        let refused: [(AutomationErrorCode, String)] = [
+            (.invalidRequest, "{\"tty\":\"/dev/ttys4\",\"segments\":[{\"text\":\"hello\"}],\"bracketedPaste\":false}"),
+            (.invalidRequest, "{\"tty\":\"/dev/ttys4\",\"text\":\"hello\"}"),
+            (.invalidRequest, "{\"tty\":\"/dev/ttys4\",\"segments\":[]}"),
+            (.invalidRequest, "{\"tty\":\"/dev/ttys4\",\"segments\":[{\"text\":\"\"}]}"),
+            (.invalidRequest, "{\"tty\":\"/dev/ttys4\",\"segments\":[{\"text\":\"a\",\"key\":\"down\"}]}"),
+            (.invalidRequest, "{\"tty\":\"/dev/ttys4\",\"segments\":[\"down\"]}"),
+            (.invalidTTY, "{\"tty\":\"/dev/pts/4\",\"segments\":[{\"key\":\"down\"}]}"),
+            (.unsupportedSpecialKey, "{\"tty\":\"/dev/ttys4\",\"segments\":[{\"text\":\"a\"},{\"key\":\"return\"}]}"),
+        ]
+        for (code, arguments) in refused {
+            assertValidationError(
+                code,
+                request: request(operation: "typeTerminalSegments", arguments: arguments)
             )
-        )
+        }
     }
 
     func testRejectsOversizedPayloadArgumentsAndInvalidTimeouts() {
